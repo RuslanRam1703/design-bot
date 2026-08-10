@@ -1,0 +1,255 @@
+/* Базовые цвета — наша собственная светлая/тёмная пара, а не сырые
+   tg-theme-* значения: у части тем Telegram text_color/secondary_bg_color
+   недостаточно контрастны друг с другом (см. баг с нечитаемым текстом
+   карточек в тёмной теме). --button/--link по-прежнему берём из Telegram —
+   это уже согласованные акцентные пары, с ними проблем нет. */
+:root {
+  --bg: #ffffff;
+  --bg-secondary: #f2f2f7;
+  --text: #1c1c1e;
+  --hint: #8e8e93;
+  --link: var(--tg-theme-link-color, #6c5ce7);
+  --button: var(--tg-theme-button-color, #6c5ce7);
+  --button-text: var(--tg-theme-button-text-color, #ffffff);
+  --accent: #6c5ce7;
+  --danger: #e17055;
+  --radius: 14px;
+  --gap: 12px;
+}
+
+:root[data-theme="dark"] {
+  --bg: #17212b;
+  --bg-secondary: #232e3c;
+  --text: #f5f5f7;
+  --hint: #8b98a5;
+  --accent: #9c8cff;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #17212b;
+    --bg-secondary: #232e3c;
+    --text: #f5f5f7;
+    --hint: #8b98a5;
+    --accent: #9c8cff;
+  }
+}
+
+* { box-sizing: border-box; }
+
+/* У <button> в браузерах color/font по умолчанию НЕ наследуются от
+   родителя (в отличие от почти всех остальных тегов) — используется
+   системный цвет кнопки, обычно тёмный, даже на тёмном фоне. Без этого
+   сброса весь текст внутри кастомных .service-item/.card/.pick и т.п.
+   рискует остаться чёрным независимо от темы. */
+button {
+  font: inherit;
+  color: inherit;
+}
+
+html, body {
+  margin: 0;
+  padding: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif;
+  font-size: 15px;
+  line-height: 1.4;
+}
+
+#app {
+  min-height: 100vh;
+  padding: 16px 16px 88px;
+}
+
+/* ---- Нижнее меню экранов Mini App ---- */
+.tab-bar {
+  position: fixed;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  display: flex;
+  background: var(--bg-secondary);
+  border-top: 1px solid rgba(127, 127, 127, 0.2);
+  padding: 6px 8px calc(6px + env(safe-area-inset-bottom, 0px));
+  z-index: 10;
+}
+.tab-item {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+  background: none;
+  border: none;
+  border-radius: 10px;
+  padding: 6px 4px;
+  cursor: pointer;
+  color: var(--hint);
+  font-size: 11px;
+}
+.tab-item .tab-icon { font-size: 20px; }
+.tab-item.active { color: var(--accent); }
+
+h1, h2, h3 { margin: 0 0 8px; color: var(--text); }
+h1 { font-size: 20px; font-weight: 700; }
+h2 { font-size: 17px; font-weight: 600; }
+p { margin: 0 0 8px; color: var(--text); }
+a { color: var(--link); text-decoration: none; }
+
+.hint { color: var(--hint); font-size: 13px; }
+.section-lead { color: var(--text); font-size: 14px; margin: 0 0 12px; }
+
+/* ---- Топ-панель с заголовком экрана ---- */
+.topbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 16px;
+}
+.topbar .back-btn {
+  border: none;
+  background: var(--bg-secondary);
+  color: var(--text);
+  width: 34px;
+  height: 34px;
+  border-radius: 10px;
+  font-size: 16px;
+  cursor: pointer;
+}
+.topbar h1 { flex: 1; }
+
+/* ---- Кнопки ---- */
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  border: none;
+  border-radius: var(--radius);
+  padding: 12px 16px;
+  font-size: 15px;
+  font-weight: 600;
+  cursor: pointer;
+  width: 100%;
+}
+.btn-primary { background: var(--button); color: var(--button-text); }
+.btn-secondary { background: var(--bg-secondary); color: var(--text); }
+.btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
+.btn-row { display: flex; gap: 8px; margin-top: 16px; }
+.btn-row .btn { width: auto; flex: 1; }
+
+/* ---- Фильтр-чипы (портфолио) ---- */
+.chips { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 16px; }
+.chip {
+  border: 1px solid var(--bg-secondary);
+  background: var(--bg-secondary);
+  color: var(--text);
+  border-radius: 999px;
+  padding: 7px 14px;
+  font-size: 13px;
+  cursor: pointer;
+}
+.chip.active { background: var(--accent); color: #fff; border-color: var(--accent); }
+
+/* ---- Грид портфолио ---- */
+.grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: var(--gap);
+}
+.card {
+  background: var(--bg-secondary);
+  color: var(--text);
+  border-radius: var(--radius);
+  overflow: hidden;
+  cursor: pointer;
+  text-align: left;
+}
+.card img { width: 100%; display: block; aspect-ratio: 3 / 2; object-fit: cover; }
+.card .card-title { padding: 8px 10px 10px; font-size: 13px; font-weight: 600; }
+
+/* ---- Кейс ---- */
+.case-images { display: flex; flex-direction: column; gap: 8px; margin-bottom: 12px; }
+.case-images img { width: 100%; border-radius: var(--radius); display: block; }
+.case-block { margin-bottom: 14px; }
+.case-block .label { font-size: 12px; text-transform: uppercase; color: var(--hint); margin-bottom: 4px; letter-spacing: .03em; }
+
+/* ---- Калькулятор ---- */
+.service-list { display: flex; flex-direction: column; gap: 8px; margin-bottom: 16px; }
+.service-item {
+  display: flex; justify-content: space-between; align-items: center;
+  background: var(--bg-secondary); color: var(--text); border-radius: var(--radius); padding: 12px 14px;
+  cursor: pointer; border: 2px solid transparent;
+}
+.service-item.selected { border-color: var(--accent); }
+.service-item .name { font-weight: 600; }
+.service-item .price { color: var(--hint); font-size: 13px; }
+
+.option-row {
+  display: flex; align-items: center; justify-content: space-between;
+  background: var(--bg-secondary); border-radius: 12px; padding: 10px 12px; margin-bottom: 8px;
+}
+.option-row .option-main { display: flex; align-items: center; gap: 10px; }
+.option-row .option-name { font-size: 14px; }
+.option-row .option-price { font-size: 12px; color: var(--hint); }
+.option-row input[type="checkbox"] { width: 20px; height: 20px; }
+
+.qty-control { display: flex; align-items: center; gap: 8px; }
+.qty-control button {
+  width: 26px; height: 26px; border-radius: 8px; border: none;
+  background: var(--accent); color: #fff; font-size: 16px; cursor: pointer;
+}
+.qty-control span { min-width: 18px; text-align: center; font-weight: 600; }
+
+.toggle-row {
+  display: flex; align-items: center; justify-content: space-between;
+  background: var(--bg-secondary); border-radius: 12px; padding: 10px 12px; margin-bottom: 8px;
+}
+.switch { position: relative; width: 44px; height: 26px; }
+.switch input { opacity: 0; width: 0; height: 0; }
+.switch .track {
+  position: absolute; inset: 0; background: #c7c7cc; border-radius: 999px; transition: .15s; cursor: pointer;
+}
+.switch .track::before {
+  content: ""; position: absolute; width: 20px; height: 20px; left: 3px; top: 3px;
+  background: #fff; border-radius: 50%; transition: .15s;
+}
+.switch input:checked + .track { background: var(--accent); }
+.switch input:checked + .track::before { transform: translateX(18px); }
+
+.result-box {
+  background: var(--bg-secondary); border-radius: var(--radius); padding: 16px; margin: 16px 0; text-align: center;
+}
+.result-box .price { font-size: 24px; font-weight: 700; color: var(--accent); }
+.result-box .term { color: var(--hint); font-size: 13px; margin-top: 4px; }
+
+/* ---- Бриф (шаги) ---- */
+.step-progress { display: flex; gap: 4px; margin-bottom: 16px; }
+.step-progress div { height: 4px; flex: 1; background: var(--bg-secondary); border-radius: 2px; }
+.step-progress div.done { background: var(--accent); }
+
+.option-buttons { display: flex; flex-direction: column; gap: 8px; }
+.option-buttons .pick {
+  text-align: left; background: var(--bg-secondary); border: 2px solid transparent; border-radius: 12px;
+  padding: 12px 14px; cursor: pointer; font-size: 14px; color: var(--text);
+}
+.option-buttons .pick.selected { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 12%, var(--bg-secondary)); }
+
+textarea, input[type="text"] {
+  width: 100%; border-radius: 12px; border: 1px solid var(--bg-secondary); background: var(--bg-secondary);
+  color: var(--text); padding: 12px; font-size: 14px; font-family: inherit; resize: vertical;
+}
+textarea:focus, input[type="text"]:focus { outline: 2px solid var(--accent); }
+.char-counter { text-align: right; font-size: 12px; color: var(--hint); margin-top: 4px; }
+.char-counter.over { color: var(--danger); }
+
+.field { margin-bottom: 16px; }
+.field label { display: block; font-size: 13px; color: var(--hint); margin-bottom: 6px; }
+
+.summary-box {
+  background: var(--bg-secondary); border-radius: var(--radius); padding: 12px 14px; margin-bottom: 16px; font-size: 13px;
+}
+
+.empty-state { text-align: center; padding: 40px 16px; color: var(--hint); }

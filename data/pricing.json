@@ -1,0 +1,81 @@
+{
+  "services": [
+    { "id": "LEND", "name": "Лендинг", "base_price": 25000, "term_min": 7, "term_max": 10, "includes": "Структура страницы, UX, UI, до 6–7 экранов, desktop, Figma" },
+    { "id": "SITE", "name": "Сайт", "base_price": 45000, "term_min": 15, "term_max": 15, "includes": "Структура, UX основных страниц, до 5 уникальных страниц, desktop, Figma" },
+    { "id": "UXUI", "name": "UX/UI цифрового продукта", "base_price": 50000, "term_min": 15, "term_max": 15, "includes": "UX, сценарии, информационная архитектура, UI, до 8 экранов, интерактивный прототип, Figma" },
+    { "id": "LOGO", "name": "Логотип / фирменный знак", "base_price": 15000, "term_min": 5, "term_max": 5, "includes": "Анализ задачи, 2 концепции, разработка направления, финальный знак, основные версии, файлы" },
+    { "id": "BRAND", "name": "Брендинг / фирменный стиль", "base_price": 45000, "term_min": 12, "term_max": 15, "includes": "Визуальная концепция, знак, цветовая система, типографика, базовая графсистема, до 3 носителей, базовый гайдлайн" },
+    { "id": "GD_PRES", "name": "Графический дизайн — Презентация", "short_name": "Презентация", "base_price": 10000, "term_min": 4, "term_max": 4, "includes": "До 10 слайдов" },
+    { "id": "GD_BANNER", "name": "Графический дизайн — Баннер/рекламный креатив", "short_name": "Баннер / рекламный креатив", "base_price": 3500, "term_min": 1, "term_max": 2, "includes": "1 формат" },
+    { "id": "GD_PRINT", "name": "Графический дизайн — Печатный материал", "short_name": "Печатный материал", "base_price": 5000, "term_min": 2, "term_max": 3, "includes": "1 формат" },
+    { "id": "SMM", "name": "Социальные сети", "base_price": 10000, "term_min": 4, "term_max": 5, "includes": "Визуальная концепция, 5 публикаций, 5 сторис, базовая система оформления" }
+  ],
+  "groups": [
+    { "id": "graphics", "label": "Графический дизайн", "service_ids": ["GD_PRES", "GD_BANNER", "GD_PRINT"] }
+  ],
+  "options": [
+    { "service_id": "LEND", "id": "LEND_1", "name": "Мобильная адаптация", "price": 5000, "days": 2, "multipliable": false },
+    { "service_id": "LEND", "id": "LEND_2", "name": "Дополнительный экран", "price": 3000, "days": 1, "multipliable": true },
+    { "service_id": "LEND", "id": "LEND_3", "name": "Сложная анимация / интерактив", "price": 7000, "days": 2, "multipliable": false },
+    { "service_id": "LEND", "id": "LEND_4", "name": "Дополнительная UX-проработка", "price": 5000, "days": 1, "multipliable": false },
+    { "service_id": "LEND", "id": "LEND_5", "name": "UI-kit проекта", "price": 5000, "days": 1, "multipliable": false },
+    { "service_id": "LEND", "id": "LEND_6", "name": "Подготовка к разработке", "price": 3000, "days": 1, "multipliable": false },
+
+    { "service_id": "SITE", "id": "SITE_1", "name": "Дополнительная страница", "price": 5000, "days": 1, "multipliable": true },
+    { "service_id": "SITE", "id": "SITE_2", "name": "Мобильная адаптация", "price": 10000, "days": 3, "multipliable": false },
+    { "service_id": "SITE", "id": "SITE_3", "name": "Сложная анимация / интерактив", "price": 10000, "days": 2, "multipliable": false },
+    { "service_id": "SITE", "id": "SITE_4", "name": "Дополнительная UX-проработка", "price": 7000, "days": 2, "multipliable": false },
+    { "service_id": "SITE", "id": "SITE_5", "name": "UI-kit / система компонентов", "price": 10000, "days": 2, "multipliable": false },
+    { "service_id": "SITE", "id": "SITE_6", "name": "Подготовка к разработке", "price": 5000, "days": 1, "multipliable": false },
+
+    { "service_id": "UXUI", "id": "UXUI_1", "name": "Дополнительный экран", "price": 3000, "days": 1, "multipliable": true },
+    { "service_id": "UXUI", "id": "UXUI_2", "name": "Дополнительный сценарий", "price": 5000, "days": 1, "multipliable": true },
+    { "service_id": "UXUI", "id": "UXUI_3", "name": "UX-аудит / исследование", "price": 10000, "days": 2, "multipliable": false },
+    { "service_id": "UXUI", "id": "UXUI_4", "name": "Сложный прототип", "price": 7000, "days": 2, "multipliable": false },
+    { "service_id": "UXUI", "id": "UXUI_5", "name": "UI-kit / система компонентов", "price": 10000, "days": 2, "multipliable": false },
+    { "service_id": "UXUI", "id": "UXUI_6", "name": "Design Tokens / Variables", "price": 7000, "days": 1, "multipliable": false },
+    { "service_id": "UXUI", "id": "UXUI_7", "name": "Подготовка к разработке", "price": 7000, "days": 2, "multipliable": false },
+    { "service_id": "UXUI", "id": "UXUI_8", "name": "Мобильная версия", "price": 15000, "days": 3, "multipliable": false },
+
+    { "service_id": "LOGO", "id": "LOGO_1", "name": "Дополнительная концепция", "price": 5000, "days": 1, "multipliable": true },
+    { "service_id": "LOGO", "id": "LOGO_2", "name": "Дополнительная итерация", "price": 2000, "days": 1, "multipliable": true },
+    { "service_id": "LOGO", "id": "LOGO_3", "name": "Дополнительная версия знака", "price": 2000, "days": 1, "multipliable": true },
+    { "service_id": "LOGO", "id": "LOGO_4", "name": "Мини-гайд", "price": 5000, "days": 1, "multipliable": false },
+    { "service_id": "LOGO", "id": "LOGO_5", "name": "Расширенный логобук", "price": 10000, "days": 2, "multipliable": false },
+
+    { "service_id": "BRAND", "id": "BRAND_1", "name": "Дополнительный носитель", "price": 3000, "days": 1, "multipliable": true },
+    { "service_id": "BRAND", "id": "BRAND_2", "name": "Дополнительная концепция", "price": 7000, "days": 2, "multipliable": true },
+    { "service_id": "BRAND", "id": "BRAND_3", "name": "Расширенная графическая система", "price": 7000, "days": 1, "multipliable": false },
+    { "service_id": "BRAND", "id": "BRAND_4", "name": "Дополнительная типографическая проработка", "price": 5000, "days": 1, "multipliable": false },
+    { "service_id": "BRAND", "id": "BRAND_5", "name": "Расширенный гайдлайн", "price": 10000, "days": 2, "multipliable": false },
+    { "service_id": "BRAND", "id": "BRAND_6", "name": "Полный брендбук", "price": 20000, "days": 4, "multipliable": false },
+
+    { "service_id": "GD_PRES", "id": "GD_PRES_1", "name": "Дополнительный слайд", "price": 700, "days": 0.5, "multipliable": true },
+    { "service_id": "GD_PRES", "id": "GD_PRES_2", "name": "Сложная инфографика", "price": 2000, "days": 1, "multipliable": true },
+    { "service_id": "GD_PRES", "id": "GD_PRES_3", "name": "Визуальная концепция", "price": 3000, "days": 1, "multipliable": false },
+
+    { "service_id": "GD_BANNER", "id": "GD_BANNER_1", "name": "Дополнительный формат", "price": 1000, "days": 0.5, "multipliable": true },
+    { "service_id": "GD_BANNER", "id": "GD_BANNER_2", "name": "Дополнительная концепция", "price": 2000, "days": 1, "multipliable": true },
+    { "service_id": "GD_BANNER", "id": "GD_BANNER_3", "name": "Серия из 5 креативов", "price": 8000, "days": 2, "multipliable": false },
+
+    { "service_id": "GD_PRINT", "id": "GD_PRINT_1", "name": "Дополнительный формат", "price": 1500, "days": 1, "multipliable": true },
+    { "service_id": "GD_PRINT", "id": "GD_PRINT_2", "name": "Сложная инфографика", "price": 3000, "days": 1, "multipliable": true },
+    { "service_id": "GD_PRINT", "id": "GD_PRINT_3", "name": "Подготовка к печати", "price": 2000, "days": 1, "multipliable": false },
+
+    { "service_id": "SMM", "id": "SMM_1", "name": "Дополнительная публикация", "price": 1500, "days": 0.5, "multipliable": true },
+    { "service_id": "SMM", "id": "SMM_2", "name": "Дополнительная сторис", "price": 700, "days": 0.5, "multipliable": true },
+    { "service_id": "SMM", "id": "SMM_3", "name": "Обложка / баннер", "price": 2000, "days": 1, "multipliable": false },
+    { "service_id": "SMM", "id": "SMM_4", "name": "Визуальная система аккаунта", "price": 7000, "days": 1, "multipliable": false },
+    { "service_id": "SMM", "id": "SMM_5", "name": "Пакет из 10 публикаций", "price": 10000, "days": 2, "multipliable": false },
+    { "service_id": "SMM", "id": "SMM_6", "name": "Редактируемые шаблоны", "price": 5000, "days": 1, "multipliable": false }
+  ],
+  "coefficients": {
+    "urgent": { "label": "Срочный проект", "multiplier": 1.25 },
+    "complex": { "label": "Высокая сложность", "multiplier": 1.2 }
+  },
+  "rounding": {
+    "price_from_factor": 0.95,
+    "price_to_factor": 1.05,
+    "round_to": 500
+  }
+}

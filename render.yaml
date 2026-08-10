@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: design-bot
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python -m bot.main
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: DESIGNER_CHAT_ID
+        sync: false
+      - key: WEBAPP_URL
+        sync: false
