@@ -1,6 +1,7 @@
 import re
 
 from aiogram import F, Router
+from aiogram.filters import Command
 from aiogram.types import CallbackQuery, Message
 
 from bot import texts
@@ -10,10 +11,19 @@ from bot.keyboards import faq_back_keyboard, faq_list_keyboard, faq_service_pick
 router = Router(name="faq")
 
 
-@router.message(F.text == texts.MENU_FAQ)
-async def show_faq_list(message: Message) -> None:
+async def _send_faq_list(message: Message) -> None:
     faq_items = load_faq()["faq"]
     await message.answer(texts.FAQ_INTRO, reply_markup=faq_list_keyboard(faq_items))
+
+
+@router.message(F.text == texts.MENU_FAQ)
+async def show_faq_list(message: Message) -> None:
+    await _send_faq_list(message)
+
+
+@router.message(Command("faq"))
+async def cmd_faq(message: Message) -> None:
+    await _send_faq_list(message)
 
 
 @router.callback_query(F.data == "faq:back")

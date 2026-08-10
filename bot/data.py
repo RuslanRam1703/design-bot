@@ -22,6 +22,10 @@ def load_portfolio() -> dict:
     return _load("portfolio.json")
 
 
+def load_about() -> dict:
+    return _load("about.json")
+
+
 def get_service(pricing: dict, service_id: str) -> dict | None:
     for s in pricing["services"]:
         if s["id"] == service_id:

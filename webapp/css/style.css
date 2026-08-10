@@ -176,6 +176,30 @@ a { color: var(--link); text-decoration: none; }
 .case-block { margin-bottom: 14px; }
 .case-block .label { font-size: 12px; text-transform: uppercase; color: var(--hint); margin-bottom: 4px; letter-spacing: .03em; }
 
+/* ---- Обо мне ---- */
+.about-header { text-align: center; margin-bottom: 20px; }
+.about-avatar {
+  width: 96px; height: 96px; border-radius: 50%; object-fit: cover;
+  margin-bottom: 10px; display: inline-block;
+}
+.about-name { font-size: 18px; font-weight: 700; margin-bottom: 2px; }
+.about-block { margin-bottom: 20px; }
+.about-block h2 { font-size: 15px; margin-bottom: 8px; }
+.plain-list { margin: 0; padding-left: 18px; }
+.plain-list li { margin-bottom: 4px; font-size: 14px; }
+.chips-static { display: flex; flex-wrap: wrap; gap: 8px; }
+.chip-static {
+  background: var(--bg-secondary); border-radius: 999px; padding: 6px 12px; font-size: 13px;
+}
+.mini-case-grid { display: grid; grid-template-columns: 1fr 1fr; gap: var(--gap); }
+.mini-case {
+  background: var(--bg-secondary); color: var(--text); border: none; border-radius: var(--radius);
+  overflow: hidden; cursor: pointer; text-align: left; padding: 0;
+}
+.mini-case img { width: 100%; display: block; aspect-ratio: 3 / 2; object-fit: cover; }
+.mini-case span { display: block; padding: 8px 10px 10px; font-size: 12px; font-weight: 600; }
+.links-list { display: flex; flex-direction: column; gap: 6px; }
+
 /* ---- Калькулятор ---- */
 .service-list { display: flex; flex-direction: column; gap: 8px; margin-bottom: 16px; }
 .service-item {

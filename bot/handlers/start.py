@@ -4,7 +4,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.types import Message
 
 from bot import config, texts
-from bot.keyboards import main_menu_keyboard
+from bot.keyboards import main_menu_keyboard, webapp_open_keyboard
 
 router = Router(name="start")
 
@@ -18,6 +18,26 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
 @router.message(Command("id"))
 async def cmd_id(message: Message) -> None:
     await message.answer(texts.MY_ID_TEMPLATE.format(chat_id=message.chat.id), parse_mode="Markdown")
+
+
+@router.message(Command("portfolio"))
+async def cmd_portfolio(message: Message) -> None:
+    await message.answer("Открыть портфолио:", reply_markup=webapp_open_keyboard(config.WEBAPP_URL, "portfolio", "📁 Открыть портфолио"))
+
+
+@router.message(Command("about"))
+async def cmd_about(message: Message) -> None:
+    await message.answer("Открыть «Обо мне»:", reply_markup=webapp_open_keyboard(config.WEBAPP_URL, "about", "👤 Открыть «Обо мне»"))
+
+
+@router.message(Command("calculator"))
+async def cmd_calculator(message: Message) -> None:
+    await message.answer("Открыть калькулятор:", reply_markup=webapp_open_keyboard(config.WEBAPP_URL, "calculator", "💰 Открыть калькулятор"))
+
+
+@router.message(Command("brief"))
+async def cmd_brief(message: Message) -> None:
+    await message.answer("Открыть заявку:", reply_markup=webapp_open_keyboard(config.WEBAPP_URL, "brief", "✍️ Оставить заявку"))
 
 
 @router.message(Command("cancel"))

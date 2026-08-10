@@ -18,19 +18,34 @@ def main_menu_keyboard(webapp_url: str) -> ReplyKeyboardMarkup:
                     web_app=WebAppInfo(url=f"{webapp_url}/portfolio"),
                 ),
                 KeyboardButton(
-                    text=texts.MENU_CALCULATOR,
-                    web_app=WebAppInfo(url=f"{webapp_url}/calculator"),
+                    text=texts.MENU_ABOUT,
+                    web_app=WebAppInfo(url=f"{webapp_url}/about"),
                 ),
             ],
             [
-                KeyboardButton(text=texts.MENU_FAQ),
+                KeyboardButton(
+                    text=texts.MENU_CALCULATOR,
+                    web_app=WebAppInfo(url=f"{webapp_url}/calculator"),
+                ),
                 KeyboardButton(
                     text=texts.MENU_BRIEF,
                     web_app=WebAppInfo(url=f"{webapp_url}/brief"),
                 ),
             ],
+            [
+                KeyboardButton(text=texts.MENU_FAQ),
+            ],
         ],
         resize_keyboard=True,
+    )
+
+
+def webapp_open_keyboard(webapp_url: str, path: str, label: str) -> InlineKeyboardMarkup:
+    """Инлайн-кнопка открытия Mini App — используется командами /portfolio,
+    /about, /calculator, /brief (реплай-кнопки в main_menu_keyboard делают
+    то же самое, это дублирующий вход через меню команд)."""
+    return InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text=label, web_app=WebAppInfo(url=f"{webapp_url}/{path}"))]]
     )
 
 

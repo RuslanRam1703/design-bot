@@ -23,7 +23,7 @@ async def handle_health(request: web.Request) -> web.Response:
 
 def create_app() -> web.Application:
     app = web.Application()
-    for path in ("/", "/portfolio", "/calculator", "/brief"):
+    for path in ("/", "/portfolio", "/about", "/calculator", "/brief"):
         app.router.add_get(path, handle_index)
     app.router.add_get("/health", handle_health)
     app.router.add_static("/css/", WEBAPP_DIR / "css")

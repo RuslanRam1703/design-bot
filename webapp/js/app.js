@@ -1,4 +1,4 @@
-/* Mini App дизайн-студии: портфолио, калькулятор, бриф.
+/* Mini App дизайнера-фрилансера: портфолио, обо мне, калькулятор, бриф.
  * Работает и внутри Telegram (через telegram-web-app.js), и в обычном
  * браузере для превью/тестирования — во втором случае отправка заявки
  * не уходит в бота, а показывается на экране как JSON (см. TG.sendData).
@@ -82,6 +82,7 @@ function applyTheme() {
 const state = {
   pricing: null,
   portfolio: null,
+  about: null,
   screen: "loading",
   history: [],
   filter: "all",
@@ -164,27 +165,31 @@ async function init() {
   applyTheme();
   TG.onThemeChanged(applyTheme);
 
-  const [pricing, portfolio] = await Promise.all([
+  const [pricing, portfolio, about] = await Promise.all([
     fetch("/data/pricing.json").then((r) => r.json()),
     fetch("/data/portfolio.json").then((r) => r.json()),
+    fetch("/data/about.json").then((r) => r.json()),
   ]);
   state.pricing = pricing;
   state.portfolio = portfolio;
+  state.about = about;
 
-  // Путь (/calculator, /brief) — основной способ понять, с какого экрана
-  // запущено приложение: кнопки меню бота теперь ведут на разные пути,
-  // а не на один "/" с разным ?screen=, — так надёжнее (Telegram может
-  // переиспользовать уже открытый WebView и не перечитывать query-строку
-  // при повторном запуске). ?screen= оставлен как запасной вариант для
-  // ручного тестирования в браузере.
+  // Путь (/calculator, /brief, /about) — основной способ понять, с какого
+  // экрана запущено приложение: кнопки меню бота теперь ведут на разные
+  // пути, а не на один "/" с разным ?screen=, — так надёжнее (Telegram
+  // может переиспользовать уже открытый WebView и не перечитывать
+  // query-строку при повторном запуске). ?screen= оставлен как запасной
+  // вариант для ручного тестирования в браузере.
   const path = window.location.pathname.replace(/\/+$/, "");
   const params = new URLSearchParams(window.location.search);
   const initialScreen = path.endsWith("/calculator") ? "calculator"
     : path.endsWith("/brief") ? "brief"
+    : path.endsWith("/about") ? "about"
     : path.endsWith("/portfolio") ? "portfolio"
     : params.get("screen");
   if (initialScreen === "calculator") state.screen = "calculator";
   else if (initialScreen === "brief") state.screen = "brief";
+  else if (initialScreen === "about") state.screen = "about";
   else state.screen = "portfolio";
 
   render();
@@ -196,6 +201,7 @@ async function init() {
 // портфолио/калькулятором/заявкой нужно средствами самого приложения.
 const TAB_SCREENS = [
   { id: "portfolio", icon: "📁", label: "Портфолио" },
+  { id: "about", icon: "👤", label: "Обо мне" },
   { id: "calculator", icon: "💰", label: "Калькулятор" },
   { id: "brief", icon: "✍️", label: "Заявка" },
 ];
@@ -240,6 +246,10 @@ function render() {
       content = renderCase();
       TG.backButton.show(goBack);
       break;
+    case "about":
+      content = renderAbout();
+      TG.backButton.show(goBack);
+      break;
     case "calculator":
       content = renderCalculator();
       TG.backButton.show(goBack);
@@ -263,6 +273,7 @@ function render() {
   switch (state.screen) {
     case "portfolio": attachPortfolioEvents(); break;
     case "case": attachCaseEvents(); break;
+    case "about": attachAboutEvents(); break;
     case "calculator": attachCalculatorEvents(); break;
     case "brief": attachBriefEvents(); break;
   }
@@ -352,6 +363,97 @@ function attachCaseEvents() {
     state.brief.calc = null;
     navigate("brief", { resetBrief: true });
   });
+}
+
+// ---- Экран: Обо мне ----
+function renderAbout() {
+  const a = state.about;
+
+  const specItems = a.specialization.map((s) => `<li>${escapeHtml(s)}</li>`).join("");
+  const toolChips = a.tools.map((t) => `<span class="chip-static">${escapeHtml(t)}</span>`).join("");
+
+  const featured = state.portfolio.cases.filter((c) => c.featured).slice(0, 3);
+  const featuredHTML = featured
+    .map(
+      (c) => `
+      <button class="mini-case" data-case="${c.id}">
+        <img src="/${c.cover}" alt="" loading="lazy" />
+        <span>${escapeHtml(c.title)}</span>
+      </button>`
+    )
+    .join("");
+
+  const educationHTML = a.education && a.education.enabled && a.education.items.length
+    ? `
+      <div class="about-block">
+        <h2>Образование</h2>
+        <ul class="plain-list">${a.education.items.map((i) => `<li>${escapeHtml(i)}</li>`).join("")}</ul>
+      </div>`
+    : "";
+
+  const linksHTML = a.links && a.links.length
+    ? `
+      <div class="about-block">
+        <h2>Ссылки</h2>
+        <div class="links-list">${a.links.map((l) => `<a href="${escapeHtml(l.url)}" target="_blank" rel="noopener">${escapeHtml(l.label)}</a>`).join("")}</div>
+      </div>`
+    : "";
+
+  return `
+    <div class="topbar">
+      <button class="back-btn" id="back">←</button>
+      <h1>👤 Обо мне</h1>
+    </div>
+
+    <div class="about-header">
+      <img class="about-avatar" src="/${a.avatar}" alt="" />
+      <div class="about-name">${escapeHtml(a.name)}</div>
+      <div class="hint">${escapeHtml(a.tagline)}</div>
+    </div>
+
+    <div class="about-block">
+      <h2>Специализация</h2>
+      <ul class="plain-list">${specItems}</ul>
+    </div>
+
+    <div class="about-block">
+      <h2>Инструменты</h2>
+      <div class="chips-static">${toolChips}</div>
+    </div>
+
+    <div class="about-block">
+      <h2>Опыт</h2>
+      <p>Опыт в дизайне: ${escapeHtml(a.experience_years)}</p>
+      <p class="hint">${escapeHtml(a.experience_text)}</p>
+    </div>
+
+    <div class="about-block">
+      <h2>Подход к работе</h2>
+      <p>${escapeHtml(a.approach)}</p>
+    </div>
+
+    ${featuredHTML ? `<div class="about-block"><h2>Избранные кейсы</h2><div class="mini-case-grid">${featuredHTML}</div></div>` : ""}
+
+    ${educationHTML}
+    ${linksHTML}
+
+    <button class="btn btn-primary" id="about-cta">Оставить заявку</button>
+  `;
+}
+
+function attachAboutEvents() {
+  const backBtn = document.getElementById("back");
+  if (backBtn) backBtn.addEventListener("click", goBack);
+
+  document.querySelectorAll("[data-case]").forEach((el) =>
+    el.addEventListener("click", () => {
+      state.currentCase = state.portfolio.cases.find((c) => c.id === el.dataset.case);
+      navigate("case");
+    })
+  );
+
+  const cta = document.getElementById("about-cta");
+  if (cta) cta.addEventListener("click", () => navigate("brief", { resetBrief: true }));
 }
 
 // ---- Экран: Калькулятор ----

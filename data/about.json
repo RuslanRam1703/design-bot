@@ -1,0 +1,30 @@
+{
+  "_comment": "ЗАГЛУШКА — см. needs_review_fields ниже и ТЗ, раздел 3/7. avatar замените на реальное фото в webapp/img/about/ (тот же путь).",
+  "needs_review_fields": ["name", "tagline", "specialization", "tools", "experience_years", "experience_text", "approach", "education", "links"],
+
+  "avatar": "img/about/avatar_placeholder.svg",
+  "name": "Имя Фамилия",
+  "tagline": "UX/UI дизайнер · Брендинг · Лендинги",
+
+  "specialization": [
+    "Лендинги и сайты",
+    "UX/UI цифровых продуктов",
+    "Логотипы и фирменный стиль",
+    "Графический дизайн",
+    "Оформление соцсетей"
+  ],
+
+  "tools": ["Figma", "Illustrator", "Photoshop"],
+
+  "experience_years": "уточняется",
+  "experience_text": "Уточняется: в каких индустриях и типах проектов есть опыт.",
+
+  "approach": "Уточняется: короткий текст от первого лица о том, как я работаю и что важно в процессе.",
+
+  "education": {
+    "enabled": false,
+    "items": []
+  },
+
+  "links": []
+}
