@@ -1,0 +1,10 @@
+{
+  "_comment": "Видимость пунктов меню бота и вкладок Mini App. Управляется через /admin -> Меню и навигация.",
+  "menu": {
+    "portfolio": true,
+    "about": true,
+    "calculator": true,
+    "brief": true,
+    "faq": true
+  }
+}

@@ -201,3 +201,237 @@ async def save_about_photo(actor_chat_id: int | str, bot: Any, file_id: str) -> 
     dest = IMG_ABOUT_DIR / filename
     await bot.download_file(file.file_path, destination=dest)
     return f"img/about/{filename}"
+
+
+# ---- Услуги калькулятора ----
+
+def list_services() -> list[dict]:
+    return _read("pricing.json")["services"]
+
+
+def get_service(service_id: str) -> dict | None:
+    return next((s for s in list_services() if s["id"] == service_id), None)
+
+
+def next_service_id() -> str:
+    """Встроенные услуги (LEND, SITE...) имеют смысловые id — для новых,
+    добавленных админом, генерируем нейтральный SVC_N, чтобы не гадать с
+    транслитерацией названия."""
+    data = _read("pricing.json")
+    nums = []
+    for s in data["services"]:
+        if s["id"].startswith("SVC_"):
+            try:
+                nums.append(int(s["id"].split("_", 1)[1]))
+            except ValueError:
+                pass
+    return f"SVC_{max(nums, default=0) + 1}"
+
+
+def add_service(actor_chat_id: int | str, *, service_id: str, name: str, base_price: float, term_min: float, term_max: float, includes: str) -> dict:
+    _require_designer(actor_chat_id)
+    data = _read("pricing.json")
+    service = {
+        "id": service_id,
+        "name": name,
+        "base_price": base_price,
+        "term_min": term_min,
+        "term_max": term_max,
+        "includes": includes,
+    }
+    data["services"].append(service)
+    _write("pricing.json", data)
+    return service
+
+
+def update_service(actor_chat_id: int | str, service_id: str, **fields: Any) -> bool:
+    _require_designer(actor_chat_id)
+    data = _read("pricing.json")
+    for s in data["services"]:
+        if s["id"] == service_id:
+            s.update(fields)
+            _write("pricing.json", data)
+            return True
+    return False
+
+
+def delete_service(actor_chat_id: int | str, service_id: str) -> bool:
+    """Удаляет услугу вместе с её опциями. Кейсы портфолио, ссылавшиеся на
+    неё через related_service, не удаляются — просто теряют автоподстановку
+    услуги в "Хочу похожий проект" (related_service -> None)."""
+    _require_designer(actor_chat_id)
+    data = _read("pricing.json")
+    before = len(data["services"])
+    data["services"] = [s for s in data["services"] if s["id"] != service_id]
+    if len(data["services"]) == before:
+        return False
+    data["options"] = [o for o in data["options"] if o["service_id"] != service_id]
+    for g in data.get("groups", []):
+        g["service_ids"] = [sid for sid in g["service_ids"] if sid != service_id]
+    _write("pricing.json", data)
+
+    portfolio = _read("portfolio.json")
+    changed = False
+    for c in portfolio["cases"]:
+        if c.get("related_service") == service_id:
+            c["related_service"] = None
+            changed = True
+    if changed:
+        _write("portfolio.json", portfolio)
+    return True
+
+
+# ---- Опции услуг ----
+
+def list_options(service_id: str) -> list[dict]:
+    return [o for o in _read("pricing.json")["options"] if o["service_id"] == service_id]
+
+
+def next_option_id(service_id: str) -> str:
+    data = _read("pricing.json")
+    nums = []
+    prefix = f"{service_id}_"
+    for o in data["options"]:
+        if o["id"].startswith(prefix):
+            try:
+                nums.append(int(o["id"][len(prefix):]))
+            except ValueError:
+                pass
+    return f"{prefix}{max(nums, default=0) + 1}"
+
+
+def add_option(actor_chat_id: int | str, *, option_id: str, service_id: str, name: str, price: float, days: float, multipliable: bool) -> dict:
+    _require_designer(actor_chat_id)
+    data = _read("pricing.json")
+    option = {
+        "service_id": service_id,
+        "id": option_id,
+        "name": name,
+        "price": price,
+        "days": days,
+        "multipliable": multipliable,
+    }
+    data["options"].append(option)
+    _write("pricing.json", data)
+    return option
+
+
+def update_option(actor_chat_id: int | str, option_id: str, **fields: Any) -> bool:
+    _require_designer(actor_chat_id)
+    data = _read("pricing.json")
+    for o in data["options"]:
+        if o["id"] == option_id:
+            o.update(fields)
+            _write("pricing.json", data)
+            return True
+    return False
+
+
+def delete_option(actor_chat_id: int | str, option_id: str) -> bool:
+    _require_designer(actor_chat_id)
+    data = _read("pricing.json")
+    before = len(data["options"])
+    data["options"] = [o for o in data["options"] if o["id"] != option_id]
+    if len(data["options"]) == before:
+        return False
+    _write("pricing.json", data)
+    return True
+
+
+# ---- Коэффициенты и округление вилки ----
+
+def get_pricing_rules() -> dict:
+    data = _read("pricing.json")
+    return {"coefficients": data["coefficients"], "rounding": data["rounding"]}
+
+
+def update_coefficient(actor_chat_id: int | str, key: str, multiplier: float) -> bool:
+    _require_designer(actor_chat_id)
+    data = _read("pricing.json")
+    if key not in data["coefficients"]:
+        return False
+    data["coefficients"][key]["multiplier"] = multiplier
+    _write("pricing.json", data)
+    return True
+
+
+def update_rounding(actor_chat_id: int | str, field: str, value: float) -> bool:
+    _require_designer(actor_chat_id)
+    data = _read("pricing.json")
+    if field not in data["rounding"]:
+        return False
+    data["rounding"][field] = value
+    _write("pricing.json", data)
+    return True
+
+
+# ---- Категории портфолио ----
+
+def next_portfolio_type_id() -> str:
+    data = _read("portfolio.json")
+    nums = []
+    for t in data["types"]:
+        if t["id"].startswith("cat_"):
+            try:
+                nums.append(int(t["id"].split("_", 1)[1]))
+            except ValueError:
+                pass
+    return f"cat_{max(nums, default=0) + 1}"
+
+
+def add_portfolio_type(actor_chat_id: int | str, *, type_id: str, label: str) -> dict:
+    _require_designer(actor_chat_id)
+    data = _read("portfolio.json")
+    type_entry = {"id": type_id, "label": label}
+    data["types"].append(type_entry)
+    _write("portfolio.json", data)
+    return type_entry
+
+
+def rename_portfolio_type(actor_chat_id: int | str, type_id: str, new_label: str) -> bool:
+    """Меняем только подпись, не id — иначе "type" во всех кейсах, которые
+    уже используют эту категорию, перестанет на неё указывать."""
+    _require_designer(actor_chat_id)
+    data = _read("portfolio.json")
+    for t in data["types"]:
+        if t["id"] == type_id:
+            t["label"] = new_label
+            _write("portfolio.json", data)
+            return True
+    return False
+
+
+def count_cases_with_type(type_id: str) -> int:
+    return sum(1 for c in list_cases() if c["type"] == type_id)
+
+
+def delete_portfolio_type(actor_chat_id: int | str, type_id: str) -> bool:
+    """Отказывает, если категория ещё используется хоть одним кейсом —
+    вызывающий код (admin.py) должен сначала проверить count_cases_with_type
+    и показать дизайнеру понятное сообщение, а не просто получить False."""
+    _require_designer(actor_chat_id)
+    if count_cases_with_type(type_id) > 0:
+        return False
+    data = _read("portfolio.json")
+    before = len(data["types"])
+    data["types"] = [t for t in data["types"] if t["id"] != type_id]
+    if len(data["types"]) == before:
+        return False
+    _write("portfolio.json", data)
+    return True
+
+
+# ---- Видимость экранов (меню бота / таб-бар Mini App) ----
+
+def get_ui_config() -> dict:
+    return _read("ui_config.json")
+
+
+def set_menu_item_enabled(actor_chat_id: int | str, key: str, enabled: bool) -> bool:
+    _require_designer(actor_chat_id)
+    data = _read("ui_config.json")
+    if key not in data["menu"]:
+        return False
+    data["menu"][key] = enabled
+    _write("ui_config.json", data)
+    return True

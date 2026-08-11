@@ -83,6 +83,7 @@ const state = {
   pricing: null,
   portfolio: null,
   about: null,
+  uiConfig: null,
   screen: "loading",
   history: [],
   filter: "all",
@@ -165,14 +166,16 @@ async function init() {
   applyTheme();
   TG.onThemeChanged(applyTheme);
 
-  const [pricing, portfolio, about] = await Promise.all([
+  const [pricing, portfolio, about, uiConfig] = await Promise.all([
     fetch("/data/pricing.json").then((r) => r.json()),
     fetch("/data/portfolio.json").then((r) => r.json()),
     fetch("/data/about.json").then((r) => r.json()),
+    fetch("/data/ui_config.json").then((r) => r.json()),
   ]);
   state.pricing = pricing;
   state.portfolio = portfolio;
   state.about = about;
+  state.uiConfig = uiConfig;
 
   // Путь (/calculator, /brief, /about) — основной способ понять, с какого
   // экрана запущено приложение: кнопки меню бота теперь ведут на разные
@@ -192,6 +195,11 @@ async function init() {
   else if (initialScreen === "about") state.screen = "about";
   else state.screen = "portfolio";
 
+  // Если админ выключил именно этот экран в /admin -> Меню и навигация —
+  // не показываем пустой/битый вид, откатываемся на портфолио.
+  const menu = state.uiConfig.menu || {};
+  if (menu[state.screen] === false) state.screen = "portfolio";
+
   render();
 }
 
@@ -207,8 +215,10 @@ const TAB_SCREENS = [
 ];
 
 function renderTabBar() {
+  const menu = (state.uiConfig && state.uiConfig.menu) || {};
+  const visibleTabs = TAB_SCREENS.filter((t) => menu[t.id] !== false);
   const active = state.screen === "case" ? "portfolio" : state.screen;
-  const items = TAB_SCREENS.map(
+  const items = visibleTabs.map(
     (t) => `
       <button class="tab-item ${t.id === active ? "active" : ""}" data-tab="${t.id}">
         <span class="tab-icon">${t.icon}</span>

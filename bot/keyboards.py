@@ -9,35 +9,34 @@ from aiogram.types import (
 from bot import texts
 
 
-def main_menu_keyboard(webapp_url: str) -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup(
-        keyboard=[
-            [
-                KeyboardButton(
-                    text=texts.MENU_PORTFOLIO,
-                    web_app=WebAppInfo(url=f"{webapp_url}/portfolio"),
-                ),
-                KeyboardButton(
-                    text=texts.MENU_ABOUT,
-                    web_app=WebAppInfo(url=f"{webapp_url}/about"),
-                ),
-            ],
-            [
-                KeyboardButton(
-                    text=texts.MENU_CALCULATOR,
-                    web_app=WebAppInfo(url=f"{webapp_url}/calculator"),
-                ),
-                KeyboardButton(
-                    text=texts.MENU_BRIEF,
-                    web_app=WebAppInfo(url=f"{webapp_url}/brief"),
-                ),
-            ],
-            [
-                KeyboardButton(text=texts.MENU_FAQ),
-            ],
-        ],
-        resize_keyboard=True,
-    )
+def main_menu_keyboard(webapp_url: str, ui_config: dict | None = None) -> ReplyKeyboardMarkup:
+    """ui_config — data/ui_config.json (см. content_store.get_ui_config), задаёт,
+    какие пункты меню включены. Порядок кнопок фиксирован, отключённые просто
+    выпадают из раскладки, а не оставляют пустое место."""
+    menu = (ui_config or {}).get("menu", {})
+
+    def enabled(key: str) -> bool:
+        return menu.get(key, True)
+
+    buttons: list[KeyboardButton] = []
+    if enabled("portfolio"):
+        buttons.append(KeyboardButton(text=texts.MENU_PORTFOLIO, web_app=WebAppInfo(url=f"{webapp_url}/portfolio")))
+    if enabled("about"):
+        buttons.append(KeyboardButton(text=texts.MENU_ABOUT, web_app=WebAppInfo(url=f"{webapp_url}/about")))
+    if enabled("calculator"):
+        buttons.append(KeyboardButton(text=texts.MENU_CALCULATOR, web_app=WebAppInfo(url=f"{webapp_url}/calculator")))
+    if enabled("brief"):
+        buttons.append(KeyboardButton(text=texts.MENU_BRIEF, web_app=WebAppInfo(url=f"{webapp_url}/brief")))
+    if enabled("faq"):
+        buttons.append(KeyboardButton(text=texts.MENU_FAQ))
+
+    rows = [buttons[i:i + 2] for i in range(0, len(buttons), 2)]
+    if not rows:
+        # Полностью пустое меню оставлять нельзя — портфолио как минимум
+        # всегда доступно, иначе бот выглядит сломанным.
+        rows = [[KeyboardButton(text=texts.MENU_PORTFOLIO, web_app=WebAppInfo(url=f"{webapp_url}/portfolio"))]]
+
+    return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
 
 
 def webapp_open_keyboard(webapp_url: str, path: str, label: str) -> InlineKeyboardMarkup:

@@ -4,15 +4,20 @@ from aiogram.fsm.context import FSMContext
 from aiogram.types import Message
 
 from bot import config, texts
+from bot.data import load_ui_config
 from bot.keyboards import main_menu_keyboard, webapp_open_keyboard
 
 router = Router(name="start")
 
 
+def _menu_keyboard():
+    return main_menu_keyboard(config.WEBAPP_URL, load_ui_config())
+
+
 @router.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext) -> None:
     await state.clear()
-    await message.answer(texts.WELCOME, reply_markup=main_menu_keyboard(config.WEBAPP_URL))
+    await message.answer(texts.WELCOME, reply_markup=_menu_keyboard())
 
 
 @router.message(Command("id"))
@@ -43,7 +48,7 @@ async def cmd_brief(message: Message) -> None:
 @router.message(Command("cancel"))
 async def cmd_cancel(message: Message, state: FSMContext) -> None:
     await state.clear()
-    await message.answer("Хорошо, отменил ожидание файла.", reply_markup=main_menu_keyboard(config.WEBAPP_URL))
+    await message.answer("Хорошо, отменил ожидание файла.", reply_markup=_menu_keyboard())
 
 
 # Держим последним в этом роутере: любой не распознанный текст — подсказка меню.
@@ -51,5 +56,5 @@ async def cmd_cancel(message: Message, state: FSMContext) -> None:
 async def fallback_text(message: Message) -> None:
     await message.answer(
         "Не совсем поняла 🙂 Воспользуйтесь кнопками меню ниже.",
-        reply_markup=main_menu_keyboard(config.WEBAPP_URL),
+        reply_markup=_menu_keyboard(),
     )

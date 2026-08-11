@@ -26,6 +26,10 @@ def load_about() -> dict:
     return _load("about.json")
 
 
+def load_ui_config() -> dict:
+    return _load("ui_config.json")
+
+
 def get_service(pricing: dict, service_id: str) -> dict | None:
     for s in pricing["services"]:
         if s["id"] == service_id:
