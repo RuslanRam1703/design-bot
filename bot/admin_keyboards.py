@@ -232,6 +232,13 @@ def nav_menu_keyboard(ui_config: dict) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
+def cancel_keyboard() -> InlineKeyboardMarkup:
+    """Вешается на любой запрос свободного текста/фото в админке — без неё
+    пользователь, передумав посреди ввода, не может выйти иначе как заново
+    вызвать /admin. Всегда возвращает в корень меню."""
+    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="admincancel")]])
+
+
 def confirm_keyboard(prefix: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[

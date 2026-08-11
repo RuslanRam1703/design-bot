@@ -48,6 +48,15 @@ async def cmd_admin(message: Message, state: FSMContext) -> None:
     await message.answer("Админ-меню:", reply_markup=kb.admin_root_keyboard())
 
 
+@router.callback_query(F.data == "admincancel")
+async def admin_cancel(callback: CallbackQuery, state: FSMContext) -> None:
+    """Универсальная кнопка "Отмена" на любом шаге, где ждём свободный
+    текст/фото — без нее пришлось бы заново набирать /admin."""
+    await state.clear()
+    await callback.message.edit_text("Отменено. Админ-меню:", reply_markup=kb.admin_root_keyboard())
+    await callback.answer()
+
+
 # ---- Навигация между разделами (используется как "назад" отовсюду) ----
 
 @router.callback_query(F.data == "adminmenu:root")
@@ -130,7 +139,7 @@ async def cases_add_start(callback: CallbackQuery, state: FSMContext) -> None:
 async def cases_add_category(callback: CallbackQuery, state: FSMContext) -> None:
     type_id = callback.data.split(":", 1)[1]
     await state.update_data(type_id=type_id)
-    await callback.message.edit_text("Название кейса (текстом):")
+    await callback.message.edit_text("Название кейса (текстом):", reply_markup=kb.cancel_keyboard())
     await state.set_state(AdminStates.add_case_title)
     await callback.answer()
 
@@ -139,7 +148,7 @@ async def cases_add_category(callback: CallbackQuery, state: FSMContext) -> None
 async def cases_add_title(message: Message, state: FSMContext) -> None:
     case_id = content_store.next_case_id()
     await state.update_data(title=message.text.strip(), case_id=case_id)
-    await message.answer("Пришлите фото кейса (как фото):")
+    await message.answer("Пришлите фото кейса (как фото):", reply_markup=kb.cancel_keyboard())
     await state.set_state(AdminStates.add_case_photo)
 
 
@@ -149,13 +158,13 @@ async def cases_add_photo(message: Message, state: FSMContext) -> None:
     file_id = message.photo[-1].file_id if message.photo else message.document.file_id
     cover = await content_store.save_case_photo(message.chat.id, message.bot, file_id, data["case_id"])
     await state.update_data(cover=cover)
-    await message.answer("Короткое описание задачи (пара предложений):")
+    await message.answer("Короткое описание задачи (пара предложений):", reply_markup=kb.cancel_keyboard())
     await state.set_state(AdminStates.add_case_description)
 
 
 @router.message(AdminStates.add_case_photo)
 async def cases_add_photo_wrong(message: Message) -> None:
-    await message.answer("Нужно фото 📎 (или /cancel, если передумали).")
+    await message.answer("Нужно фото 📎.", reply_markup=kb.cancel_keyboard())
 
 
 @router.message(AdminStates.add_case_description, F.text)
@@ -209,7 +218,7 @@ async def cases_edit_field(callback: CallbackQuery, state: FSMContext) -> None:
         return
     await state.update_data(field=field)
     prompt = "Пришлите новое фото:" if field == "cover" else "Пришлите новый текст:"
-    await callback.message.edit_text(prompt)
+    await callback.message.edit_text(prompt, reply_markup=kb.cancel_keyboard())
     await state.set_state(AdminStates.edit_case_value)
     await callback.answer()
 
@@ -220,14 +229,14 @@ async def cases_edit_value(message: Message, state: FSMContext) -> None:
     field = data["field"]
     if field == "cover":
         if not (message.photo or message.document):
-            await message.answer("Нужно фото 📎.")
+            await message.answer("Нужно фото 📎.", reply_markup=kb.cancel_keyboard())
             return
         file_id = message.photo[-1].file_id if message.photo else message.document.file_id
         value = await content_store.save_case_photo(message.chat.id, message.bot, file_id, data["case_id"])
         content_store.update_case(message.chat.id, data["case_id"], cover=value)
     else:
         if not message.text:
-            await message.answer("Нужен текст.")
+            await message.answer("Нужен текст.", reply_markup=kb.cancel_keyboard())
             return
         content_store.update_case(message.chat.id, data["case_id"], **{field: message.text.strip()})
     await message.answer("Обновлено ✅\n\nЧто ещё изменить?", reply_markup=kb.case_field_keyboard())
@@ -275,7 +284,7 @@ async def cases_delete_do(callback: CallbackQuery, state: FSMContext) -> None:
 
 @router.callback_query(F.data == "adminfaqaction:add")
 async def faq_add_start(callback: CallbackQuery, state: FSMContext) -> None:
-    await callback.message.edit_text("Текст вопроса:")
+    await callback.message.edit_text("Текст вопроса:", reply_markup=kb.cancel_keyboard())
     await state.set_state(AdminStates.add_faq_question)
     await callback.answer()
 
@@ -283,7 +292,7 @@ async def faq_add_start(callback: CallbackQuery, state: FSMContext) -> None:
 @router.message(AdminStates.add_faq_question, F.text)
 async def faq_add_question(message: Message, state: FSMContext) -> None:
     await state.update_data(question=message.text.strip())
-    await message.answer("Текст ответа:")
+    await message.answer("Текст ответа:", reply_markup=kb.cancel_keyboard())
     await state.set_state(AdminStates.add_faq_answer)
 
 
@@ -321,7 +330,7 @@ async def faq_edit_field(callback: CallbackQuery, state: FSMContext) -> None:
         await callback.answer()
         return
     await state.update_data(field=field)
-    await callback.message.edit_text("Новый текст:")
+    await callback.message.edit_text("Новый текст:", reply_markup=kb.cancel_keyboard())
     await state.set_state(AdminStates.edit_faq_value)
     await callback.answer()
 
@@ -377,13 +386,13 @@ async def about_edit_field(callback: CallbackQuery, state: FSMContext) -> None:
         return
     await state.update_data(field=field)
     if field == "avatar":
-        await callback.message.edit_text("Пришлите новое фото профиля:")
+        await callback.message.edit_text("Пришлите новое фото профиля:", reply_markup=kb.cancel_keyboard())
         await state.set_state(AdminStates.edit_about_photo)
     elif field in kb.ABOUT_LIST_FIELDS:
-        await callback.message.edit_text(f"{kb.ABOUT_LIST_FIELDS[field]}:")
+        await callback.message.edit_text(f"{kb.ABOUT_LIST_FIELDS[field]}:", reply_markup=kb.cancel_keyboard())
         await state.set_state(AdminStates.edit_about_value)
     else:
-        await callback.message.edit_text(f"{kb.ABOUT_TEXT_FIELDS[field]}:")
+        await callback.message.edit_text(f"{kb.ABOUT_TEXT_FIELDS[field]}:", reply_markup=kb.cancel_keyboard())
         await state.set_state(AdminStates.edit_about_value)
     await callback.answer()
 
@@ -399,7 +408,7 @@ async def about_edit_photo(message: Message, state: FSMContext) -> None:
 
 @router.message(AdminStates.edit_about_photo)
 async def about_edit_photo_wrong(message: Message) -> None:
-    await message.answer("Нужно фото 📎.")
+    await message.answer("Нужно фото 📎.", reply_markup=kb.cancel_keyboard())
 
 
 @router.message(AdminStates.edit_about_value, F.text)
@@ -419,7 +428,7 @@ async def about_edit_value(message: Message, state: FSMContext) -> None:
 
 @router.callback_query(F.data == "adminpriceaction:add")
 async def price_add_start(callback: CallbackQuery, state: FSMContext) -> None:
-    await callback.message.edit_text("Название новой услуги:")
+    await callback.message.edit_text("Название новой услуги:", reply_markup=kb.cancel_keyboard())
     await state.set_state(AdminStates.add_service_name)
     await callback.answer()
 
@@ -427,7 +436,7 @@ async def price_add_start(callback: CallbackQuery, state: FSMContext) -> None:
 @router.message(AdminStates.add_service_name, F.text)
 async def price_add_name(message: Message, state: FSMContext) -> None:
     await state.update_data(name=message.text.strip())
-    await message.answer("Базовая цена, ₽ (число):")
+    await message.answer("Базовая цена, ₽ (число):", reply_markup=kb.cancel_keyboard())
     await state.set_state(AdminStates.add_service_price)
 
 
@@ -435,10 +444,10 @@ async def price_add_name(message: Message, state: FSMContext) -> None:
 async def price_add_price(message: Message, state: FSMContext) -> None:
     value = _parse_number(message.text)
     if value is None:
-        await message.answer("Нужно число, например 25000. Попробуйте ещё раз:")
+        await message.answer("Нужно число, например 25000. Попробуйте ещё раз:", reply_markup=kb.cancel_keyboard())
         return
     await state.update_data(base_price=value)
-    await message.answer("Минимальный срок, дней (число):")
+    await message.answer("Минимальный срок, дней (число):", reply_markup=kb.cancel_keyboard())
     await state.set_state(AdminStates.add_service_term_min)
 
 
@@ -446,10 +455,10 @@ async def price_add_price(message: Message, state: FSMContext) -> None:
 async def price_add_term_min(message: Message, state: FSMContext) -> None:
     value = _parse_number(message.text)
     if value is None:
-        await message.answer("Нужно число. Попробуйте ещё раз:")
+        await message.answer("Нужно число. Попробуйте ещё раз:", reply_markup=kb.cancel_keyboard())
         return
     await state.update_data(term_min=value)
-    await message.answer("Максимальный срок, дней (число):")
+    await message.answer("Максимальный срок, дней (число):", reply_markup=kb.cancel_keyboard())
     await state.set_state(AdminStates.add_service_term_max)
 
 
@@ -457,10 +466,10 @@ async def price_add_term_min(message: Message, state: FSMContext) -> None:
 async def price_add_term_max(message: Message, state: FSMContext) -> None:
     value = _parse_number(message.text)
     if value is None:
-        await message.answer("Нужно число. Попробуйте ещё раз:")
+        await message.answer("Нужно число. Попробуйте ещё раз:", reply_markup=kb.cancel_keyboard())
         return
     await state.update_data(term_max=value)
-    await message.answer("Что входит в базовую стоимость (коротко текстом):")
+    await message.answer("Что входит в базовую стоимость (коротко текстом):", reply_markup=kb.cancel_keyboard())
     await state.set_state(AdminStates.add_service_includes)
 
 
@@ -513,7 +522,7 @@ async def price_edit_field(callback: CallbackQuery, state: FSMContext) -> None:
         await callback.answer()
         return
     await state.update_data(field=field)
-    await callback.message.edit_text(f"Новое значение поля «{kb.SERVICE_FIELD_LABELS[field]}»:")
+    await callback.message.edit_text(f"Новое значение поля «{kb.SERVICE_FIELD_LABELS[field]}»:", reply_markup=kb.cancel_keyboard())
     await state.set_state(AdminStates.edit_service_value)
     await callback.answer()
 
@@ -525,7 +534,7 @@ async def price_edit_value(message: Message, state: FSMContext) -> None:
     if field in ("base_price", "term_min", "term_max"):
         value = _parse_number(message.text)
         if value is None:
-            await message.answer("Нужно число. Попробуйте ещё раз:")
+            await message.answer("Нужно число. Попробуйте ещё раз:", reply_markup=kb.cancel_keyboard())
             return
         content_store.update_service(message.chat.id, data["service_id"], **{field: value})
     else:
@@ -585,7 +594,7 @@ async def price_coef_start(callback: CallbackQuery, state: FSMContext) -> None:
 async def price_coef_pick(callback: CallbackQuery, state: FSMContext) -> None:
     key = callback.data.split(":", 1)[1]
     await state.update_data(kind="coef", key=key)
-    await callback.message.edit_text(f"Новое значение для «{kb.COEFFICIENT_LABELS[key]}» (например 1.25):")
+    await callback.message.edit_text(f"Новое значение для «{kb.COEFFICIENT_LABELS[key]}» (например 1.25):", reply_markup=kb.cancel_keyboard())
     await state.set_state(AdminStates.edit_coefficients_value)
     await callback.answer()
 
@@ -594,7 +603,7 @@ async def price_coef_pick(callback: CallbackQuery, state: FSMContext) -> None:
 async def price_round_pick(callback: CallbackQuery, state: FSMContext) -> None:
     key = callback.data.split(":", 1)[1]
     await state.update_data(kind="round", key=key)
-    await callback.message.edit_text(f"Новое значение для «{kb.ROUNDING_LABELS[key]}»:")
+    await callback.message.edit_text(f"Новое значение для «{kb.ROUNDING_LABELS[key]}»:", reply_markup=kb.cancel_keyboard())
     await state.set_state(AdminStates.edit_coefficients_value)
     await callback.answer()
 
@@ -603,7 +612,7 @@ async def price_round_pick(callback: CallbackQuery, state: FSMContext) -> None:
 async def price_coef_value(message: Message, state: FSMContext) -> None:
     value = _parse_number(message.text)
     if value is None:
-        await message.answer("Нужно число. Попробуйте ещё раз:")
+        await message.answer("Нужно число. Попробуйте ещё раз:", reply_markup=kb.cancel_keyboard())
         return
     data = await state.get_data()
     if data["kind"] == "coef":
@@ -628,7 +637,7 @@ async def option_action(callback: CallbackQuery, state: FSMContext) -> None:
     service_id = data["service_id"]
 
     if action == "add":
-        await callback.message.edit_text("Название новой опции:")
+        await callback.message.edit_text("Название новой опции:", reply_markup=kb.cancel_keyboard())
         await state.set_state(AdminStates.option_add_name)
     elif action == "edit":
         options = content_store.list_options(service_id)
@@ -660,7 +669,7 @@ async def option_back_to_menu(callback: CallbackQuery, state: FSMContext) -> Non
 @router.message(AdminStates.option_add_name, F.text)
 async def option_add_name(message: Message, state: FSMContext) -> None:
     await state.update_data(opt_name=message.text.strip())
-    await message.answer("Цена опции, +₽ (число):")
+    await message.answer("Цена опции, +₽ (число):", reply_markup=kb.cancel_keyboard())
     await state.set_state(AdminStates.option_add_price)
 
 
@@ -668,10 +677,10 @@ async def option_add_name(message: Message, state: FSMContext) -> None:
 async def option_add_price(message: Message, state: FSMContext) -> None:
     value = _parse_number(message.text)
     if value is None:
-        await message.answer("Нужно число. Попробуйте ещё раз:")
+        await message.answer("Нужно число. Попробуйте ещё раз:", reply_markup=kb.cancel_keyboard())
         return
     await state.update_data(opt_price=value)
-    await message.answer("Срок опции, +дней (число, можно дробное, например 0.5):")
+    await message.answer("Срок опции, +дней (число, можно дробное, например 0.5):", reply_markup=kb.cancel_keyboard())
     await state.set_state(AdminStates.option_add_days)
 
 
@@ -679,7 +688,7 @@ async def option_add_price(message: Message, state: FSMContext) -> None:
 async def option_add_days(message: Message, state: FSMContext) -> None:
     value = _parse_number(message.text)
     if value is None:
-        await message.answer("Нужно число. Попробуйте ещё раз:")
+        await message.answer("Нужно число. Попробуйте ещё раз:", reply_markup=kb.cancel_keyboard())
         return
     await state.update_data(opt_days=value)
     await message.answer(
@@ -730,7 +739,7 @@ async def option_edit_field(callback: CallbackQuery, state: FSMContext) -> None:
     if field == "multipliable":
         await callback.message.edit_text("Множится на количество?", reply_markup=kb.yes_no_keyboard("adminoptfieldbool"))
     else:
-        await callback.message.edit_text(f"Новое значение поля «{kb.OPTION_FIELD_LABELS[field]}»:")
+        await callback.message.edit_text(f"Новое значение поля «{kb.OPTION_FIELD_LABELS[field]}»:", reply_markup=kb.cancel_keyboard())
     await state.set_state(AdminStates.option_edit_value)
     await callback.answer()
 
@@ -752,7 +761,7 @@ async def option_edit_value_text(message: Message, state: FSMContext) -> None:
     if field in ("price", "days"):
         value = _parse_number(message.text)
         if value is None:
-            await message.answer("Нужно число. Попробуйте ещё раз:")
+            await message.answer("Нужно число. Попробуйте ещё раз:", reply_markup=kb.cancel_keyboard())
             return
         content_store.update_option(message.chat.id, data["option_id"], **{field: value})
     else:
@@ -791,7 +800,7 @@ async def option_delete_do(callback: CallbackQuery, state: FSMContext) -> None:
 
 @router.callback_query(F.data == "admincataction:add")
 async def cat_add_start(callback: CallbackQuery, state: FSMContext) -> None:
-    await callback.message.edit_text("Название новой категории:")
+    await callback.message.edit_text("Название новой категории:", reply_markup=kb.cancel_keyboard())
     await state.set_state(AdminStates.add_category_label)
     await callback.answer()
 
@@ -816,7 +825,7 @@ async def cat_rename_start(callback: CallbackQuery, state: FSMContext) -> None:
 async def cat_rename_picked(callback: CallbackQuery, state: FSMContext) -> None:
     type_id = callback.data.split(":", 1)[1]
     await state.update_data(type_id=type_id)
-    await callback.message.edit_text("Новое название категории:")
+    await callback.message.edit_text("Новое название категории:", reply_markup=kb.cancel_keyboard())
     await state.set_state(AdminStates.rename_category_value)
     await callback.answer()
 
