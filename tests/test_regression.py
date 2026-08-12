@@ -367,6 +367,53 @@ class AdminCaseConstructorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self._case()["external_url"], "https://behance.net/gallery/x")
 
 
+class AdminAboutResumeFieldsTests(unittest.IsolatedAsyncioTestCase):
+    """Part 2 (уменьшённый объём): location — обычное текстовое поле,
+    skills — список через запятую, отдельный от tools. Оба уже существуют
+    как ключи в data/about.json (update_about_field требует, чтобы поле
+    уже было в data), поэтому реальные хендлеры должны их принимать через
+    общий ABOUT_TEXT_FIELDS/ABOUT_LIST_FIELDS механизм без доп. кода."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        real_data_dir = Path(__file__).resolve().parent.parent / "data"
+        for name in ("pricing.json", "portfolio.json", "faq.json", "about.json", "ui_config.json"):
+            shutil.copy(real_data_dir / name, Path(self.tmpdir) / name)
+        self._orig_data_dir = content_store.DATA_DIR
+        self._orig_designer = content_store.config.DESIGNER_CHAT_ID
+        content_store.DATA_DIR = Path(self.tmpdir)
+        content_store.config.DESIGNER_CHAT_ID = "999"
+        self.actor = 999
+
+    def tearDown(self):
+        content_store.DATA_DIR = self._orig_data_dir
+        content_store.config.DESIGNER_CHAT_ID = self._orig_designer
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    async def _state(self):
+        state = make_state(self.actor)
+        await state.set_state(AdminStates.edit_about_field_pick)
+        return state
+
+    async def test_location_edit_via_real_handler_and_clears_needs_review(self):
+        self.assertIn("location", content_store.get_about()["needs_review_fields"])
+        state = await self._state()
+        await admin.about_edit_field(make_callback("admineditabout:location", chat_id=self.actor), state)
+        self.assertEqual(await state.get_state(), AdminStates.edit_about_value.state)
+        await admin.about_edit_value(make_text_message(self.actor, "Москва, удалённо"), state)
+        about = content_store.get_about()
+        self.assertEqual(about["location"], "Москва, удалённо")
+        self.assertNotIn("location", about["needs_review_fields"])
+
+    async def test_skills_edit_is_comma_split_list_separate_from_tools(self):
+        state = await self._state()
+        await admin.about_edit_field(make_callback("admineditabout:skills", chat_id=self.actor), state)
+        await admin.about_edit_value(make_text_message(self.actor, "UX-исследования, Прототипирование"), state)
+        about = content_store.get_about()
+        self.assertEqual(about["skills"], ["UX-исследования", "Прототипирование"])
+        self.assertNotEqual(about["skills"], about["tools"])
+
+
 class ReferentialIntegrityTests(unittest.TestCase):
     """Category -> Service: и находка 09 (кастомные категории должны уметь
     получить related_service), и её следствие, о котором предупредили в

@@ -1,10 +1,11 @@
 {
-  "_comment": "DEMO CONTENT — условный профиль для демонстрации продукта, не реальный человек. education/links намеренно оставлены пустыми (needs_review) — не понадобились для demo.",
-  "needs_review_fields": ["education", "links"],
+  "_comment": "DEMO CONTENT — условный профиль для демонстрации продукта, не реальный человек. education/links/location/skills намеренно оставлены пустыми (needs_review) — не понадобились для demo.",
+  "needs_review_fields": ["education", "links", "location", "skills"],
 
   "avatar": "img/about/avatar_placeholder.svg",
   "name": "Алексей Морозов",
   "tagline": "UX/UI дизайнер · Лендинги · SaaS · Брендинг",
+  "location": "",
 
   "specialization": [
     "UX/UI дизайн",
@@ -15,6 +16,7 @@
   ],
 
   "tools": ["Figma", "Adobe Photoshop", "Adobe Illustrator", "After Effects"],
+  "skills": [],
 
   "experience_years": "7 лет",
   "experience_text": "Проектирую цифровые продукты, лендинги и визуальные системы для компаний и небольших команд. Работаю от структуры и пользовательского сценария до финального интерфейса и визуальной подачи.",

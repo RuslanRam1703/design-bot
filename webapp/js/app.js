@@ -564,6 +564,15 @@ function renderAbout() {
 
   const specItems = a.specialization.map((s) => `<li>${escapeHtml(s)}</li>`).join("");
   const toolChips = a.tools.map((t) => `<span class="chip-static">${escapeHtml(t)}</span>`).join("");
+  // Навыки — профессиональные компетенции (UX-исследования, прототипирование...)
+  // отдельно от Инструментов (софт) — раньше это было смешано в одном списке.
+  const skillsHTML = a.skills && a.skills.length
+    ? `
+      <div class="about-block">
+        <h2>Навыки</h2>
+        <div class="chips-static">${a.skills.map((s) => `<span class="chip-static">${escapeHtml(s)}</span>`).join("")}</div>
+      </div>`
+    : "";
 
   // Опыт работы (resume-style записи) — необязательный, дополняющий блок:
   // строка "Опыт: N лет" выше остаётся кратким резюме, experience[] даёт
@@ -607,12 +616,15 @@ function renderAbout() {
       <img class="about-avatar" src="/${a.avatar}" alt="" />
       <div class="about-name">${escapeHtml(a.name)}</div>
       <div class="hint">${escapeHtml(a.tagline)}</div>
+      ${a.location ? `<div class="hint">📍 ${escapeHtml(a.location)}</div>` : ""}
     </div>
 
     <div class="about-block">
       <h2>Специализация</h2>
       <ul class="plain-list">${specItems}</ul>
     </div>
+
+    ${skillsHTML}
 
     <div class="about-block">
       <h2>Инструменты</h2>
@@ -635,7 +647,10 @@ function renderAbout() {
     ${educationHTML}
     ${linksHTML}
 
-    <button class="btn btn-primary" id="about-cta">Оставить заявку</button>
+    <div class="btn-row">
+      <button class="btn btn-secondary" id="about-portfolio-cta">Смотреть портфолио</button>
+      <button class="btn btn-primary" id="about-cta">Оставить заявку</button>
+    </div>
   `;
 }
 
@@ -656,6 +671,9 @@ function attachAboutEvents() {
     state.brief.sourceCaseTitle = null;
     navigate("brief", { resetBrief: true });
   });
+
+  const portfolioCta = document.getElementById("about-portfolio-cta");
+  if (portfolioCta) portfolioCta.addEventListener("click", () => navigate("portfolio"));
 }
 
 // ---- Экран: Калькулятор ----

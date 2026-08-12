@@ -23,6 +23,7 @@ FAQ_FIELD_LABELS = {
 ABOUT_TEXT_FIELDS = {
     "name": "Имя",
     "tagline": "Тэглайн",
+    "location": "Локация",
     "experience_years": "Опыт (лет)",
     "experience_text": "Опыт — описание",
     "approach": "Подход к работе",
@@ -30,6 +31,7 @@ ABOUT_TEXT_FIELDS = {
 
 ABOUT_LIST_FIELDS = {
     "specialization": "Специализация (через запятую)",
+    "skills": "Навыки (через запятую)",
     "tools": "Инструменты (через запятую)",
 }
 
