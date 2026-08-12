@@ -37,6 +37,20 @@ const realTG = window.Telegram && window.Telegram.WebApp;
 const TG = {
   ready() { realTG?.ready(); },
   expand() { realTG?.expand(); },
+  // requestFullscreen/exitFullscreen — Bot API 8.0+. На старом клиенте
+  // метод есть на объекте, но ВЫЗОВ кидает "WebAppMethodUnsupported" не
+  // синхронно (обнаружено вживую — try/catch вокруг самого вызова его не
+  // ловит, ошибка всплывает асинхронно). Правильная защита — официальный
+  // isVersionAtLeast() ДО вызова, а не try/catch после. Раскрывает Mini
+  // App на весь экран устройства — это НЕ нативный просмотрщик фото/видео
+  // Telegram (такого API для Mini Apps не существует), просто ближайшее
+  // реально доступное.
+  enterFullscreen() {
+    if (realTG?.isVersionAtLeast?.("8.0")) realTG.requestFullscreen();
+  },
+  exitFullscreen() {
+    if (realTG?.isVersionAtLeast?.("8.0")) realTG.exitFullscreen();
+  },
   themeParams() { return realTG?.themeParams || {}; },
   colorScheme() { return realTG?.colorScheme || "light"; },
   onThemeChanged(cb) { realTG?.onEvent("themeChanged", cb); },
@@ -532,6 +546,7 @@ function openLightbox(images, index) {
   }
   renderLightboxImage();
   lightboxEl.classList.add("open");
+  TG.enterFullscreen();
 }
 
 function lightboxStep(delta) {
@@ -549,6 +564,7 @@ function renderLightboxImage() {
 
 function closeLightbox() {
   if (lightboxEl) lightboxEl.classList.remove("open");
+  TG.exitFullscreen();
 }
 
 document.addEventListener("keydown", (e) => {
