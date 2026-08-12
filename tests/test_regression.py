@@ -10,10 +10,12 @@ content_store пишет в реальные data/*.json — тесты, кот�
 Настоящие файлы проекта не трогаются.
 """
 
+import io
 import json
 import shutil
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -367,6 +369,81 @@ class AdminCaseConstructorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self._case()["external_url"], "https://behance.net/gallery/x")
 
 
+class AdminBackupHandlersTests(unittest.IsolatedAsyncioTestCase):
+    """Реальный проход через bot/handlers/admin.py для /admin -> Бэкап:
+    экспорт шлёт .zip документом, импорт принимает загруженный .zip и
+    реально восстанавливает изменённые данные — не мок, настоящий
+    content_store.import_backup_bytes через настоящий хендлер."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        real_data_dir = Path(__file__).resolve().parent.parent / "data"
+        for name in ("pricing.json", "portfolio.json", "faq.json", "about.json", "ui_config.json"):
+            shutil.copy(real_data_dir / name, Path(self.tmpdir) / name)
+        self._orig_data_dir = content_store.DATA_DIR
+        self._orig_designer = content_store.config.DESIGNER_CHAT_ID
+        content_store.DATA_DIR = Path(self.tmpdir)
+        content_store.config.DESIGNER_CHAT_ID = "999"
+        self.actor = 999
+
+    def tearDown(self):
+        content_store.DATA_DIR = self._orig_data_dir
+        content_store.config.DESIGNER_CHAT_ID = self._orig_designer
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def _make_export_callback(self):
+        return SimpleNamespace(
+            data="adminbackupaction:export",
+            message=SimpleNamespace(
+                chat=SimpleNamespace(id=self.actor),
+                edit_text=AsyncMock(),
+                answer_document=AsyncMock(),
+            ),
+            answer=AsyncMock(),
+        )
+
+    def _make_zip_document_message(self, zip_bytes: bytes):
+        return SimpleNamespace(
+            chat=SimpleNamespace(id=self.actor),
+            document=SimpleNamespace(file_id="fake_zip_id"),
+            bot=SimpleNamespace(
+                get_file=AsyncMock(return_value=SimpleNamespace(file_path="documents/backup.zip")),
+                download_file=AsyncMock(return_value=io.BytesIO(zip_bytes)),
+            ),
+            answer=AsyncMock(),
+        )
+
+    async def test_export_sends_zip_document_with_current_data(self):
+        state = make_state(self.actor)
+        cb = self._make_export_callback()
+        await admin.backup_export(cb, state)
+        cb.message.answer_document.assert_awaited_once()
+        sent_file = cb.message.answer_document.await_args.args[0]
+        with zipfile.ZipFile(io.BytesIO(sent_file.data)) as zf:
+            self.assertIn("data/portfolio.json", zf.namelist())
+
+    async def test_import_via_real_handler_restores_changed_data(self):
+        zip_bytes = content_store.export_backup_bytes()
+        content_store.update_portfolio_type_related_service(str(self.actor), "landing", "SITE")
+        self.assertEqual(content_store.default_related_service_for_type("landing"), "SITE")
+
+        state = make_state(self.actor)
+        await admin.backup_import_start(make_callback("adminbackupaction:import", chat_id=self.actor), state)
+        self.assertEqual(await state.get_state(), AdminStates.backup_restore_wait_file.state)
+
+        await admin.backup_import_receive(self._make_zip_document_message(zip_bytes), state)
+
+        self.assertEqual(content_store.default_related_service_for_type("landing"), "LEND")
+        self.assertEqual(await state.get_state(), AdminStates.backup_menu.state)
+
+    async def test_import_bad_zip_via_real_handler_does_not_crash(self):
+        state = make_state(self.actor)
+        msg = self._make_zip_document_message(b"not a zip")
+        await admin.backup_import_receive(msg, state)
+        msg.answer.assert_awaited_once()
+        self.assertIn("повреждён", msg.answer.await_args.args[0])
+
+
 class AdminAboutResumeFieldsTests(unittest.IsolatedAsyncioTestCase):
     """Part 2 (уменьшённый объём): location — обычное текстовое поле,
     skills — список через запятую, отдельный от tools. Оба уже существуют
@@ -490,6 +567,80 @@ class UpstashPersistenceTests(unittest.TestCase):
         # повторное чтение отдаёт то, что записали, а не переседевает заново
         self.assertEqual(content_store._read("ui_config.json"), {"menu": {"portfolio": False}})
         self.assertEqual(self.fake.calls.count(("GET", "ui_config.json")), 1)  # ровно одно чтение из Redis
+
+
+class BackupExportImportTests(unittest.TestCase):
+    """export_backup_bytes/import_backup_bytes — единственный бесплатный
+    (без стороннего сервиса) способ пережить redeploy на Render: дизайнер
+    выгружает .zip себе в Telegram и загружает обратно после деплоя.
+    Покрывает и data/*.json, и загруженные фото."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        real_data_dir = Path(__file__).resolve().parent.parent / "data"
+        for name in ("pricing.json", "portfolio.json", "faq.json", "about.json", "ui_config.json", "leads.json"):
+            shutil.copy(real_data_dir / name, Path(self.tmpdir) / name)
+        self._orig_data_dir = content_store.DATA_DIR
+        self._orig_designer = content_store.config.DESIGNER_CHAT_ID
+        content_store.DATA_DIR = Path(self.tmpdir)
+        content_store.config.DESIGNER_CHAT_ID = "999"
+        self.actor = "999"
+
+        # изолируем и папки с фото — реальные webapp/img/* трогать нельзя
+        self.img_tmpdir = tempfile.mkdtemp()
+        self._orig_img_portfolio = content_store.IMG_PORTFOLIO_DIR
+        self._orig_img_about = content_store.IMG_ABOUT_DIR
+        content_store.IMG_PORTFOLIO_DIR = Path(self.img_tmpdir) / "portfolio"
+        content_store.IMG_ABOUT_DIR = Path(self.img_tmpdir) / "about"
+        content_store.IMG_PORTFOLIO_DIR.mkdir(parents=True)
+        content_store.IMG_ABOUT_DIR.mkdir(parents=True)
+        (content_store.IMG_PORTFOLIO_DIR / "case_1.jpg").write_bytes(b"fake-jpeg-bytes")
+        (content_store.IMG_ABOUT_DIR / "avatar.jpg").write_bytes(b"fake-avatar-bytes")
+
+    def tearDown(self):
+        content_store.DATA_DIR = self._orig_data_dir
+        content_store.config.DESIGNER_CHAT_ID = self._orig_designer
+        content_store.IMG_PORTFOLIO_DIR = self._orig_img_portfolio
+        content_store.IMG_ABOUT_DIR = self._orig_img_about
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+        shutil.rmtree(self.img_tmpdir, ignore_errors=True)
+
+    def test_export_zip_contains_data_files_and_images(self):
+        zip_bytes = content_store.export_backup_bytes()
+        with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
+            names = zf.namelist()
+        self.assertIn("data/portfolio.json", names)
+        self.assertIn("data/leads.json", names)
+        self.assertIn("img/portfolio/case_1.jpg", names)
+        self.assertIn("img/about/avatar.jpg", names)
+
+    def test_import_restores_json_field_that_changed_after_export(self):
+        zip_bytes = content_store.export_backup_bytes()
+        content_store.update_portfolio_type_related_service(self.actor, "landing", "SITE")  # мутируем после бэкапа
+        self.assertEqual(content_store.default_related_service_for_type("landing"), "SITE")
+
+        content_store.import_backup_bytes(self.actor, zip_bytes)
+
+        self.assertEqual(content_store.default_related_service_for_type("landing"), "LEND")  # вернулось из бэкапа
+
+    def test_import_restores_deleted_image_file(self):
+        zip_bytes = content_store.export_backup_bytes()
+        (content_store.IMG_PORTFOLIO_DIR / "case_1.jpg").unlink()
+        self.assertFalse((content_store.IMG_PORTFOLIO_DIR / "case_1.jpg").exists())
+
+        content_store.import_backup_bytes(self.actor, zip_bytes)
+
+        self.assertTrue((content_store.IMG_PORTFOLIO_DIR / "case_1.jpg").exists())
+        self.assertEqual((content_store.IMG_PORTFOLIO_DIR / "case_1.jpg").read_bytes(), b"fake-jpeg-bytes")
+
+    def test_import_requires_designer(self):
+        zip_bytes = content_store.export_backup_bytes()
+        with self.assertRaises(content_store.NotDesignerError):
+            content_store.import_backup_bytes("not-the-designer", zip_bytes)
+
+    def test_import_rejects_non_zip_bytes(self):
+        with self.assertRaises(zipfile.BadZipFile):
+            content_store.import_backup_bytes(self.actor, b"not a zip file at all")
 
 
 class ReferentialIntegrityTests(unittest.TestCase):

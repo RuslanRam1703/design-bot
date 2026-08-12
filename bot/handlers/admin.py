@@ -13,13 +13,15 @@
 
 import logging
 import uuid
+import zipfile
+from datetime import datetime, timezone
 from typing import Callable
 
 from aiogram import F, Router
 from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State
-from aiogram.types import CallbackQuery, InlineKeyboardMarkup, Message
+from aiogram.types import BufferedInputFile, CallbackQuery, InlineKeyboardMarkup, Message
 
 from bot import admin_keyboards as kb
 from bot import config, content_store
@@ -40,6 +42,7 @@ CANCEL_TARGETS: dict[str, tuple[str, Callable[[], InlineKeyboardMarkup]]] = {
     "faq": ("Отменено. FAQ:", kb.admin_faq_menu_keyboard),
     "pricing": ("Отменено. Услуги и цены:", kb.pricing_menu_keyboard),
     "categories": ("Отменено. Категории портфолио:", kb.categories_menu_keyboard),
+    "backup": ("Отменено. Бэкап:", kb.backup_menu_keyboard),
     "root": ("Отменено. Админ-меню:", kb.admin_root_keyboard),
 }
 
@@ -1505,6 +1508,63 @@ async def lead_back_to_list(callback: CallbackQuery, state: FSMContext) -> None:
     await callback.message.edit_text(f"Заявки ({len(leads)}):", reply_markup=kb.leads_list_keyboard(leads, status))
     await state.set_state(AdminStates.leads_list)
     await callback.answer()
+
+
+# ---- Бэкап (экспорт/восстановление data/*.json + фото через .zip) ----
+# На бесплатном Render нет персистентного диска — единственный бесплатный
+# способ пережить redeploy без стороннего сервиса: дизайнер сам выгружает
+# .zip себе в Telegram (сохраняется у него как любой присланный файл) и
+# загружает его обратно после деплоя через "Восстановить".
+
+@router.callback_query(F.data == "adminmenu:backup")
+async def menu_backup(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    await callback.message.edit_text(
+        "Бэкап данных (заявки, кейсы, «Обо мне», услуги, FAQ, фото) — переживает деплой, только если вы его восстановите после каждого обновления бота:",
+        reply_markup=kb.backup_menu_keyboard(),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "adminbackupaction:export")
+async def backup_export(callback: CallbackQuery, state: FSMContext) -> None:
+    zip_bytes = content_store.export_backup_bytes()
+    stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d_%H%M")
+    filename = f"design-bot-backup-{stamp}.zip"
+    await callback.message.answer_document(
+        BufferedInputFile(zip_bytes, filename=filename),
+        caption="Бэкап готов ✅ Telegram сохранит его у вас как обычный файл — этим же файлом восстанавливайте после деплоя.",
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "adminbackupaction:import")
+async def backup_import_start(callback: CallbackQuery, state: FSMContext) -> None:
+    await callback.message.edit_text("Пришлите .zip файл бэкапа:", reply_markup=kb.cancel_keyboard())
+    await state.update_data(cancel_to="backup")
+    await state.set_state(AdminStates.backup_restore_wait_file)
+    await callback.answer()
+
+
+@router.message(AdminStates.backup_restore_wait_file, F.document)
+async def backup_import_receive(message: Message, state: FSMContext) -> None:
+    file = await message.bot.get_file(message.document.file_id)
+    file_bytes_io = await message.bot.download_file(file.file_path)
+    try:
+        restored = content_store.import_backup_bytes(message.chat.id, file_bytes_io.read())
+    except zipfile.BadZipFile:
+        await message.answer("Файл повреждён или не .zip — пришлите другой файл.", reply_markup=kb.cancel_keyboard())
+        return
+    if restored:
+        await message.answer(f"Восстановлено файлов: {len(restored)} ✅\n\nБэкап:", reply_markup=kb.backup_menu_keyboard())
+    else:
+        await message.answer("В архиве не нашлось знакомых файлов данных/фото — ничего не восстановлено.\n\nБэкап:", reply_markup=kb.backup_menu_keyboard())
+    await state.set_state(AdminStates.backup_menu)
+
+
+@router.message(AdminStates.backup_restore_wait_file)
+async def backup_import_wrong(message: Message, state: FSMContext) -> None:
+    await message.answer("Нужен .zip файл 📎.", reply_markup=kb.cancel_keyboard())
 
 
 # ---- Фолбэк: сообщение не того типа/формата на любом шаге админки ----

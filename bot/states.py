@@ -106,3 +106,9 @@ class AdminStates(StatesGroup):
     leads_list = State()
     lead_detail = State()
     lead_reply_text = State()
+
+    # Бэкап (экспорт/восстановление data/*.json + фото через .zip-файл в
+    # Telegram) — на бесплатном Render файловая система эфемерна, это
+    # ручной способ пережить redeploy без стороннего сервиса.
+    backup_menu = State()
+    backup_restore_wait_file = State()

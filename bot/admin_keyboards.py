@@ -85,6 +85,17 @@ def admin_root_keyboard() -> InlineKeyboardMarkup:
             [InlineKeyboardButton(text="👤 Обо мне", callback_data="adminmenu:about")],
             [InlineKeyboardButton(text="💰 Услуги и цены", callback_data="adminmenu:pricing")],
             [InlineKeyboardButton(text="🏷 Категории портфолио", callback_data="adminmenu:categories")],
+            [InlineKeyboardButton(text="💾 Бэкап", callback_data="adminmenu:backup")],
+        ]
+    )
+
+
+def backup_menu_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="📤 Экспортировать", callback_data="adminbackupaction:export")],
+            [InlineKeyboardButton(text="📥 Восстановить из файла", callback_data="adminbackupaction:import")],
+            [InlineKeyboardButton(text="◀️ Назад", callback_data="adminmenu:root")],
         ]
     )
 

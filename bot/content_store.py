@@ -14,11 +14,13 @@ actor_chat_id и сверяет его с DESIGNER_CHAT_ID сама, незав�
 который забудут защитить) запись в данные без прав физически невозможна.
 """
 
+import io
 import json
 import os
 import tempfile
 import urllib.error
 import urllib.request
+import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -797,3 +799,66 @@ def update_lead_status(actor_chat_id: int | str, lead_id: int, status: str) -> b
     lead["updated_at"] = datetime.now(timezone.utc).isoformat()
     _write_leads(leads)
     return True
+
+
+# ---- Бэкап (экспорт/восстановление через .zip в Telegram) ----
+# На бесплатном Render нет персистентного диска (см. render.yaml/README) —
+# без внешнего сервиса единственный бесплатный способ пережить redeploy:
+# дизайнер вручную выгружает .zip себе в Telegram (Telegram сам сохраняет
+# присланный документ у получателя) и загружает его обратно после деплоя.
+# Покрывает и data/*.json, и загруженные фото — то, что Upstash-режим
+# выше не покрывает вовсе.
+
+DATA_FILENAMES = ("portfolio.json", "pricing.json", "faq.json", "about.json", "ui_config.json", "leads.json")
+
+
+def export_backup_bytes() -> bytes:
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for name in DATA_FILENAMES:
+            try:
+                data = _read(name)
+            except FileNotFoundError:
+                continue
+            zf.writestr(f"data/{name}", json.dumps(data, ensure_ascii=False, indent=2))
+        for img_dir, prefix in ((IMG_PORTFOLIO_DIR, "img/portfolio"), (IMG_ABOUT_DIR, "img/about")):
+            if not img_dir.exists():
+                continue
+            for f in sorted(img_dir.iterdir()):
+                if f.is_file():
+                    zf.write(f, f"{prefix}/{f.name}")
+    return buf.getvalue()
+
+
+def import_backup_bytes(actor_chat_id: int | str, zip_bytes: bytes) -> list[str]:
+    """Восстанавливает data/*.json и фото из .zip, созданного export_backup_bytes.
+    Имена файлов в архиве берутся только по basename (без пути) и данные —
+    только по белому списку DATA_FILENAMES, чтобы вредоносный/повреждённый
+    .zip не мог записать что-то за пределами ожидаемых файлов (zip-slip)."""
+    _require_designer(actor_chat_id)
+    restored: list[str] = []
+    with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
+        for info in zf.infolist():
+            if info.is_dir():
+                continue
+            name = info.filename
+            content = zf.read(info)
+            if name.startswith("data/") and name.endswith(".json"):
+                filename = name[len("data/"):]
+                if filename not in DATA_FILENAMES:
+                    continue
+                try:
+                    data = json.loads(content.decode("utf-8"))
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    continue
+                _write(filename, data)
+                restored.append(name)
+            elif name.startswith("img/portfolio/"):
+                IMG_PORTFOLIO_DIR.mkdir(parents=True, exist_ok=True)
+                (IMG_PORTFOLIO_DIR / Path(name).name).write_bytes(content)
+                restored.append(name)
+            elif name.startswith("img/about/"):
+                IMG_ABOUT_DIR.mkdir(parents=True, exist_ok=True)
+                (IMG_ABOUT_DIR / Path(name).name).write_bytes(content)
+                restored.append(name)
+    return restored
