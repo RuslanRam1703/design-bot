@@ -414,6 +414,84 @@ class AdminAboutResumeFieldsTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotEqual(about["skills"], about["tools"])
 
 
+class FakeUpstash:
+    """Имитирует Upstash Redis REST API в памяти (без сети) — команды
+    GET/SET кодируются как JSON-массив в теле POST-запроса, ответ —
+    {"result": ...}, ровно как настоящий Upstash REST."""
+
+    def __init__(self):
+        self.store: dict[str, str] = {}
+        self.calls: list[tuple] = []
+
+    def urlopen(self, req, timeout=10):
+        args = json.loads(req.data.decode("utf-8"))
+        self.calls.append(tuple(args))
+        cmd = args[0]
+        if cmd == "GET":
+            result = self.store.get(args[1])
+        elif cmd == "SET":
+            self.store[args[1]] = args[2]
+            result = "OK"
+        else:
+            raise AssertionError(f"unexpected command in test double: {args}")
+        body = json.dumps({"result": result}).encode("utf-8")
+        return _FakeUpstashResponse(body)
+
+
+class _FakeUpstashResponse:
+    def __init__(self, body: bytes):
+        self._body = body
+
+    def read(self):
+        return self._body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+class UpstashPersistenceTests(unittest.TestCase):
+    """content_store._read/_write должны переключаться на Upstash Redis
+    (REST) вместо локальных файлов, когда заданы креды — конкретно чтобы
+    заявки и правки /admin переживали redeploy на бесплатном Render, где
+    файловая система эфемерна. Первое чтение (ключа ещё нет в Redis)
+    должно засеваться из локального файла-репозитория и сразу сохраняться."""
+
+    def setUp(self):
+        self.fake = FakeUpstash()
+        self._orig_url = content_store.config.UPSTASH_REDIS_REST_URL
+        self._orig_token = content_store.config.UPSTASH_REDIS_REST_TOKEN
+        content_store.config.UPSTASH_REDIS_REST_URL = "https://fake-upstash.example/"
+        content_store.config.UPSTASH_REDIS_REST_TOKEN = "fake-token"
+        self._patch = patch("bot.content_store.urllib.request.urlopen", side_effect=self.fake.urlopen)
+        self._patch.start()
+
+    def tearDown(self):
+        self._patch.stop()
+        content_store.config.UPSTASH_REDIS_REST_URL = self._orig_url
+        content_store.config.UPSTASH_REDIS_REST_TOKEN = self._orig_token
+
+    def test_first_read_seeds_from_local_file_and_persists_to_redis(self):
+        data = content_store._read("ui_config.json")
+        self.assertIn("menu", data)
+        self.assertIn("ui_config.json", self.fake.store)  # засеяно в Redis сразу
+
+    def test_write_then_read_round_trips_through_redis_not_local_disk(self):
+        content_store._write("ui_config.json", {"menu": {"portfolio": False}})
+        self.assertEqual(json.loads(self.fake.store["ui_config.json"]), {"menu": {"portfolio": False}})
+
+        # локальный файл на диске НЕ тронут — вся мутация ушла только в Redis
+        with open(Path(__file__).resolve().parent.parent / "data" / "ui_config.json", encoding="utf-8") as f:
+            real_local = json.load(f)
+        self.assertNotEqual(real_local, {"menu": {"portfolio": False}})
+
+        # повторное чтение отдаёт то, что записали, а не переседевает заново
+        self.assertEqual(content_store._read("ui_config.json"), {"menu": {"portfolio": False}})
+        self.assertEqual(self.fake.calls.count(("GET", "ui_config.json")), 1)  # ровно одно чтение из Redis
+
+
 class ReferentialIntegrityTests(unittest.TestCase):
     """Category -> Service: и находка 09 (кастомные категории должны уметь
     получить related_service), и её следствие, о котором предупредили в

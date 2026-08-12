@@ -17,6 +17,8 @@ actor_chat_id и сверяет его с DESIGNER_CHAT_ID сама, незав�
 import json
 import os
 import tempfile
+import urllib.error
+import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -36,12 +38,42 @@ def _require_designer(actor_chat_id: int | str) -> None:
         raise NotDesignerError(f"chat_id={actor_chat_id!r} не совпадает с DESIGNER_CHAT_ID")
 
 
-def _read(filename: str) -> Any:
+# ---- Хранилище data/*.json: локальные файлы, либо Upstash Redis (REST) ----
+# На бесплатном Render (и большинстве бесплатных PaaS) файловая система
+# эфемерна — любые правки, сделанные во время работы инстанса (заявки,
+# правки через /admin), пропадают на следующем restart/redeploy. Если
+# заданы UPSTASH_REDIS_REST_URL/TOKEN — каждый файл хранится как один
+# JSON-блоб под ключом-именем файла в Redis, переживает любой redeploy.
+# Без них — поведение как раньше, обычные локальные файлы (не нужен
+# Upstash-аккаунт для локальной разработки).
+
+def _upstash_enabled() -> bool:
+    return bool(config.UPSTASH_REDIS_REST_URL and config.UPSTASH_REDIS_REST_TOKEN)
+
+
+def _upstash_command(*args: Any) -> Any:
+    req = urllib.request.Request(
+        config.UPSTASH_REDIS_REST_URL,
+        data=json.dumps(list(args)).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {config.UPSTASH_REDIS_REST_TOKEN}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        body = json.loads(resp.read().decode("utf-8"))
+    if body.get("error"):
+        raise RuntimeError(f"Upstash error on {args[0]}: {body['error']}")
+    return body.get("result")
+
+
+def _read_local(filename: str) -> Any:
     with open(DATA_DIR / filename, "r", encoding="utf-8") as f:
         return json.load(f)
 
 
-def _write(filename: str, data: Any) -> None:
+def _write_local(filename: str, data: Any) -> None:
     path = DATA_DIR / filename
     fd, tmp_path = tempfile.mkstemp(dir=DATA_DIR, prefix=f".{filename}.", suffix=".tmp")
     try:
@@ -52,6 +84,27 @@ def _write(filename: str, data: Any) -> None:
         if os.path.exists(tmp_path):
             os.remove(tmp_path)
         raise
+
+
+def _read(filename: str) -> Any:
+    if not _upstash_enabled():
+        return _read_local(filename)
+    raw = _upstash_command("GET", filename)
+    if raw is None:
+        # Первый запуск с этим Redis (ключа ещё нет) — сеем стартовыми
+        # данными из репозитория и сразу сохраняем в Redis, чтобы дальше
+        # читать/писать только оттуда.
+        data = _read_local(filename)
+        _upstash_command("SET", filename, json.dumps(data, ensure_ascii=False))
+        return data
+    return json.loads(raw)
+
+
+def _write(filename: str, data: Any) -> None:
+    if not _upstash_enabled():
+        _write_local(filename, data)
+        return
+    _upstash_command("SET", filename, json.dumps(data, ensure_ascii=False))
 
 
 # ---- Кейсы портфолио (чтение — без ограничений, пишет только в Mini App/бота) ----
