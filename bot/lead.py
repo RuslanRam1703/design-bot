@@ -120,7 +120,14 @@ def _fmt_days(value: float) -> str:
     return f"{value:g}"
 
 
-STATUS_LABELS = {"NEW": "🆕 Новая", "IN_PROGRESS": "🔧 В работе", "DONE": "✅ Завершена"}
+STATUS_LABELS = {
+    "NEW": "🆕 Новая",
+    "VIEWED": "👀 Просмотрена",
+    "IN_PROGRESS": "💬 В работе",
+    "WAITING_CLIENT": "⏸ Ожидание клиента",
+    "DONE": "✅ Завершена",
+    "CANCELLED": "❌ Отменена",
+}
 
 
 def format_lead_admin_detail(lead: dict) -> str:

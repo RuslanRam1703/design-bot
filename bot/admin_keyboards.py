@@ -10,7 +10,6 @@ CASE_FIELD_LABELS = {
     "solution": "Решение",
     "result": "Результат",
     "related_service": "Похожая услуга",
-    "featured": "Показывать в «Обо мне»",
     "external_url": "Ссылка (Behance и т.п., необязательно)",
 }
 
@@ -72,6 +71,10 @@ MENU_ITEM_LABELS = {
 # ---- Навигация: 2 уровня — раздел -> действие ----
 
 def admin_root_keyboard() -> InlineKeyboardMarkup:
+    # "Меню и навигация" убрана из корня — это техническая настройка
+    # видимости экранов, не основной рабочий пункт для владельца бота;
+    # сам механизм (adminmenu:nav и связанные хендлеры) не удалён, просто
+    # больше не предлагается как равноценный пункт наравне с Заявками/Кейсами.
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="📋 Заявки", callback_data="adminmenu:leads")],
@@ -80,7 +83,6 @@ def admin_root_keyboard() -> InlineKeyboardMarkup:
             [InlineKeyboardButton(text="👤 Обо мне", callback_data="adminmenu:about")],
             [InlineKeyboardButton(text="💰 Услуги и цены", callback_data="adminmenu:pricing")],
             [InlineKeyboardButton(text="🏷 Категории портфолио", callback_data="adminmenu:categories")],
-            [InlineKeyboardButton(text="🧭 Меню и навигация", callback_data="adminmenu:nav")],
         ]
     )
 
@@ -349,8 +351,23 @@ def nav_menu_keyboard(ui_config: dict) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-LEAD_STATUS_LABELS = {"NEW": "🆕 Новая", "IN_PROGRESS": "🔧 В работе", "DONE": "✅ Завершена"}
-LEAD_FILTER_LABELS = {"NEW": "🆕 Новые", "IN_PROGRESS": "🔧 В работе", "DONE": "✅ Завершённые", "ALL": "Все"}
+LEAD_STATUS_LABELS = {
+    "NEW": "🆕 Новая",
+    "VIEWED": "👀 Просмотрена",
+    "IN_PROGRESS": "💬 В работе",
+    "WAITING_CLIENT": "⏸ Ожидание клиента",
+    "DONE": "✅ Завершена",
+    "CANCELLED": "❌ Отменена",
+}
+LEAD_FILTER_LABELS = {
+    "NEW": "🆕 Новые",
+    "VIEWED": "👀 Просмотренные",
+    "IN_PROGRESS": "💬 В работе",
+    "WAITING_CLIENT": "⏸ Ожидание клиента",
+    "DONE": "✅ Завершённые",
+    "CANCELLED": "❌ Отменённые",
+    "ALL": "Все",
+}
 
 
 def leads_filter_keyboard() -> InlineKeyboardMarkup:

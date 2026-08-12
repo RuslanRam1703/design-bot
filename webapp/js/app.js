@@ -565,17 +565,6 @@ function renderAbout() {
   const specItems = a.specialization.map((s) => `<li>${escapeHtml(s)}</li>`).join("");
   const toolChips = a.tools.map((t) => `<span class="chip-static">${escapeHtml(t)}</span>`).join("");
 
-  const featured = state.portfolio.cases.filter((c) => c.featured).slice(0, 3);
-  const featuredHTML = featured
-    .map(
-      (c) => `
-      <button class="mini-case" data-case="${c.id}">
-        ${c.cover ? `<img src="/${c.cover}" alt="" loading="lazy" />` : '<div class="mini-case-cover-empty"></div>'}
-        <span>${escapeHtml(c.title)}</span>
-      </button>`
-    )
-    .join("");
-
   // Опыт работы (resume-style записи) — необязательный, дополняющий блок:
   // строка "Опыт: N лет" выше остаётся кратким резюме, experience[] даёт
   // детализацию по местам/проектам, если дизайнер её заполнил.
@@ -642,8 +631,6 @@ function renderAbout() {
     </div>
 
     ${experienceHTML}
-
-    ${featuredHTML ? `<div class="about-block"><h2>Избранные кейсы</h2><div class="mini-case-grid">${featuredHTML}</div></div>` : ""}
 
     ${educationHTML}
     ${linksHTML}

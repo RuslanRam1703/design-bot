@@ -671,7 +671,7 @@ def content_readiness_summary() -> dict:
 # добавляет только отдельный список/статусы в /admin поверх того же потока,
 # без нового канала передачи данных.
 
-LEAD_STATUSES = ("NEW", "IN_PROGRESS", "DONE")
+LEAD_STATUSES = ("NEW", "VIEWED", "IN_PROGRESS", "WAITING_CLIENT", "DONE", "CANCELLED")
 
 
 def _read_leads() -> list[dict]:

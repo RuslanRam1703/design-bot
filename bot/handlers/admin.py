@@ -323,13 +323,6 @@ async def cases_edit_field(callback: CallbackQuery, state: FSMContext) -> None:
         )
         await callback.answer()
         return
-    if field == "featured":
-        await callback.message.edit_text(
-            "Показывать этот кейс в разделе «Обо мне» (до 3 избранных)?",
-            reply_markup=kb.yes_no_keyboard("admincasefeatured"),
-        )
-        await callback.answer()
-        return
     if field == "category":
         types = content_store.list_portfolio_types()
         await callback.message.edit_text("Новая категория кейса:", reply_markup=kb.change_case_category_keyboard(types))
@@ -366,15 +359,6 @@ async def cases_edit_related_service(callback: CallbackQuery, state: FSMContext)
     value = callback.data.split(":", 1)[1]
     data = await state.get_data()
     content_store.update_case(callback.message.chat.id, data["case_id"], related_service=None if value == "none" else value)
-    await callback.message.edit_text("Обновлено ✅\n\nЧто ещё изменить?", reply_markup=kb.case_field_keyboard())
-    await callback.answer()
-
-
-@router.callback_query(AdminStates.edit_case_field_pick, F.data.startswith("admincasefeatured:"))
-async def cases_edit_featured(callback: CallbackQuery, state: FSMContext) -> None:
-    value = callback.data.split(":", 1)[1] == "yes"
-    data = await state.get_data()
-    content_store.update_case(callback.message.chat.id, data["case_id"], featured=value)
     await callback.message.edit_text("Обновлено ✅\n\nЧто ещё изменить?", reply_markup=kb.case_field_keyboard())
     await callback.answer()
 
