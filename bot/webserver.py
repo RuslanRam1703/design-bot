@@ -21,8 +21,23 @@ async def handle_health(request: web.Request) -> web.Response:
     return web.Response(text="ok")
 
 
+async def _no_cache(request: web.Request, response: web.StreamResponse) -> None:
+    # index.html уже запрещал кэш (см. handle_index) — но /js/, /css/, /data/
+    # отдавались через add_static БЕЗ Cache-Control вовсе, а не только без
+    # no-store: aiohttp.web_fileresponse только проставляет Last-Modified и
+    # обрабатывает If-Modified-Since, ничего не говоря клиенту "не кэшируй".
+    # WebView в Telegram-клиенте мог годами отдавать app.js/style.css/данные
+    # из собственного диск-кэша вообще без обращения к серверу — то есть
+    # заново открытая (не переиспользованная) страница всё равно показывала
+    # старый JS. Не трогаем /img/ — картинки кейсов можно кэшировать, старая
+    # картинка не ломает функциональность, в отличие от старого app.js.
+    if request.path.startswith(("/js/", "/css/", "/data/")):
+        response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
+
+
 def create_app() -> web.Application:
     app = web.Application()
+    app.on_response_prepare.append(_no_cache)
     for path in ("/", "/portfolio", "/about", "/calculator", "/brief"):
         app.router.add_get(path, handle_index)
     app.router.add_get("/health", handle_health)
