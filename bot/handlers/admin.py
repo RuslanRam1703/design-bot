@@ -329,7 +329,8 @@ async def cases_edit_field(callback: CallbackQuery, state: FSMContext) -> None:
         await callback.answer()
         return
     if field == "images":
-        case = next((c for c in content_store.list_cases() if c["id"] == (await state.get_data())["case_id"]), None)
+        case_id = (await state.get_data())["case_id"]
+        case = _current_case(case_id)
         await callback.message.edit_text(
             "Изображения кейса — ⭐ отмечает текущую обложку:",
             reply_markup=kb.case_images_menu_keyboard(case.get("images", []) if case else [], case.get("cover") if case else None),
@@ -339,7 +340,8 @@ async def cases_edit_field(callback: CallbackQuery, state: FSMContext) -> None:
         await callback.answer()
         return
     if field == "sections":
-        case = next((c for c in content_store.list_cases() if c["id"] == (await state.get_data())["case_id"]), None)
+        case_id = (await state.get_data())["case_id"]
+        case = _current_case(case_id)
         await callback.message.edit_text(
             "Разделы кейса:",
             reply_markup=kb.case_sections_menu_keyboard(case.get("sections", []) if case else []),

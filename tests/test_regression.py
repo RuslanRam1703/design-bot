@@ -262,6 +262,111 @@ class AdminCancelIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Опции", cancel_cb.message.edit_text.await_args.args[0])
 
 
+def make_photo_message(chat_id: int) -> SimpleNamespace:
+    return SimpleNamespace(
+        chat=SimpleNamespace(id=chat_id),
+        photo=[SimpleNamespace(file_id="fake_file_id")],
+        document=None,
+        text=None,
+        bot=SimpleNamespace(
+            get_file=AsyncMock(return_value=SimpleNamespace(file_path="photos/fake.jpg")),
+            download_file=AsyncMock(),
+        ),
+        answer=AsyncMock(),
+    )
+
+
+def make_text_message(chat_id: int, text: str) -> SimpleNamespace:
+    return SimpleNamespace(
+        chat=SimpleNamespace(id=chat_id), photo=None, document=None, text=text,
+        bot=SimpleNamespace(), answer=AsyncMock(),
+    )
+
+
+class AdminCaseConstructorTests(unittest.IsolatedAsyncioTestCase):
+    """Реальный проход через bot/handlers/admin.py для конструктора кейса
+    (не изолированные вызовы content_store, а настоящие FSM-хендлеры) —
+    нашёл здесь живой баг: cases_edit_field для field in ("images", "sections")
+    строил `next((c for c in ... if c["id"] == (await state.get_data())[...]), None)` —
+    await внутри генератора неявно делает его async-генератором, и next()
+    падает с TypeError на КАЖДОМ открытии этих пунктов меню в реальном боте."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        real_data_dir = Path(__file__).resolve().parent.parent / "data"
+        for name in ("pricing.json", "portfolio.json", "faq.json", "about.json", "ui_config.json"):
+            shutil.copy(real_data_dir / name, Path(self.tmpdir) / name)
+        self._orig_data_dir = content_store.DATA_DIR
+        self._orig_designer = content_store.config.DESIGNER_CHAT_ID
+        content_store.DATA_DIR = Path(self.tmpdir)
+        content_store.config.DESIGNER_CHAT_ID = "999"
+        self.actor = 999
+        content_store.add_case(
+            str(self.actor), case_id="case_ctor_test", title="Тест", type_id="landing",
+            cover="img/portfolio/seed.svg", task="t", related_service=None,
+        )
+
+    def tearDown(self):
+        content_store.DATA_DIR = self._orig_data_dir
+        content_store.config.DESIGNER_CHAT_ID = self._orig_designer
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def _case(self):
+        return next(c for c in content_store.list_cases() if c["id"] == "case_ctor_test")
+
+    async def _state(self):
+        state = make_state(self.actor)
+        await state.update_data(case_id="case_ctor_test")
+        await state.set_state(AdminStates.edit_case_field_pick)
+        return state
+
+    async def test_opening_images_menu_does_not_crash_and_add_remove_works(self):
+        state = await self._state()
+        cb = make_callback("admineditfield:images", chat_id=self.actor)
+        await admin.cases_edit_field(cb, state)  # раньше падало здесь с TypeError
+        self.assertEqual(await state.get_state(), AdminStates.case_images_menu.state)
+
+        await admin.case_image_add_start(make_callback("admincaseimgaction:add", chat_id=self.actor), state)
+        await admin.case_image_add_receive(make_photo_message(self.actor), state)
+        self.assertEqual(len(self._case()["images"]), 2)
+
+        await admin.case_image_picked(make_callback("admincaseimgpick:1", chat_id=self.actor), state)
+        await admin.case_image_action(make_callback("admincaseimgact:cover", chat_id=self.actor), state)
+        self.assertEqual(self._case()["cover"], self._case()["images"][1])
+
+        await admin.case_image_picked(make_callback("admincaseimgpick:1", chat_id=self.actor), state)
+        await admin.case_image_action(make_callback("admincaseimgact:delete", chat_id=self.actor), state)
+        self.assertEqual(len(self._case()["images"]), 1)
+
+    async def test_opening_sections_menu_does_not_crash_and_add_edit_works(self):
+        state = await self._state()
+        cb = make_callback("admineditfield:sections", chat_id=self.actor)
+        await admin.cases_edit_field(cb, state)  # раньше падало здесь с TypeError
+        self.assertEqual(await state.get_state(), AdminStates.case_sections_menu.state)
+
+        await admin.case_section_add_start(make_callback("admincasesecaction:add", chat_id=self.actor), state)
+        await admin.case_section_add_type(make_callback("admincasesectype:text", chat_id=self.actor), state)
+        await admin.case_section_add_title(make_text_message(self.actor, "Задача"), state)
+        await admin.case_section_add_content(make_text_message(self.actor, "Описание задачи"), state)
+        self.assertEqual(self._case()["sections"][0], {"type": "text", "title": "Задача", "content": "Описание задачи"})
+
+        await admin.case_section_picked(make_callback("admincasesecpick:0", chat_id=self.actor), state)
+        await admin.case_section_action(make_callback("admincasesecact:title", chat_id=self.actor), state)
+        await admin.case_section_edit_value(make_text_message(self.actor, "Задача проекта"), state)
+        self.assertEqual(self._case()["sections"][0]["title"], "Задача проекта")
+
+    async def test_category_and_external_url_edit_via_real_handlers(self):
+        state = await self._state()
+        await admin.cases_edit_field(make_callback("admineditfield:category", chat_id=self.actor), state)
+        await admin.cases_edit_category(make_callback("admincasenewcat:site", chat_id=self.actor), state)
+        self.assertEqual(self._case()["type"], "site")
+
+        await admin.cases_edit_field(make_callback("admineditfield:external_url", chat_id=self.actor), state)
+        self.assertEqual(await state.get_state(), AdminStates.edit_case_value.state)
+        await admin.cases_edit_value(make_text_message(self.actor, "https://behance.net/gallery/x"), state)
+        self.assertEqual(self._case()["external_url"], "https://behance.net/gallery/x")
+
+
 class ReferentialIntegrityTests(unittest.TestCase):
     """Category -> Service: и находка 09 (кастомные категории должны уметь
     получить related_service), и её следствие, о котором предупредили в
