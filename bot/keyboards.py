@@ -23,8 +23,11 @@ def main_menu_keyboard(webapp_url: str, ui_config: dict | None = None) -> ReplyK
         buttons.append(KeyboardButton(text=texts.MENU_PORTFOLIO, web_app=WebAppInfo(url=f"{webapp_url}/portfolio")))
     if enabled("about"):
         buttons.append(KeyboardButton(text=texts.MENU_ABOUT, web_app=WebAppInfo(url=f"{webapp_url}/about")))
-    if enabled("calculator"):
-        buttons.append(KeyboardButton(text=texts.MENU_CALCULATOR, web_app=WebAppInfo(url=f"{webapp_url}/calculator")))
+    # Калькулятор больше не отдельный пункт постоянного меню — расчёт стал
+    # частью заявки (Order Builder, шаг 1 в /brief). Кнопку не показываем,
+    # чтобы не было двух параллельных путей к заявке; сам экран /calculator
+    # и команда /calculator остаются доступны (см. cmd_calculator), но
+    # command теперь тоже ведёт в заявку, а не на старый отдельный экран.
     if enabled("brief"):
         buttons.append(KeyboardButton(text=texts.MENU_BRIEF, web_app=WebAppInfo(url=f"{webapp_url}/brief")))
     if enabled("faq"):

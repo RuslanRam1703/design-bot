@@ -18,7 +18,7 @@ CLIENT_COMMANDS = [
     BotCommand(command="start", description="Начать / приветствие"),
     BotCommand(command="portfolio", description="Портфолио"),
     BotCommand(command="about", description="Обо мне"),
-    BotCommand(command="calculator", description="Рассчитать стоимость"),
+    BotCommand(command="calculator", description="Рассчитать стоимость (внутри заявки)"),
     BotCommand(command="faq", description="Частые вопросы"),
     BotCommand(command="brief", description="Оставить заявку"),
 ]

@@ -38,7 +38,12 @@ async def cmd_about(message: Message) -> None:
 
 @router.message(Command("calculator"))
 async def cmd_calculator(message: Message) -> None:
-    await message.answer("Открыть калькулятор:", reply_markup=webapp_open_keyboard(config.WEBAPP_URL, "calculator", "💰 Открыть калькулятор"))
+    # Расчёт стоимости больше не отдельный экран — это шаг 1 заявки (Order
+    # Builder). Команда /calculator осталась в меню команд Telegram (нельзя
+    # убрать существующую команду без риска "неизвестная команда" у тех, кто
+    # успел её сохранить/ввести привычкой), но ведёт теперь туда же, куда
+    # /brief — устраняет параллельный старый сценарий, см. bot/keyboards.py.
+    await message.answer("Расчёт стоимости — теперь часть оформления заявки. Открываю заявку:", reply_markup=webapp_open_keyboard(config.WEBAPP_URL, "brief", "✍️ Оставить заявку"))
 
 
 @router.message(Command("brief"))
