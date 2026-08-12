@@ -1,181 +1,265 @@
 {
-  "_comment": "ПРИМЕР/ЗАГЛУШКА. Реальные кейсы ещё не собраны (см. ТЗ, раздел 5) — замените title/task/solution/result/images на настоящие, картинки положите в webapp/img/portfolio/ и поменяйте пути.",
+  "_comment": "DEMO CONTENT — условные кейсы для демонстрации продукта, не реальные проекты/клиенты/метрики. Перед реальным запуском замените title/task/solution/result/cover на настоящие.",
   "types": [
     {
       "id": "landing",
-      "label": "Лендинг"
+      "label": "Лендинг",
+      "related_service": "LEND"
     },
     {
       "id": "site",
-      "label": "Сайт"
+      "label": "Сайт",
+      "related_service": "SITE"
     },
     {
       "id": "uxui",
-      "label": "UX/UI"
+      "label": "UX/UI",
+      "related_service": "UXUI"
     },
     {
       "id": "logo",
-      "label": "Логотип"
+      "label": "Логотип",
+      "related_service": "LOGO"
     },
     {
       "id": "branding",
-      "label": "Брендинг"
+      "label": "Брендинг",
+      "related_service": "BRAND"
     },
     {
       "id": "graphics",
-      "label": "Графика"
+      "label": "Графика",
+      "related_service": null
     },
     {
       "id": "social",
-      "label": "Соцсети"
+      "label": "Соцсети",
+      "related_service": "SMM"
     }
   ],
   "cases": [
     {
       "id": "case_1",
-      "title": "Лендинг для кофейни «Утро»",
+      "title": "Лендинг кофейни «Утро»",
       "type": "landing",
       "featured": true,
-      "cover": "img/portfolio/placeholder_1.svg",
+      "cover": "img/portfolio/demo_case_1.svg",
       "images": [
-        "img/portfolio/placeholder_1.svg"
+        "img/portfolio/demo_case_1.svg"
       ],
-      "task": "Нужен был лендинг для запуска доставки кофе с оформлением заказа в один экран.",
-      "solution": "Разработал структуру страницы, UX и UI под мобильный трафик, подготовил адаптацию и передал макет в Figma.",
-      "result": "Страница готова к разработке, конверсия в заявку выросла за счёт короткой формы заказа.",
-      "related_service": "LEND"
+      "task": "Нужно было создать компактный лендинг для новой кофейни с акцентом на атмосферу места, меню и локальное позиционирование.",
+      "solution": "Выстроена структура вокруг первого знакомства с заведением, меню и ключевых преимуществ. Визуальная система построена на фотографии, крупных заголовках и спокойной типографике.",
+      "result": "Получился цельный промо-лендинг с понятным сценарием от знакомства с заведением до перехода к меню и контактам.",
+      "related_service": "LEND",
+      "order_template": {
+        "service_id": "LEND",
+        "options": [
+          {
+            "option_id": "LEND_1",
+            "quantity": 1
+          }
+        ]
+      }
     },
     {
       "id": "case_2",
       "title": "Лендинг курса по фотографии",
       "type": "landing",
-      "cover": "img/portfolio/placeholder_2.svg",
+      "cover": "img/portfolio/demo_case_2.svg",
       "images": [
-        "img/portfolio/placeholder_2.svg"
+        "img/portfolio/demo_case_2.svg"
       ],
-      "task": "Требовался продающий лендинг с блоком отзывов и программой курса.",
-      "solution": "Собрал структуру от оффера до формы записи, проработал UI-kit для единообразия блоков.",
-      "result": "Готовый макет с адаптацией под мобильные устройства, передан в разработку.",
-      "related_service": "LEND"
+      "task": "Нужно было представить образовательный продукт и объяснить потенциальному студенту программу, формат обучения и преимущества курса.",
+      "solution": "Сценарий построен последовательно: проблема → программа → формат обучения → преподаватель → преимущества → CTA.",
+      "result": "Страница получила более понятную структуру и последовательную подачу образовательного продукта.",
+      "related_service": "LEND",
+      "order_template": {
+        "service_id": "LEND",
+        "options": [
+          {
+            "option_id": "LEND_2",
+            "quantity": 2
+          }
+        ]
+      }
     },
     {
       "id": "case_3",
       "title": "Фирменный стиль студии йоги «Ритм»",
       "type": "branding",
       "featured": true,
-      "cover": "img/portfolio/placeholder_3.svg",
+      "cover": "img/portfolio/demo_case_3.svg",
       "images": [
-        "img/portfolio/placeholder_3.svg"
+        "img/portfolio/demo_case_3.svg"
       ],
-      "task": "Нужен был узнаваемый фирменный стиль для новой студии: знак, цвета, базовая графика.",
-      "solution": "Разработал 2 концепции, утвердил направление, собрал знак, цветовую систему и базовый гайдлайн.",
-      "result": "Клиент получил готовый комплект для оформления соцсетей, вывески и полиграфии.",
-      "related_service": "BRAND"
+      "task": "Создать визуальную систему для небольшой студии йоги с современным и спокойным характером.",
+      "solution": "Разработаны логотип, типографическая система, графические элементы и базовые принципы применения бренда.",
+      "result": "Сформирована единая визуальная система, которую можно использовать в digital- и печатных материалах.",
+      "related_service": "BRAND",
+      "order_template": {
+        "service_id": "BRAND",
+        "options": [
+          {
+            "option_id": "BRAND_1",
+            "quantity": 1
+          }
+        ]
+      }
     },
     {
       "id": "case_4",
       "title": "Логотип пекарни «Зерно»",
       "type": "logo",
-      "cover": "img/portfolio/placeholder_4.svg",
+      "cover": "img/portfolio/demo_case_4.svg",
       "images": [
-        "img/portfolio/placeholder_4.svg"
+        "img/portfolio/demo_case_4.svg"
       ],
-      "task": "Требовался простой запоминающийся знак для локальной пекарни.",
-      "solution": "Провёл анализ задачи, предложил 2 концепции, довёл финальный знак до всех нужных версий.",
-      "result": "Готовый логотип с файлами для печати и цифрового использования.",
-      "related_service": "LOGO"
+      "task": "Создать простой запоминающийся знак для локальной пекарни.",
+      "solution": "Разработана лаконичная графическая форма с акцентом на естественность и ремесленный характер бренда.",
+      "result": "Получился универсальный знак, пригодный для упаковки, вывески и digital-коммуникаций.",
+      "related_service": "LOGO",
+      "order_template": {
+        "service_id": "LOGO",
+        "options": [
+          {
+            "option_id": "LOGO_1",
+            "quantity": 1
+          }
+        ]
+      }
     },
     {
       "id": "case_5",
       "title": "Оформление Instagram для шоурума одежды",
       "type": "social",
-      "cover": "img/portfolio/placeholder_5.svg",
+      "cover": "img/portfolio/demo_case_5.svg",
       "images": [
-        "img/portfolio/placeholder_5.svg"
+        "img/portfolio/demo_case_5.svg"
       ],
-      "task": "Нужна была единая визуальная система для аккаунта и регулярных публикаций.",
-      "solution": "Разработал визуальную концепцию, оформил 5 публикаций и 5 сторис по системе.",
-      "result": "Аккаунт стал визуально целостным, клиент продолжил вести его по шаблонам.",
-      "related_service": "SMM"
+      "task": "Создать визуальную систему публикаций для небольшого fashion-шоурума.",
+      "solution": "Разработаны шаблоны постов, сторис и принципы композиции, позволяющие сохранять единый визуальный язык.",
+      "result": "Контент получил более последовательную структуру и узнаваемую визуальную подачу.",
+      "related_service": "SMM",
+      "order_template": {
+        "service_id": "SMM",
+        "options": [
+          {
+            "option_id": "SMM_1",
+            "quantity": 3
+          }
+        ]
+      }
     },
     {
       "id": "case_6",
       "title": "Контент-план для кафе на месяц",
       "type": "social",
-      "cover": "img/portfolio/placeholder_6.svg",
+      "cover": "img/portfolio/demo_case_6.svg",
       "images": [
-        "img/portfolio/placeholder_6.svg"
+        "img/portfolio/demo_case_6.svg"
       ],
-      "task": "Нужен был пакет публикаций для соцсетей с единым стилем оформления.",
-      "solution": "Собрал редактируемые шаблоны и пакет из 10 публикаций под фирменные цвета кафе.",
-      "result": "Клиент получил готовый набор постов и шаблоны для самостоятельного использования.",
-      "related_service": "SMM"
+      "task": "Систематизировать визуальную коммуникацию кафе и подготовить основу для регулярного контента.",
+      "solution": "Определены тематические направления, форматы публикаций и визуальные шаблоны для разных типов контента.",
+      "result": "Создана понятная система, которую можно использовать как основу для регулярного ведения социальных сетей.",
+      "related_service": "SMM",
+      "order_template": {
+        "service_id": "SMM",
+        "options": [
+          {
+            "option_id": "SMM_5",
+            "quantity": 1
+          }
+        ]
+      }
     },
     {
       "id": "case_7",
       "title": "Презентация для инвесторов",
       "type": "graphics",
-      "cover": "img/portfolio/placeholder_7.svg",
+      "cover": "img/portfolio/demo_case_7.svg",
       "images": [
-        "img/portfolio/placeholder_7.svg"
+        "img/portfolio/demo_case_7.svg"
       ],
-      "task": "Нужна была презентация на 10 слайдов для питча стартапа перед инвесторами.",
-      "solution": "Разработал визуальную концепцию и оформил все слайды со сложной инфографикой.",
-      "result": "Презентация помогла структурировать питч и была использована на нескольких встречах.",
-      "related_service": "GD_PRES"
+      "task": "Структурировать информацию о цифровом продукте для презентации потенциальным инвесторам.",
+      "solution": "Сложная информация разбита на последовательные смысловые блоки, а ключевые тезисы получили визуальную иерархию.",
+      "result": "Презентация стала более последовательной и удобной для быстрого просмотра.",
+      "related_service": "GD_PRES",
+      "order_template": {
+        "service_id": "GD_PRES",
+        "options": [
+          {
+            "option_id": "GD_PRES_1",
+            "quantity": 4
+          }
+        ]
+      }
     },
     {
       "id": "case_8",
       "title": "Баннеры для рекламной кампании",
       "type": "graphics",
-      "cover": "img/portfolio/placeholder_8.svg",
+      "cover": "img/portfolio/demo_case_8.svg",
       "images": [
-        "img/portfolio/placeholder_8.svg"
+        "img/portfolio/demo_case_8.svg"
       ],
-      "task": "Требовалась серия рекламных баннеров под разные площадки размещения.",
-      "solution": "Подготовил серию из 5 креативов в едином стиле под разные форматы.",
-      "result": "Клиент запустил рекламную кампанию с готовым комплектом креативов.",
-      "related_service": "GD_BANNER"
+      "task": "Создать серию рекламных баннеров в едином визуальном стиле.",
+      "solution": "Разработана система композиций, типографики и акцентных элементов для разных рекламных форматов.",
+      "result": "Получилась масштабируемая визуальная система, которую можно адаптировать под разные размеры и сообщения.",
+      "related_service": "GD_BANNER",
+      "order_template": {
+        "service_id": "GD_BANNER",
+        "options": [
+          {
+            "option_id": "GD_BANNER_1",
+            "quantity": 2
+          }
+        ]
+      }
     },
     {
       "id": "case_9",
-      "title": "Сайт для частной стоматологии",
+      "title": "Сайт частной стоматологии",
       "type": "site",
-      "featured": true,
-      "cover": "img/portfolio/placeholder_9.svg",
+      "cover": "img/portfolio/demo_case_9.svg",
       "images": [
-        "img/portfolio/placeholder_9.svg"
+        "img/portfolio/demo_case_9.svg"
       ],
-      "task": "Нужен был сайт с записью на приём и разделами по направлениям лечения.",
-      "solution": "Продумал структуру основных страниц, UX записи на приём, подготовил UI под desktop в Figma.",
-      "result": "Готовый макет с понятной навигацией, передан в разработку.",
-      "related_service": "SITE"
+      "task": "Создать современный сайт клиники с понятной структурой услуг и удобным доступом к контактам.",
+      "solution": "Основной акцент сделан на информационной архитектуре, структуре услуг, доверительных элементах и понятных CTA.",
+      "result": "Сформирована спокойная и понятная структура сайта, ориентированная на поиск информации и запись.",
+      "related_service": "SITE",
+      "order_template": {
+        "service_id": "SITE",
+        "options": [
+          {
+            "option_id": "SITE_1",
+            "quantity": 2
+          }
+        ]
+      }
     },
     {
       "id": "case_10",
       "title": "UX/UI мобильного приложения для доставки",
       "type": "uxui",
-      "cover": "img/portfolio/placeholder_10.svg",
+      "featured": true,
+      "cover": "img/portfolio/demo_case_10.svg",
       "images": [
-        "img/portfolio/placeholder_10.svg"
+        "img/portfolio/demo_case_10.svg"
       ],
-      "task": "Нужен был прототип приложения доставки: от каталога до оформления заказа.",
-      "solution": "Проработал сценарии и информационную архитектуру, собрал UI и интерактивный прототип в Figma.",
-      "result": "Кликабельный прототип, готовый для тестирования на пользователях и передачи в разработку.",
-      "related_service": "UXUI"
-    },
-    {
-      "id": "case_11",
-      "title": "Test",
-      "type": "landing",
-      "cover": "img/portfolio/case_11.jpg",
-      "images": [
-        "img/portfolio/case_11.jpg"
-      ],
-      "task": "test test test",
-      "solution": "",
-      "result": "",
-      "related_service": "LEND"
+      "task": "Спроектировать мобильный интерфейс сервиса доставки с коротким и понятным сценарием заказа.",
+      "solution": "Оптимизирован путь от выбора товара до оформления заказа, а основные действия вынесены в очевидные точки интерфейса.",
+      "result": "Сформирован последовательный пользовательский сценарий с акцентом на скорость и понятность оформления заказа.",
+      "related_service": "UXUI",
+      "order_template": {
+        "service_id": "UXUI",
+        "options": [
+          {
+            "option_id": "UXUI_1",
+            "quantity": 3
+          }
+        ]
+      }
     }
   ]
 }

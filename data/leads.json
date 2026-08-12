@@ -1,0 +1,1 @@
+{"_comment": "Заявки клиентов (см. bot/content_store.py -> add_lead / list_leads). Простое JSON-хранилище, не CRM.", "leads": []}

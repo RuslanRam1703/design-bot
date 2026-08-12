@@ -1,3 +1,4 @@
+import dataclasses
 import json
 import logging
 
@@ -5,7 +6,7 @@ from aiogram import F, Router
 from aiogram.fsm.context import FSMContext
 from aiogram.types import Message
 
-from bot import config, texts
+from bot import config, content_store, texts
 from bot.calculator import calculate
 from bot.data import load_pricing
 from bot.lead import format_lead_message
@@ -32,6 +33,12 @@ async def handle_webapp_data(message: Message, state: FSMContext) -> None:
 
 
 async def _handle_brief_submission(message: Message, state: FSMContext, payload: dict) -> None:
+    # Сбрасываем любое старое ожидание файла ТЗ до принятия решения по этой
+    # заявке — иначе повторная отправка брифа без "пришлю файл" оставляла
+    # BriefStates.awaiting_tz_file висеть от предыдущей заявки, и все
+    # следующие сообщения клиента перехватывались как файл ТЗ.
+    await state.clear()
+
     calc_result = None
     calc_payload = payload.get("calc")
     if calc_payload and calc_payload.get("service_id"):
@@ -55,11 +62,29 @@ async def _handle_brief_submission(message: Message, state: FSMContext, payload:
     else:
         logger.warning("DESIGNER_CHAT_ID не задан — заявка не отправлена дизайнеру:\n%s", text)
 
+    # Не требуем username — Telegram user_id уже достаточен как identity и
+    # как основной канал ответа через бота (см. /admin -> Заявки).
+    telegram_identity = {
+        "user_id": user.id,
+        "username": user.username,
+        "first_name": user.first_name,
+        "last_name": user.last_name,
+    }
+    calc_summary = dataclasses.asdict(calc_result) if calc_result and calc_result.valid else None
+    # draft_id — сгенерирован Mini App вместе с черновиком (localStorage) и
+    # переживает "Дополнить информацию": повторная отправка того же
+    # черновика ОБНОВЛЯЕТ заявку вместо создания дубликата (см. Part 7 ТЗ).
+    lead = content_store.add_lead(payload, telegram_identity, calc_summary, draft_id=payload.get("draft_id"))
+
+    price_range = None
+    if calc_summary:
+        price_range = f"{calc_summary['price_from']:,} – {calc_summary['price_to']:,} ₽".replace(",", " ")
+
     if payload.get("attach_tz"):
-        await message.answer(texts.LEAD_ACK_ASK_FILE)
+        await message.answer(texts.lead_ack_ask_file(lead["id"], payload.get("service_name"), price_range))
         await state.set_state(BriefStates.awaiting_tz_file)
     else:
-        await message.answer(texts.LEAD_RECEIVED_ACK)
+        await message.answer(texts.lead_received_ack(lead["id"], payload.get("service_name"), price_range))
 
 
 @router.message(BriefStates.awaiting_tz_file, F.document | F.photo)

@@ -11,16 +11,66 @@
 универсален — используется отовсюду как "назад" к разделу или к корню.
 """
 
+import logging
+import uuid
+from typing import Callable
+
 from aiogram import F, Router
-from aiogram.filters import Command
+from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
-from aiogram.types import CallbackQuery, Message
+from aiogram.fsm.state import State
+from aiogram.types import CallbackQuery, InlineKeyboardMarkup, Message
 
 from bot import admin_keyboards as kb
 from bot import config, content_store
+from bot import lead as lead_format
 from bot.states import AdminStates
 
 router = Router(name="admin")
+logger = logging.getLogger(__name__)
+
+# Куда возвращает универсальная "❌ Отмена" (cancel_keyboard) — по значению
+# cancel_to, проставленному в state.data в момент входа в конкретный мастер
+# (см. _resolve_cancel). Раньше "Отмена" всегда вела в корень /admin, из-за
+# чего на 3-м уровне вложенности (опции услуги) отмена выбрасывала мимо и
+# услуги, и раздела "Услуги и цены" — не как "Готово", которое всегда
+# возвращает к непосредственному родителю.
+CANCEL_TARGETS: dict[str, tuple[str, Callable[[], InlineKeyboardMarkup]]] = {
+    "cases": ("Отменено. Кейсы портфолио:", kb.admin_cases_menu_keyboard),
+    "faq": ("Отменено. FAQ:", kb.admin_faq_menu_keyboard),
+    "pricing": ("Отменено. Услуги и цены:", kb.pricing_menu_keyboard),
+    "categories": ("Отменено. Категории портфолио:", kb.categories_menu_keyboard),
+    "root": ("Отменено. Админ-меню:", kb.admin_root_keyboard),
+}
+
+
+def _resolve_cancel(data: dict) -> tuple[str, InlineKeyboardMarkup, State | None, dict]:
+    target = data.get("cancel_to")
+    if target == "options" and data.get("service_id"):
+        return (
+            "Отменено. Опции этой услуги:",
+            kb.options_menu_keyboard(),
+            AdminStates.edit_service_field_pick,
+            {"service_id": data["service_id"]},
+        )
+    if target == "sections" and data.get("case_id"):
+        case = next((c for c in content_store.list_cases() if c["id"] == data["case_id"]), None)
+        return (
+            "Отменено. Разделы кейса:",
+            kb.case_sections_menu_keyboard(case.get("sections", []) if case else []),
+            AdminStates.case_sections_menu,
+            {"case_id": data["case_id"]},
+        )
+    if target == "images" and data.get("case_id"):
+        case = next((c for c in content_store.list_cases() if c["id"] == data["case_id"]), None)
+        return (
+            "Отменено. Изображения кейса:",
+            kb.case_images_menu_keyboard(case.get("images", []) if case else [], case.get("cover") if case else None),
+            AdminStates.case_images_menu,
+            {"case_id": data["case_id"]},
+        )
+    text, kb_builder = CANCEL_TARGETS.get(target, CANCEL_TARGETS["root"])
+    return text, kb_builder(), None, {}
 
 
 def _is_designer_message(message: Message) -> bool:
@@ -35,26 +85,67 @@ router.message.filter(_is_designer_message)
 router.callback_query.filter(_is_designer_callback)
 
 
-def _parse_number(text: str) -> float | None:
+def _parse_number(text: str, *, min_value: float = 0) -> float | None:
+    """min_value=0 по умолчанию — цены, сроки, коэффициенты и параметры
+    округления не имеют смысла отрицательными; опечатка админа не должна
+    напрямую попадать в клиент-facing цену (см. UX-аудит, находка F12)."""
     try:
-        return float(text.strip().replace(",", "."))
+        value = float(text.strip().replace(",", "."))
     except ValueError:
         return None
+    if value < min_value:
+        return None
+    return value
+
+
+def _admin_root_text() -> str:
+    """Корень /admin с сводкой контента, ещё не готового к показу клиентам
+    (см. UX-аудит, находки F01-F03) — needs_review/заглушки уже
+    отслеживались по отдельности, но нигде не были собраны в одну сводку,
+    которую дизайнер увидит без необходимости заходить в каждый раздел."""
+    summary = content_store.content_readiness_summary()
+    total = summary["placeholder_cases"] + summary["about_pending_fields"] + summary["faq_pending"]
+    if total == 0:
+        return "Админ-меню:"
+    parts = []
+    if summary["placeholder_cases"]:
+        parts.append(f"{summary['placeholder_cases']} кейс(ов) с фото-заглушкой")
+    if summary["about_pending_fields"]:
+        parts.append(f"«Обо мне» — {summary['about_pending_fields']} незаполненных полей")
+    if summary["faq_pending"]:
+        parts.append(f"{summary['faq_pending']} вопрос(ов) FAQ без финального ответа")
+    return "Админ-меню:\n\n⚠️ Контент ещё не готов к показу клиентам: " + "; ".join(parts) + "."
 
 
 @router.message(Command("admin"))
 async def cmd_admin(message: Message, state: FSMContext) -> None:
     await state.clear()
-    await message.answer("Админ-меню:", reply_markup=kb.admin_root_keyboard())
+    await message.answer(_admin_root_text(), reply_markup=kb.admin_root_keyboard())
 
 
 @router.callback_query(F.data == "admincancel")
 async def admin_cancel(callback: CallbackQuery, state: FSMContext) -> None:
     """Универсальная кнопка "Отмена" на любом шаге, где ждём свободный
-    текст/фото — без нее пришлось бы заново набирать /admin."""
-    await state.clear()
-    await callback.message.edit_text("Отменено. Админ-меню:", reply_markup=kb.admin_root_keyboard())
+    текст/фото — без неё пришлось бы заново набирать /admin. Возвращает к
+    разделу, с которого начался конкретный мастер (см. _resolve_cancel),
+    а не всегда в корень."""
+    text, markup, next_state, next_data = _resolve_cancel(await state.get_data())
+    await state.set_data(next_data)
+    await state.set_state(next_state)
+    await callback.message.edit_text(text, reply_markup=markup)
     await callback.answer()
+
+
+@router.message(StateFilter(AdminStates), Command("cancel"))
+async def admin_cancel_command(message: Message, state: FSMContext) -> None:
+    """Текстовый /cancel как альтернатива инлайн-кнопке "❌ Отмена" — в
+    клиентском флоу (bot/handlers/start.py) /cancel уже работает так,
+    админка была единственным местом без него: набранный /cancel просто
+    сохранялся как введённые данные (текст вопроса FAQ, название кейса...)."""
+    text, markup, next_state, next_data = _resolve_cancel(await state.get_data())
+    await state.set_data(next_data)
+    await state.set_state(next_state)
+    await message.answer(text, reply_markup=markup)
 
 
 # ---- Навигация между разделами (используется как "назад" отовсюду) ----
@@ -62,7 +153,7 @@ async def admin_cancel(callback: CallbackQuery, state: FSMContext) -> None:
 @router.callback_query(F.data == "adminmenu:root")
 async def menu_root(callback: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
-    await callback.message.edit_text("Админ-меню:", reply_markup=kb.admin_root_keyboard())
+    await callback.message.edit_text(_admin_root_text(), reply_markup=kb.admin_root_keyboard())
     await callback.answer()
 
 
@@ -120,7 +211,12 @@ async def nav_toggle(callback: CallbackQuery, state: FSMContext) -> None:
 
 @router.callback_query(F.data == "adminmenu:about")
 async def menu_about(callback: CallbackQuery, state: FSMContext) -> None:
-    await callback.message.edit_text("Что изменить в разделе «Обо мне»?", reply_markup=kb.about_field_keyboard())
+    await state.clear()
+    about = content_store.get_about()
+    await callback.message.edit_text(
+        "Что изменить в разделе «Обо мне»?",
+        reply_markup=kb.about_field_keyboard(about.get("needs_review_fields")),
+    )
     await state.set_state(AdminStates.edit_about_field_pick)
     await callback.answer()
 
@@ -131,6 +227,7 @@ async def menu_about(callback: CallbackQuery, state: FSMContext) -> None:
 async def cases_add_start(callback: CallbackQuery, state: FSMContext) -> None:
     types = content_store.list_portfolio_types()
     await callback.message.edit_text("Категория нового кейса:", reply_markup=kb.category_pick_keyboard(types))
+    await state.update_data(cancel_to="cases")
     await state.set_state(AdminStates.add_case_category)
     await callback.answer()
 
@@ -177,7 +274,7 @@ async def cases_add_description(message: Message, state: FSMContext) -> None:
         type_id=data["type_id"],
         cover=data["cover"],
         task=message.text.strip(),
-        related_service=content_store.TYPE_TO_SERVICE.get(data["type_id"]),
+        related_service=content_store.default_related_service_for_type(data["type_id"]),
     )
     await state.clear()
     await message.answer(
@@ -195,6 +292,7 @@ async def cases_edit_start(callback: CallbackQuery, state: FSMContext) -> None:
         await callback.answer()
         return
     await callback.message.edit_text("Какой кейс редактировать?", reply_markup=kb.case_pick_keyboard(cases, "admineditcase"))
+    await state.update_data(cancel_to="cases")
     await state.set_state(AdminStates.edit_case_pick)
     await callback.answer()
 
@@ -217,9 +315,320 @@ async def cases_edit_field(callback: CallbackQuery, state: FSMContext) -> None:
         await callback.answer()
         return
     await state.update_data(field=field)
+    if field == "related_service":
+        services = content_store.list_services()
+        await callback.message.edit_text(
+            "С какой услугой связать кейс (для «Хочу похожий проект»)?",
+            reply_markup=kb.related_service_pick_keyboard(services, "admincaserelservice"),
+        )
+        await callback.answer()
+        return
+    if field == "featured":
+        await callback.message.edit_text(
+            "Показывать этот кейс в разделе «Обо мне» (до 3 избранных)?",
+            reply_markup=kb.yes_no_keyboard("admincasefeatured"),
+        )
+        await callback.answer()
+        return
+    if field == "category":
+        types = content_store.list_portfolio_types()
+        await callback.message.edit_text("Новая категория кейса:", reply_markup=kb.change_case_category_keyboard(types))
+        await callback.answer()
+        return
+    if field == "images":
+        case = next((c for c in content_store.list_cases() if c["id"] == (await state.get_data())["case_id"]), None)
+        await callback.message.edit_text(
+            "Изображения кейса — ⭐ отмечает текущую обложку:",
+            reply_markup=kb.case_images_menu_keyboard(case.get("images", []) if case else [], case.get("cover") if case else None),
+        )
+        await state.update_data(cancel_to="images")
+        await state.set_state(AdminStates.case_images_menu)
+        await callback.answer()
+        return
+    if field == "sections":
+        case = next((c for c in content_store.list_cases() if c["id"] == (await state.get_data())["case_id"]), None)
+        await callback.message.edit_text(
+            "Разделы кейса:",
+            reply_markup=kb.case_sections_menu_keyboard(case.get("sections", []) if case else []),
+        )
+        await state.update_data(cancel_to="sections")
+        await state.set_state(AdminStates.case_sections_menu)
+        await callback.answer()
+        return
     prompt = "Пришлите новое фото:" if field == "cover" else "Пришлите новый текст:"
     await callback.message.edit_text(prompt, reply_markup=kb.cancel_keyboard())
     await state.set_state(AdminStates.edit_case_value)
+    await callback.answer()
+
+
+@router.callback_query(AdminStates.edit_case_field_pick, F.data.startswith("admincaserelservice:"))
+async def cases_edit_related_service(callback: CallbackQuery, state: FSMContext) -> None:
+    value = callback.data.split(":", 1)[1]
+    data = await state.get_data()
+    content_store.update_case(callback.message.chat.id, data["case_id"], related_service=None if value == "none" else value)
+    await callback.message.edit_text("Обновлено ✅\n\nЧто ещё изменить?", reply_markup=kb.case_field_keyboard())
+    await callback.answer()
+
+
+@router.callback_query(AdminStates.edit_case_field_pick, F.data.startswith("admincasefeatured:"))
+async def cases_edit_featured(callback: CallbackQuery, state: FSMContext) -> None:
+    value = callback.data.split(":", 1)[1] == "yes"
+    data = await state.get_data()
+    content_store.update_case(callback.message.chat.id, data["case_id"], featured=value)
+    await callback.message.edit_text("Обновлено ✅\n\nЧто ещё изменить?", reply_markup=kb.case_field_keyboard())
+    await callback.answer()
+
+
+@router.callback_query(AdminStates.edit_case_field_pick, F.data.startswith("admincasenewcat:"))
+async def cases_edit_category(callback: CallbackQuery, state: FSMContext) -> None:
+    new_type_id = callback.data.split(":", 1)[1]
+    data = await state.get_data()
+    content_store.update_case_category(callback.message.chat.id, data["case_id"], new_type_id)
+    await callback.message.edit_text("Обновлено ✅\n\nЧто ещё изменить?", reply_markup=kb.case_field_keyboard())
+    await callback.answer()
+
+
+# ---- Изображения кейса (вложены в редактирование кейса — case_id уже в data) ----
+
+def _current_case(case_id: str) -> dict | None:
+    return next((c for c in content_store.list_cases() if c["id"] == case_id), None)
+
+
+@router.callback_query(AdminStates.case_images_menu, F.data == "admincaseimgaction:add")
+async def case_image_add_start(callback: CallbackQuery, state: FSMContext) -> None:
+    await callback.message.edit_text("Пришлите фото для добавления в галерею:", reply_markup=kb.cancel_keyboard())
+    await state.update_data(cancel_to="images")
+    await state.set_state(AdminStates.case_image_add)
+    await callback.answer()
+
+
+@router.message(AdminStates.case_image_add, F.photo | F.document)
+async def case_image_add_receive(message: Message, state: FSMContext) -> None:
+    data = await state.get_data()
+    file_id = message.photo[-1].file_id if message.photo else message.document.file_id
+    path = await content_store.save_case_photo(message.chat.id, message.bot, file_id, f"{data['case_id']}_{uuid.uuid4().hex[:8]}")
+    content_store.add_case_image(message.chat.id, data["case_id"], path)
+    case = _current_case(data["case_id"])
+    await message.answer(
+        "Добавлено ✅\n\nИзображения кейса:",
+        reply_markup=kb.case_images_menu_keyboard(case.get("images", []), case.get("cover")),
+    )
+    await state.set_state(AdminStates.case_images_menu)
+
+
+@router.message(AdminStates.case_image_add)
+async def case_image_add_wrong(message: Message) -> None:
+    await message.answer("Нужно фото 📎.", reply_markup=kb.cancel_keyboard())
+
+
+@router.callback_query(AdminStates.case_images_menu, F.data.startswith("admincaseimgpick:"))
+async def case_image_picked(callback: CallbackQuery, state: FSMContext) -> None:
+    index = int(callback.data.split(":", 1)[1])
+    data = await state.get_data()
+    case = _current_case(data["case_id"])
+    images = case.get("images", []) if case else []
+    if not (0 <= index < len(images)):
+        await callback.answer("Изображение не найдено", show_alert=True)
+        return
+    image_path = images[index]
+    await state.update_data(image_path=image_path)
+    is_cover = case.get("cover") == image_path
+    await callback.message.edit_text(
+        f"{image_path.split('/')[-1]}{' (обложка)' if is_cover else ''}:",
+        reply_markup=kb.case_image_action_keyboard(is_cover),
+    )
+    await callback.answer()
+
+
+@router.callback_query(AdminStates.case_images_menu, F.data.startswith("admincaseimgact:"))
+async def case_image_action(callback: CallbackQuery, state: FSMContext) -> None:
+    action = callback.data.split(":", 1)[1]
+    data = await state.get_data()
+    case_id, image_path = data["case_id"], data.get("image_path")
+
+    if action == "cover":
+        content_store.set_case_cover(callback.message.chat.id, case_id, image_path)
+    elif action in ("up", "down"):
+        content_store.reorder_case_image(callback.message.chat.id, case_id, image_path, action)
+    elif action == "delete":
+        content_store.remove_case_image(callback.message.chat.id, case_id, image_path)
+    # "back" — просто возвращает к списку, ничего не меняя
+
+    case = _current_case(case_id)
+    await callback.message.edit_text(
+        "Изображения кейса — ⭐ отмечает текущую обложку:",
+        reply_markup=kb.case_images_menu_keyboard(case.get("images", []) if case else [], case.get("cover") if case else None),
+    )
+    await callback.answer()
+
+
+@router.callback_query(AdminStates.case_images_menu, F.data == "admincaseimgaction:done")
+async def case_images_done(callback: CallbackQuery, state: FSMContext) -> None:
+    await callback.message.edit_text("Что изменить?", reply_markup=kb.case_field_keyboard())
+    await state.set_state(AdminStates.edit_case_field_pick)
+    await callback.answer()
+
+
+# ---- Разделы кейса (sections) ----
+
+@router.callback_query(AdminStates.case_sections_menu, F.data == "admincasesecaction:add")
+async def case_section_add_start(callback: CallbackQuery, state: FSMContext) -> None:
+    await callback.message.edit_text("Тип раздела:", reply_markup=kb.case_section_type_keyboard())
+    await state.update_data(cancel_to="sections")
+    await state.set_state(AdminStates.case_section_add_type)
+    await callback.answer()
+
+
+@router.callback_query(AdminStates.case_section_add_type, F.data.startswith("admincasesectype:"))
+async def case_section_add_type(callback: CallbackQuery, state: FSMContext) -> None:
+    section_type = callback.data.split(":", 1)[1]
+    await state.update_data(section_type=section_type)
+    await callback.message.edit_text("Название раздела:", reply_markup=kb.cancel_keyboard())
+    await state.set_state(AdminStates.case_section_add_title)
+    await callback.answer()
+
+
+@router.message(AdminStates.case_section_add_title, F.text)
+async def case_section_add_title(message: Message, state: FSMContext) -> None:
+    data = await state.get_data()
+    title = message.text.strip()
+    if data["section_type"] == "gallery":
+        content_store.add_case_section(message.chat.id, data["case_id"], section_type="gallery", title=title, images=[])
+        case = _current_case(data["case_id"])
+        await message.answer(
+            "Раздел-галерея добавлен ✅ Добавьте в него изображения через список разделов.\n\nРазделы кейса:",
+            reply_markup=kb.case_sections_menu_keyboard(case.get("sections", []) if case else []),
+        )
+        await state.set_state(AdminStates.case_sections_menu)
+        return
+    await state.update_data(section_title=title)
+    await message.answer("Текст раздела:", reply_markup=kb.cancel_keyboard())
+    await state.set_state(AdminStates.case_section_add_content)
+
+
+@router.message(AdminStates.case_section_add_content, F.text)
+async def case_section_add_content(message: Message, state: FSMContext) -> None:
+    data = await state.get_data()
+    content_store.add_case_section(message.chat.id, data["case_id"], section_type="text", title=data["section_title"], content=message.text.strip())
+    case = _current_case(data["case_id"])
+    await message.answer("Раздел добавлен ✅\n\nРазделы кейса:", reply_markup=kb.case_sections_menu_keyboard(case.get("sections", []) if case else []))
+    await state.set_state(AdminStates.case_sections_menu)
+
+
+@router.callback_query(AdminStates.case_sections_menu, F.data.startswith("admincasesecpick:"))
+async def case_section_picked(callback: CallbackQuery, state: FSMContext) -> None:
+    index = int(callback.data.split(":", 1)[1])
+    data = await state.get_data()
+    case = _current_case(data["case_id"])
+    sections = case.get("sections", []) if case else []
+    if not (0 <= index < len(sections)):
+        await callback.answer("Раздел не найден", show_alert=True)
+        return
+    await state.update_data(section_index=index)
+    section = sections[index]
+    await callback.message.edit_text(f"«{section['title']}»:", reply_markup=kb.case_section_action_keyboard(section["type"]))
+    await state.set_state(AdminStates.case_section_edit_field_pick)
+    await callback.answer()
+
+
+@router.callback_query(AdminStates.case_section_edit_field_pick, F.data.startswith("admincasesecact:"))
+async def case_section_action(callback: CallbackQuery, state: FSMContext) -> None:
+    action = callback.data.split(":", 1)[1]
+    data = await state.get_data()
+    case_id, index = data["case_id"], data["section_index"]
+
+    if action == "title":
+        await callback.message.edit_text("Новое название раздела:", reply_markup=kb.cancel_keyboard())
+        await state.update_data(section_field="title")
+        await state.set_state(AdminStates.case_section_edit_value)
+        await callback.answer()
+        return
+    if action == "content":
+        await callback.message.edit_text("Новый текст раздела:", reply_markup=kb.cancel_keyboard())
+        await state.update_data(section_field="content")
+        await state.set_state(AdminStates.case_section_edit_value)
+        await callback.answer()
+        return
+    if action == "addimg":
+        await callback.message.edit_text("Пришлите фото для этого раздела:", reply_markup=kb.cancel_keyboard())
+        await state.set_state(AdminStates.case_section_edit_value)
+        await state.update_data(section_field="addimg")
+        await callback.answer()
+        return
+    if action == "removeimg":
+        case = _current_case(case_id)
+        images = case["sections"][index].get("images", []) if case else []
+        if not images:
+            await callback.answer("В разделе пока нет изображений", show_alert=True)
+            return
+        await callback.message.edit_text("Убрать какое изображение?", reply_markup=kb.section_image_pick_keyboard(images))
+        await callback.answer()
+        return
+    if action in ("up", "down"):
+        content_store.reorder_case_section(callback.message.chat.id, case_id, index, action)
+        case = _current_case(case_id)
+        await callback.message.edit_text("Разделы кейса:", reply_markup=kb.case_sections_menu_keyboard(case.get("sections", []) if case else []))
+        await state.set_state(AdminStates.case_sections_menu)
+        await callback.answer()
+        return
+    if action == "delete":
+        content_store.delete_case_section(callback.message.chat.id, case_id, index)
+        case = _current_case(case_id)
+        await callback.message.edit_text("Раздел удалён ✅\n\nРазделы кейса:", reply_markup=kb.case_sections_menu_keyboard(case.get("sections", []) if case else []))
+        await state.set_state(AdminStates.case_sections_menu)
+        await callback.answer()
+        return
+    # "back"
+    case = _current_case(case_id)
+    await callback.message.edit_text("Разделы кейса:", reply_markup=kb.case_sections_menu_keyboard(case.get("sections", []) if case else []))
+    await state.set_state(AdminStates.case_sections_menu)
+    await callback.answer()
+
+
+@router.callback_query(AdminStates.case_section_edit_field_pick, F.data.startswith("admincasesecimgpick:"))
+async def case_section_remove_image(callback: CallbackQuery, state: FSMContext) -> None:
+    img_index = int(callback.data.split(":", 1)[1])
+    data = await state.get_data()
+    case = _current_case(data["case_id"])
+    images = case["sections"][data["section_index"]].get("images", []) if case else []
+    if 0 <= img_index < len(images):
+        remaining = [img for i, img in enumerate(images) if i != img_index]
+        content_store.update_case_section(callback.message.chat.id, data["case_id"], data["section_index"], images=remaining)
+    section = _current_case(data["case_id"])["sections"][data["section_index"]]
+    await callback.message.edit_text(f"«{section['title']}»:", reply_markup=kb.case_section_action_keyboard(section["type"]))
+    await callback.answer()
+
+
+@router.message(AdminStates.case_section_edit_value)
+async def case_section_edit_value(message: Message, state: FSMContext) -> None:
+    data = await state.get_data()
+    field = data.get("section_field")
+    case_id, index = data["case_id"], data["section_index"]
+
+    if field == "addimg":
+        if not (message.photo or message.document):
+            await message.answer("Нужно фото 📎.", reply_markup=kb.cancel_keyboard())
+            return
+        file_id = message.photo[-1].file_id if message.photo else message.document.file_id
+        path = await content_store.save_case_photo(message.chat.id, message.bot, file_id, f"{case_id}_{uuid.uuid4().hex[:8]}")
+        case = _current_case(case_id)
+        images = case["sections"][index].get("images", []) if case else []
+        content_store.update_case_section(message.chat.id, case_id, index, images=images + [path])
+    else:
+        if not message.text:
+            await message.answer("Нужен текст.", reply_markup=kb.cancel_keyboard())
+            return
+        content_store.update_case_section(message.chat.id, case_id, index, **{field: message.text.strip()})
+
+    section = _current_case(case_id)["sections"][index]
+    await message.answer(f"Обновлено ✅\n\n«{section['title']}»:", reply_markup=kb.case_section_action_keyboard(section["type"]))
+    await state.set_state(AdminStates.case_section_edit_field_pick)
+
+
+@router.callback_query(AdminStates.case_sections_menu, F.data == "admincasesecaction:done")
+async def case_sections_done(callback: CallbackQuery, state: FSMContext) -> None:
+    await callback.message.edit_text("Что изменить?", reply_markup=kb.case_field_keyboard())
+    await state.set_state(AdminStates.edit_case_field_pick)
     await callback.answer()
 
 
@@ -251,6 +660,7 @@ async def cases_delete_start(callback: CallbackQuery, state: FSMContext) -> None
         await callback.answer()
         return
     await callback.message.edit_text("Какой кейс удалить?", reply_markup=kb.case_pick_keyboard(cases, "admindelcase"))
+    await state.update_data(cancel_to="cases")
     await state.set_state(AdminStates.delete_case_pick)
     await callback.answer()
 
@@ -285,6 +695,7 @@ async def cases_delete_do(callback: CallbackQuery, state: FSMContext) -> None:
 @router.callback_query(F.data == "adminfaqaction:add")
 async def faq_add_start(callback: CallbackQuery, state: FSMContext) -> None:
     await callback.message.edit_text("Текст вопроса:", reply_markup=kb.cancel_keyboard())
+    await state.update_data(cancel_to="faq")
     await state.set_state(AdminStates.add_faq_question)
     await callback.answer()
 
@@ -308,6 +719,7 @@ async def faq_add_answer(message: Message, state: FSMContext) -> None:
 async def faq_edit_start(callback: CallbackQuery, state: FSMContext) -> None:
     items = content_store.list_faq()
     await callback.message.edit_text("Какой вопрос редактировать?", reply_markup=kb.faq_pick_keyboard(items, "admineditfaq"))
+    await state.update_data(cancel_to="faq")
     await state.set_state(AdminStates.edit_faq_pick)
     await callback.answer()
 
@@ -347,6 +759,7 @@ async def faq_edit_value(message: Message, state: FSMContext) -> None:
 async def faq_delete_start(callback: CallbackQuery, state: FSMContext) -> None:
     items = content_store.list_faq()
     await callback.message.edit_text("Какой вопрос удалить?", reply_markup=kb.faq_pick_keyboard(items, "admindelfaq"))
+    await state.update_data(cancel_to="faq")
     await state.set_state(AdminStates.delete_faq_pick)
     await callback.answer()
 
@@ -384,6 +797,13 @@ async def about_edit_field(callback: CallbackQuery, state: FSMContext) -> None:
         await callback.message.edit_text("Админ-меню:", reply_markup=kb.admin_root_keyboard())
         await callback.answer()
         return
+    if field == "experience":
+        entries = content_store.get_about().get("experience", [])
+        await callback.message.edit_text("Опыт работы:", reply_markup=kb.about_experience_menu_keyboard(entries))
+        await state.update_data(cancel_to="root")
+        await state.set_state(AdminStates.about_experience_menu)
+        await callback.answer()
+        return
     await state.update_data(field=field)
     if field == "avatar":
         await callback.message.edit_text("Пришлите новое фото профиля:", reply_markup=kb.cancel_keyboard())
@@ -397,12 +817,88 @@ async def about_edit_field(callback: CallbackQuery, state: FSMContext) -> None:
     await callback.answer()
 
 
+@router.callback_query(AdminStates.about_experience_menu, F.data == "adminaboutexpaction:add")
+async def about_experience_add_start(callback: CallbackQuery, state: FSMContext) -> None:
+    await callback.message.edit_text("Должность / роль:", reply_markup=kb.cancel_keyboard())
+    await state.update_data(cancel_to="root")
+    await state.set_state(AdminStates.about_experience_add_role)
+    await callback.answer()
+
+
+@router.message(AdminStates.about_experience_add_role, F.text)
+async def about_experience_add_role(message: Message, state: FSMContext) -> None:
+    await state.update_data(exp_role=message.text.strip())
+    await message.answer("Компания / проект:", reply_markup=kb.cancel_keyboard())
+    await state.set_state(AdminStates.about_experience_add_company)
+
+
+@router.message(AdminStates.about_experience_add_company, F.text)
+async def about_experience_add_company(message: Message, state: FSMContext) -> None:
+    await state.update_data(exp_company=message.text.strip())
+    await message.answer("Период (например «2019 — настоящее время»):", reply_markup=kb.cancel_keyboard())
+    await state.set_state(AdminStates.about_experience_add_period)
+
+
+@router.message(AdminStates.about_experience_add_period, F.text)
+async def about_experience_add_period(message: Message, state: FSMContext) -> None:
+    await state.update_data(exp_period=message.text.strip())
+    await message.answer("Короткое описание (необязательно — можно отправить «-»):", reply_markup=kb.cancel_keyboard())
+    await state.set_state(AdminStates.about_experience_add_description)
+
+
+@router.message(AdminStates.about_experience_add_description, F.text)
+async def about_experience_add_description(message: Message, state: FSMContext) -> None:
+    data = await state.get_data()
+    description = message.text.strip()
+    content_store.add_about_experience(
+        message.chat.id,
+        role=data["exp_role"],
+        company=data["exp_company"],
+        period=data["exp_period"],
+        description="" if description == "-" else description,
+    )
+    entries = content_store.get_about().get("experience", [])
+    await message.answer("Запись добавлена ✅\n\nОпыт работы:", reply_markup=kb.about_experience_menu_keyboard(entries))
+    await state.set_state(AdminStates.about_experience_menu)
+
+
+@router.callback_query(AdminStates.about_experience_menu, F.data.startswith("adminaboutexppick:"))
+async def about_experience_picked(callback: CallbackQuery, state: FSMContext) -> None:
+    index = int(callback.data.split(":", 1)[1])
+    entries = content_store.get_about().get("experience", [])
+    if not (0 <= index < len(entries)):
+        await callback.answer("Запись не найдена", show_alert=True)
+        return
+    await state.update_data(exp_index=index)
+    e = entries[index]
+    text = f"{e['role']} — {e['company']}\n{e['period']}"
+    if e.get("description"):
+        text += f"\n\n{e['description']}"
+    await callback.message.edit_text(text, reply_markup=kb.about_experience_entry_keyboard())
+    await callback.answer()
+
+
+@router.callback_query(AdminStates.about_experience_menu, F.data.startswith("adminaboutexpentry:"))
+async def about_experience_entry_action(callback: CallbackQuery, state: FSMContext) -> None:
+    action = callback.data.split(":", 1)[1]
+    if action == "delete":
+        data = await state.get_data()
+        content_store.delete_about_experience(callback.message.chat.id, data["exp_index"])
+    entries = content_store.get_about().get("experience", [])
+    await callback.message.edit_text("Опыт работы:", reply_markup=kb.about_experience_menu_keyboard(entries))
+    await callback.answer()
+
+
 @router.message(AdminStates.edit_about_photo, F.photo | F.document)
 async def about_edit_photo(message: Message, state: FSMContext) -> None:
     file_id = message.photo[-1].file_id if message.photo else message.document.file_id
     path = await content_store.save_about_photo(message.chat.id, message.bot, file_id)
     content_store.update_about_field(message.chat.id, "avatar", path)
-    await message.answer("Фото обновлено ✅\n\nЧто ещё изменить?", reply_markup=kb.about_field_keyboard())
+    about = content_store.get_about()
+    await message.answer(
+        "Фото обновлено ✅\n\nЧто ещё изменить?",
+        reply_markup=kb.about_field_keyboard(about.get("needs_review_fields")),
+    )
     await state.set_state(AdminStates.edit_about_field_pick)
 
 
@@ -420,7 +916,11 @@ async def about_edit_value(message: Message, state: FSMContext) -> None:
         content_store.update_about_field(message.chat.id, field, values)
     else:
         content_store.update_about_field(message.chat.id, field, message.text.strip())
-    await message.answer("Обновлено ✅\n\nЧто ещё изменить?", reply_markup=kb.about_field_keyboard())
+    about = content_store.get_about()
+    await message.answer(
+        "Обновлено ✅\n\nЧто ещё изменить?",
+        reply_markup=kb.about_field_keyboard(about.get("needs_review_fields")),
+    )
     await state.set_state(AdminStates.edit_about_field_pick)
 
 
@@ -429,6 +929,7 @@ async def about_edit_value(message: Message, state: FSMContext) -> None:
 @router.callback_query(F.data == "adminpriceaction:add")
 async def price_add_start(callback: CallbackQuery, state: FSMContext) -> None:
     await callback.message.edit_text("Название новой услуги:", reply_markup=kb.cancel_keyboard())
+    await state.update_data(cancel_to="pricing")
     await state.set_state(AdminStates.add_service_name)
     await callback.answer()
 
@@ -496,6 +997,7 @@ async def price_add_includes(message: Message, state: FSMContext) -> None:
 async def price_edit_start(callback: CallbackQuery, state: FSMContext) -> None:
     services = content_store.list_services()
     await callback.message.edit_text("Какую услугу редактировать?", reply_markup=kb.service_pick_keyboard(services, "admineditservice"))
+    await state.update_data(cancel_to="pricing")
     await state.set_state(AdminStates.edit_service_pick)
     await callback.answer()
 
@@ -549,6 +1051,7 @@ async def price_edit_value(message: Message, state: FSMContext) -> None:
 async def price_delete_start(callback: CallbackQuery, state: FSMContext) -> None:
     services = content_store.list_services()
     await callback.message.edit_text("Какую услугу удалить?", reply_markup=kb.service_pick_keyboard(services, "admindelservice"))
+    await state.update_data(cancel_to="pricing")
     await state.set_state(AdminStates.delete_service_pick)
     await callback.answer()
 
@@ -586,6 +1089,7 @@ async def price_delete_do(callback: CallbackQuery, state: FSMContext) -> None:
 @router.callback_query(F.data == "adminpriceaction:coef")
 async def price_coef_start(callback: CallbackQuery, state: FSMContext) -> None:
     await callback.message.edit_text("Что изменить?", reply_markup=kb.coefficients_menu_keyboard())
+    await state.update_data(cancel_to="pricing")
     await state.set_state(AdminStates.edit_coefficients_pick)
     await callback.answer()
 
@@ -610,11 +1114,14 @@ async def price_round_pick(callback: CallbackQuery, state: FSMContext) -> None:
 
 @router.message(AdminStates.edit_coefficients_value, F.text)
 async def price_coef_value(message: Message, state: FSMContext) -> None:
-    value = _parse_number(message.text)
+    data = await state.get_data()
+    # round_to используется как делитель в формуле вилки цены (bot/calculator.py
+    # и webapp/js/calculator.js) — ноль сломал бы расчёт для всех клиентов сразу.
+    min_value = 0.01 if data.get("key") == "round_to" else 0
+    value = _parse_number(message.text, min_value=min_value)
     if value is None:
         await message.answer("Нужно число. Попробуйте ещё раз:", reply_markup=kb.cancel_keyboard())
         return
-    data = await state.get_data()
     if data["kind"] == "coef":
         content_store.update_coefficient(message.chat.id, data["key"], value)
     else:
@@ -635,6 +1142,7 @@ async def option_action(callback: CallbackQuery, state: FSMContext) -> None:
 
     data = await state.get_data()
     service_id = data["service_id"]
+    await state.update_data(cancel_to="options")
 
     if action == "add":
         await callback.message.edit_text("Название новой опции:", reply_markup=kb.cancel_keyboard())
@@ -801,6 +1309,7 @@ async def option_delete_do(callback: CallbackQuery, state: FSMContext) -> None:
 @router.callback_query(F.data == "admincataction:add")
 async def cat_add_start(callback: CallbackQuery, state: FSMContext) -> None:
     await callback.message.edit_text("Название новой категории:", reply_markup=kb.cancel_keyboard())
+    await state.update_data(cancel_to="categories")
     await state.set_state(AdminStates.add_category_label)
     await callback.answer()
 
@@ -817,6 +1326,7 @@ async def cat_add_label(message: Message, state: FSMContext) -> None:
 async def cat_rename_start(callback: CallbackQuery, state: FSMContext) -> None:
     types = content_store.list_portfolio_types()
     await callback.message.edit_text("Какую категорию переименовать?", reply_markup=kb.category_manage_pick_keyboard(types, "adminrenamecat"))
+    await state.update_data(cancel_to="categories")
     await state.set_state(AdminStates.rename_category_pick)
     await callback.answer()
 
@@ -838,10 +1348,45 @@ async def cat_rename_value(message: Message, state: FSMContext) -> None:
     await message.answer("Переименовано ✅", reply_markup=kb.categories_menu_keyboard())
 
 
+@router.callback_query(F.data == "admincataction:relservice")
+async def cat_relservice_start(callback: CallbackQuery, state: FSMContext) -> None:
+    """Дефолтная "похожая услуга" для новых кейсов в категории — раньше эта
+    связь была захардкожена в TYPE_TO_SERVICE и не редактировалась вообще;
+    теперь живёт в data/portfolio.json -> types[].related_service."""
+    types = content_store.list_portfolio_types()
+    await callback.message.edit_text("Для какой категории задать похожую услугу?", reply_markup=kb.category_manage_pick_keyboard(types, "admincatrelpick"))
+    await state.update_data(cancel_to="categories")
+    await state.set_state(AdminStates.category_related_service_pick)
+    await callback.answer()
+
+
+@router.callback_query(AdminStates.category_related_service_pick, F.data.startswith("admincatrelpick:"))
+async def cat_relservice_picked(callback: CallbackQuery, state: FSMContext) -> None:
+    type_id = callback.data.split(":", 1)[1]
+    await state.update_data(type_id=type_id)
+    services = content_store.list_services()
+    await callback.message.edit_text(
+        "С какой услугой связать эту категорию (подставляется в новые кейсы этой категории)?",
+        reply_markup=kb.related_service_pick_keyboard(services, "admincatrelservice"),
+    )
+    await callback.answer()
+
+
+@router.callback_query(AdminStates.category_related_service_pick, F.data.startswith("admincatrelservice:"))
+async def cat_relservice_set(callback: CallbackQuery, state: FSMContext) -> None:
+    value = callback.data.split(":", 1)[1]
+    data = await state.get_data()
+    content_store.update_portfolio_type_related_service(callback.message.chat.id, data["type_id"], None if value == "none" else value)
+    await state.clear()
+    await callback.message.edit_text("Обновлено ✅", reply_markup=kb.categories_menu_keyboard())
+    await callback.answer()
+
+
 @router.callback_query(F.data == "admincataction:delete")
 async def cat_delete_start(callback: CallbackQuery, state: FSMContext) -> None:
     types = content_store.list_portfolio_types()
     await callback.message.edit_text("Какую категорию удалить?", reply_markup=kb.category_manage_pick_keyboard(types, "admindelcat"))
+    await state.update_data(cancel_to="categories")
     await state.set_state(AdminStates.delete_category_pick)
     await callback.answer()
 
@@ -877,3 +1422,113 @@ async def cat_delete_do(callback: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
     await callback.message.edit_text(text, reply_markup=kb.categories_menu_keyboard())
     await callback.answer()
+
+
+# ---- Заявки ----
+
+@router.callback_query(F.data == "adminmenu:leads")
+async def menu_leads(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    leads = content_store.list_leads("ALL")
+    if not leads:
+        await callback.message.edit_text("Заявок пока нет.", reply_markup=kb.admin_root_keyboard())
+        await callback.answer()
+        return
+    await state.update_data(lead_filter="ALL")
+    await callback.message.edit_text(f"Заявки (всего {len(leads)}):", reply_markup=kb.leads_list_keyboard(leads, "ALL"))
+    await state.set_state(AdminStates.leads_list)
+    await callback.answer()
+
+
+@router.callback_query(AdminStates.leads_list, F.data == "adminleadaction:filter")
+async def leads_filter_start(callback: CallbackQuery, state: FSMContext) -> None:
+    await callback.message.edit_text("Показать заявки:", reply_markup=kb.leads_filter_keyboard())
+    await callback.answer()
+
+
+@router.callback_query(AdminStates.leads_list, F.data.startswith("adminleadfilter:"))
+async def leads_filter_apply(callback: CallbackQuery, state: FSMContext) -> None:
+    status = callback.data.split(":", 1)[1]
+    leads = content_store.list_leads(status)
+    await state.update_data(lead_filter=status)
+    label = kb.LEAD_FILTER_LABELS[status]
+    text = f"Заявки — {label} ({len(leads)}):" if leads else f"Заявок в статусе «{label}» нет."
+    await callback.message.edit_text(text, reply_markup=kb.leads_list_keyboard(leads, status))
+    await callback.answer()
+
+
+@router.callback_query(AdminStates.leads_list, F.data.startswith("adminleadpick:"))
+async def lead_open_detail(callback: CallbackQuery, state: FSMContext) -> None:
+    lead_id = int(callback.data.split(":", 1)[1])
+    lead = content_store.get_lead(lead_id)
+    if lead is None:
+        await callback.answer("Заявка не найдена", show_alert=True)
+        return
+    await state.update_data(lead_id=lead_id)
+    await callback.message.edit_text(lead_format.format_lead_admin_detail(lead), reply_markup=kb.lead_detail_keyboard(lead))
+    await state.set_state(AdminStates.lead_detail)
+    await callback.answer()
+
+
+@router.callback_query(AdminStates.lead_detail, F.data.startswith("adminleadstatus:"))
+async def lead_change_status(callback: CallbackQuery, state: FSMContext) -> None:
+    status = callback.data.split(":", 1)[1]
+    data = await state.get_data()
+    content_store.update_lead_status(callback.message.chat.id, data["lead_id"], status)
+    lead = content_store.get_lead(data["lead_id"])
+    await callback.message.edit_text(lead_format.format_lead_admin_detail(lead), reply_markup=kb.lead_detail_keyboard(lead))
+    await callback.answer("Статус обновлён")
+
+
+@router.callback_query(AdminStates.lead_detail, F.data == "adminleadaction:reply")
+async def lead_reply_start(callback: CallbackQuery, state: FSMContext) -> None:
+    data = await state.get_data()
+    lead = content_store.get_lead(data["lead_id"])
+    if lead is None or not lead.get("telegram", {}).get("user_id"):
+        await callback.answer("Нет Telegram ID клиента — ответить через бота нельзя", show_alert=True)
+        return
+    await callback.message.edit_text("Текст сообщения клиенту:", reply_markup=kb.cancel_keyboard())
+    await state.update_data(cancel_to="root")
+    await state.set_state(AdminStates.lead_reply_text)
+    await callback.answer()
+
+
+@router.message(AdminStates.lead_reply_text, F.text)
+async def lead_reply_send(message: Message, state: FSMContext) -> None:
+    data = await state.get_data()
+    lead = content_store.get_lead(data["lead_id"])
+    if lead is None:
+        await message.answer("Заявка не найдена.", reply_markup=kb.admin_root_keyboard())
+        await state.clear()
+        return
+    try:
+        await message.bot.send_message(chat_id=lead["telegram"]["user_id"], text=message.text.strip())
+        result_text = "Сообщение отправлено клиенту ✅"
+    except Exception:
+        logger.exception("Не удалось отправить сообщение клиенту по заявке #%s", lead["id"])
+        result_text = "⚠️ Не получилось отправить — клиент мог заблокировать бота."
+    await message.answer(f"{result_text}\n\n{lead_format.format_lead_admin_detail(lead)}", reply_markup=kb.lead_detail_keyboard(lead))
+    await state.set_state(AdminStates.lead_detail)
+
+
+@router.callback_query(AdminStates.lead_detail, F.data == "adminleadaction:back")
+async def lead_back_to_list(callback: CallbackQuery, state: FSMContext) -> None:
+    data = await state.get_data()
+    status = data.get("lead_filter", "ALL")
+    leads = content_store.list_leads(status)
+    await callback.message.edit_text(f"Заявки ({len(leads)}):", reply_markup=kb.leads_list_keyboard(leads, status))
+    await state.set_state(AdminStates.leads_list)
+    await callback.answer()
+
+
+# ---- Фолбэк: сообщение не того типа/формата на любом шаге админки ----
+# Держим самым последним хендлером файла — сработает, только если ни один
+# более конкретный хендлер выше не подошёл (например, стикер вместо текста,
+# голосовое вместо числа). Раньше такие сообщения проваливались сквозь все
+# роутеры бота без единого ответа — админ не понимал, жив ли бот.
+@router.message(StateFilter(AdminStates))
+async def admin_unexpected_input(message: Message) -> None:
+    await message.answer(
+        "Не поняла это сообщение 🙂 Нажмите кнопку в сообщении выше или пришлите нужный текст/число. "
+        "Чтобы выйти — /cancel."
+    )

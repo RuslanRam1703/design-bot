@@ -1,6 +1,5 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 300 300" width="300" height="300">
   <rect width="300" height="300" fill="#6C5CE7"/>
-  <circle cx="150" cy="120" r="55" fill="#ffffff" opacity="0.85"/>
-  <path d="M60 260 C60 190 100 165 150 165 C200 165 240 190 240 260 Z" fill="#ffffff" opacity="0.85"/>
-  <text x="150" y="290" font-family="Arial, sans-serif" font-size="14" fill="#ffffff" text-anchor="middle" opacity="0.7">замените на фото</text>
+  <circle cx="150" cy="135" r="55" fill="#ffffff" opacity="0.85"/>
+  <path d="M60 275 C60 205 100 180 150 180 C200 180 240 205 240 275 Z" fill="#ffffff" opacity="0.85"/>
 </svg>

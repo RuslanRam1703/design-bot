@@ -111,8 +111,8 @@ a { color: var(--link); text-decoration: none; }
   border: none;
   background: var(--bg-secondary);
   color: var(--text);
-  width: 34px;
-  height: 34px;
+  width: 44px;
+  height: 44px;
   border-radius: 10px;
   font-size: 16px;
   cursor: pointer;
@@ -172,9 +172,48 @@ a { color: var(--link); text-decoration: none; }
 
 /* ---- Кейс ---- */
 .case-images { display: flex; flex-direction: column; gap: 8px; margin-bottom: 12px; }
-.case-images img { width: 100%; border-radius: var(--radius); display: block; }
+.case-images img { width: 100%; border-radius: var(--radius); display: block; cursor: zoom-in; }
 .case-block { margin-bottom: 14px; }
 .case-block .label { font-size: 12px; text-transform: uppercase; color: var(--hint); margin-bottom: 4px; letter-spacing: .03em; }
+.external-case-link { display: inline-block; margin-bottom: 14px; font-size: 14px; font-weight: 600; }
+
+/* ---- Lightbox: изображение кейса крупным планом ---- */
+.lightbox {
+  position: fixed; inset: 0; background: rgba(0, 0, 0, .9);
+  display: none; align-items: center; justify-content: center;
+  z-index: 100; padding: 24px; cursor: zoom-out;
+}
+.lightbox.open { display: flex; }
+.lightbox img { max-width: 100%; max-height: 100%; object-fit: contain; border-radius: 8px; }
+.lightbox-close, .lightbox-prev, .lightbox-next {
+  position: absolute; border: none; background: rgba(255, 255, 255, .12); color: #fff;
+  border-radius: 50%; width: 40px; height: 40px; font-size: 20px; cursor: pointer;
+  display: flex; align-items: center; justify-content: center;
+}
+.lightbox-close { top: 16px; right: 16px; }
+.lightbox-prev { left: 16px; top: 50%; transform: translateY(-50%); }
+.lightbox-next { right: 16px; top: 50%; transform: translateY(-50%); }
+.lightbox-counter {
+  position: absolute; bottom: 20px; left: 50%; transform: translateX(-50%);
+  color: #fff; font-size: 13px; background: rgba(255, 255, 255, .12); padding: 4px 10px; border-radius: 999px;
+}
+
+/* ---- Пустые состояния (нет изображений) ---- */
+.case-images-empty {
+  background: var(--bg-secondary); border-radius: var(--radius); padding: 32px 16px;
+  text-align: center; color: var(--hint); font-size: 13px; margin-bottom: 12px;
+}
+.card-cover-empty, .mini-case-cover-empty {
+  width: 100%; aspect-ratio: 3 / 2; background: var(--bg-secondary);
+  display: flex; align-items: center; justify-content: center;
+}
+.card-cover-empty::after, .mini-case-cover-empty::after {
+  content: "🖼"; opacity: .3; font-size: 22px;
+}
+
+/* ---- Секции кейса (произвольные блоки с галереей) ---- */
+.case-section-gallery { display: flex; flex-direction: column; gap: 8px; }
+.case-section-gallery img { width: 100%; border-radius: var(--radius); display: block; cursor: zoom-in; }
 
 /* ---- Обо мне ---- */
 .about-header { text-align: center; margin-bottom: 20px; }
@@ -199,6 +238,10 @@ a { color: var(--link); text-decoration: none; }
 .mini-case img { width: 100%; display: block; aspect-ratio: 3 / 2; object-fit: cover; }
 .mini-case span { display: block; padding: 8px 10px 10px; font-size: 12px; font-weight: 600; }
 .links-list { display: flex; flex-direction: column; gap: 6px; }
+
+.experience-entry { padding: 10px 0; border-bottom: 1px solid rgba(127, 127, 127, 0.15); }
+.experience-entry:last-child { border-bottom: none; }
+.experience-entry .experience-role { font-weight: 600; font-size: 14px; }
 
 /* ---- Калькулятор ---- */
 .service-list { display: flex; flex-direction: column; gap: 8px; margin-bottom: 16px; }

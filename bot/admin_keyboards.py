@@ -2,11 +2,19 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 CASE_FIELD_LABELS = {
     "title": "Название",
-    "cover": "Фото",
+    "category": "Категория",
+    "cover": "Фото (быстрая замена обложки)",
+    "images": "🖼 Изображения",
+    "sections": "📑 Разделы кейса",
     "task": "Задача",
     "solution": "Решение",
     "result": "Результат",
+    "related_service": "Похожая услуга",
+    "featured": "Показывать в «Обо мне»",
+    "external_url": "Ссылка (Behance и т.п., необязательно)",
 }
+
+SECTION_TYPE_LABELS = {"text": "📝 Текстовый блок", "gallery": "🖼 Галерея"}
 
 FAQ_FIELD_LABELS = {
     "question": "Вопрос",
@@ -66,6 +74,7 @@ MENU_ITEM_LABELS = {
 def admin_root_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
+            [InlineKeyboardButton(text="📋 Заявки", callback_data="adminmenu:leads")],
             [InlineKeyboardButton(text="📁 Кейсы", callback_data="adminmenu:cases")],
             [InlineKeyboardButton(text="❓ FAQ", callback_data="adminmenu:faq")],
             [InlineKeyboardButton(text="👤 Обо мне", callback_data="adminmenu:about")],
@@ -116,9 +125,106 @@ def case_field_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
+def case_images_menu_keyboard(images: list[str], cover: str | None) -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton(text=f"{'⭐ ' if img == cover else ''}{img.split('/')[-1]}", callback_data=f"admincaseimgpick:{i}")]
+        for i, img in enumerate(images)
+    ]
+    rows.append([InlineKeyboardButton(text="➕ Добавить изображение", callback_data="admincaseimgaction:add")])
+    rows.append([InlineKeyboardButton(text="◀️ Назад к кейсу", callback_data="admincaseimgaction:done")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def case_image_action_keyboard(is_cover: bool) -> InlineKeyboardMarkup:
+    rows = []
+    if not is_cover:
+        rows.append([InlineKeyboardButton(text="⭐ Сделать обложкой", callback_data="admincaseimgact:cover")])
+    rows.append([
+        InlineKeyboardButton(text="⬆️ Выше", callback_data="admincaseimgact:up"),
+        InlineKeyboardButton(text="⬇️ Ниже", callback_data="admincaseimgact:down"),
+    ])
+    rows.append([InlineKeyboardButton(text="🗑 Удалить", callback_data="admincaseimgact:delete")])
+    rows.append([InlineKeyboardButton(text="◀️ Назад к списку", callback_data="admincaseimgact:back")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def case_sections_menu_keyboard(sections: list[dict]) -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton(text=f"{'🖼' if s['type'] == 'gallery' else '📝'} {s['title']}", callback_data=f"admincasesecpick:{i}")]
+        for i, s in enumerate(sections)
+    ]
+    rows.append([InlineKeyboardButton(text="➕ Добавить раздел", callback_data="admincasesecaction:add")])
+    rows.append([InlineKeyboardButton(text="◀️ Назад к кейсу", callback_data="admincasesecaction:done")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def case_section_type_keyboard() -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton(text=label, callback_data=f"admincasesectype:{key}")] for key, label in SECTION_TYPE_LABELS.items()]
+    rows.append([InlineKeyboardButton(text="❌ Отмена", callback_data="admincancel")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def case_section_action_keyboard(section_type: str) -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton(text="✏️ Название", callback_data="admincasesecact:title")]]
+    if section_type == "gallery":
+        rows.append([InlineKeyboardButton(text="➕ Добавить фото", callback_data="admincasesecact:addimg")])
+        rows.append([InlineKeyboardButton(text="🗑 Убрать фото", callback_data="admincasesecact:removeimg")])
+    else:
+        rows.append([InlineKeyboardButton(text="✏️ Текст", callback_data="admincasesecact:content")])
+    rows.append([
+        InlineKeyboardButton(text="⬆️ Выше", callback_data="admincasesecact:up"),
+        InlineKeyboardButton(text="⬇️ Ниже", callback_data="admincasesecact:down"),
+    ])
+    rows.append([InlineKeyboardButton(text="🗑 Удалить раздел", callback_data="admincasesecact:delete")])
+    rows.append([InlineKeyboardButton(text="◀️ Назад к разделам", callback_data="admincasesecact:back")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def section_image_pick_keyboard(images: list[str]) -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton(text=img.split("/")[-1], callback_data=f"admincasesecimgpick:{i}")] for i, img in enumerate(images)]
+    rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data="admincasesecact:back")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def change_case_category_keyboard(types: list[dict]) -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton(text=t["label"], callback_data=f"admincasenewcat:{t['id']}")] for t in types]
+    rows.append([InlineKeyboardButton(text="❌ Отмена", callback_data="admincancel")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def about_experience_menu_keyboard(entries: list[dict]) -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton(text=f"{e['role']} — {e['company']}", callback_data=f"adminaboutexppick:{i}")]
+        for i, e in enumerate(entries)
+    ]
+    rows.append([InlineKeyboardButton(text="➕ Добавить запись", callback_data="adminaboutexpaction:add")])
+    rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data="admineditabout:done")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def about_experience_entry_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🗑 Удалить запись", callback_data="adminaboutexpentry:delete")],
+        [InlineKeyboardButton(text="◀️ Назад к списку", callback_data="adminaboutexpentry:back")],
+    ])
+
+
+def related_service_pick_keyboard(services: list[dict], prefix: str) -> InlineKeyboardMarkup:
+    """Ручной выбор "похожей услуги" — переиспользуется и для конкретного
+    кейса (prefix="admincaserelservice"), и для категории целиком
+    (prefix="admincatrelservice", задаёт дефолт для новых кейсов в ней)."""
+    rows = [[InlineKeyboardButton(text=s["name"], callback_data=f"{prefix}:{s['id']}")] for s in services]
+    rows.append([InlineKeyboardButton(text="Без привязки", callback_data=f"{prefix}:none")])
+    rows.append([InlineKeyboardButton(text="❌ Отмена", callback_data="admincancel")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
 def faq_pick_keyboard(items: list[dict], prefix: str) -> InlineKeyboardMarkup:
     rows = [
-        [InlineKeyboardButton(text=f"{i['id']}. {i['question'][:45]}", callback_data=f"{prefix}:{i['id']}")]
+        [InlineKeyboardButton(
+            text=f"{'⚠️ ' if i.get('needs_review') else ''}{i['id']}. {i['question'][:45]}",
+            callback_data=f"{prefix}:{i['id']}",
+        )]
         for i in items
     ]
     rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data="adminmenu:faq")])
@@ -131,10 +237,20 @@ def faq_field_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def about_field_keyboard() -> InlineKeyboardMarkup:
-    rows = [[InlineKeyboardButton(text=label, callback_data=f"admineditabout:{key}")] for key, label in ABOUT_TEXT_FIELDS.items()]
-    rows += [[InlineKeyboardButton(text=label, callback_data=f"admineditabout:{key}")] for key, label in ABOUT_LIST_FIELDS.items()]
+def about_field_keyboard(needs_review_fields: list[str] | None = None) -> InlineKeyboardMarkup:
+    """needs_review_fields — data/about.json -> needs_review_fields: поля,
+    которые всё ещё заглушки (см. README, раздел 7). Помечаем ⚠️ прямо на
+    кнопке — раньше это было видно только из README/сырого JSON, не из
+    самого /admin."""
+    pending = set(needs_review_fields or [])
+
+    def mark(key: str, label: str) -> str:
+        return f"⚠️ {label}" if key in pending else label
+
+    rows = [[InlineKeyboardButton(text=mark(key, label), callback_data=f"admineditabout:{key}")] for key, label in ABOUT_TEXT_FIELDS.items()]
+    rows += [[InlineKeyboardButton(text=mark(key, label), callback_data=f"admineditabout:{key}")] for key, label in ABOUT_LIST_FIELDS.items()]
     rows.append([InlineKeyboardButton(text="Фото профиля", callback_data="admineditabout:avatar")])
+    rows.append([InlineKeyboardButton(text="💼 Опыт работы", callback_data="admineditabout:experience")])
     rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data="admineditabout:done")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -210,6 +326,7 @@ def categories_menu_keyboard() -> InlineKeyboardMarkup:
         inline_keyboard=[
             [InlineKeyboardButton(text="➕ Добавить категорию", callback_data="admincataction:add")],
             [InlineKeyboardButton(text="✏️ Переименовать", callback_data="admincataction:rename")],
+            [InlineKeyboardButton(text="🔗 Похожая услуга", callback_data="admincataction:relservice")],
             [InlineKeyboardButton(text="🗑 Удалить", callback_data="admincataction:delete")],
             [InlineKeyboardButton(text="◀️ Назад", callback_data="adminmenu:root")],
         ]
@@ -229,6 +346,39 @@ def nav_menu_keyboard(ui_config: dict) -> InlineKeyboardMarkup:
         mark = "✅" if enabled else "⬜"
         rows.append([InlineKeyboardButton(text=f"{mark} {label}", callback_data=f"adminnavtoggle:{key}")])
     rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data="adminmenu:root")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+LEAD_STATUS_LABELS = {"NEW": "🆕 Новая", "IN_PROGRESS": "🔧 В работе", "DONE": "✅ Завершена"}
+LEAD_FILTER_LABELS = {"NEW": "🆕 Новые", "IN_PROGRESS": "🔧 В работе", "DONE": "✅ Завершённые", "ALL": "Все"}
+
+
+def leads_filter_keyboard() -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton(text=label, callback_data=f"adminleadfilter:{key}")] for key, label in LEAD_FILTER_LABELS.items()]
+    rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data="adminmenu:root")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def leads_list_keyboard(leads: list[dict], status_filter: str) -> InlineKeyboardMarkup:
+    rows = []
+    for lead in leads:
+        service = (lead["payload"].get("service_name") or "без услуги")[:24]
+        name = (lead["telegram"].get("first_name") or "клиент")[:16]
+        rows.append([InlineKeyboardButton(text=f"#{lead['id']} · {name} · {service}", callback_data=f"adminleadpick:{lead['id']}")])
+    rows.append([InlineKeyboardButton(text="🔀 Фильтр", callback_data="adminleadaction:filter")])
+    rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data="adminmenu:root")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def lead_detail_keyboard(lead: dict) -> InlineKeyboardMarkup:
+    rows = [[
+        InlineKeyboardButton(text=("▶ " if lead["status"] == key else "") + label, callback_data=f"adminleadstatus:{key}")
+    ] for key, label in LEAD_STATUS_LABELS.items()]
+    rows.append([InlineKeyboardButton(text="💬 Ответить через бота", callback_data="adminleadaction:reply")])
+    username = lead["telegram"].get("username")
+    if username:
+        rows.append([InlineKeyboardButton(text="🔗 Открыть в Telegram", url=f"https://t.me/{username}")])
+    rows.append([InlineKeyboardButton(text="◀️ К списку заявок", callback_data="adminleadaction:back")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 

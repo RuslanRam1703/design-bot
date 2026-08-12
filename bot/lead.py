@@ -33,12 +33,27 @@ BUDGET_LABELS = {
     "undecided": "не определился",
 }
 
+# "direct" (обычный заход в заявку) не показываем — это большинство заявок,
+# и указывать источник имеет смысл только там, где он несёт сигнал: клиент
+# пришёл "разогретым" с конкретного кейса/расчёта, а не просто открыл бриф.
+SOURCE_LABELS = {
+    "calculator": "через калькулятор",
+    "about": "со страницы «Обо мне»",
+}
+
 
 def format_lead_message(payload: dict, calc: CalcResult | None, from_user_id: int, username: str | None) -> str:
     lines = ["🆕 <b>Новая заявка</b>", ""]
 
     service_name = payload.get("service_name") or "не указана"
     lines.append(f"<b>Услуга:</b> {_esc(service_name)}")
+
+    source = payload.get("source")
+    source_case_title = payload.get("source_case_title")
+    if source == "case" and source_case_title:
+        lines.append(f"<b>Источник:</b> кейс «{_esc(source_case_title)}» — похожий проект")
+    elif source in SOURCE_LABELS:
+        lines.append(f"<b>Источник:</b> {SOURCE_LABELS[source]}")
 
     task = (payload.get("task_description") or "").strip()
     if task:
@@ -103,3 +118,69 @@ def _fmt_days(value: float) -> str:
     if float(value).is_integer():
         return str(int(value))
     return f"{value:g}"
+
+
+STATUS_LABELS = {"NEW": "🆕 Новая", "IN_PROGRESS": "🔧 В работе", "DONE": "✅ Завершена"}
+
+
+def format_lead_admin_detail(lead: dict) -> str:
+    """Карточка заявки для /admin -> Заявки -> конкретная заявка. В отличие
+    от format_lead_message (мгновенное уведомление в момент отправки), эта
+    версия строится из уже сохранённого lead (content_store.get_lead) и
+    дополнительно показывает Telegram identity, статус и даты — то, чего
+    в разовом уведомлении не было и не должно было быть."""
+    payload = lead["payload"]
+    telegram = lead.get("telegram") or {}
+    calc = lead.get("calc_summary")
+
+    lines = [f"📋 <b>Заявка #{lead['id']}</b> — {STATUS_LABELS.get(lead['status'], lead['status'])}", ""]
+
+    lines.append("<b>Клиент</b>")
+    full_name = " ".join(filter(None, [telegram.get("first_name"), telegram.get("last_name")])) or "не указано"
+    lines.append(f"— Имя в Telegram: {_esc(full_name)}")
+    username = telegram.get("username")
+    lines.append(f"— @{_esc(username)}" if username else "— username не указан")
+    if telegram.get("user_id"):
+        lines.append(f"— Telegram ID: <code>{telegram['user_id']}</code>")
+    contact = (payload.get("contact") or "").strip()
+    if contact:
+        lines.append(f"— Контакт из формы: {_esc(contact)}")
+
+    lines.append("")
+    lines.append("<b>Заказ</b>")
+    lines.append(f"— Услуга: {_esc(payload.get('service_name') or 'не указана')}")
+    source = payload.get("source")
+    source_case_title = payload.get("source_case_title")
+    if source == "case" and source_case_title:
+        lines.append(f"— Источник: кейс «{_esc(source_case_title)}» — похожий проект")
+    elif source in SOURCE_LABELS:
+        lines.append(f"— Источник: {SOURCE_LABELS[source]}")
+    else:
+        lines.append("— Источник: прямой заход в заявку")
+
+    if calc:
+        lines.append(f"— Расчёт: {calc['price_from']:,} – {calc['price_to']:,} ₽".replace(",", " ") + f", срок {_fmt_days(calc['term_from'])}–{_fmt_days(calc['term_to'])} дн.")
+        if calc.get("selected_options"):
+            opts = ", ".join(f"{o['name']}" + (f" ×{o['qty']}" if o["qty"] > 1 else "") for o in calc["selected_options"])
+            lines.append(f"— Опции: {opts}")
+        flags = [f for f, v in (("срочно", calc.get("urgent")), ("высокая сложность", calc.get("complex_"))) if v]
+        if flags:
+            lines.append(f"— Отметки: {', '.join(flags)}")
+
+    task = (payload.get("task_description") or "").strip()
+    if task:
+        lines.append(f"— Задача: {_esc(task)}")
+    have = payload.get("have") or []
+    if have:
+        lines.append(f"— Что уже есть: {', '.join(HAVE_LABELS.get(h, h) for h in have)}")
+    if payload.get("deadline"):
+        lines.append(f"— Когда нужно: {DEADLINE_LABELS.get(payload['deadline'], payload['deadline'])}")
+    if payload.get("budget"):
+        lines.append(f"— Бюджет: {BUDGET_LABELS.get(payload['budget'], payload['budget'])}")
+
+    lines.append("")
+    lines.append(f"<i>Создана: {lead['created_at'][:16].replace('T', ' ')}</i>")
+    if lead.get("updated_at"):
+        lines.append(f"<i>Обновлена: {lead['updated_at'][:16].replace('T', ' ')}</i>")
+
+    return "\n".join(lines)

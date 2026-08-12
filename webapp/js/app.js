@@ -103,9 +103,21 @@ const state = {
     tzMode: null, // null | "none" | "file" | "form"
     tzDetails: { goal: "", mustHave: "", avoid: "", references: "" },
     calc: null,
+    source: "direct", // "direct" | "case" | "calculator" | "about" — откуда пришли в заявку, для дизайнера в уведомлении
+    sourceCaseTitle: null,
+    // Заказ (Order Builder) — конфигурация услуги теперь часть шага 1 брифа,
+    // а не отдельного экрана калькулятора (см. renderBrief() step 1).
+    orderOptions: {}, // { [optionId]: qty } — рабочее состояние, аналог calc.options
+    urgent: false,
+    complex: false,
+    draftId: null, // генерируется при первом использовании — см. generateDraftId()/init()
   },
   lastPayload: null,
 };
+
+function generateDraftId() {
+  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+}
 
 // Услуги вида "Графический дизайн — X" схлопываются в одну категорию с
 // подэкраном выбора типа — иначе выглядят как три разные услуги.
@@ -128,9 +140,9 @@ function getMenuEntries(pricing) {
   return entries;
 }
 
-function navigate(screen, { resetBrief = false, pushHistory = true } = {}) {
+function navigate(screen, { resetBrief = false, hardReset = false, pushHistory = true } = {}) {
   if (pushHistory && state.screen !== "loading") state.history.push(state.screen);
-  if (resetBrief) resetBriefState();
+  if (resetBrief) resetBriefState({ hardReset });
   state.screen = screen;
   render();
 }
@@ -141,12 +153,53 @@ function goBack() {
   render();
 }
 
-function resetBriefState() {
+// Черновик брифа переживает переключение вкладок и Back в рамках одной
+// сессии WebView через сам state, но не переживает полный перезапуск
+// WebView (Telegram иногда его уничтожает и создаёт заново). localStorage
+// закрывает именно этот разрыв — не заменяет resetBriefState/навигацию,
+// а просто восстанавливает state.brief при новом заходе в init().
+const BRIEF_DRAFT_STORAGE_KEY = "designAssistant.briefDraft";
+
+function persistBriefDraft() {
+  try {
+    localStorage.setItem(BRIEF_DRAFT_STORAGE_KEY, JSON.stringify(state.brief));
+  } catch (e) {
+    // приватный режим браузера / переполненная квота — черновик просто не переживёт перезапуск
+  }
+}
+
+function restoreBriefDraft() {
+  try {
+    const saved = localStorage.getItem(BRIEF_DRAFT_STORAGE_KEY);
+    if (saved) state.brief = { ...state.brief, ...JSON.parse(saved) };
+  } catch (e) {
+    // повреждённые данные в хранилище — остаёмся с дефолтным пустым брифом
+  }
+}
+
+function clearBriefDraft() {
+  try {
+    localStorage.removeItem(BRIEF_DRAFT_STORAGE_KEY);
+  } catch (e) {
+    // нечего чистить, если setItem выше и так не сработал
+  }
+}
+
+function resetBriefState({ hardReset = false } = {}) {
+  // hardReset: true — только "В начало" после отправки заявки. Обычный
+  // resetBriefState (CTA из кейса/калькулятора/about) намеренно переносит
+  // service/calc в свежий шаг 1 — это и есть предзаполнение. Но "В начало" —
+  // осознанное "забыть всё и начать с чистого листа": без него услуга (и
+  // вся её конфигурация опций/цены) от предыдущего заказа оставалась бы
+  // выбранной на шаге 1 при следующем обычном заходе через таб "Заявка".
   state.brief = {
-    step: state.brief.serviceId ? 2 : 1,
+    // Услуга теперь настраивается на самом шаге 1 (Order) — если она уже
+    // предзаполнена (кейс/калькулятор), шаг 1 сразу покажет её конфигурацию
+    // (опции/цену), а не перепрыгивает к шагу 2, как раньше.
+    step: 1,
     openGroupId: null,
-    serviceId: state.brief.serviceId,
-    serviceName: state.brief.serviceName,
+    serviceId: hardReset ? null : state.brief.serviceId,
+    serviceName: hardReset ? null : state.brief.serviceName,
     task: "",
     have: [],
     deadline: null,
@@ -155,7 +208,16 @@ function resetBriefState() {
     contactValue: "",
     tzMode: null,
     tzDetails: { goal: "", mustHave: "", avoid: "", references: "" },
-    calc: state.brief.calc,
+    calc: hardReset ? null : state.brief.calc,
+    source: hardReset ? "direct" : (state.brief.source || "direct"),
+    sourceCaseTitle: hardReset ? null : (state.brief.sourceCaseTitle || null),
+    orderOptions: hardReset ? {} : (state.brief.orderOptions || {}),
+    urgent: hardReset ? false : (state.brief.urgent || false),
+    complex: hardReset ? false : (state.brief.complex || false),
+    // resetBriefState всегда означает осознанный новый заход в заявку
+    // (кейс/калькулятор/about) — новый draftId, чтобы не перезаписать
+    // предыдущую, уже отправленную заявку при следующем submit.
+    draftId: generateDraftId(),
   };
 }
 
@@ -165,6 +227,8 @@ async function init() {
   TG.expand();
   applyTheme();
   TG.onThemeChanged(applyTheme);
+  restoreBriefDraft();
+  if (!state.brief.draftId) state.brief.draftId = generateDraftId();
 
   const [pricing, portfolio, about, uiConfig] = await Promise.all([
     fetch("/data/pricing.json").then((r) => r.json()),
@@ -207,10 +271,13 @@ async function init() {
 // Кнопки в чате Telegram открывают/поднимают уже открытый WebView, но НЕ
 // перезагружают его при повторном нажатии — поэтому переключаться между
 // портфолио/калькулятором/заявкой нужно средствами самого приложения.
+// Калькулятор больше не отдельная вкладка — конфигурация услуги и цены
+// теперь часть шага 1 заявки (Order Builder, см. renderBrief()). Экран
+// /calculator и команда бота остаются рабочими (не удалены), просто не
+// навязываются как равноценная альтернатива заявке в постоянной навигации.
 const TAB_SCREENS = [
   { id: "portfolio", icon: "📁", label: "Портфолио" },
   { id: "about", icon: "👤", label: "Обо мне" },
-  { id: "calculator", icon: "💰", label: "Калькулятор" },
   { id: "brief", icon: "✍️", label: "Заявка" },
 ];
 
@@ -233,8 +300,16 @@ function attachTabBarEvents() {
     el.addEventListener("click", () => {
       const screen = el.dataset.tab;
       if (screen === state.screen) return;
+      if (screen === "brief") {
+        // В отличие от остальных табов, "Заявка" может быть заполнена
+        // частично — заходим туда как обычной навигацией (сохраняя ответы
+        // и историю для корректного "назад"), а не как в свежий таб.
+        // Осознанный сброс брифа уже есть отдельно — там, где он оправдан
+        // намерением пользователя: CTA в кейсе/калькуляторе/about (resetBrief: true).
+        navigate(screen);
+        return;
+      }
       state.history = [];
-      if (screen === "brief") resetBriefState();
       state.screen = screen;
       render();
     })
@@ -243,6 +318,7 @@ function attachTabBarEvents() {
 
 // ---- Рендер ----
 function render() {
+  persistBriefDraft();
   const app = document.getElementById("app");
   let content;
   let showTabBar = true;
@@ -319,7 +395,7 @@ function renderPortfolio() {
     .map(
       (c) => `
       <button class="card" data-case="${c.id}">
-        <img src="/${c.cover}" alt="" loading="lazy" />
+        ${c.cover ? `<img src="/${c.cover}" alt="" loading="lazy" />` : '<div class="card-cover-empty"></div>'}
         <div class="card-title">${escapeHtml(c.title)}</div>
       </button>`
     )
@@ -348,32 +424,139 @@ function attachPortfolioEvents() {
 }
 
 // ---- Экран: Кейс ----
+// Разделы (sections) — гибкое содержимое вместо жёстких task/solution/
+// result: разные типы кейсов (лендинг/брендинг/UX-UI/графика) описываются
+// по-разному (см. /admin -> Кейсы -> Разделы). Кейсы, ещё не переведённые
+// на sections, продолжают рендериться по task/solution/result — так они
+// выглядели и раньше, ничего не ломается для уже существующих данных.
+function renderCaseContent(c) {
+  if (c.sections && c.sections.length) {
+    return c.sections.map((s) => {
+      if (s.type === "gallery") {
+        const imgs = (s.images || []).map((src) => `<img src="/${src}" alt="" />`).join("");
+        return `<div class="case-block"><div class="label">${escapeHtml(s.title)}</div><div class="case-section-gallery">${imgs || '<p class="hint">Пока нет изображений</p>'}</div></div>`;
+      }
+      return `<div class="case-block"><div class="label">${escapeHtml(s.title)}</div><p>${escapeHtml(s.content || "")}</p></div>`;
+    }).join("");
+  }
+  return `
+    <div class="case-block"><div class="label">Задача</div><p>${escapeHtml(c.task || "")}</p></div>
+    <div class="case-block"><div class="label">Решение</div><p>${escapeHtml(c.solution || "")}</p></div>
+    <div class="case-block"><div class="label">Результат</div><p>${escapeHtml(c.result || "")}</p></div>
+  `;
+}
+
 function renderCase() {
   const c = state.currentCase;
-  const images = c.images.map((src) => `<img src="/${src}" alt="" />`).join("");
+  const hasImages = c.images && c.images.length > 0;
+  const images = hasImages
+    ? c.images.map((src, i) => `<img src="/${src}" alt="" data-lightbox-index="${i}" />`).join("")
+    : `<div class="case-images-empty">Пока нет изображений</div>`;
+  // external_url — необязательное поле (см. bot/content_store.py -> CASE_FIELD_LABELS);
+  // ссылка показывается, только если дизайнер её заполнил для этого конкретного кейса.
+  const externalLink = c.external_url
+    ? `<a class="external-case-link" href="${escapeHtml(c.external_url)}" target="_blank" rel="noopener">Смотреть подробнее ↗</a>`
+    : "";
   return `
     <div class="topbar">
       <button class="back-btn" id="back">←</button>
       <h1>${escapeHtml(c.title)}</h1>
     </div>
     <div class="case-images">${images}</div>
-    <div class="case-block"><div class="label">Задача</div><p>${escapeHtml(c.task)}</p></div>
-    <div class="case-block"><div class="label">Решение</div><p>${escapeHtml(c.solution)}</p></div>
-    <div class="case-block"><div class="label">Результат</div><p>${escapeHtml(c.result)}</p></div>
+    ${renderCaseContent(c)}
+    ${externalLink}
     <button class="btn btn-primary" id="want-similar">Хочу похожий проект</button>
   `;
 }
 
 function attachCaseEvents() {
   document.getElementById("back").addEventListener("click", goBack);
+  const c = state.currentCase;
+  document.querySelectorAll("[data-lightbox-index]").forEach((el) =>
+    el.addEventListener("click", () => openLightbox(c.images.map((s) => `/${s}`), Number(el.dataset.lightboxIndex)))
+  );
   document.getElementById("want-similar").addEventListener("click", () => {
-    const service = state.pricing.services.find((s) => s.id === state.currentCase.related_service);
+    // order_template (см. bot/content_store.py) — снимок service_id + options
+    // конкретного кейса, используется только для предзаполнения нового
+    // заказа; сам кейс при этом не меняется (заказ — независимая копия).
+    const template = c.order_template;
+    const serviceId = template?.service_id || c.related_service;
+    const service = state.pricing.services.find((s) => s.id === serviceId);
     state.brief.serviceId = service?.id || null;
     state.brief.serviceName = service?.name || null;
     state.brief.calc = null;
+    state.brief.source = "case";
+    state.brief.sourceCaseTitle = c.title;
+    state.brief.orderOptions = {};
+    if (template && service) {
+      for (const o of template.options || []) state.brief.orderOptions[o.option_id] = o.quantity || 1;
+    }
+    state.brief.urgent = false;
+    state.brief.complex = false;
     navigate("brief", { resetBrief: true });
   });
 }
+
+// ---- Lightbox: просмотр изображений кейса крупным планом (несколько
+// изображений — стрелки/свайп/счётчик; одно — просто открыть/закрыть) ----
+let lightboxEl = null;
+let lightboxImages = [];
+let lightboxIndex = 0;
+
+function openLightbox(images, index) {
+  lightboxImages = images;
+  lightboxIndex = index;
+  if (!lightboxEl) {
+    lightboxEl = document.createElement("div");
+    lightboxEl.className = "lightbox";
+    lightboxEl.innerHTML = `
+      <button class="lightbox-close" aria-label="Закрыть">✕</button>
+      <button class="lightbox-prev" aria-label="Предыдущее">‹</button>
+      <img alt="" />
+      <button class="lightbox-next" aria-label="Следующее">›</button>
+      <div class="lightbox-counter"></div>
+    `;
+    document.body.appendChild(lightboxEl);
+    lightboxEl.querySelector(".lightbox-close").addEventListener("click", closeLightbox);
+    lightboxEl.querySelector(".lightbox-prev").addEventListener("click", (e) => { e.stopPropagation(); lightboxStep(-1); });
+    lightboxEl.querySelector(".lightbox-next").addEventListener("click", (e) => { e.stopPropagation(); lightboxStep(1); });
+    lightboxEl.addEventListener("click", (e) => { if (e.target === lightboxEl) closeLightbox(); });
+    let touchStartX = null;
+    lightboxEl.addEventListener("touchstart", (e) => { touchStartX = e.touches[0].clientX; });
+    lightboxEl.addEventListener("touchend", (e) => {
+      if (touchStartX === null) return;
+      const dx = e.changedTouches[0].clientX - touchStartX;
+      if (Math.abs(dx) > 40) lightboxStep(dx > 0 ? -1 : 1);
+      touchStartX = null;
+    });
+  }
+  renderLightboxImage();
+  lightboxEl.classList.add("open");
+}
+
+function lightboxStep(delta) {
+  lightboxIndex = (lightboxIndex + delta + lightboxImages.length) % lightboxImages.length;
+  renderLightboxImage();
+}
+
+function renderLightboxImage() {
+  lightboxEl.querySelector("img").src = lightboxImages[lightboxIndex];
+  const multi = lightboxImages.length > 1;
+  lightboxEl.querySelector(".lightbox-counter").textContent = multi ? `${lightboxIndex + 1} / ${lightboxImages.length}` : "";
+  lightboxEl.querySelector(".lightbox-prev").style.display = multi ? "" : "none";
+  lightboxEl.querySelector(".lightbox-next").style.display = multi ? "" : "none";
+}
+
+function closeLightbox() {
+  if (lightboxEl) lightboxEl.classList.remove("open");
+}
+
+document.addEventListener("keydown", (e) => {
+  if (!lightboxEl || !lightboxEl.classList.contains("open")) return;
+  if (e.key === "Escape") closeLightbox();
+  else if (e.key === "ArrowLeft") lightboxStep(-1);
+  else if (e.key === "ArrowRight") lightboxStep(1);
+});
 
 // ---- Экран: Обо мне ----
 function renderAbout() {
@@ -387,11 +570,27 @@ function renderAbout() {
     .map(
       (c) => `
       <button class="mini-case" data-case="${c.id}">
-        <img src="/${c.cover}" alt="" loading="lazy" />
+        ${c.cover ? `<img src="/${c.cover}" alt="" loading="lazy" />` : '<div class="mini-case-cover-empty"></div>'}
         <span>${escapeHtml(c.title)}</span>
       </button>`
     )
     .join("");
+
+  // Опыт работы (resume-style записи) — необязательный, дополняющий блок:
+  // строка "Опыт: N лет" выше остаётся кратким резюме, experience[] даёт
+  // детализацию по местам/проектам, если дизайнер её заполнил.
+  const experienceHTML = a.experience && a.experience.length
+    ? `
+      <div class="about-block">
+        <h2>Опыт работы</h2>
+        ${a.experience.map((e) => `
+          <div class="experience-entry">
+            <div class="experience-role">${escapeHtml(e.role)} — ${escapeHtml(e.company)}</div>
+            <div class="hint">${escapeHtml(e.period)}</div>
+            ${e.description ? `<p>${escapeHtml(e.description)}</p>` : ""}
+          </div>`).join("")}
+      </div>`
+    : "";
 
   const educationHTML = a.education && a.education.enabled && a.education.items.length
     ? `
@@ -442,6 +641,8 @@ function renderAbout() {
       <p>${escapeHtml(a.approach)}</p>
     </div>
 
+    ${experienceHTML}
+
     ${featuredHTML ? `<div class="about-block"><h2>Избранные кейсы</h2><div class="mini-case-grid">${featuredHTML}</div></div>` : ""}
 
     ${educationHTML}
@@ -463,7 +664,11 @@ function attachAboutEvents() {
   );
 
   const cta = document.getElementById("about-cta");
-  if (cta) cta.addEventListener("click", () => navigate("brief", { resetBrief: true }));
+  if (cta) cta.addEventListener("click", () => {
+    state.brief.source = "about";
+    state.brief.sourceCaseTitle = null;
+    navigate("brief", { resetBrief: true });
+  });
 }
 
 // ---- Экран: Калькулятор ----
@@ -543,12 +748,20 @@ function attachCalculatorEvents() {
     const result = calculatePrice(state.pricing, state.calc.serviceId, state.calc.options, state.calc.urgent, state.calc.complex);
     state.brief.serviceId = result.service.id;
     state.brief.serviceName = result.service.name;
+    // orderOptions/urgent/complex — рабочее состояние для шага 1 брифа
+    // (Order Builder); calc — снимок в формате payload, вычисляется заново
+    // при выходе с шага 1 (см. order-next), храним здесь только для полноты.
+    state.brief.orderOptions = { ...state.calc.options };
+    state.brief.urgent = state.calc.urgent;
+    state.brief.complex = state.calc.complex;
     state.brief.calc = {
       service_id: state.calc.serviceId,
       options: Object.entries(state.calc.options).map(([id, qty]) => ({ id, qty })),
       urgent: state.calc.urgent,
       complex: state.calc.complex,
     };
+    state.brief.source = "calculator";
+    state.brief.sourceCaseTitle = null;
     navigate("brief", { resetBrief: true });
   });
 }
@@ -648,6 +861,7 @@ function renderCalculator() {
       Услуга: <b>${escapeHtml(service.name)}</b>
       · <a href="#" id="change-service">изменить</a>
     </div>
+    ${service.includes ? `<p class="hint">В базовую стоимость входит: ${escapeHtml(service.includes)}</p>` : ""}
 
     ${optionRows}
 
@@ -671,7 +885,10 @@ function renderCalculator() {
 }
 
 // ---- Экран: Бриф ----
-const BRIEF_TOTAL_STEPS = 6;
+// 7 шагов: шаг "ТЗ" вынесен из "Контактов" в отдельный шаг — раньше один
+// экран одновременно спрашивал имя, контакт, режим ТЗ и (условно) 4 поля
+// под-формы, то есть 3-4 решения сразу на шаге с наибольшей значимостью.
+const BRIEF_TOTAL_STEPS = 7;
 
 function attachBriefEvents() {
   const backBtn = document.getElementById("back");
@@ -681,14 +898,21 @@ function attachBriefEvents() {
     el.addEventListener("click", () => {
       const id = el.dataset.servicePick;
       if (id === "unknown") {
+        // Нет услуги — конфигурировать нечего, сразу к вопросу о задаче.
         state.brief.serviceId = null;
         state.brief.serviceName = "Не определился с услугой";
+        briefNext();
       } else {
+        // Услуга выбрана — остаёмся на шаге 1, он сразу покажет её
+        // конфигурацию (опции/цену), не перепрыгиваем вперёд.
         const s = state.pricing.services.find((x) => x.id === id);
         state.brief.serviceId = s.id;
         state.brief.serviceName = s.name;
+        state.brief.orderOptions = {};
+        state.brief.urgent = false;
+        state.brief.complex = false;
+        render();
       }
-      briefNext();
     })
   );
 
@@ -704,6 +928,64 @@ function attachBriefEvents() {
     e.preventDefault();
     state.brief.openGroupId = null;
     render();
+  });
+
+  // ---- Шаг 1 (Order): опции/коэффициенты/цена выбранной услуги — тот же
+  // движок расчёта, что и в calculator.js, но состояние своё (brief.order*),
+  // чтобы не путать с отдельным экраном /calculator.
+  document.querySelectorAll("[data-order-option-toggle]").forEach((el) =>
+    el.addEventListener("change", () => {
+      const id = el.dataset.orderOptionToggle;
+      if (el.checked) state.brief.orderOptions[id] = 1;
+      else delete state.brief.orderOptions[id];
+      render();
+    })
+  );
+  document.querySelectorAll("[data-order-qty-plus]").forEach((el) =>
+    el.addEventListener("click", () => {
+      const id = el.dataset.orderQtyPlus;
+      state.brief.orderOptions[id] = (state.brief.orderOptions[id] || 1) + 1;
+      render();
+    })
+  );
+  document.querySelectorAll("[data-order-qty-minus]").forEach((el) =>
+    el.addEventListener("click", () => {
+      const id = el.dataset.orderQtyMinus;
+      const cur = state.brief.orderOptions[id] || 1;
+      if (cur <= 1) delete state.brief.orderOptions[id];
+      else state.brief.orderOptions[id] = cur - 1;
+      render();
+    })
+  );
+  const orderUrgentToggle = document.getElementById("order-urgent-toggle");
+  if (orderUrgentToggle) orderUrgentToggle.addEventListener("change", () => {
+    state.brief.urgent = orderUrgentToggle.checked;
+    render();
+  });
+  const orderComplexToggle = document.getElementById("order-complex-toggle");
+  if (orderComplexToggle) orderComplexToggle.addEventListener("change", () => {
+    state.brief.complex = orderComplexToggle.checked;
+    render();
+  });
+  const orderChangeService = document.getElementById("order-change-service");
+  if (orderChangeService) orderChangeService.addEventListener("click", (e) => {
+    e.preventDefault();
+    state.brief.serviceId = null;
+    state.brief.serviceName = null;
+    render();
+  });
+  const orderNext = document.getElementById("order-next");
+  if (orderNext) orderNext.addEventListener("click", () => {
+    // Снимок для payload — тот же формат, что раньше собирала кнопка
+    // "Отправить с этим расчётом" на экране /calculator (см. lead.py —
+    // формат заявки для дизайнера не менялся).
+    state.brief.calc = {
+      service_id: state.brief.serviceId,
+      options: Object.entries(state.brief.orderOptions).map(([id, qty]) => ({ id, qty })),
+      urgent: state.brief.urgent,
+      complex: state.brief.complex,
+    };
+    briefNext();
   });
 
   const taskInput = document.getElementById("task-input");
@@ -749,11 +1031,11 @@ function attachBriefEvents() {
   const contactInput = document.getElementById("contact-value");
   if (nameInput) nameInput.addEventListener("input", () => {
     state.brief.name = nameInput.value;
-    validateContactStep();
+    validateNameContactStep();
   });
   if (contactInput) contactInput.addEventListener("input", () => {
     state.brief.contactValue = contactInput.value;
-    validateContactStep();
+    validateNameContactStep();
   });
   document.querySelectorAll("[data-tz-pick]").forEach((el) =>
     el.addEventListener("click", () => {
@@ -779,9 +1061,19 @@ function attachBriefEvents() {
   if (submitBtn) submitBtn.addEventListener("click", submitBrief);
 }
 
+function isNameContactValid(b) {
+  return b.name.trim().length > 0 && b.contactValue.trim().length > 0;
+}
+
+function validateNameContactStep() {
+  const btn = document.getElementById("brief-next");
+  if (!btn) return;
+  btn.disabled = !isNameContactValid(state.brief);
+}
+
 function isContactStepValid() {
   const b = state.brief;
-  const basics = b.name.trim().length > 0 && b.contactValue.trim().length > 0 && b.tzMode !== null;
+  const basics = isNameContactValid(b) && b.tzMode !== null;
   if (!basics) return false;
   if (b.tzMode === "form") return b.tzDetails.goal.trim().length > 0;
   return true;
@@ -791,6 +1083,24 @@ function validateContactStep() {
   const btn = document.getElementById("brief-submit");
   if (!btn) return;
   btn.disabled = !isContactStepValid();
+}
+
+// Бюджет, подсказанный уже выполненным расчётом в калькуляторе — чтобы не
+// переспрашивать абстрактный диапазон, когда точная цена уже известна.
+// state.brief.calc хранит серверный payload-формат (service_id/options/...),
+// поэтому пересчитываем через тот же calculatePrice(), что и сам калькулятор.
+function inferBudgetFromCalc(calc) {
+  if (!calc || !calc.service_id || !state.pricing) return null;
+  const selected = {};
+  for (const o of calc.options || []) selected[o.id] = o.qty;
+  const result = calculatePrice(state.pricing, calc.service_id, selected, calc.urgent, calc.complex);
+  if (!result) return null;
+  const price = result.priceFrom;
+  if (price < 20000) return "lt20";
+  if (price < 40000) return "20-40";
+  if (price < 70000) return "40-70";
+  if (price < 100000) return "70-100";
+  return "gt100";
 }
 
 function briefNext() {
@@ -820,7 +1130,19 @@ function submitBrief() {
       references: state.brief.tzDetails.references.trim(),
     } : null,
     calc: state.brief.calc,
+    source: state.brief.source || "direct",
+    source_case_title: state.brief.sourceCaseTitle || null,
+    // draft_id — тот же на протяжении одного заказа (включая "Дополнить
+    // информацию" после отправки); бэкенд обновляет существующую заявку по
+    // этому id вместо создания дубликата — см. content_store.add_lead().
+    draft_id: state.brief.draftId,
   };
+  // Черновик НЕ чистим здесь: в реальном Telegram sendData() сразу закрывает
+  // Mini App — если чистить сейчас, "Дополнить информацию" при повторном
+  // открытии не найдёт draftId и создаст вторую заявку вместо обновления
+  // первой. Черновик естественно перезатирается следующим render() при
+  // настоящем новом заказе (resetBriefState всегда даёт новый draftId) —
+  // явная очистка нужна только когда пользователь осознанно уходит "В начало".
   TG.sendData(payload);
 }
 
@@ -838,7 +1160,59 @@ function renderBrief() {
 
   let body = "";
 
-  if (step === 1 && b.openGroupId) {
+  if (step === 1 && b.serviceId) {
+    // Order Builder: конфигурация услуги (опции/срочность/сложность/цена)
+    // прямо на шаге 1 — раньше это был отдельный экран /calculator, теперь
+    // часть заявки, с предзаполнением из кейса/калькулятора, если пришли оттуда.
+    const service = state.pricing.services.find((s) => s.id === b.serviceId);
+    const options = calcServiceOptions(state.pricing, service.id);
+    const result = calculatePrice(state.pricing, service.id, b.orderOptions, b.urgent, b.complex);
+    const optionRows = options
+      .map((o) => {
+        const checked = Boolean(b.orderOptions[o.id]);
+        const qty = b.orderOptions[o.id] || 1;
+        const qtyControl = o.multipliable && checked
+          ? `<div class="qty-control">
+               <button type="button" data-order-qty-minus="${o.id}">−</button>
+               <span>${qty}</span>
+               <button type="button" data-order-qty-plus="${o.id}">+</button>
+             </div>`
+          : "";
+        return `
+          <div class="option-row">
+            <label class="option-main">
+              <input type="checkbox" data-order-option-toggle="${o.id}" ${checked ? "checked" : ""} />
+              <div>
+                <div class="option-name">${escapeHtml(o.name)}</div>
+                <div class="option-price">+${formatMoney(o.price)}, +${formatDays(o.days)} дн.${o.multipliable ? " · можно несколько" : ""}</div>
+              </div>
+            </label>
+            ${qtyControl}
+          </div>`;
+      })
+      .join("");
+    body = `
+      <h2>Собираем проект</h2>
+      <div class="summary-box">Услуга: <b>${escapeHtml(service.name)}</b> · <a href="#" id="order-change-service">изменить</a></div>
+      ${service.includes ? `<p class="hint">В базовую стоимость входит: ${escapeHtml(service.includes)}</p>` : ""}
+      ${optionRows}
+      <div class="toggle-row">
+        <span>Срочный проект (+25%)</span>
+        <label class="switch"><input type="checkbox" id="order-urgent-toggle" ${b.urgent ? "checked" : ""} /><span class="track"></span></label>
+      </div>
+      <div class="toggle-row">
+        <span>Высокая сложность (+20%)</span>
+        <label class="switch"><input type="checkbox" id="order-complex-toggle" ${b.complex ? "checked" : ""} /><span class="track"></span></label>
+      </div>
+      <div class="result-box">
+        <div class="price">${formatMoney(result.priceFrom)} – ${formatMoney(result.priceTo)}</div>
+        <div class="term">${formatDays(result.termFrom)}–${formatDays(result.termTo)} рабочих дней</div>
+        <div class="hint">Точная сумма — предварительная, дизайнер подтвердит после брифа</div>
+      </div>
+      <button class="btn btn-primary" id="order-next">Далее</button>
+    `;
+    return wrapBrief(body, step);
+  } else if (step === 1 && b.openGroupId) {
     const group = state.pricing.groups.find((g) => g.id === b.openGroupId);
     const items = group.service_ids
       .map((id) => state.pricing.services.find((s) => s.id === id))
@@ -893,8 +1267,14 @@ function renderBrief() {
     const items = DEADLINE_OPTIONS.map((o) => `<button class="pick" data-deadline-pick="${o.id}">${o.label}</button>`).join("");
     body = `<h2>Когда нужно?</h2><div class="option-buttons">${items}</div>`;
   } else if (step === 5) {
-    const items = BUDGET_OPTIONS.map((o) => `<button class="pick" data-budget-pick="${o.id}">${o.label}</button>`).join("");
-    body = `<h2>Бюджет</h2><div class="option-buttons">${items}</div>`;
+    const inferredBudget = inferBudgetFromCalc(b.calc);
+    const hint = inferredBudget
+      ? `<p class="hint">По вашему расчёту в калькуляторе — похоже на «${BUDGET_OPTIONS.find((o) => o.id === inferredBudget).label}». Можно подтвердить или выбрать другой вариант.</p>`
+      : "";
+    const items = BUDGET_OPTIONS.map(
+      (o) => `<button class="pick ${o.id === (b.budget || inferredBudget) ? "selected" : ""}" data-budget-pick="${o.id}">${o.label}</button>`
+    ).join("");
+    body = `<h2>Бюджет</h2>${hint}<div class="option-buttons">${items}</div>`;
   } else if (step === 6) {
     body = `
       <h2>Контакты</h2>
@@ -906,13 +1286,19 @@ function renderBrief() {
         <label>Telegram или телефон</label>
         <input type="text" id="contact-value" value="${escapeHtml(b.contactValue)}" placeholder="@username или +7..." />
       </div>
-      <div class="field">
-        <label>Есть подробное ТЗ?</label>
-        <div class="option-buttons">
-          <button class="pick ${b.tzMode === "form" ? "selected" : ""}" data-tz-pick="form">Да, опишу здесь</button>
-          <button class="pick ${b.tzMode === "file" ? "selected" : ""}" data-tz-pick="file">Да, пришлю файл</button>
-          <button class="pick ${b.tzMode === "none" ? "selected" : ""}" data-tz-pick="none">Нет</button>
-        </div>
+      <div class="btn-row">
+        <button class="btn btn-secondary" id="brief-prev">Назад</button>
+        <button class="btn btn-primary" id="brief-next" ${isNameContactValid(b) ? "" : "disabled"}>Далее</button>
+      </div>
+    `;
+    return wrapBrief(body, step);
+  } else if (step === 7) {
+    body = `
+      <h2>Есть подробное ТЗ?</h2>
+      <div class="option-buttons">
+        <button class="pick ${b.tzMode === "form" ? "selected" : ""}" data-tz-pick="form">Да, опишу здесь</button>
+        <button class="pick ${b.tzMode === "file" ? "selected" : ""}" data-tz-pick="file">Да, пришлю файл</button>
+        <button class="pick ${b.tzMode === "none" ? "selected" : ""}" data-tz-pick="none">Нет</button>
       </div>
       ${b.tzMode === "form" ? `
       <div class="field">
@@ -944,10 +1330,12 @@ function renderBrief() {
 }
 
 function wrapBrief(body, step) {
-  const serviceChip = state.brief.serviceName
+  // Шаг 1 сам показывает услугу в своей summary-box (с "изменить") — общий
+  // чип здесь был бы дублем прямо над ним.
+  const serviceChip = state.brief.serviceName && step !== 1
     ? `<div class="summary-box">Услуга: <b>${escapeHtml(state.brief.serviceName)}</b></div>`
     : "";
-  const nav = step > 1 && step !== 2 && step !== 3 && step !== 6
+  const nav = step > 1 && step !== 2 && step !== 3 && step !== 6 && step !== 7
     ? `<div class="btn-row"><button class="btn btn-secondary" id="brief-prev">Назад</button></div>`
     : "";
   return `
@@ -962,21 +1350,42 @@ function wrapBrief(body, step) {
   `;
 }
 
-// ---- Экран: подтверждение (только вне Telegram, для тестирования в браузере) ----
+// ---- Экран: подтверждение (только вне Telegram, для тестирования в браузере —
+// в реальном Telegram sendData() сама закрывает Mini App, этот экран никогда
+// не увидит настоящий клиент; номер заявки и итоговую цену он получит
+// сообщением от бота, см. bot/texts.py -> lead_received_ack/lead_ack_ask_file) ----
 function renderSubmitted() {
+  const p = state.lastPayload || {};
+  const priceLine = p.calc
+    ? `<p class="hint">Расчёт передан вместе с заявкой — итоговую вилку цены дизайнер подтвердит в чате.</p>`
+    : "";
   return `
     <div class="topbar"><h1>Готово ✅</h1></div>
-    <p>Заявка отправлена (режим предпросмотра в браузере — реальная отправка в бота работает только внутри Telegram).</p>
+    <p>Заявка отправлена. В реальном Telegram здесь бот прислал бы в чат номер заявки, услугу и предварительную стоимость — этот экран показывается только в режиме предпросмотра в браузере.</p>
+    <div class="summary-box">Услуга: <b>${escapeHtml(p.service_name || "не указана")}</b></div>
+    ${priceLine}
     <p class="hint">Данные, которые ушли бы боту:</p>
-    <pre class="summary-box" style="white-space:pre-wrap;word-break:break-word;">${escapeHtml(JSON.stringify(state.lastPayload, null, 2))}</pre>
-    <button class="btn btn-primary" id="to-start">В начало</button>
+    <pre class="summary-box" style="white-space:pre-wrap;word-break:break-word;">${escapeHtml(JSON.stringify(p, null, 2))}</pre>
+    <div class="btn-row">
+      <button class="btn btn-secondary" id="add-more-info">Дополнить информацию</button>
+      <button class="btn btn-primary" id="to-start">В начало</button>
+    </div>
   `;
 }
 
 document.addEventListener("click", (e) => {
   if (e.target && e.target.id === "to-start") {
+    // Осознанный уход "в начало" — вот здесь черновик действительно можно
+    // очистить: пользователь явно закончил с этим заказом.
+    clearBriefDraft();
     state.history = [];
-    navigate("portfolio", { pushHistory: false, resetBrief: true });
+    navigate("portfolio", { pushHistory: false, resetBrief: true, hardReset: true });
+  }
+  if (e.target && e.target.id === "add-more-info") {
+    // НЕ resetBrief — тот же draftId и те же ответы, просто возвращаемся
+    // редактировать; повторная отправка обновит ту же заявку (см. submitBrief).
+    state.history = [];
+    navigate("brief", { pushHistory: false });
   }
 });
 

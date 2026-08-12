@@ -17,6 +17,7 @@ actor_chat_id и сверяет его с DESIGNER_CHAT_ID сама, незав�
 import json
 import os
 import tempfile
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -25,19 +26,6 @@ from bot import config
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 IMG_PORTFOLIO_DIR = Path(__file__).resolve().parent.parent / "webapp" / "img" / "portfolio"
 IMG_ABOUT_DIR = Path(__file__).resolve().parent.parent / "webapp" / "img" / "about"
-
-# Категория портфолио -> услуга калькулятора для автоподстановки в "Хочу
-# похожий проект". "graphics" объединяет 3 услуги — однозначно не выбрать,
-# оставляем None (see data/pricing.json -> groups).
-TYPE_TO_SERVICE = {
-    "landing": "LEND",
-    "site": "SITE",
-    "uxui": "UXUI",
-    "logo": "LOGO",
-    "branding": "BRAND",
-    "social": "SMM",
-}
-
 
 class NotDesignerError(PermissionError):
     """Попытка вызвать мутирующую функцию content_store не от имени DESIGNER_CHAT_ID."""
@@ -108,16 +96,173 @@ def add_case(actor_chat_id: int | str, *, case_id: str, title: str, type_id: str
 
 
 def update_case(actor_chat_id: int | str, case_id: str, **fields: Any) -> bool:
+    """"cover" через это поле — быстрый путь "загрузить новую обложку":
+    новое фото ДОБАВЛЯЕТСЯ в галерею (images) и становится cover, но не
+    стирает остальные изображения кейса — за полным управлением галереей
+    (добавить/удалить/переставить/назначить обложку без загрузки) см.
+    add_case_image / remove_case_image / reorder_case_image / set_case_cover."""
     _require_designer(actor_chat_id)
     data = _read("portfolio.json")
     for c in data["cases"]:
         if c["id"] == case_id:
             c.update(fields)
             if "cover" in fields:
-                c["images"] = [fields["cover"]]
+                images = c.setdefault("images", [])
+                if fields["cover"] not in images:
+                    images.append(fields["cover"])
             _write("portfolio.json", data)
             return True
     return False
+
+
+def _find_case(data: dict, case_id: str) -> dict | None:
+    return next((c for c in data["cases"] if c["id"] == case_id), None)
+
+
+def add_case_image(actor_chat_id: int | str, case_id: str, image_path: str, *, set_as_cover: bool = False) -> bool:
+    _require_designer(actor_chat_id)
+    data = _read("portfolio.json")
+    case = _find_case(data, case_id)
+    if case is None:
+        return False
+    images = case.setdefault("images", [])
+    if image_path not in images:
+        images.append(image_path)
+    if set_as_cover or not case.get("cover"):
+        case["cover"] = image_path
+    _write("portfolio.json", data)
+    return True
+
+
+def remove_case_image(actor_chat_id: int | str, case_id: str, image_path: str) -> bool:
+    """Если удаляемое изображение было обложкой — обложка автоматически
+    переходит на первое оставшееся; если изображений не осталось вовсе —
+    cover становится None (Mini App показывает пустое состояние, не
+    сломанную картинку — см. renderCase())."""
+    _require_designer(actor_chat_id)
+    data = _read("portfolio.json")
+    case = _find_case(data, case_id)
+    if case is None or image_path not in case.get("images", []):
+        return False
+    case["images"] = [i for i in case["images"] if i != image_path]
+    if case.get("cover") == image_path:
+        case["cover"] = case["images"][0] if case["images"] else None
+    _write("portfolio.json", data)
+    return True
+
+
+def reorder_case_image(actor_chat_id: int | str, case_id: str, image_path: str, direction: str) -> bool:
+    """direction: "up" (раньше в галерее) | "down" (позже)."""
+    _require_designer(actor_chat_id)
+    data = _read("portfolio.json")
+    case = _find_case(data, case_id)
+    if case is None or image_path not in case.get("images", []):
+        return False
+    images = case["images"]
+    i = images.index(image_path)
+    j = i - 1 if direction == "up" else i + 1
+    if j < 0 or j >= len(images):
+        return False
+    images[i], images[j] = images[j], images[i]
+    _write("portfolio.json", data)
+    return True
+
+
+def set_case_cover(actor_chat_id: int | str, case_id: str, image_path: str) -> bool:
+    _require_designer(actor_chat_id)
+    data = _read("portfolio.json")
+    case = _find_case(data, case_id)
+    if case is None or image_path not in case.get("images", []):
+        return False
+    case["cover"] = image_path
+    _write("portfolio.json", data)
+    return True
+
+
+def update_case_category(actor_chat_id: int | str, case_id: str, new_type_id: str) -> bool:
+    """Меняет категорию существующего кейса — раньше это было возможно
+    только при создании. related_service подставляется из дефолта НОВОЙ
+    категории только если у кейса он либо не задан, либо совпадал с
+    дефолтом СТАРОЙ категории (то есть ранее не был выбран вручную) —
+    осознанно выбранная связь с услугой при смене категории не стирается."""
+    _require_designer(actor_chat_id)
+    data = _read("portfolio.json")
+    case = _find_case(data, case_id)
+    if case is None:
+        return False
+    old_type_id = case.get("type")
+    old_default = next((t.get("related_service") for t in data["types"] if t["id"] == old_type_id), None)
+    new_default = next((t.get("related_service") for t in data["types"] if t["id"] == new_type_id), None)
+    if not case.get("related_service") or case.get("related_service") == old_default:
+        case["related_service"] = new_default
+    case["type"] = new_type_id
+    _write("portfolio.json", data)
+    return True
+
+
+# ---- Разделы содержимого кейса (sections) ----
+# Гибкая структура вместо жёстких task/solution/result — разные типы
+# кейсов (лендинг/брендинг/UX-UI/графика) описываются по-разному. Кейсы без
+# sections (пока не мигрированы) продолжают рендериться по task/solution/
+# result как раньше — см. backward-compatible рендер в webapp/js/app.js.
+
+def add_case_section(actor_chat_id: int | str, case_id: str, *, section_type: str, title: str, content: str = "", images: list[str] | None = None) -> bool:
+    _require_designer(actor_chat_id)
+    data = _read("portfolio.json")
+    case = _find_case(data, case_id)
+    if case is None:
+        return False
+    section: dict[str, Any] = {"type": section_type, "title": title}
+    if section_type == "gallery":
+        section["images"] = images or []
+    else:
+        section["content"] = content
+    case.setdefault("sections", []).append(section)
+    _write("portfolio.json", data)
+    return True
+
+
+def update_case_section(actor_chat_id: int | str, case_id: str, index: int, **fields: Any) -> bool:
+    _require_designer(actor_chat_id)
+    data = _read("portfolio.json")
+    case = _find_case(data, case_id)
+    if case is None:
+        return False
+    sections = case.get("sections", [])
+    if not (0 <= index < len(sections)):
+        return False
+    sections[index].update(fields)
+    _write("portfolio.json", data)
+    return True
+
+
+def delete_case_section(actor_chat_id: int | str, case_id: str, index: int) -> bool:
+    _require_designer(actor_chat_id)
+    data = _read("portfolio.json")
+    case = _find_case(data, case_id)
+    if case is None:
+        return False
+    sections = case.get("sections", [])
+    if not (0 <= index < len(sections)):
+        return False
+    del sections[index]
+    _write("portfolio.json", data)
+    return True
+
+
+def reorder_case_section(actor_chat_id: int | str, case_id: str, index: int, direction: str) -> bool:
+    _require_designer(actor_chat_id)
+    data = _read("portfolio.json")
+    case = _find_case(data, case_id)
+    if case is None:
+        return False
+    sections = case.get("sections", [])
+    j = index - 1 if direction == "up" else index + 1
+    if not (0 <= index < len(sections)) or not (0 <= j < len(sections)):
+        return False
+    sections[index], sections[j] = sections[j], sections[index]
+    _write("portfolio.json", data)
+    return True
 
 
 def delete_case(actor_chat_id: int | str, case_id: str) -> bool:
@@ -182,6 +327,10 @@ def delete_faq(actor_chat_id: int | str, faq_id: int) -> bool:
 
 # ---- Обо мне ----
 
+def get_about() -> dict:
+    return _read("about.json")
+
+
 def update_about_field(actor_chat_id: int | str, field: str, value: Any) -> bool:
     _require_designer(actor_chat_id)
     data = _read("about.json")
@@ -189,6 +338,36 @@ def update_about_field(actor_chat_id: int | str, field: str, value: Any) -> bool
         return False
     data[field] = value
     data["needs_review_fields"] = [f for f in data.get("needs_review_fields", []) if f != field]
+    _write("about.json", data)
+    return True
+
+
+def add_about_experience(actor_chat_id: int | str, *, role: str, company: str, period: str, description: str = "") -> bool:
+    _require_designer(actor_chat_id)
+    data = _read("about.json")
+    data.setdefault("experience", []).append({"role": role, "company": company, "period": period, "description": description})
+    _write("about.json", data)
+    return True
+
+
+def update_about_experience(actor_chat_id: int | str, index: int, **fields: Any) -> bool:
+    _require_designer(actor_chat_id)
+    data = _read("about.json")
+    entries = data.get("experience", [])
+    if not (0 <= index < len(entries)):
+        return False
+    entries[index].update(fields)
+    _write("about.json", data)
+    return True
+
+
+def delete_about_experience(actor_chat_id: int | str, index: int) -> bool:
+    _require_designer(actor_chat_id)
+    data = _read("about.json")
+    entries = data.get("experience", [])
+    if not (0 <= index < len(entries)):
+        return False
+    del entries[index]
     _write("about.json", data)
     return True
 
@@ -256,9 +435,11 @@ def update_service(actor_chat_id: int | str, service_id: str, **fields: Any) -> 
 
 
 def delete_service(actor_chat_id: int | str, service_id: str) -> bool:
-    """Удаляет услугу вместе с её опциями. Кейсы портфолио, ссылавшиеся на
-    неё через related_service, не удаляются — просто теряют автоподстановку
-    услуги в "Хочу похожий проект" (related_service -> None)."""
+    """Удаляет услугу вместе с её опциями. Кейсы портфолио и категории
+    портфолио, ссылавшиеся на неё через related_service, не удаляются —
+    просто теряют автоподстановку услуги (related_service -> None), и там,
+    и там: иначе после удаления услуги в data остался бы related_service,
+    указывающий на несуществующую услугу — referential integrity."""
     _require_designer(actor_chat_id)
     data = _read("pricing.json")
     before = len(data["services"])
@@ -275,6 +456,10 @@ def delete_service(actor_chat_id: int | str, service_id: str) -> bool:
     for c in portfolio["cases"]:
         if c.get("related_service") == service_id:
             c["related_service"] = None
+            changed = True
+    for t in portfolio["types"]:
+        if t.get("related_service") == service_id:
+            t["related_service"] = None
             changed = True
     if changed:
         _write("portfolio.json", portfolio)
@@ -367,6 +552,30 @@ def update_rounding(actor_chat_id: int | str, field: str, value: float) -> bool:
 
 # ---- Категории портфолио ----
 
+def default_related_service_for_type(type_id: str) -> str | None:
+    """Дефолтная услуга для новых кейсов в категории — читается из
+    data/portfolio.json -> types[].related_service (задаётся в /admin ->
+    Категории портфолио -> Похожая услуга). Раньше бралась из захардкоженного
+    словаря TYPE_TO_SERVICE и не работала для категорий, добавленных через
+    /admin -> Категории портфолио -> Добавить, у которых просто не было
+    записи в этом словаре."""
+    for t in list_portfolio_types():
+        if t["id"] == type_id:
+            return t.get("related_service")
+    return None
+
+
+def update_portfolio_type_related_service(actor_chat_id: int | str, type_id: str, related_service: str | None) -> bool:
+    _require_designer(actor_chat_id)
+    data = _read("portfolio.json")
+    for t in data["types"]:
+        if t["id"] == type_id:
+            t["related_service"] = related_service
+            _write("portfolio.json", data)
+            return True
+    return False
+
+
 def next_portfolio_type_id() -> str:
     data = _read("portfolio.json")
     nums = []
@@ -382,7 +591,7 @@ def next_portfolio_type_id() -> str:
 def add_portfolio_type(actor_chat_id: int | str, *, type_id: str, label: str) -> dict:
     _require_designer(actor_chat_id)
     data = _read("portfolio.json")
-    type_entry = {"id": type_id, "label": label}
+    type_entry = {"id": type_id, "label": label, "related_service": None}
     data["types"].append(type_entry)
     _write("portfolio.json", data)
     return type_entry
@@ -434,4 +643,104 @@ def set_menu_item_enabled(actor_chat_id: int | str, key: str, enabled: bool) -> 
         return False
     data["menu"][key] = enabled
     _write("ui_config.json", data)
+    return True
+
+
+# ---- Готовность контента к показу реальным клиентам ----
+
+def content_readiness_summary() -> dict:
+    """Сводка незавершённого клиент-facing контента — кейсы с обложкой-
+    заглушкой, незаполненные поля "Обо мне", вопросы FAQ без финального
+    ответа. Используется в /admin (см. handlers/admin.py), чтобы дизайнер
+    не пропустил, что часть контента ещё не готова к показу клиентам —
+    сами данные (needs_review / needs_review_fields / путь заглушки) уже
+    существовали, но нигде не были собраны в одну сводку."""
+    placeholder_cases = sum(1 for c in list_cases() if "placeholder" in (c.get("cover") or ""))
+    about_pending = len(get_about().get("needs_review_fields", []))
+    faq_pending = sum(1 for i in list_faq() if i.get("needs_review"))
+    return {
+        "placeholder_cases": placeholder_cases,
+        "about_pending_fields": about_pending,
+        "faq_pending": faq_pending,
+    }
+
+
+# ---- Заявки (leads) ----
+# Простое JSON-хранилище — не CRM и не БД: заявки по-прежнему в первую
+# очередь приходят дизайнеру сообщением в чат (bot/lead.py), это хранилище
+# добавляет только отдельный список/статусы в /admin поверх того же потока,
+# без нового канала передачи данных.
+
+LEAD_STATUSES = ("NEW", "IN_PROGRESS", "DONE")
+
+
+def _read_leads() -> list[dict]:
+    try:
+        return _read("leads.json")["leads"]
+    except FileNotFoundError:
+        return []
+
+
+def _write_leads(leads: list[dict]) -> None:
+    _write("leads.json", {"leads": leads})
+
+
+def add_lead(payload: dict, telegram: dict, calc_summary: dict | None = None, draft_id: str | None = None) -> dict:
+    """Вызывается из bot/handlers/webapp.py при получении submit_brief —
+    не требует _require_designer, потому что это действие клиента, не
+    дизайнера. draft_id (необязательный, из localStorage-черновика Mini App)
+    используется для upsert: повторная отправка того же черновика
+    (например, через "Дополнить информацию") обновляет существующую заявку
+    вместо создания дубликата — см. Part 7 ТЗ."""
+    leads = _read_leads()
+    if draft_id:
+        existing = next((l for l in leads if l.get("draft_id") == draft_id), None)
+        if existing is not None:
+            existing.update(
+                payload=payload,
+                telegram=telegram,
+                calc_summary=calc_summary,
+                updated_at=datetime.now(timezone.utc).isoformat(),
+            )
+            _write_leads(leads)
+            return existing
+
+    next_id = max((l["id"] for l in leads), default=0) + 1
+    lead = {
+        "id": next_id,
+        "draft_id": draft_id,
+        "status": "NEW",
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "updated_at": None,
+        "telegram": telegram,
+        "payload": payload,
+        "calc_summary": calc_summary,
+    }
+    leads.append(lead)
+    _write_leads(leads)
+    return lead
+
+
+def list_leads(status: str | None = None) -> list[dict]:
+    leads = _read_leads()
+    if status and status != "ALL":
+        leads = [l for l in leads if l.get("status") == status]
+    return sorted(leads, key=lambda l: l["id"], reverse=True)
+
+
+def get_lead(lead_id: int) -> dict | None:
+    return next((l for l in _read_leads() if l["id"] == lead_id), None)
+
+
+def update_lead_status(actor_chat_id: int | str, lead_id: int, status: str) -> bool:
+    _require_designer(actor_chat_id)
+    if status not in LEAD_STATUSES:
+        return False
+    leads = _read_leads()
+    lead = next((l for l in leads if l["id"] == lead_id), None)
+    if lead is None:
+        return False
+    lead["status"] = status
+    lead["updated_at"] = datetime.now(timezone.utc).isoformat()
+    _write_leads(leads)
     return True

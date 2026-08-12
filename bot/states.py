@@ -67,5 +67,42 @@ class AdminStates(StatesGroup):
     rename_category_pick = State()
     rename_category_value = State()
 
+    category_related_service_pick = State()
+
     delete_category_pick = State()
     delete_category_confirm = State()
+
+    # Изображения кейса (вложены в редактирование кейса, как опции — вложены
+    # в редактирование услуги: case_id уже есть в data к этому моменту).
+    case_images_menu = State()
+    case_image_add = State()
+    case_image_pick_delete = State()
+    case_image_pick_cover = State()
+    case_image_pick_reorder = State()
+
+    # Разделы кейса (sections) — гибкое содержимое вместо жёстких
+    # task/solution/result.
+    case_sections_menu = State()
+    case_section_add_type = State()
+    case_section_add_title = State()
+    case_section_add_content = State()
+    case_section_pick_edit = State()
+    case_section_edit_field_pick = State()
+    case_section_edit_value = State()
+    case_section_pick_delete = State()
+    case_section_pick_reorder = State()
+
+    change_case_category_pick = State()
+
+    # Опыт работы в "Обо мне" (experience[]).
+    about_experience_menu = State()
+    about_experience_add_role = State()
+    about_experience_add_company = State()
+    about_experience_add_period = State()
+    about_experience_add_description = State()
+    about_experience_pick_delete = State()
+
+    # Заявки (leads).
+    leads_list = State()
+    lead_detail = State()
+    lead_reply_text = State()

@@ -69,3 +69,13 @@ def faq_service_picker_keyboard(services: list[dict]) -> InlineKeyboardMarkup:
     ]
     rows.append([InlineKeyboardButton(text=texts.FAQ_BACK, callback_data="faq:back")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def faq_price_answer_keyboard(faq_item_id: int) -> InlineKeyboardMarkup:
+    """"Назад" с ответа про цену конкретной услуги — возвращает к выбору
+    услуги (предыдущий шаг), а не сразу к полному списку FAQ, как это было
+    бы с faq_back_keyboard(). faq_item_id — id вопроса типа service_price,
+    повторный клик по нему в faq_answer() заново рисует список услуг."""
+    return InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text=texts.FAQ_BACK_TO_SERVICES, callback_data=f"faq:{faq_item_id}")]]
+    )

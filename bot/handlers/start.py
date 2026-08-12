@@ -6,6 +6,7 @@ from aiogram.types import Message
 from bot import config, texts
 from bot.data import load_ui_config
 from bot.keyboards import main_menu_keyboard, webapp_open_keyboard
+from bot.states import BriefStates
 
 router = Router(name="start")
 
@@ -47,8 +48,10 @@ async def cmd_brief(message: Message) -> None:
 
 @router.message(Command("cancel"))
 async def cmd_cancel(message: Message, state: FSMContext) -> None:
+    was_awaiting_file = (await state.get_state()) == BriefStates.awaiting_tz_file.state
     await state.clear()
-    await message.answer("Хорошо, отменил ожидание файла.", reply_markup=_menu_keyboard())
+    text = "Хорошо, отменил ожидание файла." if was_awaiting_file else "Отменять было нечего."
+    await message.answer(text, reply_markup=_menu_keyboard())
 
 
 # Держим последним в этом роутере: любой не распознанный текст — подсказка меню.

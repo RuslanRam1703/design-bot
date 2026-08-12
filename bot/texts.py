@@ -13,6 +13,7 @@ MENU_BRIEF = "✍️ Оставить заявку"
 
 FAQ_INTRO = "Выберите вопрос:"
 FAQ_BACK = "◀️ Ко всем вопросам"
+FAQ_BACK_TO_SERVICES = "◀️ К выбору услуги"
 FAQ_PICK_SERVICE = "По какой услуге подсказать цену?"
 
 MY_ID_TEMPLATE = (
@@ -25,16 +26,30 @@ BRIEF_WEBAPP_HINT = (
     "Заявка собирается в мини-приложении — нажмите кнопку ниже, чтобы открыть форму 👇"
 )
 
-LEAD_RECEIVED_ACK = (
-    "Спасибо! Заявка отправлена 🙌\n"
-    "Я свяжусь с вами в ближайшее время."
-)
+def _lead_ack_header(lead_id: int, service_name: str | None, price_range: str | None) -> list[str]:
+    """Общая шапка подтверждения — номер заявки, услуга, предварительная
+    цена (см. Part 7 ТЗ: клиент должен видеть номер заявки, услугу и
+    предварительную стоимость сразу после отправки, а не только "спасибо")."""
+    lines = [f"Спасибо! Заявка №{lead_id} отправлена 🙌"]
+    if service_name:
+        lines.append(f"Услуга: {service_name}")
+    if price_range:
+        lines.append(f"Предварительная стоимость: {price_range}")
+    return lines
 
-LEAD_ACK_ASK_FILE = (
-    "Спасибо! Заявка отправлена 🙌\n\n"
-    "Вы отметили, что есть подробное ТЗ — пришлите файл следующим сообщением, "
-    "я его посмотрю."
-)
+
+def lead_received_ack(lead_id: int, service_name: str | None, price_range: str | None) -> str:
+    lines = _lead_ack_header(lead_id, service_name, price_range)
+    lines.append("")
+    lines.append("Я свяжусь с вами в ближайшее время.")
+    return "\n".join(lines)
+
+
+def lead_ack_ask_file(lead_id: int, service_name: str | None, price_range: str | None) -> str:
+    lines = _lead_ack_header(lead_id, service_name, price_range)
+    lines.append("")
+    lines.append("Вы отметили, что есть подробное ТЗ — пришлите файл следующим сообщением, я его посмотрю.")
+    return "\n".join(lines)
 
 TZ_FILE_FORWARDED = "Файл получен, спасибо! Я его изучу."
 TZ_FILE_EXPECTED = "Жду файл с ТЗ 📎 (или отправьте /cancel, если передумали)"
