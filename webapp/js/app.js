@@ -455,7 +455,7 @@ function renderCase() {
   const c = state.currentCase;
   const hasImages = c.images && c.images.length > 0;
   const images = hasImages
-    ? c.images.map((src, i) => `<img src="/${src}" alt="" data-lightbox-index="${i}" />`).join("")
+    ? c.images.map((src) => `<img src="/${src}" alt="" />`).join("")
     : `<div class="case-images-empty">Пока нет изображений</div>`;
   // external_url — необязательное поле (см. bot/content_store.py -> CASE_FIELD_LABELS);
   // ссылка показывается, только если дизайнер её заполнил для этого конкретного кейса.
@@ -477,9 +477,6 @@ function renderCase() {
 function attachCaseEvents() {
   document.getElementById("back").addEventListener("click", goBack);
   const c = state.currentCase;
-  document.querySelectorAll("[data-lightbox-index]").forEach((el) =>
-    el.addEventListener("click", () => openLightbox(c.images.map((s) => `/${s}`), Number(el.dataset.lightboxIndex)))
-  );
   document.getElementById("want-similar").addEventListener("click", () => {
     // order_template (см. bot/content_store.py) — снимок service_id + options
     // конкретного кейса, используется только для предзаполнения нового
@@ -501,67 +498,6 @@ function attachCaseEvents() {
     navigate("brief", { resetBrief: true });
   });
 }
-
-// ---- Lightbox: просмотр изображений кейса крупным планом (несколько
-// изображений — стрелки/свайп/счётчик; одно — просто открыть/закрыть) ----
-let lightboxEl = null;
-let lightboxImages = [];
-let lightboxIndex = 0;
-
-function openLightbox(images, index) {
-  lightboxImages = images;
-  lightboxIndex = index;
-  if (!lightboxEl) {
-    lightboxEl = document.createElement("div");
-    lightboxEl.className = "lightbox";
-    lightboxEl.innerHTML = `
-      <button class="lightbox-close" aria-label="Закрыть">✕</button>
-      <button class="lightbox-prev" aria-label="Предыдущее">‹</button>
-      <img alt="" />
-      <button class="lightbox-next" aria-label="Следующее">›</button>
-      <div class="lightbox-counter"></div>
-    `;
-    document.body.appendChild(lightboxEl);
-    lightboxEl.querySelector(".lightbox-close").addEventListener("click", closeLightbox);
-    lightboxEl.querySelector(".lightbox-prev").addEventListener("click", (e) => { e.stopPropagation(); lightboxStep(-1); });
-    lightboxEl.querySelector(".lightbox-next").addEventListener("click", (e) => { e.stopPropagation(); lightboxStep(1); });
-    lightboxEl.addEventListener("click", (e) => { if (e.target === lightboxEl) closeLightbox(); });
-    let touchStartX = null;
-    lightboxEl.addEventListener("touchstart", (e) => { touchStartX = e.touches[0].clientX; });
-    lightboxEl.addEventListener("touchend", (e) => {
-      if (touchStartX === null) return;
-      const dx = e.changedTouches[0].clientX - touchStartX;
-      if (Math.abs(dx) > 40) lightboxStep(dx > 0 ? -1 : 1);
-      touchStartX = null;
-    });
-  }
-  renderLightboxImage();
-  lightboxEl.classList.add("open");
-}
-
-function lightboxStep(delta) {
-  lightboxIndex = (lightboxIndex + delta + lightboxImages.length) % lightboxImages.length;
-  renderLightboxImage();
-}
-
-function renderLightboxImage() {
-  lightboxEl.querySelector("img").src = lightboxImages[lightboxIndex];
-  const multi = lightboxImages.length > 1;
-  lightboxEl.querySelector(".lightbox-counter").textContent = multi ? `${lightboxIndex + 1} / ${lightboxImages.length}` : "";
-  lightboxEl.querySelector(".lightbox-prev").style.display = multi ? "" : "none";
-  lightboxEl.querySelector(".lightbox-next").style.display = multi ? "" : "none";
-}
-
-function closeLightbox() {
-  if (lightboxEl) lightboxEl.classList.remove("open");
-}
-
-document.addEventListener("keydown", (e) => {
-  if (!lightboxEl || !lightboxEl.classList.contains("open")) return;
-  if (e.key === "Escape") closeLightbox();
-  else if (e.key === "ArrowLeft") lightboxStep(-1);
-  else if (e.key === "ArrowRight") lightboxStep(1);
-});
 
 // ---- Экран: Обо мне ----
 function renderAbout() {

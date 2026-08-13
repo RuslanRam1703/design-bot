@@ -172,36 +172,10 @@ a { color: var(--link); text-decoration: none; }
 
 /* ---- Кейс ---- */
 .case-images { display: flex; flex-direction: column; gap: 8px; margin-bottom: 12px; }
-.case-images img { width: 100%; border-radius: var(--radius); display: block; cursor: zoom-in; }
+.case-images img { width: 100%; border-radius: var(--radius); display: block; }
 .case-block { margin-bottom: 14px; }
 .case-block .label { font-size: 12px; text-transform: uppercase; color: var(--hint); margin-bottom: 4px; letter-spacing: .03em; }
 .external-case-link { display: inline-block; margin-bottom: 14px; font-size: 14px; font-weight: 600; }
-
-/* ---- Lightbox: изображение кейса крупным планом ---- */
-.lightbox {
-  position: fixed; inset: 0; background: rgba(0, 0, 0, .9);
-  display: none; align-items: center; justify-content: center;
-  z-index: 100; padding: 24px; cursor: zoom-out;
-}
-.lightbox.open { display: flex; }
-/* width/height: 100% (не max-width/max-height) — иначе картинка не
-   растягивается крупнее своего "естественного" intrinsic-размера
-   (у наших SVG-обложек он всего 600x400) и остаётся маленькой посреди
-   тёмного экрана вместо "как обычное фото на весь экран". object-fit
-   сохраняет пропорции и не даёт растянуть с искажением. */
-.lightbox img { width: 100%; height: 100%; object-fit: contain; border-radius: 8px; }
-.lightbox-close, .lightbox-prev, .lightbox-next {
-  position: absolute; border: none; background: rgba(255, 255, 255, .12); color: #fff;
-  border-radius: 50%; width: 40px; height: 40px; font-size: 20px; cursor: pointer;
-  display: flex; align-items: center; justify-content: center;
-}
-.lightbox-close { top: 16px; right: 16px; }
-.lightbox-prev { left: 16px; top: 50%; transform: translateY(-50%); }
-.lightbox-next { right: 16px; top: 50%; transform: translateY(-50%); }
-.lightbox-counter {
-  position: absolute; bottom: 20px; left: 50%; transform: translateX(-50%);
-  color: #fff; font-size: 13px; background: rgba(255, 255, 255, .12); padding: 4px 10px; border-radius: 999px;
-}
 
 /* ---- Пустые состояния (нет изображений) ---- */
 .case-images-empty {
@@ -218,7 +192,7 @@ a { color: var(--link); text-decoration: none; }
 
 /* ---- Секции кейса (произвольные блоки с галереей) ---- */
 .case-section-gallery { display: flex; flex-direction: column; gap: 8px; }
-.case-section-gallery img { width: 100%; border-radius: var(--radius); display: block; cursor: zoom-in; }
+.case-section-gallery img { width: 100%; border-radius: var(--radius); display: block; }
 
 /* ---- Обо мне ---- */
 .about-header { text-align: center; margin-bottom: 20px; }
