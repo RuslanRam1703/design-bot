@@ -14,20 +14,28 @@ import io
 import json
 import shutil
 import tempfile
+import time
 import unittest
+import urllib.parse
 import zipfile
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
+from aiogram.exceptions import TelegramAPIError
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.base import StorageKey
 from aiogram.fsm.storage.memory import MemoryStorage
 
+import bot.admin_keyboards as kb
 import bot.content_store as content_store
 import bot.handlers.admin as admin
 import bot.handlers.faq as faq
 import bot.handlers.webapp as webapp
+import bot.handlers.start as start
+import bot.flow as flow
+import bot.telegram_auth as telegram_auth
+import bot.webserver as webserver
 from bot.states import AdminStates, BriefStates
 
 
@@ -232,6 +240,217 @@ def make_callback(data: str, chat_id: int = 777) -> SimpleNamespace:
         message=SimpleNamespace(chat=SimpleNamespace(id=chat_id), edit_text=AsyncMock()),
         answer=AsyncMock(),
     )
+
+
+def make_flow_message(chat_id: int = 888, text: str | None = "/start", delete_raises: bool = False) -> SimpleNamespace:
+    """Для bot/flow.py — message.delete (может кидать TelegramAPIError best-
+    effort), message.answer возвращает объект с message_id/chat, message.bot
+    с delete_message/edit_message_text (тоже async, тоже могут кидать)."""
+    async def _delete():
+        if delete_raises:
+            raise TelegramAPIError(method=None, message="can't delete")
+
+    sent = SimpleNamespace(message_id=555, chat=SimpleNamespace(id=chat_id))
+    return SimpleNamespace(
+        chat=SimpleNamespace(id=chat_id),
+        text=text,
+        delete=_delete,
+        answer=AsyncMock(return_value=sent),
+        bot=SimpleNamespace(delete_message=AsyncMock(), edit_message_text=AsyncMock()),
+    )
+
+
+class FlowUtilTests(unittest.IsolatedAsyncioTestCase):
+    """bot/flow.py — принцип перенесён из Personal Assistant
+    (src/bot/utils/flow.py), не придуман заново. Все три правила: триггер
+    удаляется, старый корневой экран удаляется при открытии нового, шаги
+    внутри сценария редактируют одно сообщение. Удаления — best-effort."""
+
+    async def test_open_flow_deletes_previous_anchor_and_trigger_then_tracks_new_message(self):
+        state = make_state()
+        await state.update_data(_flow_msg_id=111, _flow_chat_id=888)
+        msg = make_flow_message()
+
+        await flow.open_flow(msg, state, "Новый экран")
+
+        msg.bot.delete_message.assert_awaited_once_with(chat_id=888, message_id=111)  # RULE 2
+        msg.answer.assert_awaited_once_with("Новый экран", reply_markup=None)
+        data = await state.get_data()
+        self.assertEqual(data["_flow_msg_id"], 555)  # новое сообщение стало текущим экраном
+
+    async def test_open_flow_survives_delete_failures_best_effort(self):
+        state = make_state()
+        await state.update_data(_flow_msg_id=111, _flow_chat_id=888)
+        msg = make_flow_message(delete_raises=True)
+        msg.bot.delete_message = AsyncMock(side_effect=TelegramAPIError(method=None, message="too old"))
+
+        await flow.open_flow(msg, state, "Новый экран")  # не должно упасть
+
+        msg.answer.assert_awaited_once()
+
+    async def test_step_from_callback_edits_in_place_not_sending_new_message(self):
+        state = make_state()
+        cb = make_callback("x", chat_id=888)
+        cb.message.message_id = 999
+        await flow.step_from_callback(cb, state, "Шаг 2")
+        cb.message.edit_text.assert_awaited_once_with("Шаг 2", reply_markup=None)
+
+    async def test_step_from_text_deletes_user_message_and_edits_anchor(self):
+        state = make_state()
+        await state.update_data(_flow_msg_id=555, _flow_chat_id=888)
+        msg = make_flow_message(text="мой ответ")
+
+        await flow.step_from_text(msg, state, "Шаг 3")
+
+        msg.bot.edit_message_text.assert_awaited_once_with("Шаг 3", chat_id=888, message_id=555, reply_markup=None)
+        msg.answer.assert_not_awaited()  # редактируем существующее, не шлём новое
+
+    async def test_step_from_text_falls_back_to_new_message_when_edit_fails(self):
+        state = make_state()
+        await state.update_data(_flow_msg_id=555, _flow_chat_id=888)
+        msg = make_flow_message(text="мой ответ")
+        msg.bot.edit_message_text = AsyncMock(side_effect=TelegramAPIError(method=None, message="message not found"))
+
+        await flow.step_from_text(msg, state, "Шаг 3")
+
+        msg.answer.assert_awaited_once_with("Шаг 3", reply_markup=None)
+
+    async def test_open_root_clears_fsm_state(self):
+        state = make_state()
+        await state.set_state(AdminStates.edit_case_field_pick)
+        msg = make_flow_message()
+
+        await flow.open_root(msg, state, "Главное меню")
+
+        self.assertIsNone(await state.get_state())
+
+
+class StartHandlerCleanupTests(unittest.IsolatedAsyncioTestCase):
+    """Реальные хендлеры bot/handlers/start.py, переведённые на flow.py —
+    /start реально пытается удалить триггер и предыдущий корневой экран,
+    а не просто существует в коде."""
+
+    async def test_cmd_start_deletes_trigger_and_tracks_new_root_screen(self):
+        state = make_state()
+        msg = make_flow_message(text="/start")
+        await start.cmd_start(msg, state)
+        msg.answer.assert_awaited_once()
+        data = await state.get_data()
+        self.assertEqual(data["_flow_msg_id"], 555)
+
+    async def test_second_root_command_deletes_first_root_screen(self):
+        state = make_state()
+        msg1 = make_flow_message(text="/start")
+        await start.cmd_start(msg1, state)
+
+        msg2 = make_flow_message(text="/portfolio")
+        await start.cmd_portfolio(msg2, state)
+
+        msg2.bot.delete_message.assert_awaited_once_with(chat_id=888, message_id=555)
+
+    async def test_fallback_text_deletes_stray_message_and_shows_menu(self):
+        state = make_state()
+        msg = make_flow_message(text="случайный текст")
+        await start.fallback_text(msg, state)
+        msg.answer.assert_awaited_once()
+
+
+class AdminCleanupFlowTests(unittest.IsolatedAsyncioTestCase):
+    """/admin (flow.open_root) и мастер добавления FAQ (flow.step_from_text)
+    — переведены на bot/flow.py как точечный пример RULE 1-3 в админке;
+    реальные хендлеры, не мок логики."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        real_data_dir = Path(__file__).resolve().parent.parent / "data"
+        for name in ("pricing.json", "portfolio.json", "faq.json", "about.json", "ui_config.json"):
+            shutil.copy(real_data_dir / name, Path(self.tmpdir) / name)
+        self._orig_data_dir = content_store.DATA_DIR
+        self._orig_designer = content_store.config.DESIGNER_CHAT_ID
+        content_store.DATA_DIR = Path(self.tmpdir)
+        content_store.config.DESIGNER_CHAT_ID = "888"
+        self.actor = 888
+
+    def tearDown(self):
+        content_store.DATA_DIR = self._orig_data_dir
+        content_store.config.DESIGNER_CHAT_ID = self._orig_designer
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    async def test_admin_command_deletes_trigger_and_previous_root(self):
+        state = make_state(self.actor)
+        msg1 = make_flow_message(chat_id=self.actor, text="/admin")
+        await admin.cmd_admin(msg1, state)
+        msg1.answer.assert_awaited_once()
+
+        msg2 = make_flow_message(chat_id=self.actor, text="/admin")
+        await admin.cmd_admin(msg2, state)
+        msg2.bot.delete_message.assert_awaited_once_with(chat_id=self.actor, message_id=555)
+
+    async def test_faq_add_wizard_edits_one_message_across_steps(self):
+        state = make_state(self.actor)
+        cb = make_callback("adminfaqaction:add", chat_id=self.actor)
+        cb.message.message_id = 555
+        await admin.faq_add_start(cb, state)
+        cb.message.edit_text.assert_awaited_once_with("Текст вопроса:", reply_markup=kb.cancel_keyboard())
+
+        q_msg = make_flow_message(chat_id=self.actor, text="Сколько стоит лендинг?")
+        await admin.faq_add_question(q_msg, state)
+        # редактирует существующий anchor (555), а не шлёт новое сообщение
+        q_msg.bot.edit_message_text.assert_awaited_once_with("Текст ответа:", chat_id=self.actor, message_id=555, reply_markup=kb.cancel_keyboard())
+        q_msg.answer.assert_not_awaited()
+
+        a_msg = make_flow_message(chat_id=self.actor, text="От 25 000 рублей")
+        await admin.faq_add_answer(a_msg, state)
+        a_msg.bot.edit_message_text.assert_awaited_once()
+        a_msg.answer.assert_not_awaited()
+
+        faq_items = content_store.list_faq()
+        self.assertTrue(any(i["question"] == "Сколько стоит лендинг?" and i["answer"] == "От 25 000 рублей" for i in faq_items))
+
+
+class AdminLeadsFullSequenceTests(unittest.IsolatedAsyncioTestCase):
+    """TEST D из ТЗ: /admin -> Заявки -> открыть -> изменить статус ->
+    вернуться, одной непрерывной последовательностью реальных хендлеров
+    (не по отдельности), с проверкой persistence на каждом шаге."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        real_data_dir = Path(__file__).resolve().parent.parent / "data"
+        for name in ("pricing.json", "portfolio.json", "faq.json", "about.json", "ui_config.json"):
+            shutil.copy(real_data_dir / name, Path(self.tmpdir) / name)
+        self._orig_data_dir = content_store.DATA_DIR
+        self._orig_designer = content_store.config.DESIGNER_CHAT_ID
+        content_store.DATA_DIR = Path(self.tmpdir)
+        content_store.config.DESIGNER_CHAT_ID = "888"
+        self.actor = 888
+        self.lead = content_store.add_lead(
+            {"service_name": "Лендинг", "task_description": "Тест"},
+            {"user_id": 55555, "username": "client", "first_name": "Клиент"},
+        )
+
+    def tearDown(self):
+        content_store.DATA_DIR = self._orig_data_dir
+        content_store.config.DESIGNER_CHAT_ID = self._orig_designer
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    async def test_list_open_change_status_back_persists_across_steps(self):
+        state = make_state(self.actor)
+
+        await admin.menu_leads(make_callback("adminmenu:leads", chat_id=self.actor), state)
+        self.assertEqual(await state.get_state(), AdminStates.leads_list.state)
+
+        await admin.lead_open_detail(make_callback(f"adminleadpick:{self.lead['id']}", chat_id=self.actor), state)
+        self.assertEqual(await state.get_state(), AdminStates.lead_detail.state)
+        self.assertEqual(content_store.get_lead(self.lead["id"])["status"], "NEW")
+
+        await admin.lead_change_status(make_callback("adminleadstatus:IN_PROGRESS", chat_id=self.actor), state)
+        self.assertEqual(content_store.get_lead(self.lead["id"])["status"], "IN_PROGRESS")  # реально сохранилось
+
+        await admin.lead_back_to_list(make_callback("adminleadaction:back", chat_id=self.actor), state)
+        self.assertEqual(await state.get_state(), AdminStates.leads_list.state)
+
+        # Статус пережил весь проход, не только момент смены
+        self.assertEqual(content_store.get_lead(self.lead["id"])["status"], "IN_PROGRESS")
 
 
 class AdminCancelIntegrationTests(unittest.IsolatedAsyncioTestCase):
@@ -1049,6 +1268,155 @@ class ParseNumberBoundsTests(unittest.TestCase):
     def test_round_to_rejects_zero_via_stricter_min_value(self):
         self.assertIsNone(admin._parse_number("0", min_value=0.01))
         self.assertEqual(admin._parse_number("500", min_value=0.01), 500)
+
+
+def _sign_init_data(fields: dict, bot_token: str) -> str:
+    """Независимая от bot/telegram_auth.py конструкция валидной initData —
+    по тому же документированному алгоритму Telegram, но написана отдельно
+    здесь, чтобы тест реально проверял правильность реализации, а не просто
+    проверял, что функция согласна сама с собой."""
+    import hashlib as _hashlib
+    import hmac as _hmac
+
+    check_string = "\n".join(f"{k}={v}" for k, v in sorted(fields.items()))
+    secret_key = _hmac.new(b"WebAppData", bot_token.encode("utf-8"), _hashlib.sha256).digest()
+    h = _hmac.new(secret_key, check_string.encode("utf-8"), _hashlib.sha256).hexdigest()
+    signed = dict(fields)
+    signed["hash"] = h
+    return urllib.parse.urlencode(signed)
+
+
+class TelegramInitDataValidationTests(unittest.TestCase):
+    """"Мои заявки" не должны доверять user_id, переданному напрямую —
+    только проверенному через initData (см. Part 8 ТЗ). Это криптографии
+    касается напрямую, поэтому проверяем и "правильная подпись проходит",
+    и — важнее — все пути отказа."""
+
+    BOT_TOKEN = "123456:test-token-not-real"
+
+    def _valid_fields(self, user_id=777, auth_date=None):
+        if auth_date is None:
+            auth_date = int(time.time())
+        return {
+            "auth_date": str(auth_date),
+            "query_id": "AAEtest",
+            "user": json.dumps({"id": user_id, "first_name": "Клиент", "username": "client1"}),
+        }
+
+    def test_correctly_signed_init_data_is_accepted(self):
+        init_data = _sign_init_data(self._valid_fields(user_id=42), self.BOT_TOKEN)
+        user = telegram_auth.validate_init_data(init_data, self.BOT_TOKEN)
+        self.assertIsNotNone(user)
+        self.assertEqual(user["id"], 42)
+
+    def test_tampered_user_id_is_rejected(self):
+        init_data = _sign_init_data(self._valid_fields(user_id=42), self.BOT_TOKEN)
+        # Подменяем user на чужой ПОСЛЕ подписи (не пересчитывая hash) — как
+        # если бы кто-то пытался запросить чужие заявки, просто изменив
+        # параметр в уже сформированном запросе. Парсим/меняем/пересобираем
+        # через тот же urlencode, а не строковый replace — иначе экранирование
+        # может не совпасть и подмена молча не сработает.
+        parsed = dict(urllib.parse.parse_qsl(init_data))
+        parsed["user"] = json.dumps({"id": 999, "first_name": "Клиент", "username": "client1"})
+        tampered = urllib.parse.urlencode(parsed)
+        self.assertIsNone(telegram_auth.validate_init_data(tampered, self.BOT_TOKEN))
+
+    def test_wrong_bot_token_is_rejected(self):
+        init_data = _sign_init_data(self._valid_fields(), self.BOT_TOKEN)
+        self.assertIsNone(telegram_auth.validate_init_data(init_data, "999999:another-token"))
+
+    def test_missing_hash_is_rejected(self):
+        fields = self._valid_fields()
+        self.assertIsNone(telegram_auth.validate_init_data(urllib.parse.urlencode(fields), self.BOT_TOKEN))
+
+    def test_expired_auth_date_is_rejected(self):
+        old = int(time.time()) - 3 * 86400  # 3 дня назад
+        init_data = _sign_init_data(self._valid_fields(auth_date=old), self.BOT_TOKEN)
+        self.assertIsNone(telegram_auth.validate_init_data(init_data, self.BOT_TOKEN, max_age_seconds=86400))
+
+    def test_empty_or_garbage_input_is_rejected_not_crashing(self):
+        self.assertIsNone(telegram_auth.validate_init_data("", self.BOT_TOKEN))
+        self.assertIsNone(telegram_auth.validate_init_data("not a valid query string ===", self.BOT_TOKEN))
+        self.assertIsNone(telegram_auth.validate_init_data("hash=abc&auth_date=123", self.BOT_TOKEN))
+
+
+class MyLeadsFilteringTests(unittest.TestCase):
+    """list_leads_by_user — User A никогда не должен получить заявки User B."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        real_data_dir = Path(__file__).resolve().parent.parent / "data"
+        for name in ("pricing.json", "portfolio.json", "faq.json", "about.json", "ui_config.json"):
+            shutil.copy(real_data_dir / name, Path(self.tmpdir) / name)
+        self._orig_data_dir = content_store.DATA_DIR
+        content_store.DATA_DIR = Path(self.tmpdir)
+
+    def tearDown(self):
+        content_store.DATA_DIR = self._orig_data_dir
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def test_user_a_does_not_see_user_b_leads(self):
+        lead_a = content_store.add_lead({"service_name": "Лендинг"}, {"user_id": 111, "username": "a"})
+        lead_b = content_store.add_lead({"service_name": "Сайт"}, {"user_id": 222, "username": "b"})
+
+        leads_for_a = content_store.list_leads_by_user(111)
+        leads_for_b = content_store.list_leads_by_user(222)
+
+        self.assertEqual([l["id"] for l in leads_for_a], [lead_a["id"]])
+        self.assertEqual([l["id"] for l in leads_for_b], [lead_b["id"]])
+        self.assertNotIn(lead_b["id"], [l["id"] for l in leads_for_a])
+
+    def test_unknown_user_gets_empty_list_not_error(self):
+        content_store.add_lead({"service_name": "Лендинг"}, {"user_id": 111, "username": "a"})
+        self.assertEqual(content_store.list_leads_by_user(999999), [])
+
+    def test_leads_sorted_newest_first(self):
+        first = content_store.add_lead({"service_name": "A"}, {"user_id": 111})
+        second = content_store.add_lead({"service_name": "B"}, {"user_id": 111})
+        leads = content_store.list_leads_by_user(111)
+        self.assertEqual([l["id"] for l in leads], [second["id"], first["id"]])
+
+
+class MyLeadsHttpEndpointTests(unittest.IsolatedAsyncioTestCase):
+    """/api/my-leads через реальный aiohttp-хендлер (не мок логики) — с
+    правильной initData отдаёт только свои заявки, без нее — 401, не 500."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        real_data_dir = Path(__file__).resolve().parent.parent / "data"
+        for name in ("pricing.json", "portfolio.json", "faq.json", "about.json", "ui_config.json"):
+            shutil.copy(real_data_dir / name, Path(self.tmpdir) / name)
+        self._orig_data_dir = content_store.DATA_DIR
+        self._orig_token = webserver.config.BOT_TOKEN
+        content_store.DATA_DIR = Path(self.tmpdir)
+        webserver.config.BOT_TOKEN = "123456:test-token-not-real"
+
+    def tearDown(self):
+        content_store.DATA_DIR = self._orig_data_dir
+        webserver.config.BOT_TOKEN = self._orig_token
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    async def test_endpoint_returns_only_authenticated_users_leads(self):
+        from aiohttp.test_utils import TestClient, TestServer
+
+        content_store.add_lead({"service_name": "Лендинг"}, {"user_id": 555, "username": "me"})
+        content_store.add_lead({"service_name": "Сайт"}, {"user_id": 666, "username": "other"})
+
+        init_data = _sign_init_data(
+            {"auth_date": str(int(time.time())), "user": json.dumps({"id": 555, "first_name": "Я"})},
+            webserver.config.BOT_TOKEN,
+        )
+
+        app = webserver.create_app()
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.get("/api/my-leads", headers={"X-Telegram-Init-Data": init_data})
+            self.assertEqual(resp.status, 200)
+            body = await resp.json()
+            self.assertEqual(len(body), 1)
+            self.assertEqual(body[0]["payload"]["service_name"], "Лендинг")
+
+            resp_no_auth = await client.get("/api/my-leads")
+            self.assertEqual(resp_no_auth.status, 401)
 
 
 if __name__ == "__main__":

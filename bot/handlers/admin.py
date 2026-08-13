@@ -24,7 +24,7 @@ from aiogram.fsm.state import State
 from aiogram.types import BufferedInputFile, CallbackQuery, InlineKeyboardMarkup, Message
 
 from bot import admin_keyboards as kb
-from bot import config, content_store
+from bot import config, content_store, flow
 from bot import lead as lead_format
 from bot.states import AdminStates
 
@@ -122,8 +122,7 @@ def _admin_root_text() -> str:
 
 @router.message(Command("admin"))
 async def cmd_admin(message: Message, state: FSMContext) -> None:
-    await state.clear()
-    await message.answer(_admin_root_text(), reply_markup=kb.admin_root_keyboard())
+    await flow.open_root(message, state, _admin_root_text(), kb.admin_root_keyboard())
 
 
 @router.callback_query(F.data == "admincancel")
@@ -683,7 +682,11 @@ async def cases_delete_do(callback: CallbackQuery, state: FSMContext) -> None:
 
 @router.callback_query(F.data == "adminfaqaction:add")
 async def faq_add_start(callback: CallbackQuery, state: FSMContext) -> None:
-    await callback.message.edit_text("Текст вопроса:", reply_markup=kb.cancel_keyboard())
+    # Продемонстрированный пример RULE 3 (flow.py) — шаги мастера
+    # редактируют одно сообщение вместо накопления новых. Остальные
+    # текстовые мастера в этом файле пока НЕ переведены (см. отчёт) —
+    # это точечный перенос принципа, не массовый рефакторинг.
+    await flow.step_from_callback(callback, state, "Текст вопроса:", kb.cancel_keyboard())
     await state.update_data(cancel_to="faq")
     await state.set_state(AdminStates.add_faq_question)
     await callback.answer()
@@ -692,7 +695,7 @@ async def faq_add_start(callback: CallbackQuery, state: FSMContext) -> None:
 @router.message(AdminStates.add_faq_question, F.text)
 async def faq_add_question(message: Message, state: FSMContext) -> None:
     await state.update_data(question=message.text.strip())
-    await message.answer("Текст ответа:", reply_markup=kb.cancel_keyboard())
+    await flow.step_from_text(message, state, "Текст ответа:", kb.cancel_keyboard())
     await state.set_state(AdminStates.add_faq_answer)
 
 
@@ -700,8 +703,8 @@ async def faq_add_question(message: Message, state: FSMContext) -> None:
 async def faq_add_answer(message: Message, state: FSMContext) -> None:
     data = await state.get_data()
     item = content_store.add_faq(message.chat.id, data["question"], message.text.strip())
-    await state.clear()
-    await message.answer(f"Вопрос №{item['id']} добавлен ✅", reply_markup=kb.admin_faq_menu_keyboard())
+    await flow.step_from_text(message, state, f"Вопрос №{item['id']} добавлен ✅", kb.admin_faq_menu_keyboard())
+    await state.set_state(None)  # не state.clear() — flow хранит id текущего экрана в data для RULE 2
 
 
 @router.callback_query(F.data == "adminfaqaction:edit")
@@ -1506,6 +1509,30 @@ async def lead_back_to_list(callback: CallbackQuery, state: FSMContext) -> None:
     status = data.get("lead_filter", "ALL")
     leads = content_store.list_leads(status)
     await callback.message.edit_text(f"Заявки ({len(leads)}):", reply_markup=kb.leads_list_keyboard(leads, status))
+    await state.set_state(AdminStates.leads_list)
+    await callback.answer()
+
+
+@router.callback_query(AdminStates.lead_detail, F.data == "adminleadaction:delete")
+async def lead_delete_start(callback: CallbackQuery, state: FSMContext) -> None:
+    data = await state.get_data()
+    await callback.message.edit_text(
+        f"Удалить заявку #{data['lead_id']}? Это необратимо.", reply_markup=kb.confirm_keyboard("admindelleadconfirm")
+    )
+    await state.set_state(AdminStates.lead_delete_confirm)
+    await callback.answer()
+
+
+@router.callback_query(AdminStates.lead_delete_confirm, F.data.startswith("admindelleadconfirm:"))
+async def lead_delete_do(callback: CallbackQuery, state: FSMContext) -> None:
+    answer = callback.data.split(":", 1)[1]
+    data = await state.get_data()
+    status = data.get("lead_filter", "ALL")
+    if answer == "yes":
+        content_store.delete_lead(callback.message.chat.id, data["lead_id"])
+    leads = content_store.list_leads(status)
+    text = f"Заявка удалена ✅\n\nЗаявки ({len(leads)}):" if answer == "yes" else f"Отменено.\n\nЗаявки ({len(leads)}):"
+    await callback.message.edit_text(text, reply_markup=kb.leads_list_keyboard(leads, status))
     await state.set_state(AdminStates.leads_list)
     await callback.answer()
 

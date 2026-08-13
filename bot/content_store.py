@@ -783,6 +783,15 @@ def list_leads(status: str | None = None) -> list[dict]:
     return sorted(leads, key=lambda l: l["id"], reverse=True)
 
 
+def list_leads_by_user(user_id: int) -> list[dict]:
+    """Для клиентского "Мои заявки" — user_id должен быть уже проверен через
+    bot.telegram_auth.validate_init_data ДО вызова этой функции, здесь
+    доверие к нему не проверяется повторно (это ответственность вызывающего
+    HTTP-хендлера, не хранилища)."""
+    leads = [l for l in _read_leads() if l.get("telegram", {}).get("user_id") == user_id]
+    return sorted(leads, key=lambda l: l["id"], reverse=True)
+
+
 def get_lead(lead_id: int) -> dict | None:
     return next((l for l in _read_leads() if l["id"] == lead_id), None)
 
@@ -797,6 +806,17 @@ def update_lead_status(actor_chat_id: int | str, lead_id: int, status: str) -> b
         return False
     lead["status"] = status
     lead["updated_at"] = datetime.now(timezone.utc).isoformat()
+    _write_leads(leads)
+    return True
+
+
+def delete_lead(actor_chat_id: int | str, lead_id: int) -> bool:
+    _require_designer(actor_chat_id)
+    leads = _read_leads()
+    before = len(leads)
+    leads = [l for l in leads if l["id"] != lead_id]
+    if len(leads) == before:
+        return False
     _write_leads(leads)
     return True
 

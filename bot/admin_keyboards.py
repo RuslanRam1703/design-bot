@@ -408,6 +408,7 @@ def lead_detail_keyboard(lead: dict) -> InlineKeyboardMarkup:
     username = lead["telegram"].get("username")
     if username:
         rows.append([InlineKeyboardButton(text="🔗 Открыть в Telegram", url=f"https://t.me/{username}")])
+    rows.append([InlineKeyboardButton(text="🗑 Удалить заявку", callback_data="adminleadaction:delete")])
     rows.append([InlineKeyboardButton(text="◀️ К списку заявок", callback_data="adminleadaction:back")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 

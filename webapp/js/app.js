@@ -44,6 +44,11 @@ const TG = {
   // лайтбокс работает в обычном (не полноэкранном) режиме Mini App.
   themeParams() { return realTG?.themeParams || {}; },
   colorScheme() { return realTG?.colorScheme || "light"; },
+  // initData — подписанный Telegram'ом пакет (user/auth_date/hash), сервер
+  // проверяет подпись перед тем как поверить user_id (см. "Мои заявки",
+  // bot/telegram_auth.py). Вне настоящего Telegram (обычный браузер) пусто —
+  // это ожидаемо, а не ошибка, экран "Мои заявки" должен это учитывать.
+  initData() { return realTG?.initData || ""; },
   onThemeChanged(cb) { realTG?.onEvent("themeChanged", cb); },
   backButton: {
     show(onClick) {
@@ -93,6 +98,7 @@ const state = {
   history: [],
   filter: "all",
   currentCase: null,
+  myLeads: { status: "idle", items: [], selected: null }, // status: idle | loading | loaded | error | no-telegram
   calc: { serviceId: null, openGroupId: null, options: {}, urgent: false, complex: false },
   brief: {
     step: 1,
@@ -109,6 +115,7 @@ const state = {
     tzDetails: { goal: "", mustHave: "", avoid: "", references: "" },
     calc: null,
     source: "direct", // "direct" | "case" | "calculator" | "about" — откуда пришли в заявку, для дизайнера в уведомлении
+    sourceCaseId: null,
     sourceCaseTitle: null,
     // Заказ (Order Builder) — конфигурация услуги теперь часть шага 1 брифа,
     // а не отдельного экрана калькулятора (см. renderBrief() step 1).
@@ -215,6 +222,7 @@ function resetBriefState({ hardReset = false } = {}) {
     tzDetails: { goal: "", mustHave: "", avoid: "", references: "" },
     calc: hardReset ? null : state.brief.calc,
     source: hardReset ? "direct" : (state.brief.source || "direct"),
+    sourceCaseId: hardReset ? null : (state.brief.sourceCaseId || null),
     sourceCaseTitle: hardReset ? null : (state.brief.sourceCaseTitle || null),
     orderOptions: hardReset ? {} : (state.brief.orderOptions || {}),
     urgent: hardReset ? false : (state.brief.urgent || false),
@@ -257,11 +265,13 @@ async function init() {
   const initialScreen = path.endsWith("/calculator") ? "calculator"
     : path.endsWith("/brief") ? "brief"
     : path.endsWith("/about") ? "about"
+    : path.endsWith("/myleads") ? "myleads"
     : path.endsWith("/portfolio") ? "portfolio"
     : params.get("screen");
   if (initialScreen === "calculator") state.screen = "calculator";
   else if (initialScreen === "brief") state.screen = "brief";
   else if (initialScreen === "about") state.screen = "about";
+  else if (initialScreen === "myleads") state.screen = "myleads";
   else state.screen = "portfolio";
 
   // Если админ выключил именно этот экран в /admin -> Меню и навигация —
@@ -284,6 +294,7 @@ const TAB_SCREENS = [
   { id: "portfolio", icon: "📁", label: "Портфолио" },
   { id: "about", icon: "👤", label: "Обо мне" },
   { id: "brief", icon: "✍️", label: "Заявка" },
+  { id: "myleads", icon: "📋", label: "Мои заявки" },
 ];
 
 function renderTabBar() {
@@ -349,6 +360,10 @@ function render() {
       content = renderBrief();
       TG.backButton.show(goBack);
       break;
+    case "myleads":
+      content = renderMyLeads();
+      TG.backButton.hide();
+      break;
     case "submitted":
       content = renderSubmitted();
       TG.backButton.hide();
@@ -367,6 +382,7 @@ function render() {
     case "about": attachAboutEvents(); break;
     case "calculator": attachCalculatorEvents(); break;
     case "brief": attachBriefEvents(); break;
+    case "myleads": attachMyLeadsEvents(); break;
   }
   if (showTabBar) attachTabBarEvents();
 
@@ -455,7 +471,7 @@ function renderCase() {
   const c = state.currentCase;
   const hasImages = c.images && c.images.length > 0;
   const images = hasImages
-    ? c.images.map((src) => `<img src="/${src}" alt="" />`).join("")
+    ? c.images.map((src, i) => `<img src="/${src}" alt="" data-lightbox-index="${i}" />`).join("")
     : `<div class="case-images-empty">Пока нет изображений</div>`;
   // external_url — необязательное поле (см. bot/content_store.py -> CASE_FIELD_LABELS);
   // ссылка показывается, только если дизайнер её заполнил для этого конкретного кейса.
@@ -477,6 +493,9 @@ function renderCase() {
 function attachCaseEvents() {
   document.getElementById("back").addEventListener("click", goBack);
   const c = state.currentCase;
+  document.querySelectorAll("[data-lightbox-index]").forEach((el) =>
+    el.addEventListener("click", () => openLightbox(c.images.map((s) => `/${s}`), Number(el.dataset.lightboxIndex)))
+  );
   document.getElementById("want-similar").addEventListener("click", () => {
     // order_template (см. bot/content_store.py) — снимок service_id + options
     // конкретного кейса, используется только для предзаполнения нового
@@ -488,6 +507,7 @@ function attachCaseEvents() {
     state.brief.serviceName = service?.name || null;
     state.brief.calc = null;
     state.brief.source = "case";
+    state.brief.sourceCaseId = c.id;
     state.brief.sourceCaseTitle = c.title;
     state.brief.orderOptions = {};
     if (template && service) {
@@ -498,6 +518,71 @@ function attachCaseEvents() {
     navigate("brief", { resetBrief: true });
   });
 }
+
+// ---- Lightbox: просмотр изображений кейса крупным планом (несколько
+// изображений — стрелки/свайп/счётчик; одно — просто открыть/закрыть).
+// Без requestFullscreen() — пробовали раньше, в реальном Telegram-клиенте
+// exitFullscreen() при закрытии закрывал весь Mini App целиком, а не
+// только картинку (живой баг, воспроизведённый пользователем). Работает
+// в обычном (не полноэкранном) режиме Mini App. ----
+let lightboxEl = null;
+let lightboxImages = [];
+let lightboxIndex = 0;
+
+function openLightbox(images, index) {
+  lightboxImages = images;
+  lightboxIndex = index;
+  if (!lightboxEl) {
+    lightboxEl = document.createElement("div");
+    lightboxEl.className = "lightbox";
+    lightboxEl.innerHTML = `
+      <button class="lightbox-close" aria-label="Закрыть">✕</button>
+      <button class="lightbox-prev" aria-label="Предыдущее">‹</button>
+      <img alt="" />
+      <button class="lightbox-next" aria-label="Следующее">›</button>
+      <div class="lightbox-counter"></div>
+    `;
+    document.body.appendChild(lightboxEl);
+    lightboxEl.querySelector(".lightbox-close").addEventListener("click", closeLightbox);
+    lightboxEl.querySelector(".lightbox-prev").addEventListener("click", (e) => { e.stopPropagation(); lightboxStep(-1); });
+    lightboxEl.querySelector(".lightbox-next").addEventListener("click", (e) => { e.stopPropagation(); lightboxStep(1); });
+    lightboxEl.addEventListener("click", (e) => { if (e.target === lightboxEl) closeLightbox(); });
+    let touchStartX = null;
+    lightboxEl.addEventListener("touchstart", (e) => { touchStartX = e.touches[0].clientX; });
+    lightboxEl.addEventListener("touchend", (e) => {
+      if (touchStartX === null) return;
+      const dx = e.changedTouches[0].clientX - touchStartX;
+      if (Math.abs(dx) > 40) lightboxStep(dx > 0 ? -1 : 1);
+      touchStartX = null;
+    });
+  }
+  renderLightboxImage();
+  lightboxEl.classList.add("open");
+}
+
+function lightboxStep(delta) {
+  lightboxIndex = (lightboxIndex + delta + lightboxImages.length) % lightboxImages.length;
+  renderLightboxImage();
+}
+
+function renderLightboxImage() {
+  lightboxEl.querySelector("img").src = lightboxImages[lightboxIndex];
+  const multi = lightboxImages.length > 1;
+  lightboxEl.querySelector(".lightbox-counter").textContent = multi ? `${lightboxIndex + 1} / ${lightboxImages.length}` : "";
+  lightboxEl.querySelector(".lightbox-prev").style.display = multi ? "" : "none";
+  lightboxEl.querySelector(".lightbox-next").style.display = multi ? "" : "none";
+}
+
+function closeLightbox() {
+  if (lightboxEl) lightboxEl.classList.remove("open");
+}
+
+document.addEventListener("keydown", (e) => {
+  if (!lightboxEl || !lightboxEl.classList.contains("open")) return;
+  if (e.key === "Escape") closeLightbox();
+  else if (e.key === "ArrowLeft") lightboxStep(-1);
+  else if (e.key === "ArrowRight") lightboxStep(1);
+});
 
 // ---- Экран: Обо мне ----
 function renderAbout() {
@@ -609,6 +694,7 @@ function attachAboutEvents() {
   const cta = document.getElementById("about-cta");
   if (cta) cta.addEventListener("click", () => {
     state.brief.source = "about";
+    state.brief.sourceCaseId = null;
     state.brief.sourceCaseTitle = null;
     navigate("brief", { resetBrief: true });
   });
@@ -707,6 +793,7 @@ function attachCalculatorEvents() {
       complex: state.calc.complex,
     };
     state.brief.source = "calculator";
+    state.brief.sourceCaseId = null;
     state.brief.sourceCaseTitle = null;
     navigate("brief", { resetBrief: true });
   });
@@ -1077,6 +1164,7 @@ function submitBrief() {
     } : null,
     calc: state.brief.calc,
     source: state.brief.source || "direct",
+    source_case_id: state.brief.sourceCaseId || null,
     source_case_title: state.brief.sourceCaseTitle || null,
     // draft_id — тот же на протяжении одного заказа (включая "Дополнить
     // информацию" после отправки); бэкенд обновляет существующую заявку по
@@ -1294,6 +1382,152 @@ function wrapBrief(body, step) {
     ${body}
     ${nav}
   `;
+}
+
+// ---- Экран: Мои заявки ----
+// Клиент видит ТОЛЬКО свои заявки. user_id никогда не передаётся с клиента
+// напрямую — сервер проверяет подпись Telegram initData и сам достаёт
+// authenticated user_id оттуда (см. bot/telegram_auth.py, /api/my-leads).
+// Вне настоящего Telegram (обычный браузер) initData пусто — это ожидаемо,
+// а не ошибка: сервер вернёт 401, экран должен показать понятное
+// объяснение, а не выглядеть сломанным.
+const MY_LEAD_STATUS_LABELS = {
+  NEW: "🆕 Новая",
+  VIEWED: "👀 Просмотрена",
+  IN_PROGRESS: "💬 В работе",
+  WAITING_CLIENT: "⏸ Ожидание информации",
+  DONE: "✅ Завершена",
+  CANCELLED: "❌ Отменена",
+};
+
+async function fetchMyLeads() {
+  const initData = TG.initData();
+  if (!initData) {
+    state.myLeads.status = "no-telegram";
+    render();
+    return;
+  }
+  state.myLeads.status = "loading";
+  render();
+  try {
+    const res = await fetch("/api/my-leads", { headers: { "X-Telegram-Init-Data": initData } });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    state.myLeads.items = await res.json();
+    state.myLeads.status = "loaded";
+  } catch (e) {
+    state.myLeads.status = "error";
+  }
+  render();
+}
+
+function renderMyLeads() {
+  const m = state.myLeads;
+  const header = `<div class="topbar"><h1>📋 Мои заявки</h1></div>`;
+
+  if (m.selected) return header.replace("📋 Мои заявки", "📋 Заявка") + renderMyLeadDetail(m.selected);
+
+  if (m.status === "idle") {
+    // Первый заход на экран в этой сессии — запускаем загрузку и сразу
+    // показываем лоадер, сам fetch довызовет render() по завершении.
+    setTimeout(fetchMyLeads, 0);
+    return header + `<div class="empty-state">Загрузка…</div>`;
+  }
+  if (m.status === "loading") {
+    return header + `<div class="empty-state">Загрузка…</div>`;
+  }
+  if (m.status === "no-telegram") {
+    return header + `<div class="empty-state">Раздел «Мои заявки» доступен только внутри Telegram — здесь бот не может подтвердить, кто вы.</div>`;
+  }
+  if (m.status === "error") {
+    return header + `<div class="empty-state">Не получилось загрузить заявки. Попробуйте открыть раздел ещё раз.</div>`;
+  }
+  if (!m.items.length) {
+    return header + `<div class="empty-state">Заявок пока нет — оформите заявку на вкладке «Заявка».</div>`;
+  }
+  const cards = m.items.map((lead) => {
+    const service = lead.payload?.service_name || "Без услуги";
+    const price = lead.calc_summary
+      ? `${formatMoney(lead.calc_summary.price_from)} – ${formatMoney(lead.calc_summary.price_to)}`
+      : "";
+    const status = MY_LEAD_STATUS_LABELS[lead.status] || lead.status;
+    const date = (lead.created_at || "").slice(0, 10);
+    return `
+      <button class="lead-card" data-lead-id="${lead.id}">
+        <div class="lead-card-top"><span>№${lead.id}</span><span>${escapeHtml(date)}</span></div>
+        <div class="lead-card-service">${escapeHtml(service)}</div>
+        ${price ? `<div class="hint">${escapeHtml(price)}</div>` : ""}
+        <div class="lead-card-status">${escapeHtml(status)}</div>
+      </button>`;
+  }).join("");
+  return header + `<div class="lead-card-list">${cards}</div>`;
+}
+
+function renderMyLeadDetail(lead) {
+  const p = lead.payload || {};
+  const status = MY_LEAD_STATUS_LABELS[lead.status] || lead.status;
+  const date = (lead.created_at || "").slice(0, 10);
+  const priceLine = lead.calc_summary
+    ? `<div class="result-box"><div class="price">${formatMoney(lead.calc_summary.price_from)} – ${formatMoney(lead.calc_summary.price_to)}</div><div class="hint">Точная сумма — предварительная</div></div>`
+    : "";
+  const optionsLine = lead.calc_summary && lead.calc_summary.selected_options && lead.calc_summary.selected_options.length
+    ? `<div class="case-block"><div class="label">Опции</div><p>${lead.calc_summary.selected_options.map((o) => escapeHtml(o.name) + (o.qty > 1 ? ` ×${o.qty}` : "")).join(", ")}</p></div>`
+    : "";
+  return `
+    <button class="btn btn-secondary" id="my-lead-back">← К списку заявок</button>
+    <div class="case-block"><div class="label">Заявка №${lead.id} · ${escapeHtml(date)}</div><p>${escapeHtml(status)}</p></div>
+    <div class="case-block"><div class="label">Услуга</div><p>${escapeHtml(p.service_name || "—")}</p></div>
+    ${optionsLine}
+    ${priceLine}
+    ${p.task_description ? `<div class="case-block"><div class="label">Задача</div><p>${escapeHtml(p.task_description)}</p></div>` : ""}
+    ${p.budget ? `<div class="case-block"><div class="label">Бюджет</div><p>${escapeHtml(BUDGET_OPTIONS.find((b) => b.id === p.budget)?.label || p.budget)}</p></div>` : ""}
+    ${p.contact ? `<div class="case-block"><div class="label">Контакты</div><p>${escapeHtml(p.contact)}</p></div>` : ""}
+    <button class="btn btn-primary" id="my-lead-continue">Дополнить информацию</button>
+  `;
+}
+
+function attachMyLeadsEvents() {
+  document.querySelectorAll("[data-lead-id]").forEach((el) =>
+    el.addEventListener("click", () => {
+      const lead = state.myLeads.items.find((l) => l.id === Number(el.dataset.leadId));
+      state.myLeads.selected = lead;
+      render();
+    })
+  );
+  const backBtn = document.getElementById("my-lead-back");
+  if (backBtn) backBtn.addEventListener("click", () => { state.myLeads.selected = null; render(); });
+
+  const continueBtn = document.getElementById("my-lead-continue");
+  if (continueBtn) continueBtn.addEventListener("click", () => {
+    const lead = state.myLeads.selected;
+    const p = lead.payload || {};
+    // Восстанавливаем черновик из уже сохранённой заявки — тот же draft_id,
+    // чтобы повторная отправка ОБНОВИЛА эту же заявку, а не создала вторую
+    // (см. content_store.add_lead — upsert по draft_id).
+    const [name, ...rest] = (p.contact || "").split(" — ");
+    state.brief = {
+      ...state.brief,
+      step: 1,
+      serviceId: p.service_id || null,
+      serviceName: p.service_name || null,
+      task: p.task_description || "",
+      have: p.have || [],
+      deadline: p.deadline || null,
+      budget: p.budget || null,
+      name: name || "",
+      contactValue: rest.join(" — ") || "",
+      tzMode: null,
+      tzDetails: { goal: "", mustHave: "", avoid: "", references: "" },
+      calc: p.calc || null,
+      orderOptions: p.calc?.options ? Object.fromEntries(p.calc.options.map((o) => [o.id, o.qty])) : {},
+      urgent: p.calc?.urgent || false,
+      complex: p.calc?.complex || false,
+      source: p.source || "direct",
+      sourceCaseId: p.source_case_id || null,
+      sourceCaseTitle: p.source_case_title || null,
+      draftId: p.draft_id || generateDraftId(),
+    };
+    navigate("brief", { pushHistory: false });
+  });
 }
 
 // ---- Экран: подтверждение (только вне Telegram, для тестирования в браузере —
