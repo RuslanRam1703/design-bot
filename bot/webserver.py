@@ -44,13 +44,14 @@ async def handle_my_leads(request: web.Request) -> web.Response:
         diag = diagnose_init_data(init_data, config.BOT_TOKEN)
         logger.warning(
             "my-leads unauthorized: initData_len=%d platform=%r version=%r has_hash=%r hash_has_tgwebappdata=%r "
-            "parse_ok=%r hash_present=%r hmac_valid=%r auth_date_present=%r auth_date_valid=%r user_present=%r "
-            "user_json_ok=%r ua=%r",
+            "initdata_ascii_only=%r parse_ok=%r hash_present=%r hmac_valid=%r auth_date_present=%r "
+            "auth_date_valid=%r user_present=%r user_json_ok=%r ua=%r",
             len(init_data),
             request.headers.get("X-Debug-Platform", ""),
             request.headers.get("X-Debug-Version", ""),
             request.headers.get("X-Debug-Has-Hash", ""),
             request.headers.get("X-Debug-Hash-Has-TgWebAppData", ""),
+            request.headers.get("X-Debug-InitData-Ascii-Only", ""),
             diag.parse_ok,
             diag.hash_present,
             diag.hmac_valid,

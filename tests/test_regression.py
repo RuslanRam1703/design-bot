@@ -1571,9 +1571,10 @@ class MyLeadsHttpEndpointTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_debug_headers_do_not_affect_auth_decision(self):
         """Диагностические заголовки (платформа/версия/наличие hash, наличие
-        tgWebAppData в hash) — это просто для логов, они НЕ должны влиять на
-        решение сервера впустить или отклонить запрос, даже если специально
-        подделаны на максимально "убедительные" значения."""
+        tgWebAppData в hash, ASCII-only ли initData на клиенте) — это просто
+        для логов, они НЕ должны влиять на решение сервера впустить или
+        отклонить запрос, даже если специально подделаны на максимально
+        "убедительные" значения."""
         from aiohttp.test_utils import TestClient, TestServer
 
         app = webserver.create_app()
@@ -1586,6 +1587,7 @@ class MyLeadsHttpEndpointTests(unittest.IsolatedAsyncioTestCase):
                     "X-Debug-Version": "99.0",
                     "X-Debug-Has-Hash": "true",
                     "X-Debug-Hash-Has-TgWebAppData": "true",
+                    "X-Debug-InitData-Ascii-Only": "true",
                 },
             )
             self.assertEqual(resp.status, 401)  # диагностика не открыла доступ
@@ -1606,6 +1608,29 @@ class MyLeadsHttpEndpointTests(unittest.IsolatedAsyncioTestCase):
                 },
             )
             self.assertEqual(resp.status, 401)
+
+    async def test_ascii_only_header_does_not_cause_false_rejection(self):
+        """Симметричная проверка: даже если X-Debug-InitData-Ascii-Only
+        подделан на "false" (как будто initData не-ASCII), это не должно
+        ЛОМАТЬ доступ для валидной, реально ASCII initData — диагностика
+        только читается для логов, никогда не участвует в решении."""
+        from aiohttp.test_utils import TestClient, TestServer
+
+        content_store.add_lead({"service_name": "Лендинг"}, {"user_id": 42, "username": "me"})
+        init_data = _sign_init_data(
+            {"auth_date": str(int(time.time())), "user": json.dumps({"id": 42, "first_name": "Я"})},
+            webserver.config.BOT_TOKEN,
+        )
+        app = webserver.create_app()
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.get(
+                "/api/my-leads",
+                headers={
+                    "X-Telegram-Init-Data": init_data,
+                    "X-Debug-InitData-Ascii-Only": "false",
+                },
+            )
+            self.assertEqual(resp.status, 200)
 
     async def test_valid_init_data_still_returns_200_after_diagnostics_added(self):
         """diagnose_init_data() теперь вызывается на каждый отказ — этот тест

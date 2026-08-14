@@ -1420,6 +1420,14 @@ async function fetchMyLeads() {
         // содержимое, чтобы отличить "Telegram не передал tgWebAppData"
         // от "передал, но SDK/наш код прочитал его неправильно".
         "X-Debug-Hash-Has-TgWebAppData": String(window.location.hash.includes("tgWebAppData")),
+        // Проверка гипотезы про HMAC mismatch: Telegram.WebApp.initData —
+        // это decodeURIComponent()-нутая строка (см. реальный SDK), может
+        // содержать не-ASCII (например, кириллицу в first_name), а Fetch
+        // API молча обрезает такие символы в значении заголовка до младшего
+        // байта (WHATWG "isomorphic encode") — если это происходит здесь,
+        // именно это и портит байты до проверки HMAC на сервере. Сам
+        // initData не логируем — только результат теста на ASCII.
+        "X-Debug-InitData-Ascii-Only": String(/^[\x00-\x7F]*$/.test(initData)),
       },
     });
     if (res.status === 401) {
