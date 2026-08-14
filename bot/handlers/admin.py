@@ -24,7 +24,7 @@ from aiogram.fsm.state import State
 from aiogram.types import BufferedInputFile, CallbackQuery, InlineKeyboardMarkup, Message
 
 from bot import admin_keyboards as kb
-from bot import config, content_store, flow
+from bot import config, content_store, flow, texts
 from bot import lead as lead_format
 from bot.states import AdminStates
 
@@ -123,6 +123,14 @@ def _admin_root_text() -> str:
 @router.message(Command("admin"))
 async def cmd_admin(message: Message, state: FSMContext) -> None:
     await flow.open_root(message, state, _admin_root_text(), kb.admin_root_keyboard())
+
+
+@router.message(F.text == texts.ADMIN_BUTTON)
+async def admin_button(message: Message, state: FSMContext) -> None:
+    # "⚙️ Админ" в reply-клавиатуре (см. bot/keyboards.py::main_reply_keyboard)
+    # — просто ярлык на /admin; router уже гарантирует _is_designer_message
+    # (см. router.message.filter выше), другая проверка здесь не нужна.
+    await cmd_admin(message, state)
 
 
 @router.callback_query(F.data == "admincancel")

@@ -4,15 +4,23 @@ from aiogram.fsm.context import FSMContext
 from aiogram.types import Message
 
 from bot import config, flow, texts
-from bot.keyboards import main_entry_keyboard, webapp_open_keyboard
+from bot.keyboards import main_reply_keyboard, webapp_open_keyboard
 from bot.states import BriefStates
 
 router = Router(name="start")
 
 
+def _is_owner_chat(chat_id) -> bool:
+    return bool(config.DESIGNER_CHAT_ID) and str(chat_id) == config.DESIGNER_CHAT_ID
+
+
+def _reply_keyboard_for(message: Message):
+    return main_reply_keyboard(is_owner=_is_owner_chat(message.chat.id))
+
+
 @router.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext) -> None:
-    await flow.open_root(message, state, texts.WELCOME, main_entry_keyboard(config.WEBAPP_URL))
+    await flow.open_root(message, state, texts.WELCOME, _reply_keyboard_for(message))
 
 
 @router.message(Command("id"))
@@ -45,7 +53,19 @@ async def cmd_brief(message: Message, state: FSMContext) -> None:
 async def cmd_cancel(message: Message, state: FSMContext) -> None:
     was_awaiting_file = (await state.get_state()) == BriefStates.awaiting_tz_file.state
     text = "Хорошо, отменил ожидание файла." if was_awaiting_file else "Отменять было нечего."
-    await flow.open_root(message, state, text, main_entry_keyboard(config.WEBAPP_URL))
+    await flow.open_root(message, state, text, _reply_keyboard_for(message))
+
+
+@router.message(F.text == texts.OPEN_APP_BUTTON)
+async def open_app_button(message: Message, state: FSMContext) -> None:
+    # Reply-кнопка — только триггер (не web_app, см. main_reply_keyboard);
+    # реальный запуск Mini App — этой inline-кнопкой, тем же путём, что и
+    # /portfolio (уже подтверждено production-тестами: initData приходит).
+    await flow.open_root(
+        message, state,
+        "Открыть приложение:",
+        webapp_open_keyboard(config.WEBAPP_URL, "portfolio", texts.OPEN_APP_BUTTON),
+    )
 
 
 # Держим последним в этом роутере: любой не распознанный текст — подсказка меню.
@@ -53,6 +73,6 @@ async def cmd_cancel(message: Message, state: FSMContext) -> None:
 async def fallback_text(message: Message, state: FSMContext) -> None:
     await flow.open_root(
         message, state,
-        "Не совсем поняла 🙂 Загляните в приложение по кнопке ниже.",
-        main_entry_keyboard(config.WEBAPP_URL),
+        "Не совсем поняла 🙂 Воспользуйтесь кнопками ниже.",
+        _reply_keyboard_for(message),
     )

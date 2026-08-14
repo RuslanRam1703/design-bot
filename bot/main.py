@@ -22,9 +22,9 @@ logger = logging.getLogger(__name__)
 
 CLIENT_COMMANDS = [
     BotCommand(command="start", description="Начать / приветствие"),
+    BotCommand(command="faq", description="Частые вопросы"),
     BotCommand(command="portfolio", description="Портфолио"),
     BotCommand(command="about", description="Обо мне"),
-    BotCommand(command="faq", description="Частые вопросы"),
     BotCommand(command="brief", description="Оставить заявку"),
 ]
 

@@ -37,6 +37,7 @@ import bot.handlers.start as start
 import bot.flow as flow
 import bot.keyboards as keyboards
 import bot.telegram_auth as telegram_auth
+import bot.texts as texts
 import bot.webserver as webserver
 from bot.states import AdminStates, BriefStates
 
@@ -385,48 +386,95 @@ class StartHandlerCleanupTests(unittest.IsolatedAsyncioTestCase):
 
 
 class EntryPointArchitectureTests(unittest.IsolatedAsyncioTestCase):
-    """Реальный Telegram (Desktop и Mobile) подтвердил, что Mini App,
-    открытый через reply KeyboardButton(web_app=...), не передаёт initData,
-    а inline WebApp-кнопка — передаёт (см. диагностику этой сессии). Эти
-    тесты фиксируют архитектурное исправление: reply-клавиатура больше не
-    используется как способ открыть Mini App нигде в постоянной навигации."""
+    """Итоговая архитектура: постоянная reply-клавиатура (обычные текстовые
+    кнопки — RULE: НИ ОДНА не web_app, реальный Telegram не передаёт
+    initData для KeyboardButton.web_app, подтверждено production-тестами),
+    "🚀 Открыть приложение" — триггер, который в ответ шлёт inline
+    web_app-кнопку (единственный подтверждённо рабочий launch-механизм)."""
+
+    def setUp(self):
+        self._orig_designer = start.config.DESIGNER_CHAT_ID
+        start.config.DESIGNER_CHAT_ID = "888"
+
+    def tearDown(self):
+        start.config.DESIGNER_CHAT_ID = self._orig_designer
 
     def test_main_menu_keyboard_no_longer_exists(self):
-        # Раньше это была reply-клавиатура с web_app-кнопками — полностью
-        # удалена, а не переименована/оставлена мёртвым кодом.
+        # Старое имя удалённой inline-двух-кнопочной клавиатуры — не должно
+        # существовать ни под старым, ни под предыдущим промежуточным именем.
         self.assertFalse(hasattr(keyboards, "main_menu_keyboard"))
+        self.assertFalse(hasattr(keyboards, "main_entry_keyboard"))
 
-    def test_main_entry_keyboard_is_inline_not_reply(self):
-        from aiogram.types import InlineKeyboardMarkup, WebAppInfo
+    def test_main_reply_keyboard_has_no_web_app_buttons(self):
+        from aiogram.types import ReplyKeyboardMarkup
 
-        markup = keyboards.main_entry_keyboard("https://example.com")
-        self.assertIsInstance(markup, InlineKeyboardMarkup)
-        urls = [btn.web_app.url for row in markup.inline_keyboard for btn in row if btn.web_app]
-        self.assertIn("https://example.com/portfolio", urls)
-        self.assertIn("https://example.com/brief", urls)
-        # Ни одна кнопка не должна быть KeyboardButton/обычной текстовой —
-        # каждая кнопка этой клавиатуры обязана быть web_app-инлайн.
-        for row in markup.inline_keyboard:
-            for btn in row:
-                self.assertIsInstance(btn.web_app, WebAppInfo)
+        for is_owner in (False, True):
+            markup = keyboards.main_reply_keyboard(is_owner=is_owner)
+            self.assertIsInstance(markup, ReplyKeyboardMarkup)
+            for row in markup.keyboard:
+                for btn in row:
+                    self.assertIsNone(btn.web_app, f"{btn.text!r} не должна быть web_app-кнопкой")
 
-    async def test_cmd_start_uses_inline_entry_keyboard_not_reply(self):
-        from aiogram.types import InlineKeyboardMarkup
+    def test_main_reply_keyboard_client_vs_owner_buttons(self):
+        client_texts = {btn.text for row in keyboards.main_reply_keyboard(is_owner=False).keyboard for btn in row}
+        owner_texts = {btn.text for row in keyboards.main_reply_keyboard(is_owner=True).keyboard for btn in row}
+        self.assertEqual(client_texts, {texts.OPEN_APP_BUTTON, texts.MENU_FAQ})
+        self.assertEqual(owner_texts, {texts.OPEN_APP_BUTTON, texts.MENU_FAQ, texts.ADMIN_BUTTON})
+
+    async def test_cmd_start_sends_reply_keyboard_without_web_app(self):
+        from aiogram.types import ReplyKeyboardMarkup
 
         state = make_state()
         msg = make_flow_message(text="/start")
         await start.cmd_start(msg, state)
         sent_markup = msg.answer.await_args.kwargs.get("reply_markup") or msg.answer.await_args.args[1]
-        self.assertIsInstance(sent_markup, InlineKeyboardMarkup)
+        self.assertIsInstance(sent_markup, ReplyKeyboardMarkup)
+        for row in sent_markup.keyboard:
+            for btn in row:
+                self.assertIsNone(btn.web_app)
 
-    async def test_fallback_text_uses_inline_entry_keyboard_not_reply(self):
-        from aiogram.types import InlineKeyboardMarkup
+    async def test_cmd_start_shows_admin_button_only_to_owner(self):
+        owner_msg = make_flow_message(chat_id=888, text="/start")
+        await start.cmd_start(owner_msg, make_state(888))
+        owner_markup = owner_msg.answer.await_args.kwargs.get("reply_markup") or owner_msg.answer.await_args.args[1]
+        owner_texts_seen = {btn.text for row in owner_markup.keyboard for btn in row}
+        self.assertIn(texts.ADMIN_BUTTON, owner_texts_seen)
+
+        client_msg = make_flow_message(chat_id=999, text="/start")
+        await start.cmd_start(client_msg, make_state(999))
+        client_markup = client_msg.answer.await_args.kwargs.get("reply_markup") or client_msg.answer.await_args.args[1]
+        client_texts_seen = {btn.text for row in client_markup.keyboard for btn in row}
+        self.assertNotIn(texts.ADMIN_BUTTON, client_texts_seen)
+
+    async def test_open_app_button_replies_with_inline_webapp_button(self):
+        from aiogram.types import InlineKeyboardMarkup, WebAppInfo
 
         state = make_state()
-        msg = make_flow_message(text="что угодно")
-        await start.fallback_text(msg, state)
+        msg = make_flow_message(text=texts.OPEN_APP_BUTTON)
+        await start.open_app_button(msg, state)
         sent_markup = msg.answer.await_args.kwargs.get("reply_markup") or msg.answer.await_args.args[1]
         self.assertIsInstance(sent_markup, InlineKeyboardMarkup)
+        btn = sent_markup.inline_keyboard[0][0]
+        self.assertIsInstance(btn.web_app, WebAppInfo)
+        self.assertTrue(btn.web_app.url.endswith("/portfolio"))
+
+    async def test_admin_button_triggers_same_as_admin_command(self):
+        state = make_state(888)
+        msg = make_flow_message(chat_id=888, text=texts.ADMIN_BUTTON)
+        await admin.admin_button(msg, state)
+        msg.answer.assert_awaited_once()
+
+    def test_client_commands_include_faq_and_no_calculator(self):
+        import bot.main as bot_main
+
+        command_names = [c.command for c in bot_main.CLIENT_COMMANDS]
+        self.assertEqual(command_names, ["start", "faq", "portfolio", "about", "brief"])
+
+    def test_owner_command_scope_is_client_commands_plus_admin(self):
+        import bot.main as bot_main
+
+        owner_names = [c.command for c in bot_main.CLIENT_COMMANDS + bot_main.ADMIN_EXTRA_COMMANDS]
+        self.assertEqual(owner_names, ["start", "faq", "portfolio", "about", "brief", "admin"])
 
     async def test_setup_menu_button_configures_webapp_menu_button(self):
         from aiogram.types import MenuButtonWebApp

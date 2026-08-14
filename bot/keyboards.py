@@ -1,32 +1,40 @@
 from aiogram.types import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    KeyboardButton,
+    ReplyKeyboardMarkup,
     WebAppInfo,
 )
 
 from bot import texts
 
 
-def main_entry_keyboard(webapp_url: str) -> InlineKeyboardMarkup:
-    """Основная точка входа в Mini App — используется /start, /cancel и
-    текстовым fallback. Inline WebApp-кнопка, НЕ reply-клавиатура: реальный
-    Telegram (Desktop и Mobile, подтверждено production-логами) не передаёт
+def main_reply_keyboard(*, is_owner: bool = False) -> ReplyKeyboardMarkup:
+    """Постоянная reply-клавиатура под полем ввода — RULE: ни одна из этих
+    кнопок НЕ KeyboardButton(web_app=...). Реальный Telegram (Desktop и
+    Mobile, подтверждено production-тестами) не передаёт
     Telegram.WebApp.initData для Mini App, открытого через
-    KeyboardButton.web_app — только через inline-кнопку, Menu Button
-    (bot/main.py::_setup_menu_button) или slash-команду с inline-кнопкой
-    (/portfolio, /about, /brief — webapp_open_keyboard ниже). Раньше здесь
-    была reply-клавиатура (main_menu_keyboard) — она полностью удалена как
-    entry point в Mini App, а не оставлена дублирующим путём с другим
-    уровнем авторизации."""
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🚀 Открыть приложение", web_app=WebAppInfo(url=f"{webapp_url}/portfolio"))],
-        [InlineKeyboardButton(text=texts.MENU_BRIEF, web_app=WebAppInfo(url=f"{webapp_url}/brief"))],
-    ])
+    KeyboardButton.web_app — поэтому "🚀 Открыть приложение" здесь обычная
+    текстовая кнопка-триггер (см. bot/handlers/start.py::open_app_button),
+    которая в ОТВЕТ показывает InlineKeyboardButton.web_app
+    (webapp_open_keyboard ниже) — единственный подтверждённо рабочий способ
+    реального запуска Mini App с identity. "❓ Частые вопросы" — обычный
+    bot-flow (bot/handlers/faq.py), Mini App вообще не требует.
+    "⚙️ Админ" показываем только владельцу (is_owner) — обрабатывается в
+    bot/handlers/admin.py, уже под существующим _is_designer_message."""
+    rows = [
+        [KeyboardButton(text=texts.OPEN_APP_BUTTON)],
+        [KeyboardButton(text=texts.MENU_FAQ)],
+    ]
+    if is_owner:
+        rows.append([KeyboardButton(text=texts.ADMIN_BUTTON)])
+    return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
 
 
 def webapp_open_keyboard(webapp_url: str, path: str, label: str) -> InlineKeyboardMarkup:
-    """Инлайн-кнопка открытия Mini App — используется командами /portfolio,
-    /about, /brief, а также main_entry_keyboard (основная точка входа)."""
+    """Инлайн-кнопка открытия Mini App — единственный тип кнопки, который
+    реально передаёт initData. Используется командами /portfolio, /about,
+    /brief, а также ответом на "🚀 Открыть приложение" (см. main_reply_keyboard)."""
     return InlineKeyboardMarkup(
         inline_keyboard=[[InlineKeyboardButton(text=label, web_app=WebAppInfo(url=f"{webapp_url}/{path}"))]]
     )
