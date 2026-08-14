@@ -1475,9 +1475,10 @@ class MyLeadsHttpEndpointTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(resp.status, 401)
 
     async def test_debug_headers_do_not_affect_auth_decision(self):
-        """Диагностические заголовки (платформа/версия/наличие hash) — это
-        просто для логов, они НЕ должны влиять на решение сервера впустить
-        или отклонить запрос, даже если специально подделаны."""
+        """Диагностические заголовки (платформа/версия/наличие hash, наличие
+        tgWebAppData в hash) — это просто для логов, они НЕ должны влиять на
+        решение сервера впустить или отклонить запрос, даже если специально
+        подделаны на максимально "убедительные" значения."""
         from aiohttp.test_utils import TestClient, TestServer
 
         app = webserver.create_app()
@@ -1489,9 +1490,27 @@ class MyLeadsHttpEndpointTests(unittest.IsolatedAsyncioTestCase):
                     "X-Debug-Platform": "ios",
                     "X-Debug-Version": "99.0",
                     "X-Debug-Has-Hash": "true",
+                    "X-Debug-Hash-Has-TgWebAppData": "true",
                 },
             )
             self.assertEqual(resp.status, 401)  # диагностика не открыла доступ
+
+    async def test_hash_has_tgwebappdata_header_does_not_bypass_invalid_signature(self):
+        """Тот же принцип отдельно для случая, когда initData ПРИСУТСТВУЕТ, но
+        подпись невалидна — поддельный X-Debug-Hash-Has-TgWebAppData не должен
+        конвертировать провал HMAC-проверки в успех."""
+        from aiohttp.test_utils import TestClient, TestServer
+
+        app = webserver.create_app()
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.get(
+                "/api/my-leads",
+                headers={
+                    "X-Telegram-Init-Data": "auth_date=1786661229&user=%7B%22id%22%3A1%7D&hash=deadbeef",
+                    "X-Debug-Hash-Has-TgWebAppData": "true",
+                },
+            )
+            self.assertEqual(resp.status, 401)
 
 
 if __name__ == "__main__":

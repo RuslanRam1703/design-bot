@@ -1416,6 +1416,10 @@ async function fetchMyLeads() {
         "X-Debug-Platform": realTG?.platform || "",
         "X-Debug-Version": realTG?.version || "",
         "X-Debug-Has-Hash": String(!!window.location.hash),
+        // Только булево наличие подстроки — не сам hash и не его
+        // содержимое, чтобы отличить "Telegram не передал tgWebAppData"
+        // от "передал, но SDK/наш код прочитал его неправильно".
+        "X-Debug-Hash-Has-TgWebAppData": String(window.location.hash.includes("tgWebAppData")),
       },
     });
     if (res.status === 401) {

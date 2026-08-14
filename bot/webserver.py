@@ -42,11 +42,12 @@ async def handle_my_leads(request: web.Request) -> web.Response:
         # подписи этим не ослабляется — на решение "пустить/не пустить" эти
         # поля не влияют.
         logger.warning(
-            "my-leads unauthorized: initData_len=%d platform=%r version=%r has_hash=%r ua=%r",
+            "my-leads unauthorized: initData_len=%d platform=%r version=%r has_hash=%r hash_has_tgwebappdata=%r ua=%r",
             len(init_data),
             request.headers.get("X-Debug-Platform", ""),
             request.headers.get("X-Debug-Version", ""),
             request.headers.get("X-Debug-Has-Hash", ""),
+            request.headers.get("X-Debug-Hash-Has-TgWebAppData", ""),
             request.headers.get("User-Agent", "")[:120],
         )
         return web.json_response({"error": "unauthorized"}, status=401)
