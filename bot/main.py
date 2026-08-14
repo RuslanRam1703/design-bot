@@ -4,7 +4,13 @@ import logging
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import BotCommand, BotCommandScopeChat, BotCommandScopeDefault
+from aiogram.types import (
+    BotCommand,
+    BotCommandScopeChat,
+    BotCommandScopeDefault,
+    MenuButtonWebApp,
+    WebAppInfo,
+)
 from aiohttp import web
 
 from bot import config
@@ -42,6 +48,21 @@ async def _setup_bot_commands(bot: Bot) -> None:
             logger.exception("DESIGNER_CHAT_ID=%r не похож на числовой chat_id — расширенное меню не задано", config.DESIGNER_CHAT_ID)
 
 
+async def _setup_menu_button(bot: Bot) -> None:
+    # Menu Button (кнопка рядом с полем ввода сообщения) — основная точка
+    # входа в Mini App. В отличие от reply-клавиатуры (KeyboardButton.web_app,
+    # больше не используется, см. bot/keyboards.py), Menu Button
+    # гарантированно передаёт Telegram.WebApp.initData — по документации
+    # Telegram работает так же, как inline-кнопка (это уже подтверждено
+    # production-тестами для /portfolio, /about, /brief). chat_id не задан —
+    # это дефолтная кнопка для всех чатов с ботом, включая DESIGNER_CHAT_ID
+    # (админу это не мешает: /admin и остальные команды продолжают работать
+    # независимо от Menu Button). WEBAPP_URL тот же, новый Mini App не нужен.
+    await bot.set_chat_menu_button(
+        menu_button=MenuButtonWebApp(text="Открыть приложение", web_app=WebAppInfo(url=config.WEBAPP_URL))
+    )
+
+
 async def main() -> None:
     bot = Bot(token=config.BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
     dp = Dispatcher(storage=MemoryStorage())
@@ -63,6 +84,7 @@ async def main() -> None:
 
     await bot.delete_webhook(drop_pending_updates=True)
     await _setup_bot_commands(bot)
+    await _setup_menu_button(bot)
     logger.info("Бот запущен в режиме polling")
 
     try:

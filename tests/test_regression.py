@@ -35,6 +35,7 @@ import bot.handlers.faq as faq
 import bot.handlers.webapp as webapp
 import bot.handlers.start as start
 import bot.flow as flow
+import bot.keyboards as keyboards
 import bot.telegram_auth as telegram_auth
 import bot.webserver as webserver
 from bot.states import AdminStates, BriefStates
@@ -381,6 +382,64 @@ class StartHandlerCleanupTests(unittest.IsolatedAsyncioTestCase):
         sent_text = msg.answer.await_args.args[0]
         for banned in ("калькулятор", "расчёт стоимости", "теперь это", "переехал"):
             self.assertNotIn(banned, sent_text.lower())
+
+
+class EntryPointArchitectureTests(unittest.IsolatedAsyncioTestCase):
+    """Реальный Telegram (Desktop и Mobile) подтвердил, что Mini App,
+    открытый через reply KeyboardButton(web_app=...), не передаёт initData,
+    а inline WebApp-кнопка — передаёт (см. диагностику этой сессии). Эти
+    тесты фиксируют архитектурное исправление: reply-клавиатура больше не
+    используется как способ открыть Mini App нигде в постоянной навигации."""
+
+    def test_main_menu_keyboard_no_longer_exists(self):
+        # Раньше это была reply-клавиатура с web_app-кнопками — полностью
+        # удалена, а не переименована/оставлена мёртвым кодом.
+        self.assertFalse(hasattr(keyboards, "main_menu_keyboard"))
+
+    def test_main_entry_keyboard_is_inline_not_reply(self):
+        from aiogram.types import InlineKeyboardMarkup, WebAppInfo
+
+        markup = keyboards.main_entry_keyboard("https://example.com")
+        self.assertIsInstance(markup, InlineKeyboardMarkup)
+        urls = [btn.web_app.url for row in markup.inline_keyboard for btn in row if btn.web_app]
+        self.assertIn("https://example.com/portfolio", urls)
+        self.assertIn("https://example.com/brief", urls)
+        # Ни одна кнопка не должна быть KeyboardButton/обычной текстовой —
+        # каждая кнопка этой клавиатуры обязана быть web_app-инлайн.
+        for row in markup.inline_keyboard:
+            for btn in row:
+                self.assertIsInstance(btn.web_app, WebAppInfo)
+
+    async def test_cmd_start_uses_inline_entry_keyboard_not_reply(self):
+        from aiogram.types import InlineKeyboardMarkup
+
+        state = make_state()
+        msg = make_flow_message(text="/start")
+        await start.cmd_start(msg, state)
+        sent_markup = msg.answer.await_args.kwargs.get("reply_markup") or msg.answer.await_args.args[1]
+        self.assertIsInstance(sent_markup, InlineKeyboardMarkup)
+
+    async def test_fallback_text_uses_inline_entry_keyboard_not_reply(self):
+        from aiogram.types import InlineKeyboardMarkup
+
+        state = make_state()
+        msg = make_flow_message(text="что угодно")
+        await start.fallback_text(msg, state)
+        sent_markup = msg.answer.await_args.kwargs.get("reply_markup") or msg.answer.await_args.args[1]
+        self.assertIsInstance(sent_markup, InlineKeyboardMarkup)
+
+    async def test_setup_menu_button_configures_webapp_menu_button(self):
+        from aiogram.types import MenuButtonWebApp
+
+        import bot.main as bot_main
+
+        fake_bot = AsyncMock()
+        await bot_main._setup_menu_button(fake_bot)
+        fake_bot.set_chat_menu_button.assert_awaited_once()
+        _, call_kwargs = fake_bot.set_chat_menu_button.call_args
+        menu_button = call_kwargs["menu_button"]
+        self.assertIsInstance(menu_button, MenuButtonWebApp)
+        self.assertEqual(menu_button.web_app.url, bot_main.config.WEBAPP_URL)
 
 
 class AdminCleanupFlowTests(unittest.IsolatedAsyncioTestCase):
