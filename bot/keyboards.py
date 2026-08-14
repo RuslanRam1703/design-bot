@@ -6,7 +6,7 @@ from aiogram.types import (
     WebAppInfo,
 )
 
-from bot import texts
+from bot import config, texts
 
 
 def main_reply_keyboard(*, is_owner: bool = False) -> ReplyKeyboardMarkup:
@@ -39,6 +39,20 @@ def main_reply_keyboard(*, is_owner: bool = False) -> ReplyKeyboardMarkup:
     if is_owner:
         rows.append([KeyboardButton(text=texts.ADMIN_BUTTON)])
     return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True, is_persistent=True)
+
+
+def reply_keyboard_for_chat(chat_id) -> ReplyKeyboardMarkup:
+    """Единая точка выбора client/owner варианта main_reply_keyboard() —
+    используется и там, где клавиатура задаётся впервые (bot/handlers/
+    start.py), и там, где её нужно "освежить" после inline-ответа
+    (bot/flow.py::refresh_reply_keyboard, вызывается из start.py/faq.py).
+    Та же проверка DESIGNER_CHAT_ID, что и в
+    bot/handlers/admin.py::_is_designer_message — не подменяет и не влияет
+    на авторизацию (та проверяется отдельно и независимо на роутере и на
+    уровне content_store._require_designer), это только выбор "что
+    показать", не "что разрешить"."""
+    is_owner = bool(config.DESIGNER_CHAT_ID) and str(chat_id) == config.DESIGNER_CHAT_ID
+    return main_reply_keyboard(is_owner=is_owner)
 
 
 def webapp_open_keyboard(webapp_url: str, path: str, label: str) -> InlineKeyboardMarkup:

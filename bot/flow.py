@@ -108,6 +108,25 @@ async def delete_trigger(message: Message) -> None:
         pass
 
 
+async def refresh_reply_keyboard(message: Message, reply_markup: ReplyKeyboardMarkup) -> None:
+    """"Освежает" постоянную reply-клавиатуру после ответа, который нёс
+    InlineKeyboardMarkup (/portfolio, /about, /brief, /faq, "🚀 Открыть
+    приложение") — Bot API не позволяет одному сообщению нести оба типа
+    разметки сразу, поэтому шлём отдельное сообщение с невидимым текстом
+    (zero-width space) только чтобы Telegram-клиент подтвердил
+    reply-клавиатуру, и сразу его best-effort удаляем — не должно
+    оставлять следа в чате и не должно ронять вызывающий handler, если
+    отправка или удаление не удались (тот же принцип, что и delete_trigger)."""
+    try:
+        sent = await message.answer("​", reply_markup=reply_markup)
+    except TelegramAPIError:
+        return
+    try:
+        await message.bot.delete_message(chat_id=sent.chat.id, message_id=sent.message_id)
+    except TelegramAPIError:
+        pass
+
+
 async def finish_flow(state: FSMContext) -> None:
     """Завершить FSM-состояние сценария, не теряя id текущего экрана — чтобы
     следующий open_flow/open_root корректно удалил именно его (RULE 2)."""

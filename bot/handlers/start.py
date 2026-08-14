@@ -4,18 +4,14 @@ from aiogram.fsm.context import FSMContext
 from aiogram.types import Message
 
 from bot import config, flow, texts
-from bot.keyboards import main_reply_keyboard, webapp_open_keyboard
+from bot.keyboards import reply_keyboard_for_chat, webapp_open_keyboard
 from bot.states import BriefStates
 
 router = Router(name="start")
 
 
-def _is_owner_chat(chat_id) -> bool:
-    return bool(config.DESIGNER_CHAT_ID) and str(chat_id) == config.DESIGNER_CHAT_ID
-
-
 def _reply_keyboard_for(message: Message):
-    return main_reply_keyboard(is_owner=_is_owner_chat(message.chat.id))
+    return reply_keyboard_for_chat(message.chat.id)
 
 
 @router.message(CommandStart())
@@ -37,16 +33,19 @@ async def cmd_id(message: Message) -> None:
 @router.message(Command("portfolio"))
 async def cmd_portfolio(message: Message, state: FSMContext) -> None:
     await flow.open_root(message, state, "Открыть портфолио:", webapp_open_keyboard(config.WEBAPP_URL, "portfolio", "📁 Открыть портфолио"))
+    await flow.refresh_reply_keyboard(message, _reply_keyboard_for(message))
 
 
 @router.message(Command("about"))
 async def cmd_about(message: Message, state: FSMContext) -> None:
     await flow.open_root(message, state, "Открыть «Обо мне»:", webapp_open_keyboard(config.WEBAPP_URL, "about", "👤 Открыть «Обо мне»"))
+    await flow.refresh_reply_keyboard(message, _reply_keyboard_for(message))
 
 
 @router.message(Command("brief"))
 async def cmd_brief(message: Message, state: FSMContext) -> None:
     await flow.open_root(message, state, "Открыть заявку:", webapp_open_keyboard(config.WEBAPP_URL, "brief", "✍️ Оставить заявку"))
+    await flow.refresh_reply_keyboard(message, _reply_keyboard_for(message))
 
 
 @router.message(Command("cancel"))
@@ -66,6 +65,7 @@ async def open_app_button(message: Message, state: FSMContext) -> None:
         "Открыть приложение:",
         webapp_open_keyboard(config.WEBAPP_URL, "portfolio", texts.OPEN_APP_BUTTON),
     )
+    await flow.refresh_reply_keyboard(message, _reply_keyboard_for(message))
 
 
 # Держим последним в этом роутере: любой не распознанный текст — подсказка меню.

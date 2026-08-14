@@ -4,9 +4,15 @@ from aiogram import F, Router
 from aiogram.filters import Command
 from aiogram.types import CallbackQuery, Message
 
-from bot import texts
+from bot import flow, texts
 from bot.data import get_service, load_faq, load_pricing
-from bot.keyboards import faq_back_keyboard, faq_list_keyboard, faq_price_answer_keyboard, faq_service_picker_keyboard
+from bot.keyboards import (
+    faq_back_keyboard,
+    faq_list_keyboard,
+    faq_price_answer_keyboard,
+    faq_service_picker_keyboard,
+    reply_keyboard_for_chat,
+)
 
 router = Router(name="faq")
 
@@ -22,6 +28,7 @@ def _client_faq_items() -> list[dict]:
 
 async def _send_faq_list(message: Message) -> None:
     await message.answer(texts.FAQ_INTRO, reply_markup=faq_list_keyboard(_client_faq_items()))
+    await flow.refresh_reply_keyboard(message, reply_keyboard_for_chat(message.chat.id))
 
 
 @router.message(F.text == texts.MENU_FAQ)

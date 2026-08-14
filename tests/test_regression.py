@@ -327,6 +327,45 @@ class FlowUtilTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIsNone(await state.get_state())
 
+    async def test_refresh_reply_keyboard_sends_invisible_text_and_deletes_it(self):
+        from aiogram.types import ReplyKeyboardMarkup
+
+        markup = ReplyKeyboardMarkup(keyboard=[[]], resize_keyboard=True)
+        msg = make_flow_message()
+
+        await flow.refresh_reply_keyboard(msg, markup)
+
+        msg.answer.assert_awaited_once()
+        call = msg.answer.await_args
+        sent_text = call.args[0] if call.args else call.kwargs.get("text")
+        self.assertEqual(sent_text, "​")
+        self.assertIs(call.kwargs.get("reply_markup"), markup)
+        # answer() в make_flow_message всегда возвращает message_id=555 —
+        # именно это сообщение и должно быть удалено.
+        msg.bot.delete_message.assert_awaited_once_with(chat_id=888, message_id=555)
+
+    async def test_refresh_reply_keyboard_survives_send_failure(self):
+        from aiogram.types import ReplyKeyboardMarkup
+
+        markup = ReplyKeyboardMarkup(keyboard=[[]], resize_keyboard=True)
+        msg = make_flow_message()
+        msg.answer = AsyncMock(side_effect=TelegramAPIError(method=None, message="blocked by user"))
+
+        await flow.refresh_reply_keyboard(msg, markup)  # не должно упасть
+
+        msg.bot.delete_message.assert_not_awaited()  # нечего удалять — отправка не удалась
+
+    async def test_refresh_reply_keyboard_survives_delete_failure(self):
+        from aiogram.types import ReplyKeyboardMarkup
+
+        markup = ReplyKeyboardMarkup(keyboard=[[]], resize_keyboard=True)
+        msg = make_flow_message()
+        msg.bot.delete_message = AsyncMock(side_effect=TelegramAPIError(method=None, message="message not found"))
+
+        await flow.refresh_reply_keyboard(msg, markup)  # не должно упасть — best-effort
+
+        msg.answer.assert_awaited_once()
+
 
 class StartHandlerCleanupTests(unittest.IsolatedAsyncioTestCase):
     """Реальные хендлеры bot/handlers/start.py, переведённые на flow.py —
@@ -349,7 +388,12 @@ class StartHandlerCleanupTests(unittest.IsolatedAsyncioTestCase):
         msg2 = make_flow_message(text="/portfolio")
         await start.cmd_portfolio(msg2, state)
 
-        msg2.bot.delete_message.assert_awaited_once_with(chat_id=888, message_id=555)
+        # cmd_portfolio теперь дополнительно вызывает refresh_reply_keyboard
+        # (см. bot/flow.py), которая сама шлёт и best-effort удаляет ещё одно
+        # сообщение — delete_message вызывается больше одного раза, но
+        # RULE 2 (удаление старого корневого экрана) всё равно должна была
+        # сработать среди этих вызовов.
+        msg2.bot.delete_message.assert_any_await(chat_id=888, message_id=555)
 
     async def test_fallback_text_deletes_stray_message_and_shows_menu(self):
         state = make_state()
@@ -421,6 +465,19 @@ class EntryPointArchitectureTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(client_texts, {texts.OPEN_APP_BUTTON, texts.MENU_FAQ})
         self.assertEqual(owner_texts, {texts.OPEN_APP_BUTTON, texts.MENU_FAQ, texts.ADMIN_BUTTON})
 
+    def test_reply_keyboard_for_chat_picks_correct_variant(self):
+        # Общий helper (bot/keyboards.py) — используется и в start.py, и в
+        # faq.py, и в bot/flow.py::refresh_reply_keyboard. Сравнение с
+        # DESIGNER_CHAT_ID — та же проверка, что и в
+        # bot/handlers/admin.py::_is_designer_message, но здесь она только
+        # выбирает, что показать, не влияет на авторизацию.
+        owner_markup = keyboards.reply_keyboard_for_chat(888)
+        client_markup = keyboards.reply_keyboard_for_chat(999)
+        owner_texts_seen = {btn.text for row in owner_markup.keyboard for btn in row}
+        client_texts_seen = {btn.text for row in client_markup.keyboard for btn in row}
+        self.assertIn(texts.ADMIN_BUTTON, owner_texts_seen)
+        self.assertNotIn(texts.ADMIN_BUTTON, client_texts_seen)
+
     async def test_cmd_start_sends_reply_keyboard_without_web_app(self):
         from aiogram.types import ReplyKeyboardMarkup
 
@@ -452,7 +509,11 @@ class EntryPointArchitectureTests(unittest.IsolatedAsyncioTestCase):
         state = make_state()
         msg = make_flow_message(text=texts.OPEN_APP_BUTTON)
         await start.open_app_button(msg, state)
-        sent_markup = msg.answer.await_args.kwargs.get("reply_markup") or msg.answer.await_args.args[1]
+        # Первый вызов answer() — содержательный ответ (inline web_app-кнопка);
+        # второй — best-effort "освежение" reply-клавиатуры (см.
+        # bot/flow.py::refresh_reply_keyboard), проверяется отдельным тестом.
+        first_call = msg.answer.await_args_list[0]
+        sent_markup = first_call.kwargs.get("reply_markup") or first_call.args[1]
         self.assertIsInstance(sent_markup, InlineKeyboardMarkup)
         btn = sent_markup.inline_keyboard[0][0]
         self.assertIsInstance(btn.web_app, WebAppInfo)
@@ -552,11 +613,12 @@ class EntryPointArchitectureTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_portfolio_about_brief_still_use_inline_webapp_keyboard(self):
         # Не меняли и не должны были менять поведение inline WebApp-кнопок —
-        # эти хендлеры по-прежнему отвечают InlineKeyboardMarkup с web_app
-        # (reply-клавиатура остаётся видна клиенту благодаря is_persistent,
-        # а не благодаря тому, что эти сообщения её тоже несут — так нельзя,
-        # Telegram разрешает только один reply_markup на сообщение).
-        from aiogram.types import InlineKeyboardMarkup, WebAppInfo
+        # эти хендлеры по-прежнему ПЕРВЫМ сообщением отвечают
+        # InlineKeyboardMarkup с web_app; ВТОРЫМ сообщением (best-effort,
+        # см. bot/flow.py::refresh_reply_keyboard) — освежают
+        # reply-клавиатуру, т.к. Telegram разрешает только один reply_markup
+        # на сообщение и не может нести оба типа сразу.
+        from aiogram.types import InlineKeyboardMarkup, ReplyKeyboardMarkup, WebAppInfo
 
         cases = [
             (start.cmd_portfolio, "portfolio"),
@@ -567,20 +629,30 @@ class EntryPointArchitectureTests(unittest.IsolatedAsyncioTestCase):
             state = make_state()
             msg = make_flow_message(text=f"/{path}")
             await handler(msg, state)
-            sent_markup = msg.answer.await_args.kwargs.get("reply_markup") or msg.answer.await_args.args[1]
+            self.assertEqual(msg.answer.await_count, 2)
+            first_call, second_call = msg.answer.await_args_list
+            sent_markup = first_call.kwargs.get("reply_markup") or first_call.args[1]
             self.assertIsInstance(sent_markup, InlineKeyboardMarkup)
             btn = sent_markup.inline_keyboard[0][0]
             self.assertIsInstance(btn.web_app, WebAppInfo)
+            refresh_markup = second_call.kwargs.get("reply_markup") or second_call.args[1]
+            self.assertIsInstance(refresh_markup, ReplyKeyboardMarkup)
             self.assertTrue(btn.web_app.url.endswith(f"/{path}"))
 
     async def test_faq_command_still_uses_inline_faq_keyboard(self):
-        from aiogram.types import InlineKeyboardMarkup
+        # /faq тоже теперь шлёт второе, best-effort сообщение для
+        # "освежения" reply-клавиатуры (см. bot/flow.py::refresh_reply_keyboard,
+        # вызывается из faq.py::_send_faq_list) — answer() вызывается дважды.
+        from aiogram.types import InlineKeyboardMarkup, ReplyKeyboardMarkup
 
         msg = make_flow_message(text="/faq")
         await faq.cmd_faq(msg)
-        msg.answer.assert_awaited_once()
-        sent_markup = msg.answer.await_args.kwargs.get("reply_markup") or msg.answer.await_args.args[1]
+        self.assertEqual(msg.answer.await_count, 2)
+        first_call, second_call = msg.answer.await_args_list
+        sent_markup = first_call.kwargs.get("reply_markup") or first_call.args[1]
         self.assertIsInstance(sent_markup, InlineKeyboardMarkup)
+        refresh_markup = second_call.kwargs.get("reply_markup") or second_call.args[1]
+        self.assertIsInstance(refresh_markup, ReplyKeyboardMarkup)
 
     async def test_open_app_button_stays_plain_text_not_web_app(self):
         # main_reply_keyboard() уже проверяется на отсутствие web_app в
