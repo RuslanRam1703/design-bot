@@ -1380,6 +1380,101 @@ class TelegramInitDataValidationTests(unittest.TestCase):
         self.assertIsNone(telegram_auth.validate_init_data(init_data, self.BOT_TOKEN))
 
 
+class InitDataDiagnosticsTests(unittest.TestCase):
+    """diagnose_init_data — только для логов при отказе; должна точно
+    показывать, какой из шагов проверки не прошёл, при этом сама НЕ
+    участвует в решении validate_init_data (см. отдельные HTTP-тесты
+    в MyLeadsHttpEndpointTests, что она не может открыть доступ)."""
+
+    BOT_TOKEN = "123456:test-token-not-real"
+
+    def test_valid_init_data_all_flags_true(self):
+        fields = {
+            "auth_date": str(int(time.time())),
+            "user": json.dumps({"id": 42, "first_name": "Клиент"}),
+        }
+        init_data = _sign_init_data(fields, self.BOT_TOKEN)
+        diag = telegram_auth.diagnose_init_data(init_data, self.BOT_TOKEN)
+        self.assertTrue(diag.parse_ok)
+        self.assertTrue(diag.hash_present)
+        self.assertTrue(diag.hmac_valid)
+        self.assertTrue(diag.auth_date_present)
+        self.assertTrue(diag.auth_date_valid)
+        self.assertTrue(diag.user_present)
+        self.assertTrue(diag.user_json_ok)
+        # validate_init_data и diagnose_init_data должны соглашаться друг с
+        # другом на valid-случае — иначе диагностика вводит в заблуждение.
+        self.assertIsNotNone(telegram_auth.validate_init_data(init_data, self.BOT_TOKEN))
+
+    def test_bad_hmac_flagged_but_other_fields_still_computed(self):
+        # Это ключевой сценарий этой задачи: initData присутствует и
+        # непустая (как в реальном отчёте — initData_len=591), но подпись
+        # не сходится. diagnose_init_data должна показать hmac_valid=False
+        # И при этом всё равно посчитать auth_date/user — в отличие от
+        # validate_init_data, которая на этом же месте останавливается.
+        fields = {
+            "auth_date": str(int(time.time())),
+            "user": json.dumps({"id": 42, "first_name": "Клиент"}),
+        }
+        init_data = _sign_init_data(fields, self.BOT_TOKEN)
+        tampered = init_data.replace(init_data.split("hash=")[1], "0" * 64)
+        diag = telegram_auth.diagnose_init_data(tampered, self.BOT_TOKEN)
+        self.assertTrue(diag.parse_ok)
+        self.assertTrue(diag.hash_present)
+        self.assertFalse(diag.hmac_valid)
+        self.assertTrue(diag.auth_date_present)
+        self.assertTrue(diag.auth_date_valid)
+        self.assertTrue(diag.user_present)
+        self.assertTrue(diag.user_json_ok)
+        self.assertIsNone(telegram_auth.validate_init_data(tampered, self.BOT_TOKEN))
+
+    def test_expired_auth_date_flagged_independently_of_user(self):
+        old = int(time.time()) - 3 * 86400
+        fields = {"auth_date": str(old), "user": json.dumps({"id": 42})}
+        init_data = _sign_init_data(fields, self.BOT_TOKEN)
+        diag = telegram_auth.diagnose_init_data(init_data, self.BOT_TOKEN, max_age_seconds=86400)
+        self.assertTrue(diag.hmac_valid)
+        self.assertTrue(diag.auth_date_present)
+        self.assertFalse(diag.auth_date_valid)
+        self.assertTrue(diag.user_present)
+        self.assertTrue(diag.user_json_ok)
+
+    def test_missing_user_flagged(self):
+        fields = {"auth_date": str(int(time.time()))}
+        init_data = _sign_init_data(fields, self.BOT_TOKEN)
+        diag = telegram_auth.diagnose_init_data(init_data, self.BOT_TOKEN)
+        self.assertTrue(diag.hmac_valid)
+        self.assertFalse(diag.user_present)
+        self.assertFalse(diag.user_json_ok)
+
+    def test_corrupted_user_json_flagged(self):
+        fields = {"auth_date": str(int(time.time())), "user": "{not valid json"}
+        init_data = _sign_init_data(fields, self.BOT_TOKEN)
+        diag = telegram_auth.diagnose_init_data(init_data, self.BOT_TOKEN)
+        self.assertTrue(diag.user_present)
+        self.assertFalse(diag.user_json_ok)
+
+    def test_missing_hash_flagged_hmac_not_applicable(self):
+        fields = {"auth_date": str(int(time.time())), "user": json.dumps({"id": 1})}
+        diag = telegram_auth.diagnose_init_data(urllib.parse.urlencode(fields), self.BOT_TOKEN)
+        self.assertTrue(diag.parse_ok)
+        self.assertFalse(diag.hash_present)
+        self.assertIsNone(diag.hmac_valid)  # не "false" — проверка не применялась
+
+    def test_empty_or_garbage_input_does_not_crash(self):
+        self.assertEqual(
+            telegram_auth.diagnose_init_data("", self.BOT_TOKEN),
+            telegram_auth.InitDataDiagnostics(False, False, None, False, None, False, False),
+        )
+        # Строка без "=" в одном из полей — то, что parse_qsl(strict_parsing=True)
+        # реально отклоняет с ValueError (не любая "странная" строка ошибочна:
+        # "a===b" — валидный query string с value "==b", это не наш случай).
+        diag = telegram_auth.diagnose_init_data("a=1&bad_field_without_equals&c=2", self.BOT_TOKEN)
+        self.assertFalse(diag.parse_ok)
+        self.assertFalse(diag.hash_present)
+        self.assertIsNone(diag.hmac_valid)
+
+
 class MyLeadsFilteringTests(unittest.TestCase):
     """list_leads_by_user — User A никогда не должен получить заявки User B."""
 
@@ -1511,6 +1606,25 @@ class MyLeadsHttpEndpointTests(unittest.IsolatedAsyncioTestCase):
                 },
             )
             self.assertEqual(resp.status, 401)
+
+    async def test_valid_init_data_still_returns_200_after_diagnostics_added(self):
+        """diagnose_init_data() теперь вызывается на каждый отказ — этот тест
+        подтверждает, что успешный (валидный) путь вообще не задет:
+        правильная initData по-прежнему даёт 200 и реальные заявки, без
+        каких-либо побочных эффектов от добавленной диагностики."""
+        from aiohttp.test_utils import TestClient, TestServer
+
+        content_store.add_lead({"service_name": "Лендинг"}, {"user_id": 42, "username": "me"})
+        init_data = _sign_init_data(
+            {"auth_date": str(int(time.time())), "user": json.dumps({"id": 42, "first_name": "Я"})},
+            webserver.config.BOT_TOKEN,
+        )
+        app = webserver.create_app()
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.get("/api/my-leads", headers={"X-Telegram-Init-Data": init_data})
+            self.assertEqual(resp.status, 200)
+            body = await resp.json()
+            self.assertEqual(len(body), 1)
 
 
 if __name__ == "__main__":

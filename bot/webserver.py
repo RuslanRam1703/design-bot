@@ -5,7 +5,7 @@ from pathlib import Path
 from aiohttp import web
 
 from bot import config, content_store
-from bot.telegram_auth import validate_init_data
+from bot.telegram_auth import diagnose_init_data, validate_init_data
 
 WEBAPP_DIR = Path(__file__).resolve().parent.parent / "webapp"
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
@@ -41,13 +41,23 @@ async def handle_my_leads(request: web.Request) -> web.Response:
         # секретного не пишем (длина строки, не содержимое), проверка
         # подписи этим не ослабляется — на решение "пустить/не пустить" эти
         # поля не влияют.
+        diag = diagnose_init_data(init_data, config.BOT_TOKEN)
         logger.warning(
-            "my-leads unauthorized: initData_len=%d platform=%r version=%r has_hash=%r hash_has_tgwebappdata=%r ua=%r",
+            "my-leads unauthorized: initData_len=%d platform=%r version=%r has_hash=%r hash_has_tgwebappdata=%r "
+            "parse_ok=%r hash_present=%r hmac_valid=%r auth_date_present=%r auth_date_valid=%r user_present=%r "
+            "user_json_ok=%r ua=%r",
             len(init_data),
             request.headers.get("X-Debug-Platform", ""),
             request.headers.get("X-Debug-Version", ""),
             request.headers.get("X-Debug-Has-Hash", ""),
             request.headers.get("X-Debug-Hash-Has-TgWebAppData", ""),
+            diag.parse_ok,
+            diag.hash_present,
+            diag.hmac_valid,
+            diag.auth_date_present,
+            diag.auth_date_valid,
+            diag.user_present,
+            diag.user_json_ok,
             request.headers.get("User-Agent", "")[:120],
         )
         return web.json_response({"error": "unauthorized"}, status=401)
