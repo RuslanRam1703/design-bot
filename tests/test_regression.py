@@ -26,6 +26,7 @@ from aiogram.exceptions import TelegramAPIError
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.base import StorageKey
 from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.utils.web_app import check_webapp_signature as aiogram_check_webapp_signature
 
 import bot.admin_keyboards as kb
 import bot.content_store as content_store
@@ -1464,7 +1465,7 @@ class InitDataDiagnosticsTests(unittest.TestCase):
     def test_empty_or_garbage_input_does_not_crash(self):
         self.assertEqual(
             telegram_auth.diagnose_init_data("", self.BOT_TOKEN),
-            telegram_auth.InitDataDiagnostics(False, False, None, False, None, False, False),
+            telegram_auth.InitDataDiagnostics(False, False, None, False, None, False, False, 0, 0, None, 0, None),
         )
         # Строка без "=" в одном из полей — то, что parse_qsl(strict_parsing=True)
         # реально отклоняет с ValueError (не любая "странная" строка ошибочна:
@@ -1473,6 +1474,89 @@ class InitDataDiagnosticsTests(unittest.TestCase):
         self.assertFalse(diag.parse_ok)
         self.assertFalse(diag.hash_present)
         self.assertIsNone(diag.hmac_valid)
+
+
+class RealisticInitDataCrossCheckTests(unittest.TestCase):
+    """Сравнение нашей validate_init_data() с эталонной реализацией
+    aiogram.utils.web_app.check_webapp_signature() на initData, максимально
+    близкой к реальному формату Telegram Mini App (Bot API 7.x+): с полем
+    signature (Ed25519, добавляется Telegram отдельно от hash) и обычным
+    набором полей chat_instance/chat_type/query_id/user с URL-encoded JSON.
+    Хэш в обоих случаях строится ПРАВИЛЬНО — по всем полям, кроме hash (как
+    в aiogram, эталонной реализации того же документированного алгоритма);
+    если наш validate_init_data при этом расходится с aiogram — это
+    подтверждённое расхождение в нашей реализации, а не в тестовых данных."""
+
+    BOT_TOKEN = "123456:test-token-not-real"
+
+    @staticmethod
+    def _sign_reference(fields: dict, bot_token: str) -> str:
+        # Намеренно НЕ переиспользует bot/telegram_auth.py — иначе тест
+        # проверял бы согласие функции самой с собой, а не с эталоном.
+        import hashlib as _hashlib
+        import hmac as _hmac
+
+        check_string = "\n".join(f"{k}={v}" for k, v in sorted(fields.items()))
+        secret_key = _hmac.new(b"WebAppData", bot_token.encode("utf-8"), _hashlib.sha256).digest()
+        h = _hmac.new(secret_key, check_string.encode("utf-8"), _hashlib.sha256).hexdigest()
+        signed = dict(fields)
+        signed["hash"] = h
+        return urllib.parse.urlencode(signed)
+
+    def _realistic_fields(self) -> dict:
+        return {
+            "auth_date": str(int(time.time())),
+            "query_id": "AAEtest_query_id",
+            "chat_instance": "-1234567890123456789",
+            "chat_type": "sender",
+            "user": json.dumps(
+                {
+                    "id": 42,
+                    "first_name": "Клиент",
+                    "last_name": "Тестов",
+                    "username": "client1",
+                    "language_code": "ru",
+                    "allows_write_to_pm": True,
+                },
+                ensure_ascii=False,
+            ),
+        }
+
+    def test_agrees_with_aiogram_without_signature_field(self):
+        init_data = self._sign_reference(self._realistic_fields(), self.BOT_TOKEN)
+        our_result = telegram_auth.validate_init_data(init_data, self.BOT_TOKEN)
+        aiogram_result = aiogram_check_webapp_signature(self.BOT_TOKEN, init_data)
+        self.assertTrue(aiogram_result)
+        self.assertEqual(our_result is not None, aiogram_result)
+
+    def test_agrees_with_aiogram_when_signature_field_present(self):
+        # Регрессионный тест на реальный production-баг: реальный Telegram
+        # (Bot API 7.x+) добавляет в Mini App initData поле "signature"
+        # (Ed25519, для отдельного способа проверки без bot-token). Для
+        # HMAC-метода (наш, bot-token) "signature" НЕ исключается из
+        # data_check_string — исключается только "hash" (и hash, и
+        # signature исключаются вместе только для ДРУГОГО, Ed25519-метода).
+        # Раньше _parse_and_split() ошибочно удалял ещё и "signature" перед
+        # вычислением хэша, из-за чего реальная initData с этим полем
+        # (как в production, tdesktop 9.6) отклонялась как невалидная,
+        # хотя эталонная реализация (aiogram) её принимает. Этот тест
+        # фиксирует исправление — при регрессе снова начнёт падать.
+        fields = self._realistic_fields()
+        fields["signature"] = "MEUCIQC-fake_ed25519_signature_base64url_encoded_value-AAA"
+        init_data = self._sign_reference(fields, self.BOT_TOKEN)
+
+        our_result = telegram_auth.validate_init_data(init_data, self.BOT_TOKEN)
+        aiogram_result = aiogram_check_webapp_signature(self.BOT_TOKEN, init_data)
+
+        self.assertTrue(aiogram_result)  # эталонная реализация: initData валидна
+        self.assertEqual(
+            our_result is not None,
+            aiogram_result,
+            "validate_init_data() расходится с эталонной aiogram.check_webapp_signature() "
+            "на initData с полем signature",
+        )
+        self.assertIsNotNone(our_result)
+        self.assertEqual(our_result["id"], 42)
 
 
 class MyLeadsFilteringTests(unittest.TestCase):

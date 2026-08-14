@@ -45,7 +45,9 @@ async def handle_my_leads(request: web.Request) -> web.Response:
         logger.warning(
             "my-leads unauthorized: initData_len=%d platform=%r version=%r has_hash=%r hash_has_tgwebappdata=%r "
             "initdata_ascii_only=%r parse_ok=%r hash_present=%r hmac_valid=%r auth_date_present=%r "
-            "auth_date_valid=%r user_present=%r user_json_ok=%r ua=%r",
+            "auth_date_valid=%r user_present=%r user_json_ok=%r parsed_item_count=%r "
+            "data_check_string_length=%r data_check_string_sha256=%r received_hash_length=%r "
+            "calculated_hash_length=%r ua=%r",
             len(init_data),
             request.headers.get("X-Debug-Platform", ""),
             request.headers.get("X-Debug-Version", ""),
@@ -59,6 +61,11 @@ async def handle_my_leads(request: web.Request) -> web.Response:
             diag.auth_date_valid,
             diag.user_present,
             diag.user_json_ok,
+            diag.parsed_item_count,
+            diag.data_check_string_length,
+            diag.data_check_string_sha256,
+            diag.received_hash_length,
+            diag.calculated_hash_length,
             request.headers.get("User-Agent", "")[:120],
         )
         return web.json_response({"error": "unauthorized"}, status=401)
