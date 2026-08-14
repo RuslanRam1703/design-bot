@@ -523,6 +523,75 @@ class EntryPointArchitectureTests(unittest.IsolatedAsyncioTestCase):
                 offenders.append(str(path))
         self.assertEqual(offenders, [])
 
+    def test_reply_keyboard_is_persistent(self):
+        # Регресс: без is_persistent=True Telegram-клиент вправе скрыть
+        # reply-клавиатуру после любого сообщения с inline-разметкой
+        # (/portfolio, /about, /brief, /faq, "🚀 Открыть приложение" —
+        # все отвечают inline, одно сообщение не может нести оба типа).
+        for is_owner in (False, True):
+            markup = keyboards.main_reply_keyboard(is_owner=is_owner)
+            self.assertTrue(markup.is_persistent)
+
+    async def test_start_sends_persistent_keyboard_client_and_owner(self):
+        client_msg = make_flow_message(chat_id=999, text="/start")
+        await start.cmd_start(client_msg, make_state(999))
+        client_markup = client_msg.answer.await_args.kwargs.get("reply_markup") or client_msg.answer.await_args.args[1]
+        self.assertTrue(client_markup.is_persistent)
+
+        owner_msg = make_flow_message(chat_id=888, text="/start")
+        await start.cmd_start(owner_msg, make_state(888))
+        owner_markup = owner_msg.answer.await_args.kwargs.get("reply_markup") or owner_msg.answer.await_args.args[1]
+        self.assertTrue(owner_markup.is_persistent)
+
+    async def test_cancel_sends_persistent_reply_keyboard(self):
+        state = make_state()
+        msg = make_flow_message(text="/cancel")
+        await start.cmd_cancel(msg, state)
+        sent_markup = msg.answer.await_args.kwargs.get("reply_markup") or msg.answer.await_args.args[1]
+        self.assertTrue(sent_markup.is_persistent)
+
+    async def test_portfolio_about_brief_still_use_inline_webapp_keyboard(self):
+        # Не меняли и не должны были менять поведение inline WebApp-кнопок —
+        # эти хендлеры по-прежнему отвечают InlineKeyboardMarkup с web_app
+        # (reply-клавиатура остаётся видна клиенту благодаря is_persistent,
+        # а не благодаря тому, что эти сообщения её тоже несут — так нельзя,
+        # Telegram разрешает только один reply_markup на сообщение).
+        from aiogram.types import InlineKeyboardMarkup, WebAppInfo
+
+        cases = [
+            (start.cmd_portfolio, "portfolio"),
+            (start.cmd_about, "about"),
+            (start.cmd_brief, "brief"),
+        ]
+        for handler, path in cases:
+            state = make_state()
+            msg = make_flow_message(text=f"/{path}")
+            await handler(msg, state)
+            sent_markup = msg.answer.await_args.kwargs.get("reply_markup") or msg.answer.await_args.args[1]
+            self.assertIsInstance(sent_markup, InlineKeyboardMarkup)
+            btn = sent_markup.inline_keyboard[0][0]
+            self.assertIsInstance(btn.web_app, WebAppInfo)
+            self.assertTrue(btn.web_app.url.endswith(f"/{path}"))
+
+    async def test_faq_command_still_uses_inline_faq_keyboard(self):
+        from aiogram.types import InlineKeyboardMarkup
+
+        msg = make_flow_message(text="/faq")
+        await faq.cmd_faq(msg)
+        msg.answer.assert_awaited_once()
+        sent_markup = msg.answer.await_args.kwargs.get("reply_markup") or msg.answer.await_args.args[1]
+        self.assertIsInstance(sent_markup, InlineKeyboardMarkup)
+
+    async def test_open_app_button_stays_plain_text_not_web_app(self):
+        # main_reply_keyboard() уже проверяется на отсутствие web_app в
+        # других тестах — здесь отдельно, явно, именно для кнопки-триггера
+        # "🚀 Открыть приложение", как запрошено отдельным пунктом.
+        markup = keyboards.main_reply_keyboard(is_owner=False)
+        trigger_btn = next(
+            btn for row in markup.keyboard for btn in row if btn.text == texts.OPEN_APP_BUTTON
+        )
+        self.assertIsNone(trigger_btn.web_app)
+
 
 class AdminCleanupFlowTests(unittest.IsolatedAsyncioTestCase):
     """/admin (flow.open_root) и мастер добавления FAQ (flow.step_from_text)

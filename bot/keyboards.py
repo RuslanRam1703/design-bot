@@ -21,14 +21,24 @@ def main_reply_keyboard(*, is_owner: bool = False) -> ReplyKeyboardMarkup:
     реального запуска Mini App с identity. "❓ Частые вопросы" — обычный
     bot-flow (bot/handlers/faq.py), Mini App вообще не требует.
     "⚙️ Админ" показываем только владельцу (is_owner) — обрабатывается в
-    bot/handlers/admin.py, уже под существующим _is_designer_message."""
+    bot/handlers/admin.py, уже под существующим _is_designer_message.
+
+    is_persistent=True — иначе Telegram-клиент вправе скрыть эту
+    reply-клавиатуру после любого сообщения, которое несёт ДРУГОЙ
+    reply_markup (а /portfolio, /about, /brief, /faq, "🚀 Открыть
+    приложение" все отвечают inline-клавиатурой — Telegram не позволяет
+    одному сообщению нести оба типа сразу). Без этого флага пользователь
+    терял постоянную клавиатуру после первой же такой команды (реальный
+    production-баг, воспроизведённый после предыдущего деплоя) — с флагом
+    клавиатура остаётся видимой независимо от того, что несёт очередное
+    сообщение бота."""
     rows = [
         [KeyboardButton(text=texts.OPEN_APP_BUTTON)],
         [KeyboardButton(text=texts.MENU_FAQ)],
     ]
     if is_owner:
         rows.append([KeyboardButton(text=texts.ADMIN_BUTTON)])
-    return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
+    return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True, is_persistent=True)
 
 
 def webapp_open_keyboard(webapp_url: str, path: str, label: str) -> InlineKeyboardMarkup:
