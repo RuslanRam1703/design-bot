@@ -8,8 +8,7 @@ from aiogram.types import (
     BotCommand,
     BotCommandScopeChat,
     BotCommandScopeDefault,
-    MenuButtonWebApp,
-    WebAppInfo,
+    MenuButtonCommands,
 )
 from aiohttp import web
 
@@ -49,18 +48,20 @@ async def _setup_bot_commands(bot: Bot) -> None:
 
 
 async def _setup_menu_button(bot: Bot) -> None:
-    # Menu Button (кнопка рядом с полем ввода сообщения) — основная точка
-    # входа в Mini App. В отличие от reply-клавиатуры (KeyboardButton.web_app,
-    # больше не используется, см. bot/keyboards.py), Menu Button
-    # гарантированно передаёт Telegram.WebApp.initData — по документации
-    # Telegram работает так же, как inline-кнопка (это уже подтверждено
-    # production-тестами для /portfolio, /about, /brief). chat_id не задан —
-    # это дефолтная кнопка для всех чатов с ботом, включая DESIGNER_CHAT_ID
-    # (админу это не мешает: /admin и остальные команды продолжают работать
-    # независимо от Menu Button). WEBAPP_URL тот же, новый Mini App не нужен.
-    await bot.set_chat_menu_button(
-        menu_button=MenuButtonWebApp(text="Открыть приложение", web_app=WebAppInfo(url=config.WEBAPP_URL))
-    )
+    # Системное Menu Telegram (иконка рядом с полем ввода) должно оставаться
+    # обычным списком команд (/start, /faq, /portfolio, /about, /brief, у
+    # владельца ещё /admin — см. CLIENT_COMMANDS/ADMIN_EXTRA_COMMANDS выше),
+    # а НЕ отдельной кнопкой запуска Mini App — ранее здесь стоял
+    # MenuButtonWebApp, из-за чего это системное меню вместо списка команд
+    # показывало "Открыть приложение" (регресс, обнаруженный в проде после
+    # commit ac09080). Запуск Mini App — только через reply-кнопку
+    # "🚀 Открыть приложение" (см. bot/keyboards.py::main_reply_keyboard,
+    # bot/handlers/start.py::open_app_button) и существующие inline
+    # web_app-кнопки — MenuButtonCommands этому не мешает и не дублирует.
+    # Вызов явный (не просто "ничего не делать"): Telegram запоминает
+    # последний заданный menu_button за бота, значение из предыдущего
+    # деплоя (MenuButtonWebApp) само не откатится без явного вызова.
+    await bot.set_chat_menu_button(menu_button=MenuButtonCommands())
 
 
 async def main() -> None:

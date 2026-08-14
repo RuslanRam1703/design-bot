@@ -476,8 +476,12 @@ class EntryPointArchitectureTests(unittest.IsolatedAsyncioTestCase):
         owner_names = [c.command for c in bot_main.CLIENT_COMMANDS + bot_main.ADMIN_EXTRA_COMMANDS]
         self.assertEqual(owner_names, ["start", "faq", "portfolio", "about", "brief", "admin"])
 
-    async def test_setup_menu_button_configures_webapp_menu_button(self):
-        from aiogram.types import MenuButtonWebApp
+    async def test_setup_menu_button_is_commands_not_webapp(self):
+        # Регресс commit ac09080: MenuButtonWebApp здесь подменял системное
+        # Telegram Menu (список команд) на кнопку запуска Mini App. Menu
+        # должно оставаться обычным списком команд — запуск Mini App теперь
+        # только через reply-кнопку "🚀 Открыть приложение" + inline-кнопки.
+        from aiogram.types import MenuButtonCommands, MenuButtonWebApp
 
         import bot.main as bot_main
 
@@ -486,8 +490,38 @@ class EntryPointArchitectureTests(unittest.IsolatedAsyncioTestCase):
         fake_bot.set_chat_menu_button.assert_awaited_once()
         _, call_kwargs = fake_bot.set_chat_menu_button.call_args
         menu_button = call_kwargs["menu_button"]
-        self.assertIsInstance(menu_button, MenuButtonWebApp)
-        self.assertEqual(menu_button.web_app.url, bot_main.config.WEBAPP_URL)
+        self.assertIsInstance(menu_button, MenuButtonCommands)
+        self.assertNotIsInstance(menu_button, MenuButtonWebApp)
+
+    def test_client_reply_keyboard_has_no_admin_button(self):
+        client_texts = {btn.text for row in keyboards.main_reply_keyboard(is_owner=False).keyboard for btn in row}
+        self.assertEqual(client_texts, {texts.OPEN_APP_BUTTON, texts.MENU_FAQ})
+        self.assertNotIn(texts.ADMIN_BUTTON, client_texts)
+
+    def test_owner_reply_keyboard_has_admin_button(self):
+        owner_texts = {btn.text for row in keyboards.main_reply_keyboard(is_owner=True).keyboard for btn in row}
+        self.assertIn(texts.ADMIN_BUTTON, owner_texts)
+        self.assertIn(texts.OPEN_APP_BUTTON, owner_texts)
+        self.assertIn(texts.MENU_FAQ, owner_texts)
+
+    def test_no_keyboard_button_uses_web_app_anywhere_in_bot_package(self):
+        # Статическая проверка исходников всего bot/ — не только
+        # main_reply_keyboard(), но вообще нигде в проекте не должно
+        # остаться KeyboardButton(web_app=...) (см. регресс, из-за которого
+        # эта задача вообще начиналась несколько итераций назад).
+        import re
+
+        bot_dir = Path(__file__).resolve().parent.parent / "bot"
+        # Ищем реальный вызов конструктора (web_app=WebAppInfo(...)), а не
+        # упоминание в докстринге/комментарии (там пишем "web_app=..." как
+        # прозу, объясняющую, чего быть не должно — это не код).
+        pattern = re.compile(r"(?<!Inline)KeyboardButton\([^)]*web_app\s*=\s*WebAppInfo")
+        offenders = []
+        for path in bot_dir.rglob("*.py"):
+            text_content = path.read_text(encoding="utf-8")
+            if pattern.search(text_content):
+                offenders.append(str(path))
+        self.assertEqual(offenders, [])
 
 
 class AdminCleanupFlowTests(unittest.IsolatedAsyncioTestCase):
