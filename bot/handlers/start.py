@@ -41,16 +41,6 @@ async def cmd_about(message: Message, state: FSMContext) -> None:
     await flow.open_root(message, state, "Открыть «Обо мне»:", webapp_open_keyboard(config.WEBAPP_URL, "about", "👤 Открыть «Обо мне»"))
 
 
-@router.message(Command("calculator"))
-async def cmd_calculator(message: Message, state: FSMContext) -> None:
-    # Расчёт стоимости больше не отдельный экран — это шаг 1 заявки (Order
-    # Builder). Команда /calculator осталась в меню команд Telegram (нельзя
-    # убрать существующую команду без риска "неизвестная команда" у тех, кто
-    # успел её сохранить/ввести привычкой), но ведёт теперь туда же, куда
-    # /brief — устраняет параллельный старый сценарий, см. bot/keyboards.py.
-    await flow.open_root(message, state, "Расчёт стоимости — теперь часть оформления заявки. Открываю заявку:", webapp_open_keyboard(config.WEBAPP_URL, "brief", "✍️ Оставить заявку"))
-
-
 @router.message(Command("brief"))
 async def cmd_brief(message: Message, state: FSMContext) -> None:
     await flow.open_root(message, state, "Открыть заявку:", webapp_open_keyboard(config.WEBAPP_URL, "brief", "✍️ Оставить заявку"))

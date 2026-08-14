@@ -25,9 +25,9 @@ def main_menu_keyboard(webapp_url: str, ui_config: dict | None = None) -> ReplyK
         buttons.append(KeyboardButton(text=texts.MENU_ABOUT, web_app=WebAppInfo(url=f"{webapp_url}/about")))
     # Калькулятор больше не отдельный пункт постоянного меню — расчёт стал
     # частью заявки (Order Builder, шаг 1 в /brief). Кнопку не показываем,
-    # чтобы не было двух параллельных путей к заявке; сам экран /calculator
-    # и команда /calculator остаются доступны (см. cmd_calculator), но
-    # command теперь тоже ведёт в заявку, а не на старый отдельный экран.
+    # чтобы не было двух параллельных путей к заявке. Команда /calculator
+    # удалена полностью (см. bot/handlers/start.py); экран /calculator в
+    # webapp остаётся только как первый шаг Order Builder внутри /brief.
     if enabled("brief"):
         buttons.append(KeyboardButton(text=texts.MENU_BRIEF, web_app=WebAppInfo(url=f"{webapp_url}/brief")))
     if enabled("faq"):
@@ -44,8 +44,8 @@ def main_menu_keyboard(webapp_url: str, ui_config: dict | None = None) -> ReplyK
 
 def webapp_open_keyboard(webapp_url: str, path: str, label: str) -> InlineKeyboardMarkup:
     """Инлайн-кнопка открытия Mini App — используется командами /portfolio,
-    /about, /calculator, /brief (реплай-кнопки в main_menu_keyboard делают
-    то же самое, это дублирующий вход через меню команд)."""
+    /about, /brief (реплай-кнопки в main_menu_keyboard делают то же самое,
+    это дублирующий вход через меню команд)."""
     return InlineKeyboardMarkup(
         inline_keyboard=[[InlineKeyboardButton(text=label, web_app=WebAppInfo(url=f"{webapp_url}/{path}"))]]
     )

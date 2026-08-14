@@ -1,4 +1,5 @@
 import json
+import logging
 from pathlib import Path
 
 from aiohttp import web
@@ -8,6 +9,7 @@ from bot.telegram_auth import validate_init_data
 
 WEBAPP_DIR = Path(__file__).resolve().parent.parent / "webapp"
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
+logger = logging.getLogger(__name__)
 
 
 async def handle_index(request: web.Request) -> web.Response:
@@ -33,6 +35,20 @@ async def handle_my_leads(request: web.Request) -> web.Response:
     init_data = request.headers.get("X-Telegram-Init-Data", "")
     user = validate_init_data(init_data, config.BOT_TOKEN)
     if user is None:
+        # Диагностика реальной причины пустого/невалидного initData у
+        # настоящих клиентов — раньше клиент вообще не долетал до сервера в
+        # этом случае (см. app.js), поэтому в логах не было ни следа. Ничего
+        # секретного не пишем (длина строки, не содержимое), проверка
+        # подписи этим не ослабляется — на решение "пустить/не пустить" эти
+        # поля не влияют.
+        logger.warning(
+            "my-leads unauthorized: initData_len=%d platform=%r version=%r has_hash=%r ua=%r",
+            len(init_data),
+            request.headers.get("X-Debug-Platform", ""),
+            request.headers.get("X-Debug-Version", ""),
+            request.headers.get("X-Debug-Has-Hash", ""),
+            request.headers.get("User-Agent", "")[:120],
+        )
         return web.json_response({"error": "unauthorized"}, status=401)
     leads = content_store.list_leads_by_user(user["id"])
     return web.json_response(leads, dumps=lambda d: json.dumps(d, ensure_ascii=False))

@@ -354,6 +354,33 @@ class StartHandlerCleanupTests(unittest.IsolatedAsyncioTestCase):
         await start.fallback_text(msg, state)
         msg.answer.assert_awaited_once()
 
+    def test_calculator_command_has_no_registered_handler(self):
+        # Раньше был отдельный /calculator с заглушкой "теперь это часть
+        # заявки" — теперь команда полностью удалена из router, а не
+        # оставлена как stub. Проверяем на уровне router.observers, а не
+        # только "функции cmd_calculator больше нет в модуле" — важно, что
+        # ни один обработчик в router не матчится на /calculator.
+        self.assertFalse(hasattr(start, "cmd_calculator"))
+        message_observer = start.router.observers["message"]
+        for handler_obj in message_observer.handlers:
+            for filter_obj in handler_obj.filters:
+                callback = getattr(filter_obj, "callback", None)
+                commands = getattr(callback, "commands", None) if callback else None
+                if commands:
+                    self.assertNotIn("calculator", commands)
+
+    async def test_calculator_text_falls_through_to_generic_fallback(self):
+        # Реальное поведение при вводе /calculator сейчас — не Command-фильтр
+        # (его больше нет), а F.text catch-all: тот же ответ, что на любой
+        # нераспознанный текст, без слов про калькулятор/расчёт/перенос.
+        state = make_state()
+        msg = make_flow_message(text="/calculator")
+        await start.fallback_text(msg, state)
+        msg.answer.assert_awaited_once()
+        sent_text = msg.answer.await_args.args[0]
+        for banned in ("калькулятор", "расчёт стоимости", "теперь это", "переехал"):
+            self.assertNotIn(banned, sent_text.lower())
+
 
 class AdminCleanupFlowTests(unittest.IsolatedAsyncioTestCase):
     """/admin (flow.open_root) и мастер добавления FAQ (flow.step_from_text)
@@ -1339,6 +1366,19 @@ class TelegramInitDataValidationTests(unittest.TestCase):
         self.assertIsNone(telegram_auth.validate_init_data("not a valid query string ===", self.BOT_TOKEN))
         self.assertIsNone(telegram_auth.validate_init_data("hash=abc&auth_date=123", self.BOT_TOKEN))
 
+    def test_validly_signed_data_with_no_user_field_is_rejected(self):
+        # Подпись верна, но самого пользователя в пакете нет (например,
+        # initData от игры/inline-режима, а не от Mini App с юзером) —
+        # без user нечего проверять на "чьи это заявки".
+        fields = {"auth_date": str(int(time.time())), "query_id": "AAEtest"}
+        init_data = _sign_init_data(fields, self.BOT_TOKEN)
+        self.assertIsNone(telegram_auth.validate_init_data(init_data, self.BOT_TOKEN))
+
+    def test_corrupted_user_json_is_rejected_not_crashing(self):
+        fields = {"auth_date": str(int(time.time())), "user": "{not valid json"}
+        init_data = _sign_init_data(fields, self.BOT_TOKEN)
+        self.assertIsNone(telegram_auth.validate_init_data(init_data, self.BOT_TOKEN))
+
 
 class MyLeadsFilteringTests(unittest.TestCase):
     """list_leads_by_user — User A никогда не должен получить заявки User B."""
@@ -1417,6 +1457,41 @@ class MyLeadsHttpEndpointTests(unittest.IsolatedAsyncioTestCase):
 
             resp_no_auth = await client.get("/api/my-leads")
             self.assertEqual(resp_no_auth.status, 401)
+
+    async def test_empty_init_data_header_is_401_not_500(self):
+        from aiohttp.test_utils import TestClient, TestServer
+
+        app = webserver.create_app()
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.get("/api/my-leads", headers={"X-Telegram-Init-Data": ""})
+            self.assertEqual(resp.status, 401)
+
+    async def test_corrupted_init_data_header_is_401_not_500(self):
+        from aiohttp.test_utils import TestClient, TestServer
+
+        app = webserver.create_app()
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.get("/api/my-leads", headers={"X-Telegram-Init-Data": "garbage=%%%not-valid"})
+            self.assertEqual(resp.status, 401)
+
+    async def test_debug_headers_do_not_affect_auth_decision(self):
+        """Диагностические заголовки (платформа/версия/наличие hash) — это
+        просто для логов, они НЕ должны влиять на решение сервера впустить
+        или отклонить запрос, даже если специально подделаны."""
+        from aiohttp.test_utils import TestClient, TestServer
+
+        app = webserver.create_app()
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.get(
+                "/api/my-leads",
+                headers={
+                    "X-Telegram-Init-Data": "",
+                    "X-Debug-Platform": "ios",
+                    "X-Debug-Version": "99.0",
+                    "X-Debug-Has-Hash": "true",
+                },
+            )
+            self.assertEqual(resp.status, 401)  # диагностика не открыла доступ
 
 
 if __name__ == "__main__":

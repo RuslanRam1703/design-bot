@@ -1402,15 +1402,27 @@ const MY_LEAD_STATUS_LABELS = {
 
 async function fetchMyLeads() {
   const initData = TG.initData();
-  if (!initData) {
-    state.myLeads.status = "no-telegram";
-    render();
-    return;
-  }
   state.myLeads.status = "loading";
   render();
   try {
-    const res = await fetch("/api/my-leads", { headers: { "X-Telegram-Init-Data": initData } });
+    // Раньше при пустом initData запрос вообще не уходил на сервер — это
+    // означало отсутствие каких-либо логов, когда initData пуст у реального
+    // клиента в реальном Telegram (см. диагностику initData). Теперь запрос
+    // уходит всегда, с диагностическими заголовками (не влияют на решение
+    // сервера пустить/не пустить — только на то, что попадает в лог).
+    const res = await fetch("/api/my-leads", {
+      headers: {
+        "X-Telegram-Init-Data": initData,
+        "X-Debug-Platform": realTG?.platform || "",
+        "X-Debug-Version": realTG?.version || "",
+        "X-Debug-Has-Hash": String(!!window.location.hash),
+      },
+    });
+    if (res.status === 401) {
+      state.myLeads.status = initData ? "error" : "no-telegram";
+      render();
+      return;
+    }
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     state.myLeads.items = await res.json();
     state.myLeads.status = "loaded";
