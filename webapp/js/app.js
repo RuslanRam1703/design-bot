@@ -312,7 +312,7 @@ async function init() {
 const TAB_SCREENS = [
   { id: "portfolio", icon: "📁", label: "Портфолио" },
   { id: "about", icon: "👤", label: "Обо мне" },
-  { id: "brief", icon: "✍️", label: "Заявка" },
+  { id: "brief", icon: "✍️", label: "Заказать" },
   { id: "myleads", icon: "📋", label: "Мои заявки" },
 ];
 
@@ -1228,14 +1228,26 @@ async function submitBrief() {
     // делом — если чистить localStorage ДО navigate(), этот render()
     // тут же перезапишет его тем же (ещё не сброшенным) state.brief,
     // молча отменяя очистку. Поэтому сначала даём render() отработать,
-    // потом чистим — state.brief в памяти остаётся нетронутым (нужен
-    // для "Дополнить информацию" в рамках текущей сессии).
+    // потом чистим.
+    //
+    // state.brief сбрасываем ПОСЛЕ этого — отправленная заявка живёт
+    // только в "Мои заявки" и НЕ должна оставаться "текущим драфтом":
+    // раньше state.brief нарочно не трогали ("нужен для Дополнить
+    // информацию в рамках сессии"), но supplement-режим (см. openSupplementFor)
+    // больше не читает state.brief вообще — он адресуется по lead_id через
+    // отдельный state.supplement. Без этого сброса повторный заход на таб
+    // "Заказать" в той же сессии WebView показывал шаг 7 только что
+    // отправленной заявки вместо чистого нового черновика (см. аудит).
+    // renderSubmitted() читает только lastPayload/lastLeadResult, не
+    // state.brief — сброс здесь никак не меняет уже показанный экран
+    // "Готово", поэтому повторный render() не нужен.
     state.submitting = false;
     state.lastPayload = payload;
     state.lastLeadResult = result; // { lead_id, created, attach_tz, price_range }
     state.history = [];
     navigate("submitted", { pushHistory: false });
     clearBriefDraft();
+    resetBriefState({ hardReset: true });
   } catch (e) {
     // Черновик НЕ теряем при ошибке — пользователь остаётся на том же шаге
     // с уже заполненными полями и может просто попробовать ещё раз.
@@ -1306,7 +1318,7 @@ function renderBrief() {
       <div class="result-box">
         <div class="price">${formatMoney(result.priceFrom)} – ${formatMoney(result.priceTo)}</div>
         <div class="term">${formatDays(result.termFrom)}–${formatDays(result.termTo)} рабочих дней</div>
-        <div class="hint">Точная сумма — предварительная, дизайнер подтвердит после брифа</div>
+        <div class="hint">Предварительная оценка стоимости по вашим параметрам</div>
       </div>
       <button class="btn btn-primary" id="order-next">Далее</button>
     `;
@@ -1367,13 +1379,22 @@ function renderBrief() {
     body = `<h2>Когда нужно?</h2><div class="option-buttons">${items}</div>`;
   } else if (step === 5) {
     const inferredBudget = inferBudgetFromCalc(b.calc);
+    // Нейтральная формулировка — раньше "похоже на X, можно подтвердить"
+    // звучало как навязанный ответ; бюджет и предварительная оценка (шаг 1)
+    // это разные вещи (см. аудит: ожидание клиента vs расчёт по scope), а
+    // не одно и то же под двумя именами.
     const hint = inferredBudget
-      ? `<p class="hint">По вашему расчёту в калькуляторе — похоже на «${BUDGET_OPTIONS.find((o) => o.id === inferredBudget).label}». Можно подтвердить или выбрать другой вариант.</p>`
+      ? `<p class="hint">Предварительная оценка попадает в диапазон «${BUDGET_OPTIONS.find((o) => o.id === inferredBudget).label}» — совпадает с вашими ожиданиями?</p>`
       : "";
     const items = BUDGET_OPTIONS.map(
       (o) => `<button class="pick ${o.id === (b.budget || inferredBudget) ? "selected" : ""}" data-budget-pick="${o.id}">${o.label}</button>`
     ).join("");
-    body = `<h2>Бюджет</h2>${hint}<div class="option-buttons">${items}</div>`;
+    body = `
+      <h2>Какой бюджет вы планируете на проект?</h2>
+      <p class="hint">Это ваш финансовый ориентир — он может отличаться от предварительной оценки выше. Дизайнер учтёт оба значения.</p>
+      ${hint}
+      <div class="option-buttons">${items}</div>
+    `;
   } else if (step === 6) {
     body = `
       <h2>Контакты</h2>
@@ -1441,7 +1462,7 @@ function wrapBrief(body, step) {
   return `
     <div class="topbar">
       <button class="back-btn" id="back">←</button>
-      <h1>✍️ Заявка</h1>
+      <h1>✍️ Заказать</h1>
     </div>
     ${renderProgress(step)}
     ${serviceChip}
