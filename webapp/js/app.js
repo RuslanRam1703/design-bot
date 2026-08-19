@@ -1,7 +1,10 @@
 /* Mini App дизайнера-фрилансера: портфолио, обо мне, калькулятор, бриф.
  * Работает и внутри Telegram (через telegram-web-app.js), и в обычном
- * браузере для превью/тестирования — во втором случае отправка заявки
- * не уходит в бота, а показывается на экране как JSON (см. TG.sendData).
+ * браузере для превью/тестирования портфолио/about/калькулятора. Отправка
+ * заявки (submitBrief) идёт через authenticated POST /api/leads (см.
+ * bot/webserver.py::handle_create_lead) — в обычном браузере без реального
+ * Telegram initData сервер её отклонит (401), тем же принципом, что и
+ * "Мои заявки" (TG.initData() пустая вне настоящего Telegram).
  */
 
 const HAVE_OPTIONS = [
@@ -125,6 +128,8 @@ const state = {
     draftId: null, // генерируется при первом использовании — см. generateDraftId()/init()
   },
   lastPayload: null,
+  lastLeadResult: null, // { lead_id, attach_tz, price_range } — ответ POST /api/leads, для renderSubmitted()
+  briefSubmitError: null, // текст ошибки под кнопкой "Отправить заявку", если POST /api/leads не удался
 };
 
 function generateDraftId() {
@@ -1145,7 +1150,7 @@ function briefPrev() {
   render();
 }
 
-function submitBrief() {
+async function submitBrief() {
   const payload = {
     action: "submit_brief",
     service_id: state.brief.serviceId,
@@ -1171,13 +1176,47 @@ function submitBrief() {
     // этому id вместо создания дубликата — см. content_store.add_lead().
     draft_id: state.brief.draftId,
   };
-  // Черновик НЕ чистим здесь: в реальном Telegram sendData() сразу закрывает
-  // Mini App — если чистить сейчас, "Дополнить информацию" при повторном
-  // открытии не найдёт draftId и создаст вторую заявку вместо обновления
-  // первой. Черновик естественно перезатирается следующим render() при
-  // настоящем новом заказе (resetBriefState всегда даёт новый draftId) —
-  // явная очистка нужна только когда пользователь осознанно уходит "В начало".
-  TG.sendData(payload);
+
+  // Telegram.WebApp.sendData() официально работает только для Mini App,
+  // запущенного через KeyboardButton.web_app
+  // (https://core.telegram.org/bots/webapps: "This method is only
+  // available for Mini Apps launched via a Keyboard button") — мы ушли от
+  // этой кнопки ради initData (см. bot/keyboards.py), значит sendData()
+  // для submit_brief больше не рабочий путь. POST /api/leads использует ту
+  // же проверенную identity, что уже работает для "Мои заявки".
+  state.briefSubmitError = null;
+  const submitBtn = document.getElementById("brief-submit");
+  if (submitBtn) submitBtn.disabled = true;
+  render();
+
+  try {
+    const res = await fetch("/api/leads", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Telegram-Init-Data": TG.initData() },
+      body: JSON.stringify(payload),
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const result = await res.json();
+    // Черновик чистим только после подтверждённого успеха с сервера — в
+    // отличие от sendData() (без ответа вообще), у HTTP есть реальное
+    // подтверждение, что заявка сохранена. Порядок важен: navigate() сам
+    // вызывает render(), а render() всегда persistBriefDraft() первым
+    // делом — если чистить localStorage ДО navigate(), этот render()
+    // тут же перезапишет его тем же (ещё не сброшенным) state.brief,
+    // молча отменяя очистку. Поэтому сначала даём render() отработать,
+    // потом чистим — state.brief в памяти остаётся нетронутым (нужен
+    // для "Дополнить информацию" в рамках текущей сессии).
+    state.lastPayload = payload;
+    state.lastLeadResult = result; // { lead_id, attach_tz, price_range }
+    state.history = [];
+    navigate("submitted", { pushHistory: false });
+    clearBriefDraft();
+  } catch (e) {
+    // Черновик НЕ теряем при ошибке — пользователь остаётся на том же шаге
+    // с уже заполненными полями и может просто попробовать ещё раз.
+    state.briefSubmitError = "Не получилось отправить заявку. Проверьте соединение и попробуйте ещё раз.";
+    render();
+  }
 }
 
 function renderProgress(step) {
@@ -1352,6 +1391,7 @@ function renderBrief() {
         <input type="text" id="tz-references" value="${escapeHtml(b.tzDetails.references)}" placeholder="Ссылки на примеры, которые нравятся" />
       </div>
       ` : ""}
+      ${state.briefSubmitError ? `<p class="error-text">${escapeHtml(state.briefSubmitError)}</p>` : ""}
       <div class="btn-row">
         <button class="btn btn-secondary" id="brief-prev">Назад</button>
         <button class="btn btn-primary" id="brief-submit" ${isContactStepValid() ? "" : "disabled"}>Отправить заявку</button>
@@ -1554,25 +1594,35 @@ function attachMyLeadsEvents() {
   });
 }
 
-// ---- Экран: подтверждение (только вне Telegram, для тестирования в браузере —
-// в реальном Telegram sendData() сама закрывает Mini App, этот экран никогда
-// не увидит настоящий клиент; номер заявки и итоговую цену он получит
-// сообщением от бота, см. bot/texts.py -> lead_received_ack/lead_ack_ask_file) ----
+// ---- Экран: подтверждение после успешного POST /api/leads ----
+// Раньше этот экран видел только dev-фоллбэк вне Telegram (sendData() сама
+// закрывала Mini App у настоящего клиента, подтверждение шло отдельным
+// сообщением в чате) — теперь HTTP-ответ не закрывает Mini App сама, так
+// что этот экран стал боевым: показывает номер заявки и сумму расчёта
+// прямо здесь, плюс переход в "Мои заявки" (см. п.8 требований — успех
+// подтверждается внутри Mini App, уведомление владельцу в чат остаётся
+// отдельно, см. bot/webserver.py::handle_create_lead).
 function renderSubmitted() {
   const p = state.lastPayload || {};
-  const priceLine = p.calc
-    ? `<p class="hint">Расчёт передан вместе с заявкой — итоговую вилку цены дизайнер подтвердит в чате.</p>`
+  const result = state.lastLeadResult || {};
+  const priceLine = result.price_range
+    ? `<div class="result-box"><div class="price">${formatMoney(result.price_range.from)} – ${formatMoney(result.price_range.to)}</div><div class="hint">Точная сумма — предварительная, дизайнер подтвердит в чате</div></div>`
+    : "";
+  const tzLine = result.attach_tz
+    ? `<p class="hint">Вы отметили, что пришлёте файл ТЗ — отправьте его следующим сообщением прямо в этот чат с ботом (не через Mini App).</p>`
     : "";
   return `
     <div class="topbar"><h1>Готово ✅</h1></div>
-    <p>Заявка отправлена. В реальном Telegram здесь бот прислал бы в чат номер заявки, услугу и предварительную стоимость — этот экран показывается только в режиме предпросмотра в браузере.</p>
-    <div class="summary-box">Услуга: <b>${escapeHtml(p.service_name || "не указана")}</b></div>
+    <div class="case-block"><div class="label">Заявка №${result.lead_id ?? "—"}</div><p>Услуга: ${escapeHtml(p.service_name || "не указана")}</p></div>
     ${priceLine}
-    <p class="hint">Данные, которые ушли бы боту:</p>
-    <pre class="summary-box" style="white-space:pre-wrap;word-break:break-word;">${escapeHtml(JSON.stringify(p, null, 2))}</pre>
+    ${tzLine}
+    <p>Я свяжусь с вами в ближайшее время.</p>
     <div class="btn-row">
       <button class="btn btn-secondary" id="add-more-info">Дополнить информацию</button>
-      <button class="btn btn-primary" id="to-start">В начало</button>
+      <button class="btn btn-primary" id="to-my-leads">Мои заявки</button>
+    </div>
+    <div class="btn-row">
+      <button class="btn btn-secondary" id="to-start">В начало</button>
     </div>
   `;
 }
@@ -1590,6 +1640,14 @@ document.addEventListener("click", (e) => {
     // редактировать; повторная отправка обновит ту же заявку (см. submitBrief).
     state.history = [];
     navigate("brief", { pushHistory: false });
+  }
+  if (e.target && e.target.id === "to-my-leads") {
+    // status сбрасываем в "idle", чтобы fetchMyLeads() перезапросил список —
+    // иначе только что созданной заявки не было бы видно до следующего
+    // захода (state.myLeads уже мог быть "loaded" с прошлого раза).
+    state.myLeads.status = "idle";
+    state.history = [];
+    navigate("myleads", { pushHistory: false });
   }
 });
 

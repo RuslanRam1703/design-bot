@@ -39,7 +39,7 @@ import bot.keyboards as keyboards
 import bot.telegram_auth as telegram_auth
 import bot.texts as texts
 import bot.webserver as webserver
-from bot.states import AdminStates, BriefStates
+from bot.states import AdminStates
 
 
 def make_state(chat_id: int = 555) -> FSMContext:
@@ -62,12 +62,13 @@ def make_message() -> SimpleNamespace:
 
 
 class BriefLifecycleTests(unittest.IsolatedAsyncioTestCase):
-    """P0 из аудита: старое awaiting_tz_file не должно переживать новую
-    заявку, отправленную без "пришлю файл" — иначе все следующие сообщения
-    клиента перехватываются как файл ТЗ от предыдущей заявки."""
+    """P0 из аудита: awaiting_tz_file — теперь persistent-поле самой заявки
+    (content_store), не FSM — переживает restart/redeploy (тот же Upstash-
+    слой, что и вся заявка), и не должно переживать новую заявку без
+    "пришлю файл", и не должно путать заявки разных пользователей."""
 
     def setUp(self):
-        # _handle_brief_submission теперь пишет заявку через content_store.add_lead
+        # _handle_brief_submission пишет заявку через content_store.add_lead
         # (см. Part 6-7 ТЗ) — без подмены DATA_DIR тесты писали бы тестовые
         # заявки в настоящий data/leads.json.
         self.tmpdir = tempfile.mkdtemp()
@@ -79,29 +80,58 @@ class BriefLifecycleTests(unittest.IsolatedAsyncioTestCase):
         shutil.rmtree(self.tmpdir, ignore_errors=True)
 
     async def test_second_submission_without_tz_clears_stale_awaiting_state(self):
-        state = make_state()
         message = make_message()
 
-        # Заявка №1: "пришлю файл" -> бот должен перейти в ожидание файла.
-        await webapp._handle_brief_submission(message, state, {"service_name": "Лендинг", "attach_tz": True})
-        self.assertEqual(await state.get_state(), BriefStates.awaiting_tz_file.state)
+        # Заявка (draft_id="d1"): "пришлю файл" -> заявка должна ждать файл.
+        await webapp._handle_brief_submission(message, {"service_name": "Лендинг", "attach_tz": True, "draft_id": "d1"})
+        self.assertIsNotNone(content_store.find_lead_awaiting_file(message.from_user.id))
 
-        # Заявка №2 (например, клиент передумал и не прислал файл): состояние
-        # должно быть полностью очищено, а не остаться от заявки №1.
-        await webapp._handle_brief_submission(message, state, {"service_name": "Лендинг", "attach_tz": False})
-        self.assertIsNone(await state.get_state())
+        # Тот же draft_id (клиент передумал через "Дополнить информацию" и
+        # убрал "пришлю файл") -> upsert той же заявки, флаг должен сняться,
+        # а не остаться висеть от предыдущей отправки.
+        await webapp._handle_brief_submission(message, {"service_name": "Лендинг", "attach_tz": False, "draft_id": "d1"})
+        self.assertIsNone(content_store.find_lead_awaiting_file(message.from_user.id))
 
     async def test_repeat_submission_with_tz_again_still_ends_clean_without_file(self):
-        state = make_state()
         message = make_message()
 
-        await webapp._handle_brief_submission(message, state, {"service_name": "Лендинг", "attach_tz": True})
-        await webapp._handle_brief_submission(message, state, {"service_name": "Лендинг", "attach_tz": True})
-        self.assertEqual(await state.get_state(), BriefStates.awaiting_tz_file.state)
+        await webapp._handle_brief_submission(message, {"service_name": "Лендинг", "attach_tz": True, "draft_id": "d2"})
+        await webapp._handle_brief_submission(message, {"service_name": "Лендинг", "attach_tz": True, "draft_id": "d2"})
+        self.assertIsNotNone(content_store.find_lead_awaiting_file(message.from_user.id))
 
         # Присланный файл закрывает ожидание (тот же путь, что и в проде).
-        await webapp.handle_tz_file(message, state)
-        self.assertIsNone(await state.get_state())
+        await webapp.handle_tz_file(message)
+        self.assertIsNone(content_store.find_lead_awaiting_file(message.from_user.id))
+
+    async def test_file_from_different_user_does_not_close_someone_elses_wait(self):
+        # Security: файл от чужого user_id не должен закрывать чужое
+        # ожидание и не должен пересылаться дизайнеру как relevant TЗ.
+        owner_message = make_message()  # from_user.id == 1
+        await webapp._handle_brief_submission(
+            owner_message, {"service_name": "Лендинг", "attach_tz": True, "draft_id": "d3"}
+        )
+
+        stranger_message = make_message()
+        stranger_message.from_user = SimpleNamespace(id=999, username="stranger", first_name="Чужой", last_name=None)
+        await webapp.handle_tz_file(stranger_message)
+
+        self.assertIsNotNone(content_store.find_lead_awaiting_file(1))  # заявка владельца всё ещё ждёт файл
+        stranger_message.forward.assert_not_awaited()
+        stranger_message.answer.assert_not_awaited()  # чужому отправителю тоже ничего не отвечаем
+
+    async def test_awaiting_state_survives_simulated_restart(self):
+        # "Persistence через restart/redeploy" — здесь эмулируется тем, что
+        # find_lead_awaiting_file каждый раз читает данные заново с диска
+        # (_read_leads), а не держит что-то в памяти процесса, как раньше
+        # делал FSM MemoryStorage (терялось при рестарте бота).
+        message = make_message()
+        await webapp._handle_brief_submission(message, {"service_name": "Лендинг", "attach_tz": True, "draft_id": "d4"})
+
+        # "Рестарт" — работаем со свежим вызовом, ничего не переиспользуем
+        # из предыдущего процесса/переменных, кроме самого файла на диске.
+        lead = content_store.find_lead_awaiting_file(message.from_user.id)
+        self.assertIsNotNone(lead)
+        self.assertTrue(lead["awaiting_tz_file"])
 
 
 class LeadNotificationContentTests(unittest.IsolatedAsyncioTestCase):
@@ -121,7 +151,6 @@ class LeadNotificationContentTests(unittest.IsolatedAsyncioTestCase):
         shutil.rmtree(self.tmpdir, ignore_errors=True)
 
     async def test_case_sourced_calculated_brief_produces_expected_notification(self):
-        state = make_state()
         message = make_message()
 
         payload = {
@@ -141,7 +170,7 @@ class LeadNotificationContentTests(unittest.IsolatedAsyncioTestCase):
         }
         message.web_app_data = SimpleNamespace(data=json.dumps(payload))
 
-        await webapp.handle_webapp_data(message, state)
+        await webapp.handle_webapp_data(message)
 
         message.bot.send_message.assert_awaited_once()
         text = message.bot.send_message.await_args.kwargs["text"]
@@ -152,10 +181,9 @@ class LeadNotificationContentTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Бюджет:</b> 40 000–70 000 ₽", text)
         self.assertNotIn("ТЗ:</b> клиент пришлёт файл", text)  # attach_tz=False
         message.answer.assert_awaited_once()
-        self.assertIsNone(await state.get_state())  # attach_tz=False -> ничего не ждём
+        self.assertIsNone(content_store.find_lead_awaiting_file(message.from_user.id))  # attach_tz=False -> ничего не ждём
 
     async def test_direct_brief_has_no_source_noise_in_notification(self):
-        state = make_state()
         message = make_message()
 
         payload = {
@@ -175,11 +203,11 @@ class LeadNotificationContentTests(unittest.IsolatedAsyncioTestCase):
         }
         message.web_app_data = SimpleNamespace(data=json.dumps(payload))
 
-        await webapp.handle_webapp_data(message, state)
+        await webapp.handle_webapp_data(message)
 
         text = message.bot.send_message.await_args.kwargs["text"]
         self.assertNotIn("Источник", text)  # "direct" осознанно не показываем — см. lead.py
-        self.assertEqual(await state.get_state(), BriefStates.awaiting_tz_file.state)  # attach_tz=True
+        self.assertIsNotNone(content_store.find_lead_awaiting_file(message.from_user.id))  # attach_tz=True
 
 
 class AdminCancelContextTests(unittest.TestCase):
@@ -256,6 +284,9 @@ def make_flow_message(chat_id: int = 888, text: str | None = "/start", delete_ra
     sent = SimpleNamespace(message_id=555, chat=SimpleNamespace(id=chat_id))
     return SimpleNamespace(
         chat=SimpleNamespace(id=chat_id),
+        # В приватном чате с ботом chat_id == from_user.id всегда — тот же
+        # принцип использует cmd_cancel (content_store.find_lead_awaiting_file).
+        from_user=SimpleNamespace(id=chat_id, username=None, first_name="Тест", last_name=None),
         text=text,
         delete=_delete,
         answer=AsyncMock(return_value=sent),
@@ -439,9 +470,21 @@ class EntryPointArchitectureTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self._orig_designer = start.config.DESIGNER_CHAT_ID
         start.config.DESIGNER_CHAT_ID = "888"
+        # cmd_cancel теперь читает content_store.find_lead_awaiting_file, а
+        # admin_button -> cmd_admin читает portfolio/faq/about для сводки —
+        # изолируем DATA_DIR (с сидированием реальных файлов), чтобы не
+        # трогать настоящий data/*.json.
+        self.tmpdir = tempfile.mkdtemp()
+        real_data_dir = Path(__file__).resolve().parent.parent / "data"
+        for name in ("pricing.json", "portfolio.json", "faq.json", "about.json", "ui_config.json"):
+            shutil.copy(real_data_dir / name, Path(self.tmpdir) / name)
+        self._orig_data_dir = content_store.DATA_DIR
+        content_store.DATA_DIR = Path(self.tmpdir)
 
     def tearDown(self):
         start.config.DESIGNER_CHAT_ID = self._orig_designer
+        content_store.DATA_DIR = self._orig_data_dir
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
 
     def test_main_menu_keyboard_no_longer_exists(self):
         # Старое имя удалённой inline-двух-кнопочной клавиатуры — не должно
@@ -1908,7 +1951,7 @@ class MyLeadsHttpEndpointTests(unittest.IsolatedAsyncioTestCase):
             webserver.config.BOT_TOKEN,
         )
 
-        app = webserver.create_app()
+        app = webserver.create_app(AsyncMock())
         async with TestClient(TestServer(app)) as client:
             resp = await client.get("/api/my-leads", headers={"X-Telegram-Init-Data": init_data})
             self.assertEqual(resp.status, 200)
@@ -1922,7 +1965,7 @@ class MyLeadsHttpEndpointTests(unittest.IsolatedAsyncioTestCase):
     async def test_empty_init_data_header_is_401_not_500(self):
         from aiohttp.test_utils import TestClient, TestServer
 
-        app = webserver.create_app()
+        app = webserver.create_app(AsyncMock())
         async with TestClient(TestServer(app)) as client:
             resp = await client.get("/api/my-leads", headers={"X-Telegram-Init-Data": ""})
             self.assertEqual(resp.status, 401)
@@ -1930,7 +1973,7 @@ class MyLeadsHttpEndpointTests(unittest.IsolatedAsyncioTestCase):
     async def test_corrupted_init_data_header_is_401_not_500(self):
         from aiohttp.test_utils import TestClient, TestServer
 
-        app = webserver.create_app()
+        app = webserver.create_app(AsyncMock())
         async with TestClient(TestServer(app)) as client:
             resp = await client.get("/api/my-leads", headers={"X-Telegram-Init-Data": "garbage=%%%not-valid"})
             self.assertEqual(resp.status, 401)
@@ -1943,7 +1986,7 @@ class MyLeadsHttpEndpointTests(unittest.IsolatedAsyncioTestCase):
         "убедительные" значения."""
         from aiohttp.test_utils import TestClient, TestServer
 
-        app = webserver.create_app()
+        app = webserver.create_app(AsyncMock())
         async with TestClient(TestServer(app)) as client:
             resp = await client.get(
                 "/api/my-leads",
@@ -1964,7 +2007,7 @@ class MyLeadsHttpEndpointTests(unittest.IsolatedAsyncioTestCase):
         конвертировать провал HMAC-проверки в успех."""
         from aiohttp.test_utils import TestClient, TestServer
 
-        app = webserver.create_app()
+        app = webserver.create_app(AsyncMock())
         async with TestClient(TestServer(app)) as client:
             resp = await client.get(
                 "/api/my-leads",
@@ -1987,7 +2030,7 @@ class MyLeadsHttpEndpointTests(unittest.IsolatedAsyncioTestCase):
             {"auth_date": str(int(time.time())), "user": json.dumps({"id": 42, "first_name": "Я"})},
             webserver.config.BOT_TOKEN,
         )
-        app = webserver.create_app()
+        app = webserver.create_app(AsyncMock())
         async with TestClient(TestServer(app)) as client:
             resp = await client.get(
                 "/api/my-leads",
@@ -2010,12 +2053,203 @@ class MyLeadsHttpEndpointTests(unittest.IsolatedAsyncioTestCase):
             {"auth_date": str(int(time.time())), "user": json.dumps({"id": 42, "first_name": "Я"})},
             webserver.config.BOT_TOKEN,
         )
-        app = webserver.create_app()
+        app = webserver.create_app(AsyncMock())
         async with TestClient(TestServer(app)) as client:
             resp = await client.get("/api/my-leads", headers={"X-Telegram-Init-Data": init_data})
             self.assertEqual(resp.status, 200)
             body = await resp.json()
             self.assertEqual(len(body), 1)
+
+
+class CreateLeadHttpEndpointTests(unittest.IsolatedAsyncioTestCase):
+    """POST /api/leads — заменяет Telegram.WebApp.sendData() для submitBrief()
+    (см. webapp/js/app.js), т.к. sendData() официально работает только для
+    Mini App, запущенного через KeyboardButton.web_app, а мы ушли от этой
+    кнопки ради initData. Тот же принцип identity, что и в /api/my-leads —
+    user_id ТОЛЬКО из validate_init_data, никогда из body."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        real_data_dir = Path(__file__).resolve().parent.parent / "data"
+        for name in ("pricing.json", "portfolio.json", "faq.json", "about.json", "ui_config.json"):
+            shutil.copy(real_data_dir / name, Path(self.tmpdir) / name)
+        self._orig_data_dir = content_store.DATA_DIR
+        self._orig_token = webserver.config.BOT_TOKEN
+        content_store.DATA_DIR = Path(self.tmpdir)
+        webserver.config.BOT_TOKEN = "123456:test-token-not-real"
+
+    def tearDown(self):
+        content_store.DATA_DIR = self._orig_data_dir
+        webserver.config.BOT_TOKEN = self._orig_token
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def _init_data(self, user_id=42, **extra_fields):
+        fields = {
+            "auth_date": str(int(time.time())),
+            "user": json.dumps({"id": user_id, "first_name": "Клиент", "username": "client1"}),
+            **extra_fields,
+        }
+        return _sign_init_data(fields, webserver.config.BOT_TOKEN)
+
+    async def test_valid_init_data_creates_lead_and_returns_200(self):
+        from aiohttp.test_utils import TestClient, TestServer
+
+        app = webserver.create_app(AsyncMock())
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.post(
+                "/api/leads",
+                headers={"X-Telegram-Init-Data": self._init_data(), "Content-Type": "application/json"},
+                json={"service_name": "Лендинг", "attach_tz": False, "task_description": "тест"},
+            )
+            self.assertEqual(resp.status, 200)
+            body = await resp.json()
+            self.assertIn("lead_id", body)
+
+        leads = content_store.list_leads_by_user(42)
+        self.assertEqual(len(leads), 1)
+
+    async def test_missing_init_data_is_401_and_creates_no_lead(self):
+        from aiohttp.test_utils import TestClient, TestServer
+
+        app = webserver.create_app(AsyncMock())
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.post(
+                "/api/leads",
+                headers={"Content-Type": "application/json"},
+                json={"service_name": "Лендинг"},
+            )
+            self.assertEqual(resp.status, 401)
+        self.assertEqual(content_store.list_leads(), [])
+
+    async def test_invalid_init_data_is_401_and_creates_no_lead(self):
+        from aiohttp.test_utils import TestClient, TestServer
+
+        app = webserver.create_app(AsyncMock())
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.post(
+                "/api/leads",
+                headers={"X-Telegram-Init-Data": "garbage=%%%not-valid", "Content-Type": "application/json"},
+                json={"service_name": "Лендинг"},
+            )
+            self.assertEqual(resp.status, 401)
+        self.assertEqual(content_store.list_leads(), [])
+
+    async def test_user_id_spoofed_in_body_is_ignored(self):
+        # Ключевое требование безопасности: body может содержать что угодно
+        # (в т.ч. попытку выдать себя за другого user_id) — сервер должен
+        # использовать ИСКЛЮЧИТЕЛЬНО user_id из провалидированной initData.
+        from aiohttp.test_utils import TestClient, TestServer
+
+        app = webserver.create_app(AsyncMock())
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.post(
+                "/api/leads",
+                headers={"X-Telegram-Init-Data": self._init_data(user_id=42), "Content-Type": "application/json"},
+                json={"service_name": "Лендинг", "user_id": 999999, "telegram": {"user_id": 999999}},
+            )
+            self.assertEqual(resp.status, 200)
+
+        self.assertEqual(content_store.list_leads_by_user(999999), [])
+        leads_for_real_user = content_store.list_leads_by_user(42)
+        self.assertEqual(len(leads_for_real_user), 1)
+
+    async def test_draft_id_upsert_updates_existing_lead_not_duplicate(self):
+        from aiohttp.test_utils import TestClient, TestServer
+
+        app = webserver.create_app(AsyncMock())
+        async with TestClient(TestServer(app)) as client:
+            first = await client.post(
+                "/api/leads",
+                headers={"X-Telegram-Init-Data": self._init_data(), "Content-Type": "application/json"},
+                json={"service_name": "Лендинг", "draft_id": "d-upsert-1"},
+            )
+            first_body = await first.json()
+            second = await client.post(
+                "/api/leads",
+                headers={"X-Telegram-Init-Data": self._init_data(), "Content-Type": "application/json"},
+                json={"service_name": "Лендинг, доп. правки", "draft_id": "d-upsert-1"},
+            )
+            second_body = await second.json()
+
+        self.assertEqual(first_body["lead_id"], second_body["lead_id"])  # тот же lead, не новый
+        leads = content_store.list_leads_by_user(42)
+        self.assertEqual(len(leads), 1)
+        self.assertEqual(leads[0]["payload"]["service_name"], "Лендинг, доп. правки")
+
+    async def test_source_case_fields_and_calc_summary_are_saved(self):
+        from aiohttp.test_utils import TestClient, TestServer
+
+        app = webserver.create_app(AsyncMock())
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.post(
+                "/api/leads",
+                headers={"X-Telegram-Init-Data": self._init_data(), "Content-Type": "application/json"},
+                json={
+                    "service_name": "Лендинг",
+                    "source": "case",
+                    "source_case_id": "case_3",
+                    "source_case_title": "Лендинг кофейни",
+                    "calc": {"service_id": "LEND", "options": [], "urgent": False, "complex": False},
+                },
+            )
+            self.assertEqual(resp.status, 200)
+            body = await resp.json()
+            self.assertIsNotNone(body["price_range"])  # calc_summary реально посчитан
+
+        lead = content_store.list_leads_by_user(42)[0]
+        self.assertEqual(lead["payload"]["source_case_id"], "case_3")
+        self.assertEqual(lead["payload"]["source_case_title"], "Лендинг кофейни")
+        self.assertIsNotNone(lead["calc_summary"])
+
+    async def test_attach_tz_true_creates_awaiting_file_state(self):
+        from aiohttp.test_utils import TestClient, TestServer
+
+        app = webserver.create_app(AsyncMock())
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.post(
+                "/api/leads",
+                headers={"X-Telegram-Init-Data": self._init_data(), "Content-Type": "application/json"},
+                json={"service_name": "Лендинг", "attach_tz": True},
+            )
+            body = await resp.json()
+            self.assertTrue(body["attach_tz"])
+
+        lead = content_store.find_lead_awaiting_file(42)
+        self.assertIsNotNone(lead)
+
+    async def test_designer_is_notified_via_bot_instance(self):
+        # bot передан в create_app() именно для этого — уведомление
+        # DESIGNER_CHAT_ID должно идти через РЕАЛЬНЫЙ переданный Bot, а не
+        # какой-то отдельный, не связанный с полученным аргументом инстанс.
+        from aiohttp.test_utils import TestClient, TestServer
+
+        fake_bot = AsyncMock()
+        self._orig_designer = webserver.config.DESIGNER_CHAT_ID
+        webserver.config.DESIGNER_CHAT_ID = "777"
+        try:
+            app = webserver.create_app(fake_bot)
+            async with TestClient(TestServer(app)) as client:
+                await client.post(
+                    "/api/leads",
+                    headers={"X-Telegram-Init-Data": self._init_data(), "Content-Type": "application/json"},
+                    json={"service_name": "Лендинг"},
+                )
+            fake_bot.send_message.assert_awaited_once()
+            self.assertEqual(fake_bot.send_message.await_args.kwargs["chat_id"], "777")
+        finally:
+            webserver.config.DESIGNER_CHAT_ID = self._orig_designer
+
+    async def test_invalid_json_body_is_400_not_500(self):
+        from aiohttp.test_utils import TestClient, TestServer
+
+        app = webserver.create_app(AsyncMock())
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.post(
+                "/api/leads",
+                headers={"X-Telegram-Init-Data": self._init_data(), "Content-Type": "application/json"},
+                data="not valid json {{{",
+            )
+            self.assertEqual(resp.status, 400)
 
 
 if __name__ == "__main__":

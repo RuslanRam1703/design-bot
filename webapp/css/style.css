@@ -99,6 +99,7 @@ a { color: var(--link); text-decoration: none; }
 
 .hint { color: var(--hint); font-size: 13px; }
 .section-lead { color: var(--text); font-size: 14px; margin: 0 0 12px; }
+.error-text { color: var(--danger); font-size: 14px; }
 
 /* ---- Топ-панель с заголовком экрана ---- */
 .topbar {

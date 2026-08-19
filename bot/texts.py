@@ -51,7 +51,6 @@ def lead_ack_ask_file(lead_id: int, service_name: str | None, price_range: str |
     return "\n".join(lines)
 
 TZ_FILE_FORWARDED = "Файл получен, спасибо! Я его изучу."
-TZ_FILE_EXPECTED = "Жду файл с ТЗ 📎 (или отправьте /cancel, если передумали)"
 
 CASE_INTEREST_ACK = "Хорошо! Открываю заявку с указанием этой услуги 👇"
 

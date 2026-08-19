@@ -76,7 +76,7 @@ async def main() -> None:
     dp.include_router(faq.router)
     dp.include_router(start.router)  # start — последним: содержит catch-all для текста
 
-    app = create_app()
+    app = create_app(bot)
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, host="0.0.0.0", port=config.PORT)

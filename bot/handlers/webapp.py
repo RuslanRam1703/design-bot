@@ -3,21 +3,27 @@ import json
 import logging
 
 from aiogram import F, Router
-from aiogram.fsm.context import FSMContext
 from aiogram.types import Message
 
 from bot import config, content_store, texts
 from bot.calculator import calculate
 from bot.data import load_pricing
 from bot.lead import format_lead_message
-from bot.states import BriefStates
 
 router = Router(name="webapp")
 logger = logging.getLogger(__name__)
 
 
 @router.message(F.web_app_data)
-async def handle_webapp_data(message: Message, state: FSMContext) -> None:
+async def handle_webapp_data(message: Message) -> None:
+    """Legacy-путь: Telegram.WebApp.sendData() официально работает только
+    для Mini App, запущенного через KeyboardButton.web_app
+    (https://core.telegram.org/bots/webapps) — мы ушли от этой кнопки ради
+    initData (см. bot/keyboards.py), поэтому submitBrief() теперь шлёт
+    POST /api/leads (bot/webserver.py::handle_create_lead), а не sendData().
+    Хендлер оставлен нетронутым как fallback — на случай, если что-то в
+    будущем всё же вызовет sendData() (например, старый закэшированный
+    app.js у части клиентов до следующего обращения к серверу)."""
     try:
         payload = json.loads(message.web_app_data.data)
     except (json.JSONDecodeError, TypeError):
@@ -27,18 +33,12 @@ async def handle_webapp_data(message: Message, state: FSMContext) -> None:
 
     action = payload.get("action")
     if action == "submit_brief":
-        await _handle_brief_submission(message, state, payload)
+        await _handle_brief_submission(message, payload)
     else:
         logger.warning("Неизвестное action из webapp: %r", action)
 
 
-async def _handle_brief_submission(message: Message, state: FSMContext, payload: dict) -> None:
-    # Сбрасываем любое старое ожидание файла ТЗ до принятия решения по этой
-    # заявке — иначе повторная отправка брифа без "пришлю файл" оставляла
-    # BriefStates.awaiting_tz_file висеть от предыдущей заявки, и все
-    # следующие сообщения клиента перехватывались как файл ТЗ.
-    await state.clear()
-
+async def _handle_brief_submission(message: Message, payload: dict) -> None:
     calc_result = None
     calc_payload = payload.get("calc")
     if calc_payload and calc_payload.get("service_id"):
@@ -74,6 +74,10 @@ async def _handle_brief_submission(message: Message, state: FSMContext, payload:
     # draft_id — сгенерирован Mini App вместе с черновиком (localStorage) и
     # переживает "Дополнить информацию": повторная отправка того же
     # черновика ОБНОВЛЯЕТ заявку вместо создания дубликата (см. Part 7 ТЗ).
+    # add_lead() сама выставляет awaiting_tz_file из payload["attach_tz"] —
+    # см. bot/content_store.py, тот же persistent-механизм, что и для
+    # основного HTTP-пути (handle_tz_file ниже не различает, откуда взялась
+    # заявка).
     lead = content_store.add_lead(payload, telegram_identity, calc_summary, draft_id=payload.get("draft_id"))
 
     price_range = None
@@ -82,22 +86,29 @@ async def _handle_brief_submission(message: Message, state: FSMContext, payload:
 
     if payload.get("attach_tz"):
         await message.answer(texts.lead_ack_ask_file(lead["id"], payload.get("service_name"), price_range))
-        await state.set_state(BriefStates.awaiting_tz_file)
     else:
         await message.answer(texts.lead_received_ack(lead["id"], payload.get("service_name"), price_range))
 
 
-@router.message(BriefStates.awaiting_tz_file, F.document | F.photo)
-async def handle_tz_file(message: Message, state: FSMContext) -> None:
+@router.message(F.document | F.photo)
+async def handle_tz_file(message: Message) -> None:
+    """Не привязано к FSM-состоянию (раньше — BriefStates.awaiting_tz_file,
+    терялось при рестарте бота) — вместо этого ищем заявку САМОГО этого
+    отправителя (message.from_user.id — всегда надёжный Telegram-identity,
+    как и для создания заявки), которая ждёт файл — см.
+    content_store.find_lead_awaiting_file. Чужую заявку так найти
+    невозможно: фильтр по user_id, не по произвольному id из сообщения.
+    Если ждущей заявки нет — просто ничего не делаем, документ/фото не
+    наш случай (например, админ шлёт архив бэкапа — это отдельный,
+    FSM-scoped хендлер в admin.py, который стоит раньше в порядке
+    роутеров и перехватит его первым)."""
+    lead = content_store.find_lead_awaiting_file(message.from_user.id)
+    if lead is None:
+        return
     if config.DESIGNER_CHAT_ID:
         try:
             await message.forward(chat_id=config.DESIGNER_CHAT_ID)
         except Exception:
-            logger.exception("Не удалось переслать файл ТЗ дизайнеру")
+            logger.exception("Не удалось переслать файл ТЗ дизайнеру (lead #%s)", lead["id"])
+    content_store.mark_tz_file_received(lead["id"])
     await message.answer(texts.TZ_FILE_FORWARDED)
-    await state.clear()
-
-
-@router.message(BriefStates.awaiting_tz_file)
-async def handle_tz_file_wrong_type(message: Message) -> None:
-    await message.answer(texts.TZ_FILE_EXPECTED)

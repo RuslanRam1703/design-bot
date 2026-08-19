@@ -1,10 +1,6 @@
 from aiogram.fsm.state import State, StatesGroup
 
 
-class BriefStates(StatesGroup):
-    awaiting_tz_file = State()
-
-
 class AdminStates(StatesGroup):
     add_case_category = State()
     add_case_title = State()

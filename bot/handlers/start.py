@@ -3,9 +3,8 @@ from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.types import Message
 
-from bot import config, flow, texts
+from bot import config, content_store, flow, texts
 from bot.keyboards import reply_keyboard_for_chat, webapp_open_keyboard
-from bot.states import BriefStates
 
 router = Router(name="start")
 
@@ -50,8 +49,17 @@ async def cmd_brief(message: Message, state: FSMContext) -> None:
 
 @router.message(Command("cancel"))
 async def cmd_cancel(message: Message, state: FSMContext) -> None:
-    was_awaiting_file = (await state.get_state()) == BriefStates.awaiting_tz_file.state
-    text = "Хорошо, отменил ожидание файла." if was_awaiting_file else "Отменять было нечего."
+    # Раньше проверялось FSM-состояние BriefStates.awaiting_tz_file — теперь
+    # "жду файл" хранится persistent в самой заявке (см.
+    # content_store.find_lead_awaiting_file/mark_tz_file_received,
+    # bot/handlers/webapp.py::handle_tz_file), переживает рестарт бота.
+    # /cancel здесь просто снимает флаг ожидания — заявка остаётся как есть.
+    awaiting_lead = content_store.find_lead_awaiting_file(message.from_user.id)
+    if awaiting_lead is not None:
+        content_store.mark_tz_file_received(awaiting_lead["id"])
+        text = "Хорошо, отменил ожидание файла."
+    else:
+        text = "Отменять было нечего."
     await flow.open_root(message, state, text, _reply_keyboard_for(message))
 
 
