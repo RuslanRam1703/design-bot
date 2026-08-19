@@ -130,6 +130,20 @@ const state = {
   lastPayload: null,
   lastLeadResult: null, // { lead_id, attach_tz, price_range } — ответ POST /api/leads, для renderSubmitted()
   briefSubmitError: null, // текст ошибки под кнопкой "Отправить заявку", если POST /api/leads не удался
+  // submitting — единственный источник правды "отправка уже идёт" (НЕ прямое
+  // DOM-свойство disabled на кнопке): render() каждый раз пересоздаёт всю
+  // разметку шага 7 заново (app.innerHTML = ...), поэтому disabled,
+  // выставленный напрямую на элементе, немедленно терялся при следующем
+  // render() — кнопка визуально снова становилась кликабельной за доли
+  // секунды, и повторные тапы порождали несколько POST /api/leads на один
+  // клик (см. аудит). Теперь renderBrief() сам читает этот флаг.
+  submitting: false,
+  // supplement — полностью отдельное состояние для режима "Дополнить
+  // информацию к уже существующей заявке" (см. аудит). Намеренно НЕ часть
+  // state.brief и никогда не проходит через persistBriefDraft()/
+  // restoreBriefDraft()/clearBriefDraft() — обычный черновик новой заявки
+  // не должен ни читаться, ни перезаписываться этим режимом.
+  supplement: null, // { leadId, comment, additionalRequirements, references, contact, wantsFile, submitting, error, sent, supplementId }
 };
 
 function generateDraftId() {
@@ -369,6 +383,10 @@ function render() {
       content = renderMyLeads();
       TG.backButton.hide();
       break;
+    case "supplement":
+      content = renderSupplement();
+      TG.backButton.show(goBack);
+      break;
     case "submitted":
       content = renderSubmitted();
       TG.backButton.hide();
@@ -388,6 +406,7 @@ function render() {
     case "calculator": attachCalculatorEvents(); break;
     case "brief": attachBriefEvents(); break;
     case "myleads": attachMyLeadsEvents(); break;
+    case "supplement": attachSupplementEvents(); break;
   }
   if (showTabBar) attachTabBarEvents();
 
@@ -1151,8 +1170,14 @@ function briefPrev() {
 }
 
 async function submitBrief() {
+  // Ранний выход, если отправка уже в процессе — сама по себе кнопка НЕ
+  // защищает от повторного вызова (см. комментарий у state.submitting),
+  // поэтому проверка нужна и здесь, на уровне функции.
+  if (state.submitting) return;
+
   const payload = {
     action: "submit_brief",
+    mode: "new",
     service_id: state.brief.serviceId,
     service_name: state.brief.serviceName,
     task_description: state.brief.task.trim(),
@@ -1184,9 +1209,8 @@ async function submitBrief() {
   // этой кнопки ради initData (см. bot/keyboards.py), значит sendData()
   // для submit_brief больше не рабочий путь. POST /api/leads использует ту
   // же проверенную identity, что уже работает для "Мои заявки".
+  state.submitting = true;
   state.briefSubmitError = null;
-  const submitBtn = document.getElementById("brief-submit");
-  if (submitBtn) submitBtn.disabled = true;
   render();
 
   try {
@@ -1206,14 +1230,16 @@ async function submitBrief() {
     // молча отменяя очистку. Поэтому сначала даём render() отработать,
     // потом чистим — state.brief в памяти остаётся нетронутым (нужен
     // для "Дополнить информацию" в рамках текущей сессии).
+    state.submitting = false;
     state.lastPayload = payload;
-    state.lastLeadResult = result; // { lead_id, attach_tz, price_range }
+    state.lastLeadResult = result; // { lead_id, created, attach_tz, price_range }
     state.history = [];
     navigate("submitted", { pushHistory: false });
     clearBriefDraft();
   } catch (e) {
     // Черновик НЕ теряем при ошибке — пользователь остаётся на том же шаге
     // с уже заполненными полями и может просто попробовать ещё раз.
+    state.submitting = false;
     state.briefSubmitError = "Не получилось отправить заявку. Проверьте соединение и попробуйте ещё раз.";
     render();
   }
@@ -1393,8 +1419,8 @@ function renderBrief() {
       ` : ""}
       ${state.briefSubmitError ? `<p class="error-text">${escapeHtml(state.briefSubmitError)}</p>` : ""}
       <div class="btn-row">
-        <button class="btn btn-secondary" id="brief-prev">Назад</button>
-        <button class="btn btn-primary" id="brief-submit" ${isContactStepValid() ? "" : "disabled"}>Отправить заявку</button>
+        <button class="btn btn-secondary" id="brief-prev" ${state.submitting ? "disabled" : ""}>Назад</button>
+        <button class="btn btn-primary" id="brief-submit" ${(state.submitting || !isContactStepValid()) ? "disabled" : ""}>${state.submitting ? "Отправляю…" : "Отправить заявку"}</button>
       </div>
     `;
     return wrapBrief(body, step);
@@ -1562,36 +1588,167 @@ function attachMyLeadsEvents() {
 
   const continueBtn = document.getElementById("my-lead-continue");
   if (continueBtn) continueBtn.addEventListener("click", () => {
-    const lead = state.myLeads.selected;
-    const p = lead.payload || {};
-    // Восстанавливаем черновик из уже сохранённой заявки — тот же draft_id,
-    // чтобы повторная отправка ОБНОВИЛА эту же заявку, а не создала вторую
-    // (см. content_store.add_lead — upsert по draft_id).
-    const [name, ...rest] = (p.contact || "").split(" — ");
-    state.brief = {
-      ...state.brief,
-      step: 1,
-      serviceId: p.service_id || null,
-      serviceName: p.service_name || null,
-      task: p.task_description || "",
-      have: p.have || [],
-      deadline: p.deadline || null,
-      budget: p.budget || null,
-      name: name || "",
-      contactValue: rest.join(" — ") || "",
-      tzMode: null,
-      tzDetails: { goal: "", mustHave: "", avoid: "", references: "" },
-      calc: p.calc || null,
-      orderOptions: p.calc?.options ? Object.fromEntries(p.calc.options.map((o) => [o.id, o.qty])) : {},
-      urgent: p.calc?.urgent || false,
-      complex: p.calc?.complex || false,
-      source: p.source || "direct",
-      sourceCaseId: p.source_case_id || null,
-      sourceCaseTitle: p.source_case_title || null,
-      draftId: p.draft_id || generateDraftId(),
-    };
-    navigate("brief", { pushHistory: false });
+    openSupplementFor(state.myLeads.selected);
   });
+}
+
+// ---- Экран: Дополнение к существующей заявке ----
+// Отдельный режим, намеренно НЕ переиспользующий 7-шаговый Order Builder —
+// раньше "Дополнить информацию" перестраивало state.brief из уже
+// сохранённого lead.payload и отправляло клиента заново проходить весь
+// бриф с draftId старой заявки, из-за чего POST /api/leads (mode="new")
+// полностью перезаписывал payload заявки без какой-либо истории изменений
+// (см. аудит). Теперь дополнение — это отдельный append-only supplement на
+// lead["supplements"] (bot/content_store.py::add_lead_supplement),
+// адресуемый строго по lead_id, а не по draft_id.
+function openSupplementFor(lead) {
+  const p = (lead && lead.payload) || {};
+  state.supplement = {
+    leadId: lead.id,
+    comment: "",
+    additionalRequirements: "",
+    references: "",
+    contact: p.contact || "",
+    wantsFile: false,
+    submitting: false,
+    error: null,
+    sent: false,
+    supplementId: null,
+  };
+  navigate("supplement");
+}
+
+function renderSupplement() {
+  const s = state.supplement;
+  if (!s) return `<div class="empty-state">Заявка не выбрана.</div>`;
+
+  if (s.sent) {
+    return `
+      <div class="topbar"><h1>Дополнение отправлено ✅</h1></div>
+      <div class="case-block"><div class="label">Заявка №${s.leadId}</div><p>Дизайнер увидит дополнение в чате.</p></div>
+      <div class="btn-row">
+        <button class="btn btn-primary" id="supplement-back-to-lead">Вернуться к заявке</button>
+      </div>
+    `;
+  }
+
+  return `
+    <div class="topbar">
+      <button class="back-btn" id="back">←</button>
+      <h1>Дополнение к заявке №${s.leadId}</h1>
+    </div>
+    <div class="field">
+      <label>Что хотите добавить/изменить?</label>
+      <textarea id="supp-comment" rows="4" placeholder="Опишите, что нужно уточнить или добавить">${escapeHtml(s.comment)}</textarea>
+    </div>
+    <div class="field">
+      <label>Дополнительные требования (необязательно)</label>
+      <textarea id="supp-additional" rows="3">${escapeHtml(s.additionalRequirements)}</textarea>
+    </div>
+    <div class="field">
+      <label>Референсы (необязательно)</label>
+      <textarea id="supp-references" rows="3">${escapeHtml(s.references)}</textarea>
+    </div>
+    <div class="field">
+      <label>Контакты</label>
+      <input type="text" id="supp-contact" value="${escapeHtml(s.contact)}" placeholder="@username или +7..." />
+    </div>
+    <div class="field">
+      <button type="button" class="pick ${s.wantsFile ? "selected" : ""}" id="supp-wants-file">
+        📎 ${s.wantsFile ? "Пришлю файл следующим сообщением ✓" : "Хочу приложить файл"}
+      </button>
+    </div>
+    ${s.error ? `<p class="error-text">${escapeHtml(s.error)}</p>` : ""}
+    <div class="btn-row">
+      <button class="btn btn-primary" id="supplement-submit" ${s.submitting ? "disabled" : ""}>${s.submitting ? "Отправляю…" : "Отправить дополнение"}</button>
+    </div>
+    <div class="btn-row">
+      <button class="btn btn-secondary" id="supplement-start-new">Начать новую заявку</button>
+    </div>
+  `;
+}
+
+function attachSupplementEvents() {
+  const s = state.supplement;
+  if (!s) return;
+
+  if (s.sent) {
+    const backToLeadBtn = document.getElementById("supplement-back-to-lead");
+    if (backToLeadBtn) backToLeadBtn.addEventListener("click", () => {
+      // status: "idle" — перезапросить список, чтобы карточка заявки
+      // отражала только что отправленное дополнение.
+      state.myLeads.status = "idle";
+      state.myLeads.selected = null;
+      state.history = [];
+      navigate("myleads", { pushHistory: false });
+    });
+    return;
+  }
+
+  const backBtn = document.getElementById("back");
+  if (backBtn) backBtn.addEventListener("click", goBack);
+
+  const commentEl = document.getElementById("supp-comment");
+  if (commentEl) commentEl.addEventListener("input", () => { state.supplement.comment = commentEl.value; });
+  const additionalEl = document.getElementById("supp-additional");
+  if (additionalEl) additionalEl.addEventListener("input", () => { state.supplement.additionalRequirements = additionalEl.value; });
+  const referencesEl = document.getElementById("supp-references");
+  if (referencesEl) referencesEl.addEventListener("input", () => { state.supplement.references = referencesEl.value; });
+  const contactEl = document.getElementById("supp-contact");
+  if (contactEl) contactEl.addEventListener("input", () => { state.supplement.contact = contactEl.value; });
+
+  const wantsFileBtn = document.getElementById("supp-wants-file");
+  if (wantsFileBtn) wantsFileBtn.addEventListener("click", () => {
+    state.supplement.wantsFile = !state.supplement.wantsFile;
+    render();
+  });
+
+  const startNewBtn = document.getElementById("supplement-start-new");
+  if (startNewBtn) startNewBtn.addEventListener("click", () => {
+    // Явный уход в обычный Order Builder "с нуля" — сюда клиента приводит
+    // осознанный выбор поменять состав заказа (услугу/срок/бюджет), что
+    // supplement-форма намеренно не поддерживает (см. аудит: "Если
+    // клиенту нужно изменить состав/параметры заказа — это новая заявка").
+    state.history = [];
+    navigate("brief", { pushHistory: false, resetBrief: true, hardReset: true });
+  });
+
+  const submitBtn = document.getElementById("supplement-submit");
+  if (submitBtn) submitBtn.addEventListener("click", submitSupplement);
+}
+
+async function submitSupplement() {
+  const s = state.supplement;
+  if (!s || s.submitting) return;
+
+  s.submitting = true;
+  s.error = null;
+  render();
+
+  const fields = {
+    comment: s.comment.trim(),
+    additional_requirements: s.additionalRequirements.trim(),
+    references: s.references.trim(),
+    contact: s.contact.trim(),
+  };
+
+  try {
+    const res = await fetch("/api/leads", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Telegram-Init-Data": TG.initData() },
+      body: JSON.stringify({ mode: "supplement", lead_id: s.leadId, fields, wants_file: s.wantsFile }),
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const result = await res.json();
+    state.supplement.submitting = false;
+    state.supplement.sent = true;
+    state.supplement.supplementId = result.supplement_id;
+    render();
+  } catch (e) {
+    state.supplement.submitting = false;
+    state.supplement.error = "Не получилось отправить дополнение. Проверьте соединение и попробуйте ещё раз.";
+    render();
+  }
 }
 
 // ---- Экран: подтверждение после успешного POST /api/leads ----
@@ -1636,10 +1793,13 @@ document.addEventListener("click", (e) => {
     navigate("portfolio", { pushHistory: false, resetBrief: true, hardReset: true });
   }
   if (e.target && e.target.id === "add-more-info") {
-    // НЕ resetBrief — тот же draftId и те же ответы, просто возвращаемся
-    // редактировать; повторная отправка обновит ту же заявку (см. submitBrief).
-    state.history = [];
-    navigate("brief", { pushHistory: false });
+    // Раньше вело обратно в 7-шаговый Order Builder на том же (последнем)
+    // шаге — теперь единый supplement-режим, тот же что из "Мои заявки"
+    // (см. openSupplementFor/аудит).
+    const result = state.lastLeadResult || {};
+    if (result.lead_id) {
+      openSupplementFor({ id: result.lead_id, payload: state.lastPayload || {} });
+    }
   }
   if (e.target && e.target.id === "to-my-leads") {
     // status сбрасываем в "idle", чтобы fetchMyLeads() перезапросил список —

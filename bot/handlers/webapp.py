@@ -8,7 +8,7 @@ from aiogram.types import Message
 from bot import config, content_store, texts
 from bot.calculator import calculate
 from bot.data import load_pricing
-from bot.lead import format_lead_message
+from bot.lead import format_lead_message, format_material_message
 
 router = Router(name="webapp")
 logger = logging.getLogger(__name__)
@@ -52,16 +52,6 @@ async def _handle_brief_submission(message: Message, payload: dict) -> None:
         )
 
     user = message.from_user
-    text = format_lead_message(payload, calc_result, from_user_id=user.id, username=user.username)
-
-    if config.DESIGNER_CHAT_ID:
-        try:
-            await message.bot.send_message(chat_id=config.DESIGNER_CHAT_ID, text=text, parse_mode="HTML")
-        except Exception:
-            logger.exception("Не удалось отправить заявку дизайнеру (DESIGNER_CHAT_ID=%s)", config.DESIGNER_CHAT_ID)
-    else:
-        logger.warning("DESIGNER_CHAT_ID не задан — заявка не отправлена дизайнеру:\n%s", text)
-
     # Не требуем username — Telegram user_id уже достаточен как identity и
     # как основной канал ответа через бота (см. /admin -> Заявки).
     telegram_identity = {
@@ -72,13 +62,26 @@ async def _handle_brief_submission(message: Message, payload: dict) -> None:
     }
     calc_summary = dataclasses.asdict(calc_result) if calc_result and calc_result.valid else None
     # draft_id — сгенерирован Mini App вместе с черновиком (localStorage) и
-    # переживает "Дополнить информацию": повторная отправка того же
-    # черновика ОБНОВЛЯЕТ заявку вместо создания дубликата (см. Part 7 ТЗ).
-    # add_lead() сама выставляет awaiting_tz_file из payload["attach_tz"] —
-    # см. bot/content_store.py, тот же persistent-механизм, что и для
-    # основного HTTP-пути (handle_tz_file ниже не различает, откуда взялась
-    # заявка).
+    # используется ТОЛЬКО для upsert повторного/дублирующегося submit ОДНОГО
+    # И ТОГО ЖЕ ещё не изменённого черновика (не для "Дополнить информацию" —
+    # это отдельный supplement-режим, см. bot/webserver.py::
+    # _handle_lead_supplement и аудит). add_lead() сама выставляет
+    # awaiting_tz_file из payload["attach_tz"] — см. bot/content_store.py,
+    # тот же persistent-механизм, что и для основного HTTP-пути
+    # (handle_tz_file ниже не различает, откуда взялась заявка).
     lead = content_store.add_lead(payload, telegram_identity, calc_summary, draft_id=payload.get("draft_id"))
+
+    # Уведомляем владельца только при реальном создании — та же логика
+    # idempotency, что и в bot/webserver.py::_handle_lead_create (см. аудит).
+    if lead["created"]:
+        text = format_lead_message(payload, calc_result, lead_id=lead["id"], from_user_id=user.id, username=user.username)
+        if config.DESIGNER_CHAT_ID:
+            try:
+                await message.bot.send_message(chat_id=config.DESIGNER_CHAT_ID, text=text, parse_mode="HTML")
+            except Exception:
+                logger.exception("Не удалось отправить заявку дизайнеру (DESIGNER_CHAT_ID=%s)", config.DESIGNER_CHAT_ID)
+        else:
+            logger.warning("DESIGNER_CHAT_ID не задан — заявка не отправлена дизайнеру:\n%s", text)
 
     price_range = None
     if calc_summary:
@@ -98,17 +101,38 @@ async def handle_tz_file(message: Message) -> None:
     как и для создания заявки), которая ждёт файл — см.
     content_store.find_lead_awaiting_file. Чужую заявку так найти
     невозможно: фильтр по user_id, не по произвольному id из сообщения.
-    Если ждущей заявки нет — просто ничего не делаем, документ/фото не
-    наш случай (например, админ шлёт архив бэкапа — это отдельный,
+    add_lead/add_lead_supplement поддерживают инвариант "максимум одна
+    ожидающая заявка на клиента" (см. content_store._clear_other_awaiting и
+    аудит) — при нескольких заявках одного клиента файл не может уйти не
+    туда. Если ждущей заявки нет — просто ничего не делаем, документ/фото
+    не наш случай (например, админ шлёт архив бэкапа — это отдельный,
     FSM-scoped хендлер в admin.py, который стоит раньше в порядке
     роутеров и перехватит его первым)."""
     lead = content_store.find_lead_awaiting_file(message.from_user.id)
     if lead is None:
         return
+
+    if message.document:
+        file_id, file_unique_id, kind = message.document.file_id, message.document.file_unique_id, "document"
+    else:
+        photo = message.photo[-1]
+        file_id, file_unique_id, kind = photo.file_id, photo.file_unique_id, "photo"
+    source = lead.get("awaiting_tz_file_source") or "new"
+    # Материал сохраняем ДО пересылки — если пересылка упадёт (Telegram API
+    # недоступен и т.п.), связь "файл ↔ заявка" всё равно не теряется, её
+    # можно будет восстановить вручную через file_id из /admin.
+    content_store.record_lead_material(lead["id"], file_id, file_unique_id, kind, source)
+
     if config.DESIGNER_CHAT_ID:
         try:
+            # message.forward() не умеет добавлять caption (ограничение Bot
+            # API) — номер заявки уходит отдельным сообщением перед форвардом,
+            # иначе пересланный файл в чате владельца ничем не отличался бы
+            # от материала любой другой заявки (см. аудит).
+            await message.bot.send_message(
+                chat_id=config.DESIGNER_CHAT_ID, text=format_material_message(lead["id"]), parse_mode="HTML",
+            )
             await message.forward(chat_id=config.DESIGNER_CHAT_ID)
         except Exception:
-            logger.exception("Не удалось переслать файл ТЗ дизайнеру (lead #%s)", lead["id"])
-    content_store.mark_tz_file_received(lead["id"])
+            logger.exception("Не удалось переслать материал дизайнеру (lead #%s)", lead["id"])
     await message.answer(texts.TZ_FILE_FORWARDED)

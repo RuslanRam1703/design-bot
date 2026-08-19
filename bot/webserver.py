@@ -9,8 +9,10 @@ from aiohttp import web
 from bot import config, content_store
 from bot.calculator import calculate
 from bot.data import load_pricing
-from bot.lead import format_lead_message
+from bot.lead import format_lead_message, format_lead_supplement_message
 from bot.telegram_auth import diagnose_init_data, validate_init_data
+
+SUPPLEMENT_FIELD_KEYS = ("comment", "additional_requirements", "references", "contact")
 
 WEBAPP_DIR = Path(__file__).resolve().parent.parent / "webapp"
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
@@ -107,6 +109,24 @@ async def handle_create_lead(request: web.Request) -> web.Response:
     if not isinstance(payload, dict):
         return web.json_response({"error": "invalid_payload"}, status=400)
 
+    # user — уже провалидированный dict из validate_init_data ({"id":...,
+    # "username":..., "first_name":..., "last_name":...}), а не aiogram
+    # message.from_user — та же форма telegram_identity, что и в legacy
+    # bot/handlers/webapp.py::_handle_brief_submission, но из другого источника.
+    telegram_identity = {
+        "user_id": user["id"],
+        "username": user.get("username"),
+        "first_name": user.get("first_name"),
+        "last_name": user.get("last_name"),
+    }
+    bot: Bot = request.app["bot"]
+
+    if payload.get("mode") == "supplement":
+        return await _handle_lead_supplement(payload, telegram_identity, bot)
+    return await _handle_lead_create(payload, telegram_identity, bot)
+
+
+async def _handle_lead_create(payload: dict, telegram_identity: dict, bot: Bot) -> web.Response:
     calc_result = None
     calc_payload = payload.get("calc")
     if isinstance(calc_payload, dict) and calc_payload.get("service_id"):
@@ -120,34 +140,78 @@ async def handle_create_lead(request: web.Request) -> web.Response:
         )
     calc_summary = dataclasses.asdict(calc_result) if calc_result and calc_result.valid else None
 
-    # user — уже провалидированный dict из validate_init_data ({"id":...,
-    # "username":..., "first_name":..., "last_name":...}), а не aiogram
-    # message.from_user — та же форма telegram_identity, что и в legacy
-    # bot/handlers/webapp.py::_handle_brief_submission, но из другого источника.
-    telegram_identity = {
-        "user_id": user["id"],
-        "username": user.get("username"),
-        "first_name": user.get("first_name"),
-        "last_name": user.get("last_name"),
-    }
     lead = content_store.add_lead(payload, telegram_identity, calc_summary, draft_id=payload.get("draft_id"))
+    created = lead["created"]
 
-    bot: Bot = request.app["bot"]
-    text = format_lead_message(payload, calc_result, from_user_id=user["id"], username=user.get("username"))
-    if config.DESIGNER_CHAT_ID:
-        try:
-            await bot.send_message(chat_id=config.DESIGNER_CHAT_ID, text=text, parse_mode="HTML")
-        except Exception:
-            logger.exception("Не удалось отправить заявку дизайнеру (lead #%s)", lead["id"])
-    else:
-        logger.warning("DESIGNER_CHAT_ID не задан — заявка не отправлена дизайнеру (lead #%s)", lead["id"])
+    # Уведомляем владельца ТОЛЬКО при реальном создании — повторный/
+    # дублирующийся POST того же draft_id (см. аудит: кнопка "Отправить
+    # заявку" могла до фикса срабатывать несколько раз на один клик)
+    # обновляет ту же заявку через add_lead(), но не должен слать вторую
+    # копию "Новая заявка" в чат дизайнеру.
+    if created:
+        text = format_lead_message(
+            payload, calc_result, lead_id=lead["id"],
+            from_user_id=telegram_identity["user_id"], username=telegram_identity.get("username"),
+        )
+        if config.DESIGNER_CHAT_ID:
+            try:
+                await bot.send_message(chat_id=config.DESIGNER_CHAT_ID, text=text, parse_mode="HTML")
+            except Exception:
+                logger.exception("Не удалось отправить заявку дизайнеру (lead #%s)", lead["id"])
+        else:
+            logger.warning("DESIGNER_CHAT_ID не задан — заявка не отправлена дизайнеру (lead #%s)", lead["id"])
 
     price_range = None
     if calc_summary:
         price_range = {"from": calc_summary["price_from"], "to": calc_summary["price_to"]}
 
     return web.json_response(
-        {"lead_id": lead["id"], "attach_tz": bool(payload.get("attach_tz")), "price_range": price_range},
+        {"lead_id": lead["id"], "created": created, "attach_tz": bool(payload.get("attach_tz")), "price_range": price_range},
+        dumps=lambda d: json.dumps(d, ensure_ascii=False),
+        status=200,
+    )
+
+
+async def _handle_lead_supplement(payload: dict, telegram_identity: dict, bot: Bot) -> web.Response:
+    """mode="supplement" — дополнение к уже существующей заявке, адресуется
+    строго по lead_id (НЕ draft_id — тот принадлежит другому, уже
+    закрытому этапу жизни заявки, см. content_store.add_lead_supplement).
+    Не трогает lead["payload"] — то, что было в исходном Order Builder,
+    остаётся как есть; дополнение — отдельная append-only запись."""
+    lead_id = payload.get("lead_id")
+    if not isinstance(lead_id, int) or isinstance(lead_id, bool):
+        return web.json_response({"error": "invalid_lead_id"}, status=400)
+
+    raw_fields = payload.get("fields")
+    if not isinstance(raw_fields, dict):
+        return web.json_response({"error": "invalid_fields"}, status=400)
+    fields = {
+        key: raw_fields[key].strip()
+        for key in SUPPLEMENT_FIELD_KEYS
+        if isinstance(raw_fields.get(key), str) and raw_fields[key].strip()
+    }
+    wants_file = bool(payload.get("wants_file"))
+    if not fields and not wants_file:
+        return web.json_response({"error": "empty_supplement"}, status=400)
+
+    try:
+        lead, supplement_id = content_store.add_lead_supplement(lead_id, telegram_identity, fields, wants_file=wants_file)
+    except content_store.LeadNotFoundError:
+        return web.json_response({"error": "not_found"}, status=404)
+    except content_store.NotLeadOwnerError:
+        return web.json_response({"error": "forbidden"}, status=403)
+
+    text = format_lead_supplement_message(lead_id, fields)
+    if config.DESIGNER_CHAT_ID:
+        try:
+            await bot.send_message(chat_id=config.DESIGNER_CHAT_ID, text=text, parse_mode="HTML")
+        except Exception:
+            logger.exception("Не удалось отправить дополнение дизайнеру (lead #%s)", lead_id)
+    else:
+        logger.warning("DESIGNER_CHAT_ID не задан — дополнение не отправлено дизайнеру (lead #%s)", lead_id)
+
+    return web.json_response(
+        {"lead_id": lead_id, "supplement_id": supplement_id},
         dumps=lambda d: json.dumps(d, ensure_ascii=False),
         status=200,
     )

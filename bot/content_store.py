@@ -729,6 +729,15 @@ def content_readiness_summary() -> dict:
 LEAD_STATUSES = ("NEW", "VIEWED", "IN_PROGRESS", "WAITING_CLIENT", "DONE", "CANCELLED")
 
 
+class LeadNotFoundError(Exception):
+    """supplement/материал для несуществующего lead_id."""
+
+
+class NotLeadOwnerError(Exception):
+    """lead_id существует, но telegram.user_id (из validate_init_data) не
+    совпадает с telegram.user_id заявки — попытка дополнить чужую заявку."""
+
+
 def _read_leads() -> list[dict]:
     try:
         return _read("leads.json")["leads"]
@@ -740,22 +749,51 @@ def _write_leads(leads: list[dict]) -> None:
     _write("leads.json", {"leads": leads})
 
 
+def _clear_other_awaiting(leads: list[dict], user_id: int, keep_lead_id: int) -> None:
+    """Гарантирует, что в любой момент у ОДНОГО клиента максимум одна
+    заявка помечена awaiting_tz_file=True. Раньше find_lead_awaiting_file
+    выбирал "самую свежую" среди нескольких ожидающих заявок (max по id) —
+    если у клиента параллельно две заявки ждут файл, входящий документ мог
+    уйти не туда (см. аудит). Вместо угадывания в момент получения файла —
+    не допускаем самого состояния неоднозначности: постановка новой заявки
+    в ожидание файла всегда снимает ожидание со всех остальных заявок
+    этого же клиента."""
+    for l in leads:
+        if l["id"] != keep_lead_id and l.get("telegram", {}).get("user_id") == user_id and l.get("awaiting_tz_file"):
+            l["awaiting_tz_file"] = False
+            l["awaiting_tz_file_source"] = None
+
+
 def add_lead(payload: dict, telegram: dict, calc_summary: dict | None = None, draft_id: str | None = None) -> dict:
     """Вызывается и из bot/webserver.py::handle_create_lead (основной путь,
     authenticated HTTP), и из bot/handlers/webapp.py::handle_webapp_data
     (legacy sendData() — оставлен как fallback) — не требует
     _require_designer, потому что это действие клиента, не дизайнера.
     draft_id (необязательный, из localStorage-черновика Mini App)
-    используется для upsert: повторная отправка того же черновика
-    (например, через "Дополнить информацию") обновляет существующую заявку
-    вместо создания дубликата — см. Part 7 ТЗ.
+    используется для upsert: повторная отправка ТОГО ЖЕ ещё не изменённого
+    черновика (например, из-за дублирующегося клика — см. аудит про
+    submit idempotency) обновляет существующую заявку вместо создания
+    дубликата — НЕ путать с supplement-режимом (add_lead_supplement ниже):
+    draft_id живёt в localStorage клиента ДО первого успешного submit,
+    supplement адресуется по lead_id уже ПОСЛЕ того, как заявка создана и
+    localStorage-черновик очищен.
+
+    Возвращаемый dict — это КОПИЯ сохранённой заявки с добавленным
+    служебным ключом "created" (True — новая заявка, False — обновление
+    существующей по draft_id). Ключ добавлен только в возвращаемое
+    значение и не персистится (см. handle_create_lead — уведомлять
+    владельца нужно только при реальном создании, не при каждом
+    повторном/дублирующемся submit одного и того же черновика).
 
     awaiting_tz_file — persistent (переживает restart/redeploy через тот же
     Upstash-слой, что и вся заявка) замена FSM-состоянию
     BriefStates.awaiting_tz_file: раньше "жду файл от этого клиента"
     хранилось только в памяти процесса и терялось при рестарте; теперь это
     поле самой заявки, проверяется в handle_tz_file по telegram.user_id —
-    см. find_lead_awaiting_file/mark_tz_file_received ниже."""
+    см. find_lead_awaiting_file/mark_tz_file_received/record_lead_material
+    ниже. awaiting_tz_file_source запоминает, каким действием клиент начал
+    ждать файл ("new" — при создании заявки, "supplement" — из дополнения),
+    чтобы materials[].source был точным, а не предположением."""
     leads = _read_leads()
     awaiting_tz_file = bool(payload.get("attach_tz"))
     if draft_id:
@@ -766,10 +804,13 @@ def add_lead(payload: dict, telegram: dict, calc_summary: dict | None = None, dr
                 telegram=telegram,
                 calc_summary=calc_summary,
                 awaiting_tz_file=awaiting_tz_file,
+                awaiting_tz_file_source=("new" if awaiting_tz_file else None),
                 updated_at=datetime.now(timezone.utc).isoformat(),
             )
+            if awaiting_tz_file:
+                _clear_other_awaiting(leads, telegram["user_id"], existing["id"])
             _write_leads(leads)
-            return existing
+            return {**existing, "created": False}
 
     next_id = max((l["id"] for l in leads), default=0) + 1
     lead = {
@@ -782,19 +823,92 @@ def add_lead(payload: dict, telegram: dict, calc_summary: dict | None = None, dr
         "payload": payload,
         "calc_summary": calc_summary,
         "awaiting_tz_file": awaiting_tz_file,
+        "awaiting_tz_file_source": "new" if awaiting_tz_file else None,
+        "supplements": [],
+        "materials": [],
     }
     leads.append(lead)
+    if awaiting_tz_file:
+        _clear_other_awaiting(leads, telegram["user_id"], lead["id"])
     _write_leads(leads)
-    return lead
+    return {**lead, "created": True}
+
+
+def add_lead_supplement(lead_id: int, telegram: dict, fields: dict, wants_file: bool = False) -> tuple[dict, int]:
+    """Дополнение к уже существующей заявке — НЕ трогает lead["payload"]
+    (исходные ответы Order Builder остаются как есть), только добавляет
+    append-only запись в lead["supplements"]. lead_id — единственный и
+    достаточный идентификатор режима дополнения: в отличие от draft_id
+    (который существует только в localStorage клиента ДО первого submit),
+    lead_id уже известен клиенту из "Мои заявки" и однозначно указывает на
+    конкретную, уже существующую заявку.
+
+    Владение проверяется здесь, а не только на уровне HTTP-хендлера — тот
+    же telegram.user_id, что уже сохранён на заявке (сам он туда попал из
+    validate_init_data при создании), должен совпадать с текущим
+    провалидированным user_id. LeadNotFoundError/NotLeadOwnerError — на
+    хендлере превращаются в 404/403, тело чужой заявки клиенту не видно."""
+    leads = _read_leads()
+    lead = next((l for l in leads if l["id"] == lead_id), None)
+    if lead is None:
+        raise LeadNotFoundError(lead_id)
+    if lead.get("telegram", {}).get("user_id") != telegram.get("user_id"):
+        raise NotLeadOwnerError(lead_id)
+
+    supplements = lead.setdefault("supplements", [])
+    next_supplement_id = max((s["id"] for s in supplements), default=0) + 1
+    supplements.append({
+        "id": next_supplement_id,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "fields": fields,
+    })
+    lead["updated_at"] = datetime.now(timezone.utc).isoformat()
+    if wants_file:
+        lead["awaiting_tz_file"] = True
+        lead["awaiting_tz_file_source"] = "supplement"
+        _clear_other_awaiting(leads, telegram["user_id"], lead_id)
+    _write_leads(leads)
+    return lead, next_supplement_id
+
+
+def record_lead_material(lead_id: int, file_id: str, file_unique_id: str, kind: str, source: str) -> bool:
+    """Сохраняет метаданные присланного клиентом файла (document/photo) НА
+    заявке — раньше файл только пересылался владельцу через message.forward()
+    и нигде не сохранялся, связь "файл ↔ заявка" существовала лишь на
+    момент исполнения handle_tz_file и тут же терялась (см. аудит). Сам
+    файл по-прежнему не скачивается и не хранится нами — только Telegram
+    file_id/file_unique_id, этого достаточно, чтобы позже получить файл
+    заново через Bot API (getFile), без Google Drive/S3 на этом этапе."""
+    leads = _read_leads()
+    lead = next((l for l in leads if l["id"] == lead_id), None)
+    if lead is None:
+        return False
+    materials = lead.setdefault("materials", [])
+    materials.append({
+        "file_id": file_id,
+        "file_unique_id": file_unique_id,
+        "kind": kind,
+        "source": source,
+        "received_at": datetime.now(timezone.utc).isoformat(),
+    })
+    lead["awaiting_tz_file"] = False
+    lead["awaiting_tz_file_source"] = None
+    lead["updated_at"] = datetime.now(timezone.utc).isoformat()
+    _write_leads(leads)
+    return True
 
 
 def find_lead_awaiting_file(user_id: int) -> dict | None:
     """Для handle_tz_file (bot/handlers/webapp.py) — связывает присланный в
     чат документ/фото с правильной заявкой ТОЛЬКО по проверенному
     Telegram user_id (см. message.from_user.id — всегда надёжен, не
-    initData, но тот же принцип "не доверять чужому id"). Если у
-    пользователя несколько заявок, ждущих файл, — берём самую свежую (по
-    id) как наиболее вероятно актуальную."""
+    initData, но тот же принцип "не доверять чужому id"). add_lead/
+    add_lead_supplement поддерживают инвариант "максимум одна заявка этого
+    клиента одновременно ждёт файл" (см. _clear_other_awaiting) — поэтому
+    здесь больше НЕТ угадывания "самой свежей" среди нескольких кандидатов
+    (см. аудит): при соблюдённом инварианте кандидат всего один, max()
+    остаётся только защитой на случай уже существующих в хранилище данных,
+    сохранённых до этого исправления."""
     leads = [
         l for l in _read_leads()
         if l.get("telegram", {}).get("user_id") == user_id and l.get("awaiting_tz_file")
@@ -803,11 +917,16 @@ def find_lead_awaiting_file(user_id: int) -> dict | None:
 
 
 def mark_tz_file_received(lead_id: int) -> bool:
+    """Снять ожидание файла БЕЗ записи материала — используется только для
+    "Отменить" (bot/handlers/start.py::cmd_cancel). Получение реального
+    файла идёт через record_lead_material (выше), которая сама снимает
+    awaiting_tz_file — эта функция для него не нужна."""
     leads = _read_leads()
     lead = next((l for l in leads if l["id"] == lead_id), None)
     if lead is None:
         return False
     lead["awaiting_tz_file"] = False
+    lead["awaiting_tz_file_source"] = None
     lead["updated_at"] = datetime.now(timezone.utc).isoformat()
     _write_leads(leads)
     return True

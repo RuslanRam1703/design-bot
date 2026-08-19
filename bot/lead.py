@@ -42,8 +42,8 @@ SOURCE_LABELS = {
 }
 
 
-def format_lead_message(payload: dict, calc: CalcResult | None, from_user_id: int, username: str | None) -> str:
-    lines = ["🆕 <b>Новая заявка</b>", ""]
+def format_lead_message(payload: dict, calc: CalcResult | None, lead_id: int, from_user_id: int, username: str | None) -> str:
+    lines = [f"🆕 <b>Новая заявка #{lead_id}</b>", ""]
 
     service_name = payload.get("service_name") or "не указана"
     lines.append(f"<b>Услуга:</b> {_esc(service_name)}")
@@ -120,6 +120,39 @@ def _fmt_days(value: float) -> str:
     return f"{value:g}"
 
 
+# Ключи должны совпадать с тем, что шлёт webapp/js/app.js::submitSupplement
+# (fields.comment/additional_requirements/references/contact) — намеренно
+# НЕ весь набор полей Order Builder (service/deadline/budget/have/urgent/
+# complex/calc), см. аудит: изменение состава заказа — это новая заявка,
+# не дополнение.
+SUPPLEMENT_FIELD_LABELS = {
+    "comment": "Что добавить/изменить",
+    "additional_requirements": "Дополнительные требования",
+    "references": "Референсы",
+    "contact": "Контакты",
+}
+
+
+def format_lead_supplement_message(lead_id: int, fields: dict) -> str:
+    """Уведомление владельцу о дополнении к уже существующей заявке — НЕ
+    формат "Новая заявка" (см. аудит: спутанное с созданием уведомление
+    было одним из найденных багов), только номер заявки и то, что реально
+    прислано в этом дополнении."""
+    lines = [f"✏️ <b>Дополнение к заявке #{lead_id}</b>", ""]
+    for key, label in SUPPLEMENT_FIELD_LABELS.items():
+        value = (fields.get(key) or "").strip()
+        if value:
+            lines.append(f"<b>{label}:</b> {_esc(value)}")
+    return "\n".join(lines)
+
+
+def format_material_message(lead_id: int) -> str:
+    """Текст перед пересылкой файла (message.forward() не умеет добавлять
+    caption — Bot API этого не поддерживает, поэтому номер заявки уходит
+    отдельным сообщением непосредственно перед форвардом, см. аудит)."""
+    return f"📎 <b>Материал к заявке #{lead_id}</b>"
+
+
 STATUS_LABELS = {
     "NEW": "🆕 Новая",
     "VIEWED": "👀 Просмотрена",
@@ -184,6 +217,30 @@ def format_lead_admin_detail(lead: dict) -> str:
         lines.append(f"— Когда нужно: {DEADLINE_LABELS.get(payload['deadline'], payload['deadline'])}")
     if payload.get("budget"):
         lines.append(f"— Бюджет: {BUDGET_LABELS.get(payload['budget'], payload['budget'])}")
+
+    supplements = lead.get("supplements") or []
+    if supplements:
+        lines.append("")
+        lines.append(f"<b>Дополнения ({len(supplements)})</b>")
+        for s in supplements:
+            ts = (s.get("created_at") or "")[:16].replace("T", " ")
+            lines.append(f"— #{s['id']} ({ts}):")
+            for key, label in SUPPLEMENT_FIELD_LABELS.items():
+                value = (s.get("fields", {}).get(key) or "").strip()
+                if value:
+                    lines.append(f"   {label}: {_esc(value)}")
+
+    materials = lead.get("materials") or []
+    if materials:
+        lines.append("")
+        lines.append(f"<b>Материалы ({len(materials)})</b>")
+        kind_labels = {"document": "файл", "photo": "фото"}
+        source_labels = {"new": "при создании", "supplement": "из дополнения"}
+        for m in materials:
+            ts = (m.get("received_at") or "")[:16].replace("T", " ")
+            kind = kind_labels.get(m.get("kind"), m.get("kind"))
+            source = source_labels.get(m.get("source"), m.get("source"))
+            lines.append(f"— {kind}, {ts} ({source})")
 
     lines.append("")
     lines.append(f"<i>Создана: {lead['created_at'][:16].replace('T', ' ')}</i>")
