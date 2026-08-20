@@ -462,9 +462,10 @@ class NavAnchorTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_reset_nav_screen_recreates_anchor_when_manually_deleted(self):
         # Пользователь мог вручную удалить NAV anchor (Telegram это
-        # разрешает в приватных чатах) — edit_message_text падает с ДРУГОЙ
-        # ошибкой (не "not modified") -> best-effort пересоздаём, не роняя
-        # handler.
+        # разрешает в приватных чатах) — edit_message_text падает с ошибкой
+        # из _NAV_ANCHOR_GONE_MARKERS ("message to edit not found" —
+        # однозначный признак, что сообщения больше нет) -> best-effort
+        # пересоздаём, не роняя handler.
         state = make_state()
         await state.update_data(**{flow._NAV_ANCHOR_MSG_KEY: 111, flow._NAV_ANCHOR_CHAT_KEY: 888})
         msg = make_flow_message()
@@ -477,6 +478,41 @@ class NavAnchorTests(unittest.IsolatedAsyncioTestCase):
         msg.answer.assert_awaited_once()  # новый NAV anchor создан
         data = await state.get_data()
         self.assertEqual(data.get(flow._NAV_ANCHOR_MSG_KEY), 555)  # обновлён на новый message_id
+
+    async def test_reset_nav_screen_recreates_anchor_when_message_cant_be_edited(self):
+        # Второй маркер из _NAV_ANCHOR_GONE_MARKERS — "message can't be
+        # edited" (например, сообщение слишком старое для редактирования).
+        state = make_state()
+        await state.update_data(**{flow._NAV_ANCHOR_MSG_KEY: 111, flow._NAV_ANCHOR_CHAT_KEY: 888})
+        msg = make_flow_message()
+        msg.bot.edit_message_text = AsyncMock(
+            side_effect=TelegramAPIError(method=None, message="Bad Request: message can't be edited")
+        )
+
+        await flow.reset_nav_screen(msg, state)  # не должно упасть
+
+        msg.answer.assert_awaited_once()  # новый NAV anchor создан
+        data = await state.get_data()
+        self.assertEqual(data.get(flow._NAV_ANCHOR_MSG_KEY), 555)
+
+    async def test_reset_nav_screen_ignores_unrelated_transient_error_without_recreating(self):
+        # Production-аудит: ЛЮБАЯ другая ошибка (не "not modified", не из
+        # _NAV_ANCHOR_GONE_MARKERS) — например, транзитный flood-control —
+        # НЕ должна приводить к пересозданию anchor'а. Раньше (до этого
+        # фикса) любая такая ошибка трактовалась как "anchor удалён" и
+        # вызывала каскадное дублирование NAV anchor в production.
+        state = make_state()
+        await state.update_data(**{flow._NAV_ANCHOR_MSG_KEY: 111, flow._NAV_ANCHOR_CHAT_KEY: 888})
+        msg = make_flow_message()
+        msg.bot.edit_message_text = AsyncMock(
+            side_effect=TelegramAPIError(method=None, message="Too Many Requests: retry later")
+        )
+
+        await flow.reset_nav_screen(msg, state)  # не должно упасть
+
+        msg.answer.assert_not_awaited()  # НЕ создан новый anchor
+        data = await state.get_data()
+        self.assertEqual(data.get(flow._NAV_ANCHOR_MSG_KEY), 111)  # anchor не изменился
 
     def test_refresh_reply_keyboard_removed(self):
         self.assertFalse(hasattr(flow, "refresh_reply_keyboard"))

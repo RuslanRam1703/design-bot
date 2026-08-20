@@ -38,6 +38,21 @@ _ANCHOR_CHAT_KEY = "_flow_chat_id"
 _NAV_ANCHOR_MSG_KEY = "_nav_msg_id"
 _NAV_ANCHOR_CHAT_KEY = "_nav_chat_id"
 
+# Тексты ошибок Telegram Bot API, однозначно означающие "сообщения больше
+# не существует" (реально удалено) — только они оправдывают пересоздание
+# NAV anchor в reset_nav_screen. Любая другая ошибка edit_message_text
+# (флуд-контроль, транзитная задержка и т.п.) — best-effort игнорируется.
+#
+# Строковое сравнение — не "придумано", а единственный доступный в aiogram
+# способ: и "message is not modified", и "message to edit not found", и
+# "message can't be edited" Telegram возвращает с ОДНИМ и тем же HTTP-кодом
+# 400 (см. aiogram.client.session.base.BaseSession.check_response —
+# статус-код 400 всегда даёт один и тот же класс TelegramBadRequest,
+# отдельного класса на каждый текст нет; TelegramNotFound в aiogram
+# маппится только на реальный HTTP 404, который Telegram для этих ошибок
+# не отдаёт). Различить их можно только по exc.message (description).
+_NAV_ANCHOR_GONE_MARKERS = ("message to edit not found", "message can't be edited")
+
 
 async def open_flow(
     message: Message,
@@ -176,7 +191,16 @@ async def reset_nav_screen(message: Message, state: FSMContext) -> None:
     (например, пользователь удалил его вручную — Telegram это разрешает в
     приватных чатах) — best-effort пересоздаёт anchor, не роняя handler.
     "message is not modified" (двойное нажатие "Главное меню" подряд) —
-    штатный, не ошибочный случай, отдельно не пересоздаёт anchor."""
+    штатный, не ошибочный случай, отдельно не пересоздаёт anchor.
+
+    Пересоздание — ТОЛЬКО при однозначных признаках, что сообщения больше
+    не существует (см. _NAV_ANCHOR_GONE_MARKERS). Любая другая ошибка
+    (транзитная — flood control, eventual-consistency lag сразу после
+    отправки и т.п.) — best-effort игнорируется, БЕЗ пересоздания: см.
+    production-аудит — более широкое условие ("любая другая ошибка =
+    anchor удалён") приводило к каскадному дублированию NAV anchor на
+    транзитных ошибках edit_message_text, не связанных с реальным
+    удалением сообщения."""
     await finish_flow(state)
 
     data = await state.get_data()
@@ -200,9 +224,12 @@ async def reset_nav_screen(message: Message, state: FSMContext) -> None:
     try:
         await message.bot.edit_message_text(texts.WELCOME, chat_id=nav_chat, message_id=nav_id)
     except TelegramAPIError as exc:
-        if "not modified" in exc.message.lower():
+        error_text = exc.message.lower()
+        if "not modified" in error_text:
             return
-        await _create_nav_anchor(message, state)
+        if any(marker in error_text for marker in _NAV_ANCHOR_GONE_MARKERS):
+            await _create_nav_anchor(message, state)
+        # любая другая ошибка — best-effort, ничего не пересоздаём (см. docstring)
 
 
 async def finish_flow(state: FSMContext) -> None:
