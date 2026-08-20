@@ -614,6 +614,24 @@ class EntryPointArchitectureTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(client_texts, {texts.OPEN_APP_BUTTON, texts.MENU_FAQ})
         self.assertNotIn(texts.ADMIN_BUTTON, client_texts)
 
+    def test_startup_does_not_drop_pending_updates(self):
+        # См. production-hardening аудит: drop_pending_updates=True на каждом
+        # старте (Render rolling-деплой) безусловно отбрасывал бы реальные
+        # клиентские апдейты (сообщения/файлы/callback-и), попавшие в узкое
+        # окно, когда новый инстанс перекрывается со старым. main() нельзя
+        # безопасно вызвать напрямую в тесте — он реально стартует aiohttp-
+        # сервер и блокируется в бесконечном polling-цикле, а рефакторить его
+        # ради тестируемости здесь явно не просили, поэтому проверяем сам
+        # исходный код функции — этого достаточно, чтобы не дать значению
+        # тихо откатиться обратно на True при будущей правке.
+        import inspect
+
+        import bot.main as bot_main
+
+        source = inspect.getsource(bot_main.main)
+        self.assertIn("delete_webhook(drop_pending_updates=False)", source)
+        self.assertNotIn("delete_webhook(drop_pending_updates=True)", source)
+
     def test_owner_reply_keyboard_has_admin_button(self):
         owner_texts = {btn.text for row in keyboards.main_reply_keyboard(is_owner=True).keyboard for btn in row}
         self.assertIn(texts.ADMIN_BUTTON, owner_texts)

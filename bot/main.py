@@ -83,7 +83,16 @@ async def main() -> None:
     await site.start()
     logger.info("Mini App сервер запущен: http://0.0.0.0:%s (снаружи — %s)", config.PORT, config.WEBAPP_URL)
 
-    await bot.delete_webhook(drop_pending_updates=True)
+    # drop_pending_updates=False — на free-plan Render rolling-деплой новый
+    # инстанс на короткое время перекрывается со старым (TelegramConflictError
+    # в этом окне — ожидаемое, безопасное поведение, Telegram сам разруливает
+    # конфликт polling-запросов). Но drop_pending_updates=True безусловно
+    # отбрасывал бы любые апдейты, накопившиеся именно в этом окне — реальные
+    # сообщения/файлы/callback-и клиентов, а не мусор (см. production-hardening
+    # аудит). Оставляем их дожидаться нового инстанса вместо потери: повторная
+    # обработка уже сущ. апдейта — не проблема (draft_id upsert/append-only/
+    # status-idempotency уже переживают повтор без дублей).
+    await bot.delete_webhook(drop_pending_updates=False)
     await _setup_bot_commands(bot)
     await _setup_menu_button(bot)
     logger.info("Бот запущен в режиме polling")
