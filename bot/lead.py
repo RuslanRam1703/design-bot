@@ -178,9 +178,19 @@ CLIENT_STATUS_LABELS = {
 }
 
 
-def format_status_notification(lead_id: int, status: str) -> str:
+def format_status_notification(service_name: str | None, status: str) -> str:
+    """lead.id намеренно НЕ используется здесь — это глобальный сквозной
+    счётчик по ВСЕМ заявкам от ВСЕХ клиентов (см. content_store.add_lead),
+    а не персональный номер заказа клиента; показывать его в уведомлении
+    значило бы невольно раскрывать общий объём заявок в системе (см.
+    UX-аудит). service_name уже собран на этапе submit — короткий,
+    человекочитаемый, всегда либо реальная услуга, либо явный "Не
+    определился с услугой", так что практически никогда не пуст; пустая
+    строка/None — запасной случай (повреждённые/очень старые данные), а не
+    ожидаемый сценарий."""
     label = CLIENT_STATUS_LABELS.get(status, status)
-    return f"Заявка #{lead_id}\nСтатус: {label}"
+    name = (service_name or "").strip() or "Ваша заявка"
+    return f"Ваша заявка обновлена\n{name}\nСтатус: {label}"
 
 
 def format_lead_admin_detail(lead: dict) -> str:

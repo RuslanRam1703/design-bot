@@ -2850,7 +2850,10 @@ class StatusNotificationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(callback.bot.send_message.await_args.kwargs["chat_id"], 55555)
         self.assertEqual(content_store.get_lead(lead["id"])["status"], "IN_PROGRESS")
 
-    async def test_status_change_notification_has_correct_lead_id_and_label(self):
+    async def test_status_change_notification_has_service_name_and_label(self):
+        # lead.id — глобальный сквозной счётчик по ВСЕМ заявкам от ВСЕХ
+        # клиентов (см. content_store.add_lead), клиенту его не показываем
+        # (см. UX-аудит) — вместо номера используется service_name.
         lead = self._make_lead()
         state = make_state(self.actor)
         await state.update_data(lead_id=lead["id"])
@@ -2859,8 +2862,39 @@ class StatusNotificationTests(unittest.IsolatedAsyncioTestCase):
         await admin.lead_change_status(callback, state)
 
         text = callback.bot.send_message.await_args.kwargs["text"]
-        self.assertIn(f"#{lead['id']}", text)
+        self.assertIn("Ваша заявка обновлена", text)
+        self.assertIn("Лендинг", text)  # service_name из _make_lead()
         self.assertIn("Нужно ваше действие", text)
+
+    async def test_status_change_notification_does_not_contain_lead_id(self):
+        lead = self._make_lead()
+        state = make_state(self.actor)
+        await state.update_data(lead_id=lead["id"])
+        callback = make_callback("adminleadstatus:DONE", chat_id=self.actor)
+
+        await admin.lead_change_status(callback, state)
+
+        text = callback.bot.send_message.await_args.kwargs["text"]
+        self.assertNotIn(f"#{lead['id']}", text)
+        self.assertNotIn(str(lead["id"]), text)
+
+    async def test_status_change_notification_falls_back_when_service_name_missing(self):
+        lead = content_store.add_lead(
+            {"task_description": "Без указания услуги"},  # service_name отсутствует в payload
+            {"user_id": 55555, "username": "client", "first_name": "Клиент"},
+        )
+        state = make_state(self.actor)
+        await state.update_data(lead_id=lead["id"])
+        callback = make_callback("adminleadstatus:IN_PROGRESS", chat_id=self.actor)
+
+        await admin.lead_change_status(callback, state)
+
+        # notification всё равно отправлена, с безопасным fallback
+        callback.bot.send_message.assert_awaited_once()
+        text = callback.bot.send_message.await_args.kwargs["text"]
+        self.assertIn("Ваша заявка обновлена", text)
+        self.assertIn("Ваша заявка", text)  # fallback вместо пустого service_name
+        self.assertIn("В работе", text)
 
     async def test_repeat_same_status_sends_zero_notifications(self):
         lead = self._make_lead()  # уже "NEW" по умолчанию
@@ -2910,6 +2944,33 @@ class StatusNotificationTests(unittest.IsolatedAsyncioTestCase):
         lead_after = content_store.get_lead(lead["id"])
         self.assertEqual(len(lead_after["owner_messages"]), 1)
         self.assertEqual(lead_after["owner_messages"][0]["text"], "Ранее написанный ответ")
+
+
+class FormatStatusNotificationTests(unittest.TestCase):
+    """Прямые тесты bot/lead.py::format_status_notification — отдельно от
+    handler-уровня (StatusNotificationTests выше), для точности fallback-логики."""
+
+    def test_uses_service_name_when_present(self):
+        text = lead_format.format_status_notification("Лендинг", "VIEWED")
+        self.assertEqual(text, "Ваша заявка обновлена\nЛендинг\nСтатус: 👀 На рассмотрении")
+
+    def test_no_lead_id_in_output_by_construction(self):
+        # format_status_notification больше не принимает lead_id вообще —
+        # это гарантия на уровне сигнатуры, не только по содержимому текста.
+        text = lead_format.format_status_notification("Сайт", "DONE")
+        self.assertNotIn("#", text)
+
+    def test_fallback_on_empty_string(self):
+        text = lead_format.format_status_notification("", "NEW")
+        self.assertEqual(text, "Ваша заявка обновлена\nВаша заявка\nСтатус: 🆕 Заявка получена")
+
+    def test_fallback_on_none(self):
+        text = lead_format.format_status_notification(None, "CANCELLED")
+        self.assertIn("Ваша заявка обновлена\nВаша заявка\nСтатус:", text)
+
+    def test_fallback_on_whitespace_only(self):
+        text = lead_format.format_status_notification("   ", "IN_PROGRESS")
+        self.assertIn("Ваша заявка обновлена\nВаша заявка\nСтатус:", text)
 
 
 if __name__ == "__main__":

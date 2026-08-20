@@ -1494,7 +1494,7 @@ async def lead_change_status(callback: CallbackQuery, state: FSMContext) -> None
         try:
             await callback.bot.send_message(
                 chat_id=lead["telegram"]["user_id"],
-                text=lead_format.format_status_notification(lead["id"], status),
+                text=lead_format.format_status_notification(lead.get("payload", {}).get("service_name"), status),
             )
         except Exception:
             logger.exception("Не удалось уведомить клиента о смене статуса заявки #%s", lead["id"])
