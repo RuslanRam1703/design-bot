@@ -517,8 +517,8 @@ class EntryPointArchitectureTests(unittest.IsolatedAsyncioTestCase):
     def test_main_reply_keyboard_client_vs_owner_buttons(self):
         client_texts = {btn.text for row in keyboards.main_reply_keyboard(is_owner=False).keyboard for btn in row}
         owner_texts = {btn.text for row in keyboards.main_reply_keyboard(is_owner=True).keyboard for btn in row}
-        self.assertEqual(client_texts, {texts.OPEN_APP_BUTTON, texts.MENU_FAQ})
-        self.assertEqual(owner_texts, {texts.OPEN_APP_BUTTON, texts.MENU_FAQ, texts.ADMIN_BUTTON})
+        self.assertEqual(client_texts, {texts.MAIN_MENU_BUTTON, texts.MENU_FAQ})
+        self.assertEqual(owner_texts, {texts.MAIN_MENU_BUTTON, texts.MENU_FAQ, texts.ADMIN_BUTTON})
 
     def test_reply_keyboard_for_chat_picks_correct_variant(self):
         # Общий helper (bot/keyboards.py) — используется и в start.py, и в
@@ -580,23 +580,45 @@ class EntryPointArchitectureTests(unittest.IsolatedAsyncioTestCase):
         await admin.admin_button(msg, state)
         msg.answer.assert_awaited_once()
 
-    def test_client_commands_include_faq_and_no_calculator(self):
+    def test_client_commands_are_start_and_faq_only(self):
+        # portfolio/about/brief убраны из видимого command list — Menu Button
+        # теперь ведёт прямо в Mini App, где эти разделы доступны как
+        # навигация (webapp/js/app.js::TAB_SCREENS). Сами handlers НЕ
+        # удалены (см. test_legacy_command_handlers_still_registered).
         import bot.main as bot_main
 
         command_names = [c.command for c in bot_main.CLIENT_COMMANDS]
-        self.assertEqual(command_names, ["start", "faq", "portfolio", "about", "brief"])
+        self.assertEqual(command_names, ["start", "faq"])
+        self.assertNotIn("portfolio", command_names)
+        self.assertNotIn("about", command_names)
+        self.assertNotIn("brief", command_names)
+        self.assertNotIn("calculator", command_names)
 
     def test_owner_command_scope_is_client_commands_plus_admin(self):
         import bot.main as bot_main
 
         owner_names = [c.command for c in bot_main.CLIENT_COMMANDS + bot_main.ADMIN_EXTRA_COMMANDS]
-        self.assertEqual(owner_names, ["start", "faq", "portfolio", "about", "brief", "admin"])
+        self.assertEqual(owner_names, ["start", "faq", "admin"])
 
-    async def test_setup_menu_button_is_commands_not_webapp(self):
-        # Регресс commit ac09080: MenuButtonWebApp здесь подменял системное
-        # Telegram Menu (список команд) на кнопку запуска Mini App. Menu
-        # должно оставаться обычным списком команд — запуск Mini App теперь
-        # только через reply-кнопку "🚀 Открыть приложение" + inline-кнопки.
+    async def test_legacy_command_handlers_still_registered(self):
+        # /portfolio, /about, /brief убраны только из видимого command list —
+        # handlers остаются рабочими deep-link'ами.
+        state = make_state()
+        for cmd, handler in (
+            ("/portfolio", start.cmd_portfolio),
+            ("/about", start.cmd_about),
+            ("/brief", start.cmd_brief),
+        ):
+            msg = make_flow_message(text=cmd)
+            await handler(msg, state)
+            msg.answer.assert_awaited()
+
+    async def test_setup_menu_button_is_webapp_direct_launch(self):
+        # Финальная архитектура (см. UX-аудит "Telegram launch UX"): Menu
+        # Button запускает Mini App напрямую, одним тапом — список команд
+        # сокращён (CLIENT_COMMANDS) именно чтобы portfolio/about/brief не
+        # "терялись" при этой смене (см. предыдущий откаченный эксперимент,
+        # commit 2130dc7/a78dc81 — там список команд ещё не был сокращён).
         from aiogram.types import MenuButtonCommands, MenuButtonWebApp
 
         import bot.main as bot_main
@@ -606,13 +628,29 @@ class EntryPointArchitectureTests(unittest.IsolatedAsyncioTestCase):
         fake_bot.set_chat_menu_button.assert_awaited_once()
         _, call_kwargs = fake_bot.set_chat_menu_button.call_args
         menu_button = call_kwargs["menu_button"]
-        self.assertIsInstance(menu_button, MenuButtonCommands)
-        self.assertNotIsInstance(menu_button, MenuButtonWebApp)
+        self.assertIsInstance(menu_button, MenuButtonWebApp)
+        self.assertNotIsInstance(menu_button, MenuButtonCommands)
+        self.assertEqual(menu_button.text, "Открыть приложение")
+        self.assertEqual(menu_button.web_app.url, bot_main.config.WEBAPP_URL)
 
     def test_client_reply_keyboard_has_no_admin_button(self):
         client_texts = {btn.text for row in keyboards.main_reply_keyboard(is_owner=False).keyboard for btn in row}
-        self.assertEqual(client_texts, {texts.OPEN_APP_BUTTON, texts.MENU_FAQ})
+        self.assertEqual(client_texts, {texts.MAIN_MENU_BUTTON, texts.MENU_FAQ})
         self.assertNotIn(texts.ADMIN_BUTTON, client_texts)
+
+    def test_bot_description_texts_fit_telegram_limits(self):
+        # setMyShortDescription <=120 символов, setMyDescription <=512
+        # (см. bot/main.py::_setup_bot_description, UX-аудит п.4).
+        self.assertLessEqual(len(texts.BOT_SHORT_DESCRIPTION), 120)
+        self.assertLessEqual(len(texts.BOT_DESCRIPTION), 512)
+
+    async def test_setup_bot_description_calls_both_setters_with_correct_text(self):
+        import bot.main as bot_main
+
+        fake_bot = AsyncMock()
+        await bot_main._setup_bot_description(fake_bot)
+        fake_bot.set_my_short_description.assert_awaited_once_with(short_description=texts.BOT_SHORT_DESCRIPTION)
+        fake_bot.set_my_description.assert_awaited_once_with(description=texts.BOT_DESCRIPTION)
 
     def test_startup_does_not_drop_pending_updates(self):
         # См. production-hardening аудит: drop_pending_updates=True на каждом
@@ -635,7 +673,7 @@ class EntryPointArchitectureTests(unittest.IsolatedAsyncioTestCase):
     def test_owner_reply_keyboard_has_admin_button(self):
         owner_texts = {btn.text for row in keyboards.main_reply_keyboard(is_owner=True).keyboard for btn in row}
         self.assertIn(texts.ADMIN_BUTTON, owner_texts)
-        self.assertIn(texts.OPEN_APP_BUTTON, owner_texts)
+        self.assertIn(texts.MAIN_MENU_BUTTON, owner_texts)
         self.assertIn(texts.MENU_FAQ, owner_texts)
 
     def test_no_keyboard_button_uses_web_app_anywhere_in_bot_package(self):
@@ -656,6 +694,25 @@ class EntryPointArchitectureTests(unittest.IsolatedAsyncioTestCase):
             if pattern.search(text_content):
                 offenders.append(str(path))
         self.assertEqual(offenders, [])
+
+    def test_no_reply_keyboard_remove_anywhere_in_bot_package(self):
+        # Статическая проверка: ReplyKeyboardRemove нигде не используется —
+        # persistent-клавиатура не должна исчезать ни в одном сценарии
+        # (см. UX-аудит "Telegram launch UX", п.12 про keyboard-persistence).
+        bot_dir = Path(__file__).resolve().parent.parent / "bot"
+        offenders = [
+            str(path) for path in bot_dir.rglob("*.py")
+            if "ReplyKeyboardRemove" in path.read_text(encoding="utf-8")
+        ]
+        self.assertEqual(offenders, [])
+
+    def test_no_persistent_cancel_button_for_client_or_owner(self):
+        # "❌ Отмена" не бизнес-действие и не постоянная навигация — доступна
+        # только контекстно (typed /cancel, inline cancel_keyboard() внутри
+        # мастеров admin.py), не как persistent-кнопка reply-клавиатуры.
+        for is_owner in (False, True):
+            texts_seen = {btn.text for row in keyboards.main_reply_keyboard(is_owner=is_owner).keyboard for btn in row}
+            self.assertNotIn("❌ Отмена", texts_seen)
 
     def test_reply_keyboard_is_persistent(self):
         # Регресс: без is_persistent=True Telegram-клиент вправе скрыть
@@ -727,13 +784,14 @@ class EntryPointArchitectureTests(unittest.IsolatedAsyncioTestCase):
         refresh_markup = second_call.kwargs.get("reply_markup") or second_call.args[1]
         self.assertIsInstance(refresh_markup, ReplyKeyboardMarkup)
 
-    async def test_open_app_button_stays_plain_text_not_web_app(self):
+    async def test_main_menu_button_stays_plain_text_not_web_app(self):
         # main_reply_keyboard() уже проверяется на отсутствие web_app в
-        # других тестах — здесь отдельно, явно, именно для кнопки-триггера
-        # "🚀 Открыть приложение", как запрошено отдельным пунктом.
+        # других тестах — здесь отдельно, явно, именно для "⌂ Главное меню"
+        # (запуск Mini App теперь только через Telegram Menu Button, не
+        # через эту reply-кнопку).
         markup = keyboards.main_reply_keyboard(is_owner=False)
         trigger_btn = next(
-            btn for row in markup.keyboard for btn in row if btn.text == texts.OPEN_APP_BUTTON
+            btn for row in markup.keyboard for btn in row if btn.text == texts.MAIN_MENU_BUTTON
         )
         self.assertIsNone(trigger_btn.web_app)
 
@@ -958,6 +1016,89 @@ class AdminLeadsQueueUxTests(unittest.IsolatedAsyncioTestCase):
 
         updated = content_store.get_lead(lead["id"])
         self.assertEqual(updated.get("owner_messages", []), [])
+
+
+class MainMenuConfirmationTests(unittest.IsolatedAsyncioTestCase):
+    """"⌂ Главное меню" (см. UX-аудит "Telegram launch UX", п.3): нет
+    активного bot/FSM-состояния -> сразу существующая /start-логика; есть
+    -> inline-подтверждение без отдельного долгоживущего state. Отдельно —
+    что owner-версия (bot/handlers/admin.py::admin_main_menu_button)
+    реально побеждает раньше AdminStates.*, F.text мастеров."""
+
+    def setUp(self):
+        self._orig_designer = start.config.DESIGNER_CHAT_ID
+        start.config.DESIGNER_CHAT_ID = "888"
+
+    def tearDown(self):
+        start.config.DESIGNER_CHAT_ID = self._orig_designer
+
+    def _fake_callback(self, data: str, chat_id: int = 888):
+        return SimpleNamespace(data=data, message=make_flow_message(chat_id=chat_id), answer=AsyncMock())
+
+    async def test_no_active_state_runs_start_immediately(self):
+        from aiogram.types import ReplyKeyboardMarkup
+
+        state = make_state()
+        msg = make_flow_message(text=texts.MAIN_MENU_BUTTON)
+        await start.main_menu_button(msg, state)
+        sent_text = msg.answer.await_args.args[0] if msg.answer.await_args.args else msg.answer.await_args.kwargs.get("text")
+        sent_markup = msg.answer.await_args.kwargs.get("reply_markup") or msg.answer.await_args.args[1]
+        self.assertEqual(sent_text, texts.WELCOME)  # это и есть существующая /start-логика, не что-то новое
+        self.assertIsInstance(sent_markup, ReplyKeyboardMarkup)
+
+    async def test_active_state_shows_confirmation_without_resetting_it(self):
+        from aiogram.types import InlineKeyboardMarkup
+
+        state = make_state(888)
+        await state.set_state(AdminStates.add_faq_answer)
+        msg = make_flow_message(chat_id=888, text=texts.MAIN_MENU_BUTTON)
+        await start.main_menu_button(msg, state)
+        sent_text = msg.answer.await_args_list[0].args[0] if msg.answer.await_args_list[0].args else msg.answer.await_args_list[0].kwargs.get("text")
+        sent_markup = msg.answer.await_args_list[0].kwargs.get("reply_markup") or msg.answer.await_args_list[0].args[1]
+        self.assertEqual(sent_text, texts.MAIN_MENU_CONFIRM_TEXT)
+        self.assertIsInstance(sent_markup, InlineKeyboardMarkup)
+        self.assertEqual(await state.get_state(), AdminStates.add_faq_answer.state)  # ничего не сброшено самим показом
+
+    async def test_confirm_resets_state_via_existing_start_logic(self):
+        state = make_state(888)
+        await state.set_state(AdminStates.add_faq_answer)
+        cb = self._fake_callback("mainmenu:confirm")
+        await start.main_menu_confirm(cb, state)
+        self.assertIsNone(await state.get_state())
+        cb.message.answer.assert_awaited()  # реально выполнился cmd_start (шлёт WELCOME)
+        sent_text = cb.message.answer.await_args.args[0] if cb.message.answer.await_args.args else cb.message.answer.await_args.kwargs.get("text")
+        self.assertEqual(sent_text, texts.WELCOME)
+
+    async def test_decline_preserves_state_and_sends_nothing_new(self):
+        state = make_state(888)
+        await state.set_state(AdminStates.add_faq_answer)
+        cb = self._fake_callback("mainmenu:decline")
+        await start.main_menu_decline(cb, state)
+        self.assertEqual(await state.get_state(), AdminStates.add_faq_answer.state)  # ничего не сброшено
+        cb.message.answer.assert_not_awaited()  # ничего не отправлено — только confirmation убрана
+
+    async def test_admin_main_menu_button_wins_over_wizard_text_handler(self):
+        # Критично: без регистрации РАНЬШЕ мастеров текст кнопки был бы
+        # проглочен как введённые данные (напр. ответ FAQ) вместо срабатывания
+        # как аварийный выход (см. bot/handlers/admin.py::admin_main_menu_button).
+        handler_names = [h.callback.__name__ for h in admin.router.message.handlers]
+        self.assertIn("admin_main_menu_button", handler_names)
+        self.assertIn("faq_add_answer", handler_names)
+        self.assertLess(
+            handler_names.index("admin_main_menu_button"),
+            handler_names.index("faq_add_answer"),
+        )
+
+    async def test_owner_main_menu_button_handled_by_admin_router_not_client(self):
+        # Владелец мидвэй в мастере — "⌂ Главное меню" должен показать
+        # confirmation через admin.admin_main_menu_button (тот же общий
+        # helper, что и у клиента, но зарегистрированный в admin.router).
+        state = make_state(888)
+        await state.set_state(AdminStates.add_faq_answer)
+        msg = make_flow_message(chat_id=888, text=texts.MAIN_MENU_BUTTON)
+        await admin.admin_main_menu_button(msg, state)
+        self.assertEqual(await state.get_state(), AdminStates.add_faq_answer.state)
+        msg.answer.assert_awaited()
 
 
 class AdminCancelIntegrationTests(unittest.IsolatedAsyncioTestCase):

@@ -8,23 +8,27 @@ from aiogram.types import (
     BotCommand,
     BotCommandScopeChat,
     BotCommandScopeDefault,
-    MenuButtonCommands,
+    MenuButtonWebApp,
+    WebAppInfo,
 )
 from aiohttp import web
 
-from bot import config, content_store
+from bot import config, content_store, texts
 from bot.handlers import admin, faq, start, webapp
 from bot.webserver import create_app
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger(__name__)
 
+# /portfolio, /about, /brief намеренно НЕ входят в видимый список — они
+# полностью покрыты навигацией внутри Mini App (webapp/js/app.js::
+# TAB_SCREENS), куда теперь ведёт прямой запуск через Menu Button (см.
+# _setup_menu_button ниже). Handlers команд остаются рабочими как legacy/
+# deep-link — см. bot/handlers/start.py::cmd_portfolio/cmd_about/cmd_brief,
+# просто больше не рекламируются в командном меню.
 CLIENT_COMMANDS = [
     BotCommand(command="start", description="Начать / приветствие"),
     BotCommand(command="faq", description="Частые вопросы"),
-    BotCommand(command="portfolio", description="Портфолио"),
-    BotCommand(command="about", description="Обо мне"),
-    BotCommand(command="brief", description="Оставить заявку"),
 ]
 
 ADMIN_EXTRA_COMMANDS = [
@@ -48,20 +52,39 @@ async def _setup_bot_commands(bot: Bot) -> None:
 
 
 async def _setup_menu_button(bot: Bot) -> None:
-    # Системное Menu Telegram (иконка рядом с полем ввода) должно оставаться
-    # обычным списком команд (/start, /faq, /portfolio, /about, /brief, у
-    # владельца ещё /admin — см. CLIENT_COMMANDS/ADMIN_EXTRA_COMMANDS выше),
-    # а НЕ отдельной кнопкой запуска Mini App — ранее здесь стоял
-    # MenuButtonWebApp, из-за чего это системное меню вместо списка команд
-    # показывало "Открыть приложение" (регресс, обнаруженный в проде после
-    # commit ac09080). Запуск Mini App — только через reply-кнопку
-    # "🚀 Открыть приложение" (см. bot/keyboards.py::main_reply_keyboard,
-    # bot/handlers/start.py::open_app_button) и существующие inline
-    # web_app-кнопки — MenuButtonCommands этому не мешает и не дублирует.
-    # Вызов явный (не просто "ничего не делать"): Telegram запоминает
-    # последний заданный menu_button за бота, значение из предыдущего
-    # деплоя (MenuButtonWebApp) само не откатится без явного вызова.
-    await bot.set_chat_menu_button(menu_button=MenuButtonCommands())
+    # Системное Menu Telegram (иконка рядом с полем ввода) — прямой запуск
+    # Mini App (MenuButtonWebApp), корень WEBAPP_URL (без /portfolio и т.п.
+    # — портфолио/about/заказ/"Мои заявки" теперь только навигация ВНУТРИ
+    # уже открытого Mini App, см. webapp/js/app.js::TAB_SCREENS). Один тап
+    # сразу открывает Mini App, без промежуточного сообщения-кнопки.
+    #
+    # MenuButtonWebApp и MenuButtonCommands взаимоисключающие — Telegram
+    # хранит только одно значение за бота, поэтому список команд
+    # (CLIENT_COMMANDS выше) сокращён до /start, /faq: то, что раньше было
+    # только в командах (/portfolio, /about, /brief), теперь полностью
+    # доступно через сам Mini App — ничего не становится недостижимым.
+    # Вызов явный при каждом старте: предыдущее значение само не откатится.
+    #
+    # Постоянная reply-клавиатура (bot/keyboards.py::main_reply_keyboard)
+    # больше не содержит отдельной кнопки-триггера запуска — она дублировала
+    # бы эту же кнопку. Inline "🚀 Открыть приложение" в уже отправленных
+    # сообщениях и legacy-команды /portfolio, /about, /brief остаются
+    # рабочими как fallback/contextual launch (см. bot/handlers/start.py).
+    await bot.set_chat_menu_button(
+        menu_button=MenuButtonWebApp(text="Открыть приложение", web_app=WebAppInfo(url=config.WEBAPP_URL))
+    )
+
+
+async def _setup_bot_description(bot: Bot) -> None:
+    # setMyDescription/setMyShortDescription (Bot API) — то, что пользователь
+    # видит ДО первого /start (профиль бота, экран с системной кнопкой
+    # "Запустить" — её саму мы не задаём, это Telegram). Держим в коде
+    # (bot/texts.py::BOT_DESCRIPTION/BOT_SHORT_DESCRIPTION), а не только в
+    # BotFather, по тому же принципу, что и CLIENT_COMMANDS/menu_button
+    # выше — версионируется вместе с кодом, не полагается на то, что кто-то
+    # не забудет продублировать это вручную в BotFather после деплоя.
+    await bot.set_my_short_description(short_description=texts.BOT_SHORT_DESCRIPTION)
+    await bot.set_my_description(description=texts.BOT_DESCRIPTION)
 
 
 async def main() -> None:
@@ -101,6 +124,7 @@ async def main() -> None:
     await bot.delete_webhook(drop_pending_updates=False)
     await _setup_bot_commands(bot)
     await _setup_menu_button(bot)
+    await _setup_bot_description(bot)
     logger.info("Бот запущен в режиме polling")
 
     try:

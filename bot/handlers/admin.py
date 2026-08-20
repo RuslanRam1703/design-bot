@@ -26,6 +26,7 @@ from aiogram.types import BufferedInputFile, CallbackQuery, InlineKeyboardMarkup
 from bot import admin_keyboards as kb
 from bot import config, content_store, flow, texts
 from bot import lead as lead_format
+from bot.handlers.start import main_menu_or_confirm
 from bot.states import AdminStates
 
 router = Router(name="admin")
@@ -156,6 +157,20 @@ async def admin_cancel_command(message: Message, state: FSMContext) -> None:
     await state.set_data(next_data)
     await state.set_state(next_state)
     await message.answer(text, reply_markup=markup)
+
+
+@router.message(F.text == texts.MAIN_MENU_BUTTON)
+async def admin_main_menu_button(message: Message, state: FSMContext) -> None:
+    """"⌂ Главное меню" для владельца — та же логика, что у клиента (см.
+    bot/handlers/start.py::main_menu_or_confirm), но зарегистрирована
+    ЗДЕСЬ и РАНО (сразу после admin_cancel_command, до любого из
+    AdminStates.*, F.text мастеров ниже) — иначе, будь владелец, например,
+    в середине ввода ответа FAQ (AdminStates.add_faq_answer, F.text без
+    доп. фильтра), текст кнопки был бы молча проглочен как введённые данные
+    вместо того, чтобы сработать как аварийный выход (тот же принцип, что
+    уже обеспечивает надёжность admin_cancel_command выше — регистрация
+    раньше мастеров, а не какая-то особая приоритизация от aiogram)."""
+    await main_menu_or_confirm(message, state)
 
 
 # ---- Навигация между разделами (используется как "назад" отовсюду) ----

@@ -9,6 +9,22 @@ OPEN_APP_BUTTON = "🚀 Открыть приложение"
 ADMIN_BUTTON = "⚙️ Админ"
 MENU_FAQ = "❓ Частые вопросы"
 MENU_BRIEF = "✍️ Оставить заявку"
+MAIN_MENU_BUTTON = "⌂ Главное меню"
+
+MAIN_MENU_CONFIRM_TEXT = "Вернуться в главное меню?\nТекущее действие будет прервано."
+MAIN_MENU_CONFIRM_YES = "✅ Да, продолжить"
+MAIN_MENU_CONFIRM_NO = "↩️ Остаться"
+
+# Bot API setMyShortDescription/setMyDescription (см. bot/main.py::
+# _setup_bot_description) — видны пользователю ДО первого /start, в
+# профиле бота и на экране "Запустить". Лимиты Telegram: short ≤120,
+# description ≤512 символов (см. regression-тест на длину).
+BOT_SHORT_DESCRIPTION = "Дизайн-помощник: портфолио, расчёт стоимости и заявка на проект."
+BOT_DESCRIPTION = (
+    "Design Assistant — бот-помощник по дизайну. Посмотрите портфолио, "
+    "получите предварительную оценку стоимости проекта и отправьте заявку "
+    "на дизайн. Нажмите «Запустить», чтобы начать."
+)
 
 FAQ_INTRO = "Выберите вопрос:"
 FAQ_BACK = "◀️ Ко всем вопросам"
