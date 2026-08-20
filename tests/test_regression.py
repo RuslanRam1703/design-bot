@@ -824,7 +824,10 @@ class AdminLeadsFullSequenceTests(unittest.IsolatedAsyncioTestCase):
 
         await admin.lead_open_detail(make_callback(f"adminleadpick:{self.lead['id']}", chat_id=self.actor), state)
         self.assertEqual(await state.get_state(), AdminStates.lead_detail.state)
-        self.assertEqual(content_store.get_lead(self.lead["id"])["status"], "NEW")
+        # Открытие карточки NEW-заявки автоматически переводит её в VIEWED
+        # (см. UX-аудит "Заявки как рабочая очередь") — раньше здесь
+        # оставался NEW, статус менялся только явным кликом по кнопке.
+        self.assertEqual(content_store.get_lead(self.lead["id"])["status"], "VIEWED")
 
         await admin.lead_change_status(make_callback("adminleadstatus:IN_PROGRESS", chat_id=self.actor), state)
         self.assertEqual(content_store.get_lead(self.lead["id"])["status"], "IN_PROGRESS")  # реально сохранилось
@@ -834,6 +837,127 @@ class AdminLeadsFullSequenceTests(unittest.IsolatedAsyncioTestCase):
 
         # Статус пережил весь проход, не только момент смены
         self.assertEqual(content_store.get_lead(self.lead["id"])["status"], "IN_PROGRESS")
+
+
+class AdminLeadsQueueUxTests(unittest.IsolatedAsyncioTestCase):
+    """UX-аудит "Заявки как рабочая очередь" (продуктовый блок, пункты 1-4):
+    дефолтный фильтр /admin -> Заявки, статус+дата в списке, авто NEW ->
+    VIEWED при открытии карточки — без уведомления клиента/owner_message."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        real_data_dir = Path(__file__).resolve().parent.parent / "data"
+        for name in ("pricing.json", "portfolio.json", "faq.json", "about.json", "ui_config.json"):
+            shutil.copy(real_data_dir / name, Path(self.tmpdir) / name)
+        self._orig_data_dir = content_store.DATA_DIR
+        self._orig_designer = content_store.config.DESIGNER_CHAT_ID
+        content_store.DATA_DIR = Path(self.tmpdir)
+        content_store.config.DESIGNER_CHAT_ID = "777"
+        self.actor = 777
+        self.telegram = {"user_id": 55555, "username": "client", "first_name": "Клиент"}
+
+    def tearDown(self):
+        content_store.DATA_DIR = self._orig_data_dir
+        content_store.config.DESIGNER_CHAT_ID = self._orig_designer
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def _button_texts(self, markup) -> list[str]:
+        return [btn.text for row in markup.inline_keyboard for btn in row]
+
+    async def test_default_filter_excludes_done_and_cancelled(self):
+        active_lead = content_store.add_lead({"service_name": "Активная"}, self.telegram)
+        done_lead = content_store.add_lead({"service_name": "Завершённая"}, self.telegram)
+        content_store.update_lead_status(self.actor, done_lead["id"], "DONE")
+        cancelled_lead = content_store.add_lead({"service_name": "Отменённая"}, self.telegram)
+        content_store.update_lead_status(self.actor, cancelled_lead["id"], "CANCELLED")
+
+        state = make_state(self.actor)
+        cb = make_callback("adminmenu:leads", chat_id=self.actor)
+        await admin.menu_leads(cb, state)
+
+        self.assertEqual((await state.get_data())["lead_filter"], "ACTIVE")
+        texts = " ".join(self._button_texts(cb.message.edit_text.await_args.kwargs["reply_markup"]))
+        self.assertIn(f"#{active_lead['id']}", texts)
+        self.assertNotIn(f"#{done_lead['id']}", texts)
+        self.assertNotIn(f"#{cancelled_lead['id']}", texts)
+
+    async def test_explicit_filter_still_works(self):
+        content_store.add_lead({"service_name": "Новая"}, self.telegram)
+        done_lead = content_store.add_lead({"service_name": "Завершённая"}, self.telegram)
+        content_store.update_lead_status(self.actor, done_lead["id"], "DONE")
+
+        state = make_state(self.actor)
+        cb = make_callback("adminleadfilter:DONE", chat_id=self.actor)
+        await admin.leads_filter_apply(cb, state)
+
+        self.assertEqual((await state.get_data())["lead_filter"], "DONE")
+        texts = " ".join(self._button_texts(cb.message.edit_text.await_args.kwargs["reply_markup"]))
+        self.assertIn(f"#{done_lead['id']}", texts)
+
+    def test_list_keyboard_shows_status_and_updated_at(self):
+        lead = content_store.add_lead({"service_name": "Лендинг"}, self.telegram)
+        content_store.update_lead_status(self.actor, lead["id"], "WAITING_CLIENT")
+        lead = content_store.get_lead(lead["id"])
+
+        markup = kb.leads_list_keyboard([lead], "ACTIVE")
+        text = markup.inline_keyboard[0][0].text
+
+        self.assertIn(f"#{lead['id']}", text)
+        self.assertIn("⏸", text)  # эмодзи WAITING_CLIENT из LEAD_STATUS_LABELS, тот же набор
+        self.assertIn(lead["updated_at"][5:16].replace("T", " "), text)  # "MM-DD HH:MM"
+
+    async def test_new_lead_opened_once_becomes_viewed_and_updates_timestamp(self):
+        lead = content_store.add_lead({"service_name": "Лендинг"}, self.telegram)
+        self.assertIsNone(lead["updated_at"])
+
+        state = make_state(self.actor)
+        await admin.lead_open_detail(make_callback(f"adminleadpick:{lead['id']}", chat_id=self.actor), state)
+
+        updated = content_store.get_lead(lead["id"])
+        self.assertEqual(updated["status"], "VIEWED")
+        self.assertIsNotNone(updated["updated_at"])  # реально обновилось — заявка "просмотрена по-настоящему"
+
+    async def test_already_viewed_lead_opened_again_no_extra_update(self):
+        lead = content_store.add_lead({"service_name": "Лендинг"}, self.telegram)
+        content_store.update_lead_status(self.actor, lead["id"], "VIEWED")
+        before = content_store.get_lead(lead["id"])["updated_at"]
+
+        state = make_state(self.actor)
+        await admin.lead_open_detail(make_callback(f"adminleadpick:{lead['id']}", chat_id=self.actor), state)
+
+        after = content_store.get_lead(lead["id"])
+        self.assertEqual(after["status"], "VIEWED")
+        self.assertEqual(after["updated_at"], before)  # ни одной лишней записи
+
+    async def test_non_new_status_untouched_on_open(self):
+        lead = content_store.add_lead({"service_name": "Лендинг"}, self.telegram)
+        content_store.update_lead_status(self.actor, lead["id"], "DONE")
+        before = content_store.get_lead(lead["id"])["updated_at"]
+
+        state = make_state(self.actor)
+        await admin.lead_open_detail(make_callback(f"adminleadpick:{lead['id']}", chat_id=self.actor), state)
+
+        after = content_store.get_lead(lead["id"])
+        self.assertEqual(after["status"], "DONE")
+        self.assertEqual(after["updated_at"], before)
+
+    async def test_auto_viewed_does_not_send_client_notification(self):
+        lead = content_store.add_lead({"service_name": "Лендинг"}, self.telegram)
+        state = make_state(self.actor)
+        cb = make_callback(f"adminleadpick:{lead['id']}", chat_id=self.actor)
+
+        await admin.lead_open_detail(cb, state)
+
+        cb.bot.send_message.assert_not_awaited()  # смена статуса кликом уведомляет, авто-VIEWED — нет
+
+    async def test_auto_viewed_does_not_create_owner_message(self):
+        lead = content_store.add_lead({"service_name": "Лендинг"}, self.telegram)
+        state = make_state(self.actor)
+
+        await admin.lead_open_detail(make_callback(f"adminleadpick:{lead['id']}", chat_id=self.actor), state)
+
+        updated = content_store.get_lead(lead["id"])
+        self.assertEqual(updated.get("owner_messages", []), [])
 
 
 class AdminCancelIntegrationTests(unittest.IsolatedAsyncioTestCase):
@@ -2107,6 +2231,72 @@ class LeadStoreTests(unittest.TestCase):
         new_only = content_store.list_leads("NEW")
         self.assertEqual([l["id"] for l in new_only], [lead1["id"]])
 
+    def test_list_leads_updated_lead_rises_above_newer_untouched_lead(self):
+        # UX-аудит "Заявки как рабочая очередь": заявка, которую только что
+        # обновили, должна подниматься наверх, даже если у неё меньший id,
+        # чем у другой, нетронутой после создания заявки.
+        old_lead = content_store.add_lead({"service_name": "A"}, self.telegram)
+        new_lead = content_store.add_lead({"service_name": "B"}, self.telegram)
+        content_store.update_lead_status(self.actor, old_lead["id"], "IN_PROGRESS")
+
+        # Форсируем заведомо более позднюю метку — как и в аналогичном
+        # тесте для list_leads_by_user() (MyLeadsFilteringTests), два
+        # datetime.now(timezone.utc) подряд иногда совпадают по разрешению
+        # системных часов, тест иначе был бы flaky.
+        leads = content_store._read_leads()
+        for l in leads:
+            if l["id"] == old_lead["id"]:
+                l["updated_at"] = "2030-01-01T00:00:00+00:00"
+        content_store._write_leads(leads)
+
+        result = content_store.list_leads()
+        self.assertEqual([l["id"] for l in result], [old_lead["id"], new_lead["id"]])
+
+    def test_list_leads_same_updated_at_tiebreaks_on_higher_id(self):
+        first = content_store.add_lead({"service_name": "A"}, self.telegram)
+        second = content_store.add_lead({"service_name": "B"}, self.telegram)
+        leads = content_store._read_leads()
+        same_ts = "2026-01-01T00:00:00+00:00"
+        for l in leads:
+            if l["id"] in (first["id"], second["id"]):
+                l["updated_at"] = same_ts
+        content_store._write_leads(leads)
+
+        result = content_store.list_leads()
+        self.assertEqual([l["id"] for l in result], [second["id"], first["id"]])
+
+    def test_list_leads_active_filter_excludes_done_and_cancelled(self):
+        leads_by_status = {}
+        for status in content_store.LEAD_STATUSES:
+            lead = content_store.add_lead({"service_name": status}, self.telegram)
+            if status != "NEW":
+                content_store.update_lead_status(self.actor, lead["id"], status)
+            leads_by_status[status] = lead["id"]
+
+        active_ids = {l["id"] for l in content_store.list_leads("ACTIVE")}
+        self.assertEqual(
+            active_ids,
+            {leads_by_status[s] for s in ("NEW", "VIEWED", "IN_PROGRESS", "WAITING_CLIENT")},
+        )
+        self.assertNotIn(leads_by_status["DONE"], active_ids)
+        self.assertNotIn(leads_by_status["CANCELLED"], active_ids)
+
+    def test_list_leads_explicit_status_filters_still_work(self):
+        lead = content_store.add_lead({"service_name": "A"}, self.telegram)
+        content_store.update_lead_status(self.actor, lead["id"], "DONE")
+
+        self.assertEqual([l["id"] for l in content_store.list_leads("DONE")], [lead["id"]])
+        self.assertEqual(content_store.list_leads("CANCELLED"), [])
+        self.assertEqual([l["id"] for l in content_store.list_leads("ALL")], [lead["id"]])
+
+    def test_active_is_not_a_real_lead_status(self):
+        # "ACTIVE" — техническое значение только для list_leads(), не
+        # персистентный business-статус (см. content_store.ACTIVE_LEAD_STATUSES).
+        self.assertNotIn("ACTIVE", content_store.LEAD_STATUSES)
+        lead = content_store.add_lead({"service_name": "A"}, self.telegram)
+        self.assertFalse(content_store.update_lead_status(self.actor, lead["id"], "ACTIVE"))
+        self.assertEqual(content_store.get_lead(lead["id"])["status"], "NEW")  # не изменился
+
     def test_update_lead_status_rejects_unknown_status_and_requires_designer(self):
         lead = content_store.add_lead({"service_name": "A"}, self.telegram)
         self.assertFalse(content_store.update_lead_status(self.actor, lead["id"], "BOGUS"))
@@ -2489,15 +2679,18 @@ class MyLeadsFilteringTests(unittest.TestCase):
         self.assertEqual(result[0]["payload"]["task_description"], "Тест")
         self.assertEqual(result[0]["status"], "DONE")
 
-    def test_admin_list_leads_unaffected_by_new_client_sort(self):
-        # list_leads() (для /admin) остаётся отсортирован строго по id —
-        # новая сортировка касается только list_leads_by_user().
+    def test_admin_list_leads_now_also_sorts_by_updated_at(self):
+        # Ранее list_leads() (для /admin) был отсортирован строго по id —
+        # с UX-аудита "Заявки как рабочая очередь" (P2 продуктовый блок)
+        # он использует тот же принцип, что и list_leads_by_user() ниже:
+        # недавняя активность поднимает заявку наверх, даже если она
+        # создана раньше другой, нетронутой заявки.
         old_lead = content_store.add_lead({"service_name": "A"}, {"user_id": 111})
         new_lead = content_store.add_lead({"service_name": "B"}, {"user_id": 111})
         content_store.update_lead_status(self.actor, old_lead["id"], "IN_PROGRESS")
 
         admin_leads = content_store.list_leads()
-        self.assertEqual([l["id"] for l in admin_leads], [new_lead["id"], old_lead["id"]])
+        self.assertEqual([l["id"] for l in admin_leads], [old_lead["id"], new_lead["id"]])
 
 
 class MyLeadsHttpEndpointTests(unittest.IsolatedAsyncioTestCase):

@@ -814,6 +814,14 @@ def content_readiness_summary() -> dict:
 
 LEAD_STATUSES = ("NEW", "VIEWED", "IN_PROGRESS", "WAITING_CLIENT", "DONE", "CANCELLED")
 
+# "ACTIVE" — НЕ business-статус (не входит в LEAD_STATUSES, никогда не
+# пишется в lead["status"], в LEAD_STATUSES-валидацию update_lead_status не
+# участвует) — это чисто технический alias для list_leads(status=...),
+# означающий "не завершено" (см. UX-аудит "Заявки как рабочая очередь",
+# default view /admin -> Заявки). Единственное место, которое его понимает
+# — сам list_leads() ниже.
+ACTIVE_LEAD_STATUSES = ("NEW", "VIEWED", "IN_PROGRESS", "WAITING_CLIENT")
+
 
 class LeadNotFoundError(Exception):
     """supplement/материал для несуществующего lead_id."""
@@ -1019,10 +1027,22 @@ def mark_tz_file_received(lead_id: int) -> bool:
 
 
 def list_leads(status: str | None = None) -> list[dict]:
+    """Для /admin -> Заявки. status="ACTIVE" — см. ACTIVE_LEAD_STATUSES
+    выше (не персистентный статус, чисто фильтр по НЕ-завершённым).
+
+    Сортировка — updated_at DESC, фолбэк created_at, тай-брейк id DESC:
+    тот же принцип, что уже используется в list_leads_by_user() ниже (для
+    клиентского "Мои заявки") — недавняя активность (смена статуса,
+    supplement, материал, ответ дизайнера, теперь и просто открытие
+    карточки владельцем) должна поднимать заявку наверх рабочей очереди,
+    а не оставлять её на месте по порядку создания (см. UX-аудит "Заявки
+    как рабочая очередь")."""
     leads = _read_leads()
-    if status and status != "ALL":
+    if status == "ACTIVE":
+        leads = [l for l in leads if l.get("status") in ACTIVE_LEAD_STATUSES]
+    elif status and status != "ALL":
         leads = [l for l in leads if l.get("status") == status]
-    return sorted(leads, key=lambda l: l["id"], reverse=True)
+    return sorted(leads, key=lambda l: (l.get("updated_at") or l["created_at"], l["id"]), reverse=True)
 
 
 def list_leads_by_user(user_id: int) -> list[dict]:

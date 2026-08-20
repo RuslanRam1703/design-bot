@@ -1428,14 +1428,22 @@ async def cat_delete_do(callback: CallbackQuery, state: FSMContext) -> None:
 
 @router.callback_query(F.data == "adminmenu:leads")
 async def menu_leads(callback: CallbackQuery, state: FSMContext) -> None:
+    # Дефолтный экран — активные заявки (см. content_store.ACTIVE_LEAD_STATUSES,
+    # UX-аудит "Заявки как рабочая очередь"): DONE/CANCELLED не должны
+    # заслонять то, что реально требует внимания. "Заявок вообще нет"
+    # проверяем отдельно по ВСЕМ заявкам — иначе "0 активных, но есть
+    # завершённые" ошибочно выглядело бы как пустая система и уводило бы
+    # сразу в корень меню, а не в список с доступом к фильтру "Все".
     await state.clear()
-    leads = content_store.list_leads("ALL")
-    if not leads:
+    all_leads = content_store.list_leads("ALL")
+    if not all_leads:
         await callback.message.edit_text("Заявок пока нет.", reply_markup=kb.admin_root_keyboard())
         await callback.answer()
         return
-    await state.update_data(lead_filter="ALL")
-    await callback.message.edit_text(f"Заявки (всего {len(leads)}):", reply_markup=kb.leads_list_keyboard(leads, "ALL"))
+    leads = content_store.list_leads("ACTIVE")
+    await state.update_data(lead_filter="ACTIVE")
+    text = f"Заявки — активные ({len(leads)}):" if leads else "Активных заявок нет."
+    await callback.message.edit_text(text, reply_markup=kb.leads_list_keyboard(leads, "ACTIVE"))
     await state.set_state(AdminStates.leads_list)
     await callback.answer()
 
@@ -1464,6 +1472,16 @@ async def lead_open_detail(callback: CallbackQuery, state: FSMContext) -> None:
     if lead is None:
         await callback.answer("Заявка не найдена", show_alert=True)
         return
+    if lead["status"] == "NEW":
+        # Открытие карточки владельцем = "заявка просмотрена" — тот же
+        # content_store.update_lead_status(), что и у кнопок статуса в
+        # деталях, но БЕЗ уведомления клиента (его шлёт только
+        # lead_change_status — явная смена статуса кликом, не сам факт
+        # чтения) и без owner_message (см. UX-аудит "Заявки как рабочая
+        # очередь"). Ровно один update; на любом другом статусе (включая
+        # уже VIEWED) — ничего не меняем.
+        content_store.update_lead_status(callback.message.chat.id, lead_id, "VIEWED")
+        lead = content_store.get_lead(lead_id)
     await state.update_data(lead_id=lead_id)
     await callback.message.edit_text(lead_format.format_lead_admin_detail(lead), reply_markup=kb.lead_detail_keyboard(lead))
     await state.set_state(AdminStates.lead_detail)

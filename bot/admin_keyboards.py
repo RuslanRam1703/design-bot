@@ -390,11 +390,22 @@ def leads_filter_keyboard() -> InlineKeyboardMarkup:
 
 
 def leads_list_keyboard(leads: list[dict], status_filter: str) -> InlineKeyboardMarkup:
+    # Статус + дата последней активности прямо в строке списка — раньше
+    # это было видно только открыв карточку, из-за чего единственный
+    # способ понять состояние очереди заявок был открывать их по одной
+    # (см. UX-аудит "Заявки как рабочая очередь"). Эмодзи — тот же,
+    # что уже используется в LEAD_STATUS_LABELS (детали заявки, фильтр),
+    # отдельного набора статусов не вводим. Имя/услугу пришлось сократить
+    # сильнее прежнего (Telegram: до 64 символов на текст кнопки), чтобы
+    # новые поля поместились без переполнения.
     rows = []
     for lead in leads:
-        service = (lead["payload"].get("service_name") or "без услуги")[:24]
-        name = (lead["telegram"].get("first_name") or "клиент")[:16]
-        rows.append([InlineKeyboardButton(text=f"#{lead['id']} · {name} · {service}", callback_data=f"adminleadpick:{lead['id']}")])
+        service = (lead["payload"].get("service_name") or "без услуги")[:18]
+        name = (lead["telegram"].get("first_name") or "клиент")[:12]
+        status_emoji = LEAD_STATUS_LABELS.get(lead["status"], "").split(" ", 1)[0]
+        updated = (lead.get("updated_at") or lead["created_at"])[:16].replace("T", " ")[5:]  # "MM-DD HH:MM"
+        text = f"{status_emoji} #{lead['id']} · {name} · {service} · {updated}"
+        rows.append([InlineKeyboardButton(text=text, callback_data=f"adminleadpick:{lead['id']}")])
     rows.append([InlineKeyboardButton(text="🔀 Фильтр", callback_data="adminleadaction:filter")])
     rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data="adminmenu:root")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
