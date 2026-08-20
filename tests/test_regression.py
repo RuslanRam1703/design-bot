@@ -272,14 +272,16 @@ class AdminRouterOrderingTests(unittest.TestCase):
         self.assertEqual(names[-1], "admin_unexpected_input")
 
 
-def make_callback(data: str, chat_id: int = 777) -> SimpleNamespace:
+def make_callback(data: str, chat_id: int = 777, bot: AsyncMock | None = None) -> SimpleNamespace:
     """Достаточно для admin.py callback-хендлеров: callback.data,
     callback.message.chat.id, callback.message.edit_text (async),
-    callback.answer (async)."""
+    callback.answer (async), callback.bot (async send_message — нужен
+    lead_change_status для уведомления клиента о смене статуса)."""
     return SimpleNamespace(
         data=data,
         message=SimpleNamespace(chat=SimpleNamespace(id=chat_id), edit_text=AsyncMock()),
         answer=AsyncMock(),
+        bot=bot if bot is not None else AsyncMock(),
     )
 
 
@@ -2739,6 +2741,109 @@ class OwnerMessageTests(unittest.IsolatedAsyncioTestCase):
         # эквивалентно [] на уровне API/frontend; на уровне content_store
         # свежесозданный lead уже содержит owner_messages: [] явно.
         self.assertEqual(self.lead.get("owner_messages", []), [])
+
+
+class StatusNotificationTests(unittest.IsolatedAsyncioTestCase):
+    """Уведомление клиенту при смене статуса (lead_change_status) — см.
+    аудит: должно уходить ровно один раз при реальном изменении статуса,
+    не должно уходить при повторной установке того же значения, не должно
+    ронять сохранение статуса при сбое Telegram, и не должно затрагивать
+    owner_messages[] (отдельный, независимый поток)."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        real_data_dir = Path(__file__).resolve().parent.parent / "data"
+        for name in ("pricing.json", "portfolio.json", "faq.json", "about.json", "ui_config.json"):
+            shutil.copy(real_data_dir / name, Path(self.tmpdir) / name)
+        self._orig_data_dir = content_store.DATA_DIR
+        self._orig_designer = content_store.config.DESIGNER_CHAT_ID
+        content_store.DATA_DIR = Path(self.tmpdir)
+        content_store.config.DESIGNER_CHAT_ID = "888"
+        self.actor = 888
+
+    def tearDown(self):
+        content_store.DATA_DIR = self._orig_data_dir
+        content_store.config.DESIGNER_CHAT_ID = self._orig_designer
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def _make_lead(self, user_id=55555):
+        return content_store.add_lead(
+            {"service_name": "Лендинг", "task_description": "Тест"},
+            {"user_id": user_id, "username": "client", "first_name": "Клиент"},
+        )
+
+    async def test_status_change_sends_one_notification(self):
+        lead = self._make_lead()
+        state = make_state(self.actor)
+        await state.update_data(lead_id=lead["id"])
+        callback = make_callback("adminleadstatus:IN_PROGRESS", chat_id=self.actor)
+
+        await admin.lead_change_status(callback, state)
+
+        callback.bot.send_message.assert_awaited_once()
+        self.assertEqual(callback.bot.send_message.await_args.kwargs["chat_id"], 55555)
+        self.assertEqual(content_store.get_lead(lead["id"])["status"], "IN_PROGRESS")
+
+    async def test_status_change_notification_has_correct_lead_id_and_label(self):
+        lead = self._make_lead()
+        state = make_state(self.actor)
+        await state.update_data(lead_id=lead["id"])
+        callback = make_callback("adminleadstatus:WAITING_CLIENT", chat_id=self.actor)
+
+        await admin.lead_change_status(callback, state)
+
+        text = callback.bot.send_message.await_args.kwargs["text"]
+        self.assertIn(f"#{lead['id']}", text)
+        self.assertIn("Нужно ваше действие", text)
+
+    async def test_repeat_same_status_sends_zero_notifications(self):
+        lead = self._make_lead()  # уже "NEW" по умолчанию
+        state = make_state(self.actor)
+        await state.update_data(lead_id=lead["id"])
+        callback = make_callback("adminleadstatus:NEW", chat_id=self.actor)
+
+        await admin.lead_change_status(callback, state)
+
+        callback.bot.send_message.assert_not_awaited()
+        self.assertEqual(content_store.get_lead(lead["id"])["status"], "NEW")
+
+    async def test_missing_user_id_changes_status_but_sends_zero_notifications(self):
+        lead = content_store.add_lead(
+            {"service_name": "Лендинг"}, {"user_id": None, "username": None, "first_name": None},
+        )
+        state = make_state(self.actor)
+        await state.update_data(lead_id=lead["id"])
+        callback = make_callback("adminleadstatus:IN_PROGRESS", chat_id=self.actor)
+
+        await admin.lead_change_status(callback, state)
+
+        callback.bot.send_message.assert_not_awaited()
+        self.assertEqual(content_store.get_lead(lead["id"])["status"], "IN_PROGRESS")
+
+    async def test_send_message_exception_leaves_status_changed(self):
+        lead = self._make_lead()
+        state = make_state(self.actor)
+        await state.update_data(lead_id=lead["id"])
+        failing_bot = AsyncMock()
+        failing_bot.send_message.side_effect = TelegramAPIError(method=None, message="bot was blocked")
+        callback = make_callback("adminleadstatus:DONE", chat_id=self.actor, bot=failing_bot)
+
+        await admin.lead_change_status(callback, state)  # не должно бросить исключение наружу
+
+        self.assertEqual(content_store.get_lead(lead["id"])["status"], "DONE")
+
+    async def test_status_change_does_not_touch_owner_messages(self):
+        lead = self._make_lead()
+        content_store.add_owner_message(self.actor, lead["id"], "Ранее написанный ответ", "sent")
+        state = make_state(self.actor)
+        await state.update_data(lead_id=lead["id"])
+        callback = make_callback("adminleadstatus:IN_PROGRESS", chat_id=self.actor)
+
+        await admin.lead_change_status(callback, state)
+
+        lead_after = content_store.get_lead(lead["id"])
+        self.assertEqual(len(lead_after["owner_messages"]), 1)
+        self.assertEqual(lead_after["owner_messages"][0]["text"], "Ранее написанный ответ")
 
 
 if __name__ == "__main__":

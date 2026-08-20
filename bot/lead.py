@@ -162,6 +162,26 @@ STATUS_LABELS = {
     "CANCELLED": "❌ Отменена",
 }
 
+# Отдельный словарь от STATUS_LABELS выше — тот для админа (карточка в
+# /admin, более технические формулировки), этот — то, что видит клиент и в
+# Telegram-уведомлении, и в Mini App ("Мои заявки"). Формулировки должны
+# совпадать буква в букву с webapp/js/app.js::MY_LEAD_STATUS_LABELS —
+# иначе текст уведомления разойдётся с тем, что клиент увидит, открыв
+# Mini App (см. аудит про статусы/уведомления).
+CLIENT_STATUS_LABELS = {
+    "NEW": "🆕 Заявка получена",
+    "VIEWED": "👀 На рассмотрении",
+    "IN_PROGRESS": "💬 В работе",
+    "WAITING_CLIENT": "⏸ Нужно ваше действие",
+    "DONE": "✅ Завершено",
+    "CANCELLED": "❌ Отменено",
+}
+
+
+def format_status_notification(lead_id: int, status: str) -> str:
+    label = CLIENT_STATUS_LABELS.get(status, status)
+    return f"Заявка #{lead_id}\nСтатус: {label}"
+
 
 def format_lead_admin_detail(lead: dict) -> str:
     """Карточка заявки для /admin -> Заявки -> конкретная заявка. В отличие

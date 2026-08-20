@@ -1474,8 +1474,31 @@ async def lead_open_detail(callback: CallbackQuery, state: FSMContext) -> None:
 async def lead_change_status(callback: CallbackQuery, state: FSMContext) -> None:
     status = callback.data.split(":", 1)[1]
     data = await state.get_data()
+    # Старый статус — ДО update_lead_status, иначе "изменился ли статус
+    # реально" неизвестно (сигнатуру update_lead_status не меняем, она
+    # по-прежнему просто bool успех/неуспех — см. аудит).
+    lead_before = content_store.get_lead(data["lead_id"])
+    old_status = lead_before["status"] if lead_before else None
+
     content_store.update_lead_status(callback.message.chat.id, data["lead_id"], status)
     lead = content_store.get_lead(data["lead_id"])
+
+    # Уведомление клиенту — только если статус реально поменялся (не
+    # повторная установка того же значения) и есть куда слать. owner_messages[]
+    # здесь не трогается вообще — это отдельный, независимый поток (только
+    # явные текстовые ответы дизайнера через "Ответить через бота"), не
+    # персистентный лог статус-уведомлений — сам lead["status"] уже
+    # источник правды, Mini App покажет его корректно независимо от того,
+    # дошло ли сейчас сообщение в Telegram.
+    if lead and old_status != status and lead.get("telegram", {}).get("user_id"):
+        try:
+            await callback.bot.send_message(
+                chat_id=lead["telegram"]["user_id"],
+                text=lead_format.format_status_notification(lead["id"], status),
+            )
+        except Exception:
+            logger.exception("Не удалось уведомить клиента о смене статуса заявки #%s", lead["id"])
+
     await callback.message.edit_text(lead_format.format_lead_admin_detail(lead), reply_markup=kb.lead_detail_keyboard(lead))
     await callback.answer("Статус обновлён")
 
