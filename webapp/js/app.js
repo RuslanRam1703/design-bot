@@ -170,24 +170,11 @@ document.addEventListener("click", () => {
   }
 });
 
-function diagRenderOverlay() {
-  const el = document.getElementById("diag-overlay");
-  if (!diagOverlayEnabled()) {
-    if (el) el.remove();
-    return;
-  }
-  const box = el || document.createElement("div");
-  if (!el) {
-    box.id = "diag-overlay";
-    box.style.cssText = [
-      "position:fixed", "top:0", "left:0", "right:0", "z-index:99999",
-      "background:rgba(0,0,0,0.85)", "color:#0f0",
-      "font:11px/1.4 monospace", "padding:8px",
-      "max-height:45vh", "overflow-y:auto", "white-space:pre-wrap",
-      "pointer-events:none",
-    ].join(";");
-    document.body.appendChild(box);
-  }
+// Тот же текст используется и для отрисовки, и для копирования — единственный
+// источник, чтобы кнопка "Скопировать" никогда не разошлась с тем, что видно
+// на экране. Только session_id/screen/step/booleans/лог событий (см. состав
+// diagLog() выше) — то же самое, что уже было в консоли/overlay, ничего нового.
+function diagBuildText() {
   const header = [
     `session ${DIAG_SESSION_ID}`,
     `screen=${state.screen} step=${state.brief.step} draftId=${!!state.brief.draftId} localStorage=${diagLocalStoragePresent()}`,
@@ -196,7 +183,88 @@ function diagRenderOverlay() {
   const lines = DIAG_LOG_BUFFER
     .map((e) => `${e.event} ${JSON.stringify(e.data)}`)
     .join("\n");
-  box.textContent = `${header}\n${lines}`;
+  return `${header}\n${lines}`;
+}
+
+function diagCopyText(text, statusEl) {
+  const showStatus = (ok) => {
+    if (!statusEl) return;
+    statusEl.textContent = ok ? "Скопировано" : "Не получилось скопировать";
+    setTimeout(() => { statusEl.textContent = ""; }, 2000);
+  };
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(text).then(() => showStatus(true)).catch(() => diagCopyTextFallback(text, showStatus));
+  } else {
+    diagCopyTextFallback(text, showStatus);
+  }
+}
+
+// Фолбэк на случай, если navigator.clipboard недоступен/запрещён в
+// конкретном WebView (некоторые встроенные браузеры это режут) — тот же
+// старый приём через скрытый textarea + execCommand("copy").
+function diagCopyTextFallback(text, showStatus) {
+  try {
+    const ta = document.createElement("textarea");
+    ta.value = text;
+    ta.style.position = "fixed";
+    ta.style.opacity = "0";
+    document.body.appendChild(ta);
+    ta.focus();
+    ta.select();
+    const ok = document.execCommand("copy");
+    document.body.removeChild(ta);
+    showStatus(ok);
+  } catch (e) {
+    showStatus(false);
+  }
+}
+
+function diagRenderOverlay() {
+  const el = document.getElementById("diag-overlay");
+  if (!diagOverlayEnabled()) {
+    if (el) el.remove();
+    return;
+  }
+  let box = el;
+  let contentEl;
+  let statusEl;
+  if (!box) {
+    box = document.createElement("div");
+    box.id = "diag-overlay";
+    box.style.cssText = [
+      "position:fixed", "top:0", "left:0", "right:0", "z-index:99999",
+      "background:rgba(0,0,0,0.9)", "color:#0f0",
+      "font:11px/1.4 monospace", "padding:8px",
+      "max-height:55vh", "overflow-y:auto",
+    ].join(";");
+
+    const toolbar = document.createElement("div");
+    toolbar.style.cssText = "display:flex;align-items:center;gap:8px;margin-bottom:6px;";
+
+    const copyBtn = document.createElement("button");
+    copyBtn.id = "diag-copy-btn";
+    copyBtn.textContent = "Скопировать диагностику";
+    copyBtn.type = "button";
+    copyBtn.style.cssText = "font:11px monospace;padding:4px 8px;cursor:pointer;";
+    copyBtn.addEventListener("click", () => diagCopyText(diagBuildText(), document.getElementById("diag-copy-status")));
+    toolbar.appendChild(copyBtn);
+
+    statusEl = document.createElement("span");
+    statusEl.id = "diag-copy-status";
+    toolbar.appendChild(statusEl);
+
+    box.appendChild(toolbar);
+
+    contentEl = document.createElement("div");
+    contentEl.id = "diag-overlay-content";
+    contentEl.style.cssText = "white-space:pre-wrap;";
+    box.appendChild(contentEl);
+
+    document.body.appendChild(box);
+  } else {
+    contentEl = document.getElementById("diag-overlay-content");
+  }
+  contentEl.textContent = diagBuildText();
 }
 
 // ---- Состояние приложения ----
