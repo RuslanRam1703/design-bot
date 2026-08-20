@@ -92,20 +92,27 @@ function applyTheme() {
 }
 
 // ---- ВРЕМЕННАЯ runtime-диагностика (см. аудит про stale step 7 в проде) ----
-// TODO(diag): удалить после того, как источник состояния подтверждён —
-// это не часть постоянной архитектуры, только console.log без payload/
-// user_id/контактов/содержимого заявки/токенов, ничего не отправляется
-// на сервер и никуда не сохраняется.
+// TODO(diag): удалить весь этот блок и debug-overlay ниже после того, как
+// источник состояния подтверждён — это не часть постоянной архитектуры,
+// только console.log/overlay без payload/user_id/контактов/содержимого
+// заявки/токенов, ничего не отправляется на сервер и никуда не сохраняется
+// (кроме самого факта "overlay включён" — см. DIAG_OVERLAY_KEY ниже).
 const DIAG_SESSION_ID = (window.crypto && window.crypto.randomUUID)
   ? window.crypto.randomUUID()
   : `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
 
+const DIAG_LOG_LIMIT = 20;
+const DIAG_LOG_BUFFER = [];
+
 function diagLog(event, data) {
+  DIAG_LOG_BUFFER.push({ event, data });
+  if (DIAG_LOG_BUFFER.length > DIAG_LOG_LIMIT) DIAG_LOG_BUFFER.shift();
   try {
     console.log(`[diag][${DIAG_SESSION_ID}] ${event}`, data);
   } catch (e) {
     // console недоступен — не критично, это только диагностика
   }
+  diagRenderOverlay();
 }
 
 function diagLocalStoragePresent() {
@@ -114,6 +121,82 @@ function diagLocalStoragePresent() {
   } catch (e) {
     return null;
   }
+}
+
+// ---- ВРЕМЕННЫЙ debug-overlay ----
+// В Telegram Desktop нет удобного доступа к консоли WebView, поэтому те же
+// diagLog()-события дополнительно рисуются прямо поверх интерфейса — но
+// ТОЛЬКО если явно включено (см. активацию ниже), чтобы обычные
+// пользователи никогда его не видели.
+const DIAG_OVERLAY_KEY = "designAssistant.debugOverlay";
+
+function diagOverlayEnabled() {
+  try {
+    if (new URLSearchParams(location.search).get("debug") === "1") {
+      // ?debug=1 в URL — если такая ссылка когда-либо доступна — сразу
+      // запоминаем в localStorage, чтобы флаг пережил переход/перезаход
+      // без query-параметра (а именно это и нужно проверить в этом тесте).
+      localStorage.setItem(DIAG_OVERLAY_KEY, "1");
+      return true;
+    }
+    return localStorage.getItem(DIAG_OVERLAY_KEY) === "1";
+  } catch (e) {
+    return false;
+  }
+}
+
+function diagSetOverlayEnabled(on) {
+  try {
+    if (on) localStorage.setItem(DIAG_OVERLAY_KEY, "1");
+    else localStorage.removeItem(DIAG_OVERLAY_KEY);
+  } catch (e) {
+    // недоступен localStorage — просто не переживёт перезагрузку
+  }
+  diagRenderOverlay();
+}
+
+// Активация без URL: 5 тапов в любом месте экрана в течение 3 секунд —
+// не мешает обычным кликам (только считает, ничего не блокирует/не
+// останавливает всплытие событий).
+let diagTapCount = 0;
+let diagTapTimer = null;
+document.addEventListener("click", () => {
+  diagTapCount += 1;
+  if (diagTapTimer) clearTimeout(diagTapTimer);
+  diagTapTimer = setTimeout(() => { diagTapCount = 0; }, 3000);
+  if (diagTapCount >= 5) {
+    diagTapCount = 0;
+    diagSetOverlayEnabled(!diagOverlayEnabled());
+  }
+});
+
+function diagRenderOverlay() {
+  const el = document.getElementById("diag-overlay");
+  if (!diagOverlayEnabled()) {
+    if (el) el.remove();
+    return;
+  }
+  const box = el || document.createElement("div");
+  if (!el) {
+    box.id = "diag-overlay";
+    box.style.cssText = [
+      "position:fixed", "top:0", "left:0", "right:0", "z-index:99999",
+      "background:rgba(0,0,0,0.85)", "color:#0f0",
+      "font:11px/1.4 monospace", "padding:8px",
+      "max-height:45vh", "overflow-y:auto", "white-space:pre-wrap",
+      "pointer-events:none",
+    ].join(";");
+    document.body.appendChild(box);
+  }
+  const header = [
+    `session ${DIAG_SESSION_ID}`,
+    `screen=${state.screen} step=${state.brief.step} draftId=${!!state.brief.draftId} localStorage=${diagLocalStoragePresent()}`,
+    "---",
+  ].join("\n");
+  const lines = DIAG_LOG_BUFFER
+    .map((e) => `${e.event} ${JSON.stringify(e.data)}`)
+    .join("\n");
+  box.textContent = `${header}\n${lines}`;
 }
 
 // ---- Состояние приложения ----
