@@ -277,7 +277,7 @@ const state = {
   history: [],
   filter: "all",
   currentCase: null,
-  myLeads: { status: "idle", items: [], selected: null }, // status: idle | loading | loaded | error | no-telegram
+  myLeads: { status: "idle", items: [], selected: null, ownerHistoryExpanded: false }, // status: idle | loading | loaded | error | no-telegram
   calc: { serviceId: null, openGroupId: null, options: {}, urgent: false, complex: false },
   brief: {
     step: 1,
@@ -1865,6 +1865,30 @@ function renderMyLeadDetail(lead) {
   const optionsLine = lead.calc_summary && lead.calc_summary.selected_options && lead.calc_summary.selected_options.length
     ? `<div class="case-block"><div class="label">Опции</div><p>${lead.calc_summary.selected_options.map((o) => escapeHtml(o.name) + (o.qty > 1 ? ` ×${o.qty}` : "")).join(", ")}</p></div>`
     : "";
+  // owner_messages — append-only ответы дизайнера (bot/handlers/admin.py::
+  // lead_reply_send), отдельный поток, никак не связанный с payload/
+  // supplements/materials. Блок вообще не рендерится, если ответов нет —
+  // не показываем пустую секцию заявкам, которым дизайнер ещё не отвечал.
+  const ownerMessages = lead.owner_messages || [];
+  let ownerCommentBlock = "";
+  if (ownerMessages.length) {
+    const last = ownerMessages[ownerMessages.length - 1];
+    const earlier = ownerMessages.slice(0, -1);
+    const historyToggle = earlier.length
+      ? `<button class="btn btn-secondary" id="my-lead-owner-history-toggle">${state.myLeads.ownerHistoryExpanded ? "Скрыть историю" : `Показать историю (${ownerMessages.length})`}</button>`
+      : "";
+    const historyList = state.myLeads.ownerHistoryExpanded && earlier.length
+      ? `<div class="case-block">${earlier.slice().reverse().map((m) => `<p><span class="hint">${escapeHtml((m.sent_at || "").slice(0, 10))}</span> — ${escapeHtml(m.text)}</p>`).join("")}</div>`
+      : "";
+    ownerCommentBlock = `
+      <div class="case-block">
+        <div class="label">Комментарий дизайнера</div>
+        <p>${escapeHtml(last.text)}</p>
+      </div>
+      ${historyToggle}
+      ${historyList}
+    `;
+  }
   return `
     <button class="btn btn-secondary" id="my-lead-back">← К списку заявок</button>
     <div class="case-block"><div class="label">Заявка №${lead.id} · ${escapeHtml(date)}</div><p>${escapeHtml(status)}</p></div>
@@ -1874,6 +1898,7 @@ function renderMyLeadDetail(lead) {
     ${p.task_description ? `<div class="case-block"><div class="label">Задача</div><p>${escapeHtml(p.task_description)}</p></div>` : ""}
     ${p.budget ? `<div class="case-block"><div class="label">Бюджет</div><p>${escapeHtml(BUDGET_OPTIONS.find((b) => b.id === p.budget)?.label || p.budget)}</p></div>` : ""}
     ${p.contact ? `<div class="case-block"><div class="label">Контакты</div><p>${escapeHtml(p.contact)}</p></div>` : ""}
+    ${ownerCommentBlock}
     <button class="btn btn-primary" id="my-lead-continue">Дополнить информацию</button>
   `;
 }
@@ -1883,11 +1908,18 @@ function attachMyLeadsEvents() {
     el.addEventListener("click", () => {
       const lead = state.myLeads.items.find((l) => l.id === Number(el.dataset.leadId));
       state.myLeads.selected = lead;
+      state.myLeads.ownerHistoryExpanded = false; // новая заявка — сворачиваем историю прошлой
       render();
     })
   );
   const backBtn = document.getElementById("my-lead-back");
   if (backBtn) backBtn.addEventListener("click", () => { state.myLeads.selected = null; render(); });
+
+  const ownerHistoryToggle = document.getElementById("my-lead-owner-history-toggle");
+  if (ownerHistoryToggle) ownerHistoryToggle.addEventListener("click", () => {
+    state.myLeads.ownerHistoryExpanded = !state.myLeads.ownerHistoryExpanded;
+    render();
+  });
 
   const continueBtn = document.getElementById("my-lead-continue");
   if (continueBtn) continueBtn.addEventListener("click", () => {

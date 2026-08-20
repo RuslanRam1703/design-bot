@@ -1501,12 +1501,26 @@ async def lead_reply_send(message: Message, state: FSMContext) -> None:
         await message.answer("Заявка не найдена.", reply_markup=kb.admin_root_keyboard())
         await state.clear()
         return
+    text = message.text.strip()
     try:
-        await message.bot.send_message(chat_id=lead["telegram"]["user_id"], text=message.text.strip())
+        # "Ответ по заявке #N" — контекст только в исходящем клиенту
+        # сообщении (сам клиент мог получать от бота что угодно ещё); в
+        # owner_messages сохраняется чистый текст без этой обёртки — внутри
+        # detail конкретной заявки номер и так очевиден.
+        await message.bot.send_message(
+            chat_id=lead["telegram"]["user_id"],
+            text=f"Ответ по заявке #{lead['id']}\n\n{text}",
+        )
+        delivery_status = "sent"
         result_text = "Сообщение отправлено клиенту ✅"
     except Exception:
         logger.exception("Не удалось отправить сообщение клиенту по заявке #%s", lead["id"])
-        result_text = "⚠️ Не получилось отправить — клиент мог заблокировать бота."
+        delivery_status = "failed"
+        result_text = "⚠️ Не получилось отправить — клиент мог заблокировать бота. Ответ всё равно сохранён в истории заявки."
+    # Сохраняем независимо от результата отправки — иначе неудачная
+    # доставка (клиент заблокировал бота) стирала бы сам факт, что дизайнер
+    # вообще отвечал, см. аудит.
+    lead = content_store.add_owner_message(message.chat.id, lead["id"], text, delivery_status) or lead
     await message.answer(f"{result_text}\n\n{lead_format.format_lead_admin_detail(lead)}", reply_markup=kb.lead_detail_keyboard(lead))
     await state.set_state(AdminStates.lead_detail)
 

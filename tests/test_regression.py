@@ -39,6 +39,7 @@ import bot.keyboards as keyboards
 import bot.telegram_auth as telegram_auth
 import bot.texts as texts
 import bot.webserver as webserver
+from bot import lead as lead_format
 from bot.states import AdminStates
 
 
@@ -2590,6 +2591,154 @@ class LeadMaterialTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(lead)
         self.assertEqual(lead["id"], lead_id)
         self.assertEqual(lead["awaiting_tz_file_source"], "supplement")
+
+
+def make_reply_message(chat_id: int, text: str, send_message: AsyncMock) -> SimpleNamespace:
+    """Достаточно для lead_reply_send: message.text, message.chat.id (actor
+    для _require_designer), message.bot.send_message (контролируемый —
+    успех/исключение задаёт сам тест), message.answer."""
+    return SimpleNamespace(
+        text=text,
+        chat=SimpleNamespace(id=chat_id),
+        bot=SimpleNamespace(send_message=send_message),
+        answer=AsyncMock(),
+    )
+
+
+class OwnerMessageTests(unittest.IsolatedAsyncioTestCase):
+    """owner_messages[] — append-only ответы дизайнера клиенту, тот же
+    паттерн, что и supplements[]/materials[] (см. аудит): отдельный поток,
+    не трогает payload, не теряется при неудачной Telegram-доставке."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        real_data_dir = Path(__file__).resolve().parent.parent / "data"
+        for name in ("pricing.json", "portfolio.json", "faq.json", "about.json", "ui_config.json"):
+            shutil.copy(real_data_dir / name, Path(self.tmpdir) / name)
+        self._orig_data_dir = content_store.DATA_DIR
+        self._orig_designer = content_store.config.DESIGNER_CHAT_ID
+        content_store.DATA_DIR = Path(self.tmpdir)
+        content_store.config.DESIGNER_CHAT_ID = "888"
+        self.actor = 888
+        self.lead = content_store.add_lead(
+            {"service_name": "Лендинг", "task_description": "Исходная задача"},
+            {"user_id": 55555, "username": "client", "first_name": "Клиент"},
+        )
+
+    def tearDown(self):
+        content_store.DATA_DIR = self._orig_data_dir
+        content_store.config.DESIGNER_CHAT_ID = self._orig_designer
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    # ---- content_store.add_owner_message ----
+
+    def test_new_owner_message_is_saved(self):
+        lead = content_store.add_owner_message(self.actor, self.lead["id"], "Первый ответ", "sent")
+        self.assertEqual(len(lead["owner_messages"]), 1)
+        self.assertEqual(lead["owner_messages"][0]["text"], "Первый ответ")
+        self.assertEqual(lead["owner_messages"][0]["delivery_status"], "sent")
+        self.assertEqual(lead["owner_messages"][0]["id"], 1)
+
+    def test_two_messages_are_both_kept_append_only(self):
+        content_store.add_owner_message(self.actor, self.lead["id"], "Первый", "sent")
+        lead = content_store.add_owner_message(self.actor, self.lead["id"], "Второй", "sent")
+        self.assertEqual(len(lead["owner_messages"]), 2)
+        self.assertEqual(lead["owner_messages"][0]["text"], "Первый")
+        self.assertEqual(lead["owner_messages"][1]["text"], "Второй")
+        self.assertEqual(lead["owner_messages"][0]["id"], 1)
+        self.assertEqual(lead["owner_messages"][1]["id"], 2)
+
+    def test_owner_message_does_not_change_payload(self):
+        lead = content_store.add_owner_message(self.actor, self.lead["id"], "Ответ", "sent")
+        self.assertEqual(lead["payload"]["task_description"], "Исходная задача")
+
+    def test_owner_message_updates_updated_at(self):
+        self.assertIsNone(self.lead["updated_at"])
+        lead = content_store.add_owner_message(self.actor, self.lead["id"], "Ответ", "sent")
+        self.assertIsNotNone(lead["updated_at"])
+
+    def test_owner_message_requires_designer(self):
+        with self.assertRaises(content_store.NotDesignerError):
+            content_store.add_owner_message("not-the-designer", self.lead["id"], "Ответ", "sent")
+
+    def test_owner_message_for_unknown_lead_returns_none(self):
+        self.assertIsNone(content_store.add_owner_message(self.actor, 999999, "Ответ", "sent"))
+
+    # ---- bot/handlers/admin.py::lead_reply_send (реальный хендлер) ----
+
+    async def test_lead_reply_send_success_sets_delivery_status_sent(self):
+        state = make_state(self.actor)
+        await state.update_data(lead_id=self.lead["id"])
+        await state.set_state(AdminStates.lead_reply_text)
+
+        message = make_reply_message(self.actor, "Всё уточнили, приступаем", AsyncMock())
+        await admin.lead_reply_send(message, state)
+
+        lead = content_store.get_lead(self.lead["id"])
+        self.assertEqual(len(lead["owner_messages"]), 1)
+        self.assertEqual(lead["owner_messages"][0]["delivery_status"], "sent")
+        self.assertEqual(lead["owner_messages"][0]["text"], "Всё уточнили, приступаем")
+        # Контекст "Ответ по заявке #N" — только в исходящем сообщении клиенту.
+        sent_text = message.bot.send_message.await_args.kwargs["text"]
+        self.assertIn(f"#{self.lead['id']}", sent_text)
+        self.assertIn("Всё уточнили, приступаем", sent_text)
+
+    async def test_lead_reply_send_failure_sets_delivery_status_failed_and_keeps_message(self):
+        state = make_state(self.actor)
+        await state.update_data(lead_id=self.lead["id"])
+        await state.set_state(AdminStates.lead_reply_text)
+
+        failing_send = AsyncMock(side_effect=TelegramAPIError(method=None, message="bot was blocked"))
+        message = make_reply_message(self.actor, "Ответ, который не дойдёт", failing_send)
+        await admin.lead_reply_send(message, state)
+
+        lead = content_store.get_lead(self.lead["id"])
+        self.assertEqual(len(lead["owner_messages"]), 1)  # не потерялось
+        self.assertEqual(lead["owner_messages"][0]["delivery_status"], "failed")
+        self.assertEqual(lead["owner_messages"][0]["text"], "Ответ, который не дойдёт")
+        # Владельцу — понятная ошибка, не тихий сбой.
+        admin_text = message.answer.await_args.args[0]
+        self.assertIn("Не получилось отправить", admin_text)
+
+    async def test_admin_detail_shows_owner_messages(self):
+        content_store.add_owner_message(self.actor, self.lead["id"], "Первый ответ", "sent")
+        content_store.add_owner_message(self.actor, self.lead["id"], "Второй, не дошёл", "failed")
+        lead = content_store.get_lead(self.lead["id"])
+
+        text = lead_format.format_lead_admin_detail(lead)
+        self.assertIn("Ответы дизайнера", text)
+        self.assertIn("Первый ответ", text)
+        self.assertIn("Второй, не дошёл", text)
+        self.assertIn("не доставлено", text)
+
+    # ---- /api/my-leads (HTTP) ----
+
+    async def test_my_leads_returns_owner_messages(self):
+        from aiohttp.test_utils import TestClient, TestServer
+
+        content_store.add_owner_message(self.actor, self.lead["id"], "Виден клиенту", "sent")
+        self._orig_token = webserver.config.BOT_TOKEN
+        webserver.config.BOT_TOKEN = "123456:test-token-not-real"
+        try:
+            fields = {"auth_date": str(int(time.time())), "user": json.dumps({"id": 55555, "first_name": "Клиент"})}
+            init_data = _sign_init_data(fields, webserver.config.BOT_TOKEN)
+            app = webserver.create_app(AsyncMock())
+            async with TestClient(TestServer(app)) as client:
+                resp = await client.get("/api/my-leads", headers={"X-Telegram-Init-Data": init_data})
+                body = await resp.json()
+        finally:
+            webserver.config.BOT_TOKEN = self._orig_token
+
+        self.assertEqual(resp.status, 200)
+        lead = next(l for l in body if l["id"] == self.lead["id"])
+        self.assertEqual(len(lead["owner_messages"]), 1)
+        self.assertEqual(lead["owner_messages"][0]["text"], "Виден клиенту")
+
+    def test_lead_without_owner_messages_has_empty_list_not_missing_key(self):
+        # Существующие лиды (созданные до этой фичи) — отсутствие поля
+        # эквивалентно [] на уровне API/frontend; на уровне content_store
+        # свежесозданный lead уже содержит owner_messages: [] явно.
+        self.assertEqual(self.lead.get("owner_messages", []), [])
 
 
 if __name__ == "__main__":

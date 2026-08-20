@@ -242,6 +242,15 @@ def format_lead_admin_detail(lead: dict) -> str:
             source = source_labels.get(m.get("source"), m.get("source"))
             lines.append(f"— {kind}, {ts} ({source})")
 
+    owner_messages = lead.get("owner_messages") or []
+    if owner_messages:
+        lines.append("")
+        lines.append(f"<b>Ответы дизайнера ({len(owner_messages)})</b>")
+        for m in reversed(owner_messages):  # последний сверху — самое актуальное видно сразу
+            ts = (m.get("sent_at") or "")[:16].replace("T", " ")
+            failed_note = " ⚠️ не доставлено" if m.get("delivery_status") == "failed" else ""
+            lines.append(f"— #{m['id']} ({ts}){failed_note}: {_esc(m.get('text', ''))}")
+
     lines.append("")
     lines.append(f"<i>Создана: {lead['created_at'][:16].replace('T', ' ')}</i>")
     if lead.get("updated_at"):

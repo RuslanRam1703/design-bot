@@ -966,6 +966,33 @@ def update_lead_status(actor_chat_id: int | str, lead_id: int, status: str) -> b
     return True
 
 
+def add_owner_message(actor_chat_id: int | str, lead_id: int, text: str, delivery_status: str) -> dict | None:
+    """Ответ дизайнера клиенту (bot/handlers/admin.py::lead_reply_send) —
+    append-only, тот же паттерн, что и add_lead_supplement/record_lead_material
+    выше: не трогает payload/supplements/materials, отдельный независимый
+    поток на lead. delivery_status ("sent"/"failed") приходит от вызывающего
+    кода уже готовым — на момент вызова этой функции попытка отправки через
+    Bot API уже сделана, здесь только сохраняем факт и её результат, чтобы
+    ответ не терялся из истории заявки даже если Telegram-доставка не удалась
+    (клиент заблокировал бота и т.п.)."""
+    _require_designer(actor_chat_id)
+    leads = _read_leads()
+    lead = next((l for l in leads if l["id"] == lead_id), None)
+    if lead is None:
+        return None
+    messages = lead.setdefault("owner_messages", [])
+    next_id = max((m["id"] for m in messages), default=0) + 1
+    messages.append({
+        "id": next_id,
+        "text": text,
+        "sent_at": datetime.now(timezone.utc).isoformat(),
+        "delivery_status": delivery_status,
+    })
+    lead["updated_at"] = datetime.now(timezone.utc).isoformat()
+    _write_leads(leads)
+    return lead
+
+
 def delete_lead(actor_chat_id: int | str, lead_id: int) -> bool:
     _require_designer(actor_chat_id)
     leads = _read_leads()
