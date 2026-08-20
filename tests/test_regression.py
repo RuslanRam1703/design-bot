@@ -623,6 +623,48 @@ class NavAnchorRaceConditionTests(unittest.IsolatedAsyncioTestCase):
         data = await state.get_data()
         self.assertEqual(data.get(flow._NAV_ANCHOR_MSG_KEY), first_nav_id)
 
+    async def test_main_menu_cleanup_never_touches_nav_anchor(self):
+        # "⌂ Главное меню" (flow.main_menu_cleanup) -- НЕ /start: NAV anchor
+        # не создаётся, не редактируется, не пересоздаётся вообще. Только
+        # сброс сценария + удаление TRANSIENT-экрана + удаление trigger.
+        state = make_state(781)
+        await state.set_state(AdminStates.add_faq_answer)
+        await state.update_data(**{
+            flow._NAV_ANCHOR_MSG_KEY: 111, flow._NAV_ANCHOR_CHAT_KEY: 781,
+            flow._ANCHOR_MSG_KEY: 222, flow._ANCHOR_CHAT_KEY: 781,
+        })
+        msg = make_flow_message(chat_id=781)
+        deleted = {"trigger": False}
+
+        async def _tracked_delete():
+            deleted["trigger"] = True
+
+        msg.delete = _tracked_delete
+
+        await flow.main_menu_cleanup(msg, state)
+
+        msg.answer.assert_not_awaited()                       # WELCOME не создан
+        msg.bot.edit_message_text.assert_not_awaited()         # NAV anchor не отредактирован
+        msg.bot.delete_message.assert_awaited_once_with(chat_id=781, message_id=222)  # TRANSIENT удалён
+        self.assertTrue(deleted["trigger"])                    # trigger удалён
+        self.assertIsNone(await state.get_state())             # FSM сброшен
+        data = await state.get_data()
+        self.assertIsNone(data.get(flow._ANCHOR_MSG_KEY))
+        self.assertEqual(data.get(flow._NAV_ANCHOR_MSG_KEY), 111)  # NAV anchor не изменился
+
+    async def test_main_menu_cleanup_safe_without_nav_anchor(self):
+        # F. Cold-state edge case: main_menu_cleanup вызван, когда NAV
+        # anchor вообще не отслеживается -- ничего не создаёт, не падает.
+        state = make_state(782)
+        msg = make_flow_message(chat_id=782)
+
+        await flow.main_menu_cleanup(msg, state)  # не должно упасть
+
+        msg.answer.assert_not_awaited()
+        msg.bot.edit_message_text.assert_not_awaited()
+        data = await state.get_data()
+        self.assertIsNone(data.get(flow._NAV_ANCHOR_MSG_KEY))  # по-прежнему не создан
+
 
 class StartHandlerCleanupTests(unittest.IsolatedAsyncioTestCase):
     """Реальные хендлеры bot/handlers/start.py, переведённые на flow.py —
@@ -1275,11 +1317,13 @@ class AdminLeadsQueueUxTests(unittest.IsolatedAsyncioTestCase):
 
 
 class MainMenuConfirmationTests(unittest.IsolatedAsyncioTestCase):
-    """"⌂ Главное меню" (см. UX-аудит "Telegram launch UX", п.3): нет
-    активного bot/FSM-состояния -> сразу существующая /start-логика; есть
-    -> inline-подтверждение без отдельного долгоживущего state. Отдельно —
-    что owner-версия (bot/handlers/admin.py::admin_main_menu_button)
-    реально побеждает раньше AdminStates.*, F.text мастеров."""
+    """"⌂ Главное меню" (см. production-аудит про дублирование NAV anchor):
+    нет активного bot/FSM-состояния -> только cleanup (flow.main_menu_cleanup
+    -- НЕ /start, WELCOME/NAV anchor не трогает); есть -> inline-подтверждение
+    без отдельного долгоживущего state, "Да" тоже ведёт в main_menu_cleanup,
+    не в cmd_start. Отдельно — что owner-версия (bot/handlers/admin.py::
+    admin_main_menu_button) реально побеждает раньше AdminStates.*, F.text
+    мастеров."""
 
     def setUp(self):
         self._orig_designer = start.config.DESIGNER_CHAT_ID
@@ -1291,16 +1335,33 @@ class MainMenuConfirmationTests(unittest.IsolatedAsyncioTestCase):
     def _fake_callback(self, data: str, chat_id: int = 888):
         return SimpleNamespace(data=data, message=make_flow_message(chat_id=chat_id), answer=AsyncMock())
 
-    async def test_no_active_state_runs_start_immediately(self):
-        from aiogram.types import ReplyKeyboardMarkup
+    async def test_no_active_state_cleans_up_without_touching_nav_anchor(self):
+        # A. Главное меню без active state -- ТОЛЬКО cleanup: WELCOME не
+        # создаётся, NAV anchor не редактируется, TRANSIENT и trigger
+        # удаляются, FSM сброшен.
+        state = make_state(999)
+        await state.update_data(**{
+            flow._NAV_ANCHOR_MSG_KEY: 111, flow._NAV_ANCHOR_CHAT_KEY: 999,
+            flow._ANCHOR_MSG_KEY: 222, flow._ANCHOR_CHAT_KEY: 999,
+        })
+        msg = make_flow_message(chat_id=999, text=texts.MAIN_MENU_BUTTON)
+        deleted = {"trigger": False}
 
-        state = make_state()
-        msg = make_flow_message(text=texts.MAIN_MENU_BUTTON)
+        async def _tracked_delete():
+            deleted["trigger"] = True
+
+        msg.delete = _tracked_delete
+
         await start.main_menu_button(msg, state)
-        sent_text = msg.answer.await_args.args[0] if msg.answer.await_args.args else msg.answer.await_args.kwargs.get("text")
-        sent_markup = msg.answer.await_args.kwargs.get("reply_markup") or msg.answer.await_args.args[1]
-        self.assertEqual(sent_text, texts.WELCOME)  # это и есть существующая /start-логика, не что-то новое
-        self.assertIsInstance(sent_markup, ReplyKeyboardMarkup)
+
+        msg.answer.assert_not_awaited()
+        msg.bot.edit_message_text.assert_not_awaited()
+        msg.bot.delete_message.assert_awaited_once_with(chat_id=999, message_id=222)
+        self.assertTrue(deleted["trigger"])
+        self.assertIsNone(await state.get_state())
+        data = await state.get_data()
+        self.assertIsNone(data.get(flow._ANCHOR_MSG_KEY))
+        self.assertEqual(data.get(flow._NAV_ANCHOR_MSG_KEY), 111)
 
     async def test_active_state_shows_confirmation_without_resetting_it(self):
         from aiogram.types import InlineKeyboardMarkup
@@ -1315,15 +1376,66 @@ class MainMenuConfirmationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsInstance(sent_markup, InlineKeyboardMarkup)
         self.assertEqual(await state.get_state(), AdminStates.add_faq_answer.state)  # ничего не сброшено самим показом
 
-    async def test_confirm_resets_state_via_existing_start_logic(self):
+    async def test_confirm_calls_main_menu_cleanup_without_welcome(self):
+        # B. "Да" -> flow.main_menu_cleanup: сценарий сброшен, WELCOME НЕ
+        # создан, существующий NAV anchor не тронут.
         state = make_state(888)
         await state.set_state(AdminStates.add_faq_answer)
+        await state.update_data(**{flow._NAV_ANCHOR_MSG_KEY: 111, flow._NAV_ANCHOR_CHAT_KEY: 888})
         cb = self._fake_callback("mainmenu:confirm")
         await start.main_menu_confirm(cb, state)
         self.assertIsNone(await state.get_state())
-        cb.message.answer.assert_awaited()  # реально выполнился cmd_start (шлёт WELCOME)
-        sent_text = cb.message.answer.await_args.args[0] if cb.message.answer.await_args.args else cb.message.answer.await_args.kwargs.get("text")
-        self.assertEqual(sent_text, texts.WELCOME)
+        cb.message.answer.assert_not_awaited()  # WELCOME не создан
+        cb.message.bot.edit_message_text.assert_not_awaited()  # NAV anchor не тронут
+        data = await state.get_data()
+        self.assertEqual(data.get(flow._NAV_ANCHOR_MSG_KEY), 111)
+
+    async def test_repeated_main_menu_presses_create_zero_new_nav_messages(self):
+        # C. Главное меню -> Главное меню -> Главное меню: ни одного нового
+        # NAV/WELCOME сообщения, message_id NAV anchor не меняется.
+        state = make_state(999)
+        await state.update_data(**{flow._NAV_ANCHOR_MSG_KEY: 111, flow._NAV_ANCHOR_CHAT_KEY: 999})
+        total_answer = 0
+        total_edit = 0
+        for _ in range(3):
+            msg = make_flow_message(chat_id=999, text=texts.MAIN_MENU_BUTTON)
+            await start.main_menu_button(msg, state)
+            total_answer += msg.answer.await_count
+            total_edit += msg.bot.edit_message_text.await_count
+        self.assertEqual(total_answer, 0)
+        self.assertEqual(total_edit, 0)
+        data = await state.get_data()
+        self.assertEqual(data.get(flow._NAV_ANCHOR_MSG_KEY), 111)
+
+    async def test_main_menu_paths_never_call_cmd_start(self):
+        # Critical regression: ни main_menu_button (client), ни
+        # admin_main_menu_button (owner), ни confirm-путь НЕ должны
+        # вызывать start.cmd_start ни при каких обстоятельствах —
+        # единственный вызывающий cmd_start во всём проекте — сам
+        # /start-роутер (см. static grep в аудите).
+        original_cmd_start = start.cmd_start
+        spy = AsyncMock(side_effect=original_cmd_start)
+        start.cmd_start = spy
+        try:
+            # client, без активного state
+            state1 = make_state(999)
+            msg1 = make_flow_message(chat_id=999, text=texts.MAIN_MENU_BUTTON)
+            await start.main_menu_button(msg1, state1)
+
+            # owner, без активного state
+            state2 = make_state(888)
+            msg2 = make_flow_message(chat_id=888, text=texts.MAIN_MENU_BUTTON)
+            await admin.admin_main_menu_button(msg2, state2)
+
+            # confirm-путь при активном state
+            state3 = make_state(888)
+            await state3.set_state(AdminStates.add_faq_answer)
+            cb = self._fake_callback("mainmenu:confirm")
+            await start.main_menu_confirm(cb, state3)
+
+            spy.assert_not_awaited()
+        finally:
+            start.cmd_start = original_cmd_start
 
     async def test_decline_preserves_state_and_sends_nothing_new(self):
         state = make_state(888)
@@ -1386,11 +1498,11 @@ class FaqCleanupRegressionTests(unittest.IsolatedAsyncioTestCase):
         menu_msg.bot.delete_message.assert_awaited_once_with(chat_id=888, message_id=555)
 
     async def test_faq_then_main_menu_leaves_exactly_one_current_root_message(self):
-        # NAV anchor уже существует после FAQ -> Главное меню РЕДАКТИРУЕТ
-        # его обратно в WELCOME (edit-in-place), а не шлёт новое сообщение
-        # (см. bot/flow.py::reset_nav_screen — main_menu_or_confirm/cmd_start
-        # больше не проходит через открытие нового TRANSIENT-экрана для
-        # этого случая).
+        # E. NAV anchor уже существует после FAQ -> Главное меню ТОЛЬКО
+        # чистит TRANSIENT (FAQ), NAV anchor не трогает вообще (см.
+        # bot/flow.py::main_menu_cleanup — main_menu_or_confirm больше не
+        # проходит ни через reset_nav_screen, ни через cmd_start для этого
+        # случая).
         state = make_state(888)
         faq_msg = make_flow_message(chat_id=888, text=texts.MENU_FAQ)
         await faq.show_faq_list(faq_msg, state)
@@ -1401,13 +1513,33 @@ class FaqCleanupRegressionTests(unittest.IsolatedAsyncioTestCase):
         menu_msg = make_flow_message(chat_id=888, text=texts.MAIN_MENU_BUTTON)
         await start.main_menu_button(menu_msg, state)
 
-        menu_msg.answer.assert_not_awaited()  # ни одного нового сообщения
-        menu_msg.bot.edit_message_text.assert_awaited_once_with(
-            texts.WELCOME, chat_id=888, message_id=nav_id_after_faq
-        )
+        menu_msg.answer.assert_not_awaited()  # WELCOME не создан
+        menu_msg.bot.edit_message_text.assert_not_awaited()  # NAV anchor не тронут
         data = await state.get_data()
         self.assertIsNone(data.get(flow._ANCHOR_MSG_KEY))  # старый FAQ TRANSIENT-anchor очищен
         self.assertEqual(data.get(flow._NAV_ANCHOR_MSG_KEY), nav_id_after_faq)  # NAV anchor тот же самый
+
+    async def test_admin_then_main_menu_cleans_up_admin_screen_without_touching_nav(self):
+        # E. Owner: Admin -> Главное меню -- transient (admin-экран)
+        # удаляется, NAV anchor не трогается, WELCOME не создаётся.
+        state = make_state(888)
+        admin_msg = make_flow_message(chat_id=888, text="/admin")
+        await admin.cmd_admin(admin_msg, state)
+        data = await state.get_data()
+        nav_id_after_admin = data.get(flow._NAV_ANCHOR_MSG_KEY)
+        transient_id_after_admin = data.get(flow._ANCHOR_MSG_KEY)
+        self.assertIsNotNone(nav_id_after_admin)
+        self.assertIsNotNone(transient_id_after_admin)
+
+        menu_msg = make_flow_message(chat_id=888, text=texts.MAIN_MENU_BUTTON)
+        await admin.admin_main_menu_button(menu_msg, state)
+
+        menu_msg.answer.assert_not_awaited()
+        menu_msg.bot.edit_message_text.assert_not_awaited()
+        menu_msg.bot.delete_message.assert_awaited_once_with(chat_id=888, message_id=transient_id_after_admin)
+        data = await state.get_data()
+        self.assertIsNone(data.get(flow._ANCHOR_MSG_KEY))
+        self.assertEqual(data.get(flow._NAV_ANCHOR_MSG_KEY), nav_id_after_admin)
 
     async def test_faq_then_start_cleans_up_old_faq_message(self):
         # /start не менялся в этом фиксе — тот же open_root, что и раньше,

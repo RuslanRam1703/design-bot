@@ -89,12 +89,14 @@ async def main_menu_or_confirm(message: Message, state: FSMContext) -> None:
     мастеров, иначе они проглотили бы текст кнопки как обычный ввод — см.
     bot/keyboards.py::main_reply_keyboard).
 
-    Нет активного bot/FSM-состояния — терять нечего, выполняем текущую
-    /start-логику сразу (см. cmd_start). Есть — показываем подтверждение
-    (inline, без отдельного долгоживущего state под саму confirmation,
-    см. bot/keyboards.py::main_menu_confirm_keyboard)."""
+    Нет активного bot/FSM-состояния — терять нечего, просто сбрасываем
+    TRANSIENT-экран и триггер (см. flow.main_menu_cleanup) — БЕЗ WELCOME:
+    "Главное меню" не /start, NAV anchor уже существует и его не нужно
+    трогать. Есть — показываем подтверждение (inline, без отдельного
+    долгоживущего state под саму confirmation, см.
+    bot/keyboards.py::main_menu_confirm_keyboard)."""
     if await state.get_state() is None:
-        await cmd_start(message, state)
+        await flow.main_menu_cleanup(message, state)
         return
     await flow.delete_trigger(message)
     # NAV anchor не затронут этим экраном — освежать нечего (см. bot/flow.py).
@@ -108,11 +110,10 @@ async def main_menu_button(message: Message, state: FSMContext) -> None:
 
 @router.callback_query(F.data == "mainmenu:confirm")
 async def main_menu_confirm(callback: CallbackQuery, state: FSMContext) -> None:
-    # callback.message — то самое confirmation-сообщение; cmd_start() сам
-    # удалит его как "триггер" (RULE 1) и вернёт NAV anchor к WELCOME
-    # (edit-in-place, см. bot/flow.py::reset_nav_screen) — ровно то, что
-    # просили: "выполнить существующую /start logic".
-    await cmd_start(callback.message, state)
+    # callback.message — то самое confirmation-сообщение; main_menu_cleanup
+    # сам удалит его как "триггер" (RULE 1). NAV anchor не трогаем — это
+    # "Главное меню", не /start (см. bot/flow.py::main_menu_cleanup).
+    await flow.main_menu_cleanup(callback.message, state)
     await callback.answer()
 
 

@@ -178,29 +178,11 @@ async def _create_nav_anchor(message: Message, state: FSMContext) -> None:
     await state.update_data(**{_NAV_ANCHOR_MSG_KEY: sent.message_id, _NAV_ANCHOR_CHAT_KEY: sent.chat.id})
 
 
-async def reset_nav_screen(message: Message, state: FSMContext) -> None:
-    """"⌂ Главное меню" / /start — полный возврат к чистому persistent
-    navigation. Завершает любой активный сценарий (аварийный выход — тот же
-    смысл, что раньше был у open_root через finish_flow), удаляет текущий
-    TRANSIENT экран и триггер, затем показывает приветствие ЧЕРЕЗ уже
-    существующий NAV anchor (edit_message_text), а не новым сообщением —
-    то самое сообщение, что несёт reply-клавиатуру, никогда не
-    пересоздаётся без необходимости (см. ensure_nav_anchor).
-
-    Если редактирование не удалось из-за того, что anchor реально пропал
-    (например, пользователь удалил его вручную — Telegram это разрешает в
-    приватных чатах) — best-effort пересоздаёт anchor, не роняя handler.
-    "message is not modified" (двойное нажатие "Главное меню" подряд) —
-    штатный, не ошибочный случай, отдельно не пересоздаёт anchor.
-
-    Пересоздание — ТОЛЬКО при однозначных признаках, что сообщения больше
-    не существует (см. _NAV_ANCHOR_GONE_MARKERS). Любая другая ошибка
-    (транзитная — flood control, eventual-consistency lag сразу после
-    отправки и т.п.) — best-effort игнорируется, БЕЗ пересоздания: см.
-    production-аудит — более широкое условие ("любая другая ошибка =
-    anchor удалён") приводило к каскадному дублированию NAV anchor на
-    транзитных ошибках edit_message_text, не связанных с реальным
-    удалением сообщения."""
+async def _cleanup_transient(message: Message, state: FSMContext) -> None:
+    """Общая часть для reset_nav_screen и main_menu_cleanup: завершить
+    активный сценарий (аварийный выход — RULE 2-совместимо), удалить
+    текущий TRANSIENT экран (если был) и триггер. НЕ трогает NAV anchor
+    вообще — это исключительно забота вызывающей стороны."""
     await finish_flow(state)
 
     data = await state.get_data()
@@ -214,6 +196,37 @@ async def reset_nav_screen(message: Message, state: FSMContext) -> None:
         await state.update_data(**{_ANCHOR_MSG_KEY: None, _ANCHOR_CHAT_KEY: None})
 
     await delete_trigger(message)
+
+
+async def reset_nav_screen(message: Message, state: FSMContext) -> None:
+    """Только реальный /start (см. bot/handlers/start.py::cmd_start —
+    единственный вызывающий). "⌂ Главное меню" через это НЕ идёт (см.
+    main_menu_cleanup ниже) — только /start показывает/пересоздаёт WELCOME
+    через NAV anchor; повторные "Главное меню" NAV anchor не трогают
+    вообще (см. UX-аудит: каждое такое касание — потенциальный источник
+    дублирования при транзитных ошибках Bot API).
+
+    Завершает активный сценарий, удаляет текущий TRANSIENT экран и
+    триггер (см. _cleanup_transient), затем показывает приветствие ЧЕРЕЗ
+    уже существующий NAV anchor (edit_message_text), а не новым
+    сообщением — то самое сообщение, что несёт reply-клавиатуру, никогда
+    не пересоздаётся без необходимости (см. ensure_nav_anchor).
+
+    Если редактирование не удалось из-за того, что anchor реально пропал
+    (например, пользователь удалил его вручную — Telegram это разрешает в
+    приватных чатах) — best-effort пересоздаёт anchor, не роняя handler.
+    "message is not modified" — штатный, не ошибочный случай, отдельно не
+    пересоздаёт anchor.
+
+    Пересоздание — ТОЛЬКО при однозначных признаках, что сообщения больше
+    не существует (см. _NAV_ANCHOR_GONE_MARKERS). Любая другая ошибка
+    (транзитная — flood control, eventual-consistency lag сразу после
+    отправки и т.п.) — best-effort игнорируется, БЕЗ пересоздания: см.
+    production-аудит — более широкое условие ("любая другая ошибка =
+    anchor удалён") приводило к каскадному дублированию NAV anchor на
+    транзитных ошибках edit_message_text, не связанных с реальным
+    удалением сообщения."""
+    await _cleanup_transient(message, state)
 
     if await ensure_nav_anchor(message, state):
         return  # только что отправлен этим же вызовом — уже показывает WELCOME
@@ -230,6 +243,20 @@ async def reset_nav_screen(message: Message, state: FSMContext) -> None:
         if any(marker in error_text for marker in _NAV_ANCHOR_GONE_MARKERS):
             await _create_nav_anchor(message, state)
         # любая другая ошибка — best-effort, ничего не пересоздаём (см. docstring)
+
+
+async def main_menu_cleanup(message: Message, state: FSMContext) -> None:
+    """"⌂ Главное меню" (оба пути — см. bot/handlers/start.py::
+    main_menu_or_confirm и main_menu_confirm) — ТОЛЬКО сброс сценария и
+    очистка TRANSIENT-экрана (см. _cleanup_transient). NAV anchor
+    оставляется КАК ЕСТЬ: не создаётся, не редактируется, не
+    пересоздаётся — ни одного сетевого вызова к нему. Кнопка "Главное
+    меню" физически не могла быть нажата, если NAV anchor (несущий её
+    reply-клавиатуру) уже не существует — трогать его тут функционально
+    незачем, а каждое касание (edit_message_text на каждый клик) было
+    источником production-дублирования WELCOME при транзитных ошибках
+    Bot API (см. UX-аудит)."""
+    await _cleanup_transient(message, state)
 
 
 async def finish_flow(state: FSMContext) -> None:
