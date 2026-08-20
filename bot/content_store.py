@@ -943,9 +943,20 @@ def list_leads_by_user(user_id: int) -> list[dict]:
     """Для клиентского "Мои заявки" — user_id должен быть уже проверен через
     bot.telegram_auth.validate_init_data ДО вызова этой функции, здесь
     доверие к нему не проверяется повторно (это ответственность вызывающего
-    HTTP-хендлера, не хранилища)."""
+    HTTP-хендлера, не хранилища).
+
+    Сортировка: updated_at DESC, при равенстве — id DESC (см. UX-аудит про
+    "Мои заявки" — заявка с недавней активностью дизайнера — статус,
+    supplement, owner_message, материал — должна подниматься выше, а не
+    оставаться на месте по порядку создания). updated_at — None у ещё ни
+    разу не менявшихся заявок (см. add_lead) — в этом случае единственная
+    известная точка активности это сам момент создания, поэтому используем
+    created_at как фолбэк. ISO 8601-строки (везде datetime.now(timezone.utc)
+    .isoformat(), один и тот же формат) сравниваются лексикографически
+    корректно — парсинг в datetime не нужен. list_leads() (для /admin)
+    сортировку не меняет — это отдельная функция, здесь не затронута."""
     leads = [l for l in _read_leads() if l.get("telegram", {}).get("user_id") == user_id]
-    return sorted(leads, key=lambda l: l["id"], reverse=True)
+    return sorted(leads, key=lambda l: (l.get("updated_at") or l["created_at"], l["id"]), reverse=True)
 
 
 def get_lead(lead_id: int) -> dict | None:

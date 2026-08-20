@@ -1905,10 +1905,14 @@ class MyLeadsFilteringTests(unittest.TestCase):
         for name in ("pricing.json", "portfolio.json", "faq.json", "about.json", "ui_config.json"):
             shutil.copy(real_data_dir / name, Path(self.tmpdir) / name)
         self._orig_data_dir = content_store.DATA_DIR
+        self._orig_designer = content_store.config.DESIGNER_CHAT_ID
         content_store.DATA_DIR = Path(self.tmpdir)
+        content_store.config.DESIGNER_CHAT_ID = "888"
+        self.actor = 888
 
     def tearDown(self):
         content_store.DATA_DIR = self._orig_data_dir
+        content_store.config.DESIGNER_CHAT_ID = self._orig_designer
         shutil.rmtree(self.tmpdir, ignore_errors=True)
 
     def test_user_a_does_not_see_user_b_leads(self):
@@ -1927,10 +1931,72 @@ class MyLeadsFilteringTests(unittest.TestCase):
         self.assertEqual(content_store.list_leads_by_user(999999), [])
 
     def test_leads_sorted_newest_first(self):
+        # Обе заявки ни разу не обновлялись (updated_at=None у обеих) —
+        # сортировка падает на created_at, порядок по факту создания.
         first = content_store.add_lead({"service_name": "A"}, {"user_id": 111})
         second = content_store.add_lead({"service_name": "B"}, {"user_id": 111})
         leads = content_store.list_leads_by_user(111)
         self.assertEqual([l["id"] for l in leads], [second["id"], first["id"]])
+
+    def test_updated_old_lead_rises_above_newer_untouched_lead(self):
+        # См. UX-аудит "Мои заявки" — недавняя активность (статус/supplement/
+        # owner_message/материал) должна поднимать заявку наверх, даже если
+        # она создана раньше другой, нетронутой заявки.
+        old_lead = content_store.add_lead({"service_name": "A"}, {"user_id": 111})
+        new_lead = content_store.add_lead({"service_name": "B"}, {"user_id": 111})
+        content_store.update_lead_status(self.actor, old_lead["id"], "IN_PROGRESS")
+
+        # update_lead_status() уже реально отработал (сам факт простановки
+        # updated_at проверяется отдельно, в других тестах) — но два
+        # datetime.now(timezone.utc) вызова подряд в одном тесте иногда
+        # совпадают до используемого разрешения системных часов, из-за чего
+        # updated_at старой заявки может оказаться РАВЕН created_at новой —
+        # тогда тай-брейк по id (осознанно реализованный) отдаёт победу
+        # новой заявке, и тест стал бы flaky. Форсируем заведомо более
+        # позднюю метку, чтобы порядок проверялся детерминированно.
+        leads = content_store._read_leads()
+        for l in leads:
+            if l["id"] == old_lead["id"]:
+                l["updated_at"] = "2030-01-01T00:00:00+00:00"
+        content_store._write_leads(leads)
+
+        leads = content_store.list_leads_by_user(111)
+        self.assertEqual([l["id"] for l in leads], [old_lead["id"], new_lead["id"]])
+
+    def test_same_updated_at_tiebreaks_on_higher_id(self):
+        first = content_store.add_lead({"service_name": "A"}, {"user_id": 111})
+        second = content_store.add_lead({"service_name": "B"}, {"user_id": 111})
+        # Форсируем одинаковый updated_at у обеих — на быстром хранилище
+        # (Upstash) реальное совпадение до секунды вполне возможно, это не
+        # искусственный случай.
+        leads = content_store._read_leads()
+        same_ts = "2026-01-01T00:00:00+00:00"
+        for l in leads:
+            if l["id"] in (first["id"], second["id"]):
+                l["updated_at"] = same_ts
+        content_store._write_leads(leads)
+
+        result = content_store.list_leads_by_user(111)
+        self.assertEqual([l["id"] for l in result], [second["id"], first["id"]])
+
+    def test_sorting_does_not_change_lead_fields(self):
+        lead = content_store.add_lead({"service_name": "Лендинг", "task_description": "Тест"}, {"user_id": 111})
+        content_store.update_lead_status(self.actor, lead["id"], "DONE")
+
+        result = content_store.list_leads_by_user(111)
+        self.assertEqual(result[0]["payload"]["service_name"], "Лендинг")
+        self.assertEqual(result[0]["payload"]["task_description"], "Тест")
+        self.assertEqual(result[0]["status"], "DONE")
+
+    def test_admin_list_leads_unaffected_by_new_client_sort(self):
+        # list_leads() (для /admin) остаётся отсортирован строго по id —
+        # новая сортировка касается только list_leads_by_user().
+        old_lead = content_store.add_lead({"service_name": "A"}, {"user_id": 111})
+        new_lead = content_store.add_lead({"service_name": "B"}, {"user_id": 111})
+        content_store.update_lead_status(self.actor, old_lead["id"], "IN_PROGRESS")
+
+        admin_leads = content_store.list_leads()
+        self.assertEqual([l["id"] for l in admin_leads], [new_lead["id"], old_lead["id"]])
 
 
 class MyLeadsHttpEndpointTests(unittest.IsolatedAsyncioTestCase):
