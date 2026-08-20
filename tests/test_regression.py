@@ -1100,14 +1100,21 @@ class FakeUpstash:
     {"result": ...}, ровно как настоящий Upstash REST.
 
     fail_on — опциональный набор (cmd, key) пар, на которых urlopen должен
-    вместо ответа поднять исключение (симуляция сетевого сбоя/ошибки
-    Upstash) — используется тестами P0-1 storage-инициализации, чтобы
-    проверить, что MARKER_KEY не выставляется при сбое GET/SET."""
+    вместо ответа поднять исключение (симуляция сетевого сбоя) —
+    используется тестами P0-1 storage-инициализации, чтобы проверить, что
+    MARKER_KEY не выставляется при сбое GET/SET.
 
-    def __init__(self, fail_on: set[tuple[str, str]] | None = None):
+    error_on — опциональный набор (cmd, key) пар, на которых Upstash
+    отвечает НЕ исключением (соединение прошло успешно), а собственным
+    JSON-телом с полем "error" — используется тестами P2 (structured
+    logging), чтобы проверить именно ветку `body.get("error")` в
+    _upstash_command, отдельную от сетевых сбоев."""
+
+    def __init__(self, fail_on: set[tuple[str, str]] | None = None, error_on: set[tuple[str, str]] | None = None):
         self.store: dict[str, str] = {}
         self.calls: list[tuple] = []
         self.fail_on = fail_on or set()
+        self.error_on = error_on or set()
 
     def urlopen(self, req, timeout=10):
         args = json.loads(req.data.decode("utf-8"))
@@ -1115,6 +1122,9 @@ class FakeUpstash:
         cmd = args[0]
         if (cmd, args[1]) in self.fail_on:
             raise ConnectionError(f"simulated Upstash failure on {args[:2]}")
+        if (cmd, args[1]) in self.error_on:
+            body = json.dumps({"error": "simulated Upstash error response"}).encode("utf-8")
+            return _FakeUpstashResponse(body)
         if cmd == "GET":
             result = self.store.get(args[1])
         elif cmd == "SET":
@@ -1284,6 +1294,138 @@ class StorageInitializationTests(unittest.TestCase):
 
     def test_marker_key_not_in_backup_filenames(self):
         self.assertNotIn(content_store.MARKER_KEY, content_store.DATA_FILENAMES)
+
+
+class UpstashLoggingTests(unittest.TestCase):
+    """_upstash_command centralized structured logging (P2, production-
+    hardening аудит): любой сбой GET/SET должен быть однозначно виден в
+    Render logs — операция + ключ, без содержимого/секретов — и не должен
+    менять fail-loud поведение (исключение всегда пробрасывается как есть,
+    без изменения типа/текста)."""
+
+    FAKE_TOKEN = "fake-token-should-never-appear-in-logs"
+    FAKE_PAYLOAD_MARKER = "SECRET_CONTACT_PHONE_+79990001122"
+
+    def setUp(self):
+        self.fake = FakeUpstash()
+        self._orig_url = content_store.config.UPSTASH_REDIS_REST_URL
+        self._orig_token = content_store.config.UPSTASH_REDIS_REST_TOKEN
+        content_store.config.UPSTASH_REDIS_REST_URL = "https://fake-upstash.example/"
+        content_store.config.UPSTASH_REDIS_REST_TOKEN = self.FAKE_TOKEN
+        self._patch = patch("bot.content_store.urllib.request.urlopen", side_effect=self.fake.urlopen)
+        self._patch.start()
+
+    def tearDown(self):
+        self._patch.stop()
+        content_store.config.UPSTASH_REDIS_REST_URL = self._orig_url
+        content_store.config.UPSTASH_REDIS_REST_TOKEN = self._orig_token
+
+    def test_get_network_failure_logs_one_warning(self):
+        self.fake.fail_on = {("GET", "leads.json")}
+        with self.assertLogs("bot.content_store", level="WARNING") as log_ctx:
+            with self.assertRaises(ConnectionError):
+                content_store._read("leads.json")
+        self.assertEqual(len(log_ctx.output), 1)
+        self.assertIn("Upstash GET failed: leads.json", log_ctx.output[0])
+
+    def test_set_network_failure_logs_one_warning(self):
+        self.fake.fail_on = {("SET", "leads.json")}
+        with self.assertLogs("bot.content_store", level="WARNING") as log_ctx:
+            with self.assertRaises(ConnectionError):
+                content_store._write("leads.json", {"leads": []})
+        self.assertEqual(len(log_ctx.output), 1)
+        self.assertIn("Upstash SET failed: leads.json", log_ctx.output[0])
+
+    def test_upstash_explicit_error_response_logs_warning_and_raises_runtime_error(self):
+        self.fake.error_on = {("GET", "leads.json")}
+        with self.assertLogs("bot.content_store", level="WARNING") as log_ctx:
+            with self.assertRaises(RuntimeError) as ctx:
+                content_store._read("leads.json")
+        self.assertEqual(len(log_ctx.output), 1)
+        self.assertIn("Upstash GET failed: leads.json", log_ctx.output[0])
+        self.assertIn("Upstash error on GET", str(ctx.exception))  # текст существующего исключения не изменился
+
+    def test_successful_get_and_set_log_no_warning(self):
+        self.fake.store["ui_config.json"] = json.dumps({"menu": {"portfolio": True}})
+        with self.assertNoLogs("bot.content_store", level="WARNING"):
+            content_store._read("ui_config.json")
+            content_store._write("ui_config.json", {"menu": {"portfolio": False}})
+
+    def test_key_missing_logs_error_only_no_extra_warning(self):
+        self.fake.store[content_store.MARKER_KEY] = "2026-01-01T00:00:00+00:00"
+        with self.assertLogs("bot.content_store", level="WARNING") as log_ctx:
+            with self.assertRaises(content_store.UpstashKeyMissingError):
+                content_store._read("leads.json")
+        self.assertEqual(len(log_ctx.output), 1)  # ровно одна запись, не две
+        self.assertTrue(log_ctx.output[0].startswith("ERROR"))
+        self.assertIn("Upstash key missing: leads.json", log_ctx.output[0])
+
+    def test_initialization_failure_logs_warning_and_high_level_exception(self):
+        self.fake.fail_on = {("SET", "about.json")}
+        with self.assertLogs("bot.content_store", level="WARNING") as log_ctx:
+            with self.assertRaises(ConnectionError):
+                content_store.ensure_storage_initialized()
+        self.assertTrue(any("Upstash SET failed: about.json" in msg for msg in log_ctx.output))
+        self.assertTrue(any("Upstash initialization failed" in msg for msg in log_ctx.output))
+
+    def test_local_mode_unaffected_no_warnings(self):
+        # Локальный режим пишет на реальный диск (_write_local) — реальный
+        # data/ трогать нельзя, изолируем DATA_DIR отдельным tempdir'ом
+        # только для этого теста (остальные тесты класса работают через
+        # fake Upstash в памяти и диска не касаются вовсе).
+        tmpdir = tempfile.mkdtemp()
+        real_data_dir = Path(__file__).resolve().parent.parent / "data"
+        shutil.copy(real_data_dir / "ui_config.json", Path(tmpdir) / "ui_config.json")
+        orig_data_dir = content_store.DATA_DIR
+        content_store.DATA_DIR = Path(tmpdir)
+        content_store.config.UPSTASH_REDIS_REST_URL = ""
+        content_store.config.UPSTASH_REDIS_REST_TOKEN = ""
+        try:
+            with self.assertNoLogs("bot.content_store", level="WARNING"):
+                content_store._write("ui_config.json", content_store._read("ui_config.json"))
+        finally:
+            content_store.DATA_DIR = orig_data_dir
+            shutil.rmtree(tmpdir, ignore_errors=True)
+        self.assertEqual(self.fake.calls, [])  # ни одного сетевого вызова вообще — Upstash выключен
+
+    # ---- Secret-safety (P2, явное требование аудита) ----
+
+    def test_no_secrets_or_content_in_logs_across_all_failure_scenarios(self):
+        real_payload = {
+            "leads": [{
+                "id": 1,
+                "telegram": {"user_id": 123456789},
+                "payload": {"phone": self.FAKE_PAYLOAD_MARKER},
+            }]
+        }
+        all_output: list[str] = []
+
+        self.fake.fail_on = {("GET", "leads.json")}
+        with self.assertLogs("bot.content_store", level="WARNING") as log_ctx:
+            with self.assertRaises(ConnectionError):
+                content_store._read("leads.json")
+        all_output += log_ctx.output
+
+        # SET-сбой с реальным чувствительным контентом в args[2]
+        self.fake.fail_on = {("SET", "leads.json")}
+        with self.assertLogs("bot.content_store", level="WARNING") as log_ctx:
+            with self.assertRaises(ConnectionError):
+                content_store._write("leads.json", real_payload)
+        all_output += log_ctx.output
+
+        # explicit error-ответ Upstash тоже с реальным контентом в запросе
+        self.fake.fail_on = set()
+        self.fake.error_on = {("SET", "leads.json")}
+        with self.assertLogs("bot.content_store", level="WARNING") as log_ctx:
+            with self.assertRaises(RuntimeError):
+                content_store._write("leads.json", real_payload)
+        all_output += log_ctx.output
+
+        combined = "\n".join(all_output)
+        self.assertNotIn(self.FAKE_TOKEN, combined)  # Upstash token
+        self.assertNotIn(content_store.config.BOT_TOKEN, combined)  # BOT_TOKEN
+        self.assertNotIn(self.FAKE_PAYLOAD_MARKER, combined)  # payload/contacts
+        self.assertNotIn("123456789", combined)  # user_id
 
 
 def _make_zip(entries: dict[str, bytes]) -> bytes:

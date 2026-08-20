@@ -73,6 +73,17 @@ def _upstash_enabled() -> bool:
 
 
 def _upstash_command(*args: Any) -> Any:
+    # Централизованное логирование сбоев (P2, production-hardening аудит):
+    # это единственная точка, через которую проходят ВСЕ GET/SET (обычные
+    # _read/_write, ensure_storage_initialized, backup) — логируем здесь
+    # ОДИН раз на уровне WARNING и пробрасываем исходное исключение без
+    # изменений (fail-loud не меняется). Логируем ТОЛЬКО args[0] (команда)
+    # и args[1] (ключ/filename) — НИКОГДА args[2] (для SET это полное
+    # содержимое файла: для leads.json — реальные контакты/payload
+    # клиентов) и никогда сам токен (он есть только в headers запроса,
+    # в лог не попадает).
+    command = args[0]
+    key = args[1] if len(args) > 1 else None
     req = urllib.request.Request(
         config.UPSTASH_REDIS_REST_URL,
         data=json.dumps(list(args)).encode("utf-8"),
@@ -82,10 +93,15 @@ def _upstash_command(*args: Any) -> Any:
         },
         method="POST",
     )
-    with urllib.request.urlopen(req, timeout=10) as resp:
-        body = json.loads(resp.read().decode("utf-8"))
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            body = json.loads(resp.read().decode("utf-8"))
+    except Exception:
+        logger.warning("Upstash %s failed: %s", command, key)
+        raise
     if body.get("error"):
-        raise RuntimeError(f"Upstash error on {args[0]}: {body['error']}")
+        logger.warning("Upstash %s failed: %s", command, key)
+        raise RuntimeError(f"Upstash error on {command}: {body['error']}")
     return body.get("result")
 
 
@@ -118,7 +134,7 @@ def _read(filename: str) -> Any:
             # значит "ключа нет" здесь означает не "ещё не создан", а
             # ПРОПАЛ. Реседить его локальным seed'ом нельзя — это тихо
             # потеряло бы production-данные (P0-1). Fail loud вместо этого.
-            logger.error("Storage: missing production key detected: %s", filename)
+            logger.error("Upstash key missing: %s", filename)
             raise UpstashKeyMissingError(filename)
         # MARKER_KEY ещё нет — редкая гонка с ещё не завершившимся
         # ensure_storage_initialized (например, самый первый запрос успел
@@ -174,7 +190,7 @@ def ensure_storage_initialized() -> None:
                 seeded.append(filename)
         _upstash_command("SET", MARKER_KEY, datetime.now(timezone.utc).isoformat())
     except Exception:
-        logger.exception("Storage: initialization failed, marker not set")
+        logger.exception("Upstash initialization failed")
         raise
     logger.info("Storage: initialization completed, seeded=%s", seeded)
 
