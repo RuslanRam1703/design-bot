@@ -1772,6 +1772,28 @@ const MY_LEAD_STATUS_LABELS = {
   CANCELLED: "❌ Отменено",
 };
 
+// Общая для списка и детали — гарантирует одинаковую раскраску статуса
+// в обоих местах структурно, а не просто "по договорённости" (см. UX-аудит
+// про статусы). Текст WAITING_CLIENT уже говорит "нужно ваше действие" —
+// отдельный secondary hint с тем же смыслом был бы дублированием, поэтому
+// его нет: сам лейбл статуса уже несёт нужную информацию.
+function myLeadStatusClass(status) {
+  if (status === "WAITING_CLIENT") return "status-warning";
+  if (status === "DONE") return "status-success";
+  if (status === "CANCELLED") return "status-muted";
+  return "";
+}
+
+// created_at всегда есть; updated_at показываем отдельной строкой только
+// если день реально отличается от дня создания — иначе "Обновлено" в тот
+// же день, что и "Создана", не несёт клиенту новой информации.
+function myLeadDateLines(lead) {
+  const createdDate = (lead.created_at || "").slice(0, 10);
+  const updatedDate = (lead.updated_at || "").slice(0, 10);
+  const updatedDiffers = updatedDate && updatedDate !== createdDate;
+  return { createdDate, updatedDate, updatedDiffers };
+}
+
 async function fetchMyLeads() {
   const initData = TG.initData();
   state.myLeads.status = "loading";
@@ -1838,7 +1860,7 @@ function renderMyLeads() {
     return header + `<div class="empty-state">Не получилось загрузить заявки. Попробуйте открыть раздел ещё раз.</div>`;
   }
   if (!m.items.length) {
-    return header + `<div class="empty-state">Заявок пока нет — оформите заявку на вкладке «Заявка».</div>`;
+    return header + `<div class="empty-state">Заявок пока нет — оформите заявку на вкладке «Заказать».</div>`;
   }
   const cards = m.items.map((lead) => {
     const service = lead.payload?.service_name || "Без услуги";
@@ -1846,28 +1868,40 @@ function renderMyLeads() {
       ? `${formatMoney(lead.calc_summary.price_from)} – ${formatMoney(lead.calc_summary.price_to)}`
       : "";
     const status = MY_LEAD_STATUS_LABELS[lead.status] || lead.status;
-    const date = (lead.created_at || "").slice(0, 10);
+    const { createdDate, updatedDate, updatedDiffers } = myLeadDateLines(lead);
+    const dateLabel = updatedDiffers ? `Обновлено ${updatedDate}` : createdDate;
     return `
       <button class="lead-card" data-lead-id="${lead.id}">
-        <div class="lead-card-top"><span>№${lead.id}</span><span>${escapeHtml(date)}</span></div>
+        <div class="lead-card-top"><span>№${lead.id}</span><span>${escapeHtml(dateLabel)}</span></div>
         <div class="lead-card-service">${escapeHtml(service)}</div>
         ${price ? `<div class="hint">${escapeHtml(price)}</div>` : ""}
-        <div class="lead-card-status">${escapeHtml(status)}</div>
+        <div class="lead-card-status ${myLeadStatusClass(lead.status)}">${escapeHtml(status)}</div>
       </button>`;
   }).join("");
   return header + `<div class="lead-card-list">${cards}</div>`;
 }
 
+// Те же ключи, что bot/lead.py::SUPPLEMENT_FIELD_LABELS — только заполненные
+// поля показываем, пустые пропускаем (см. supplement-форма, где часть полей
+// необязательна).
+const MY_LEAD_SUPPLEMENT_FIELD_LABELS = {
+  comment: "Комментарий",
+  additional_requirements: "Доп. требования",
+  references: "Референсы",
+  contact: "Контакты",
+};
+
 function renderMyLeadDetail(lead) {
   const p = lead.payload || {};
   const status = MY_LEAD_STATUS_LABELS[lead.status] || lead.status;
-  const date = (lead.created_at || "").slice(0, 10);
+  const { createdDate, updatedDate, updatedDiffers } = myLeadDateLines(lead);
   const priceLine = lead.calc_summary
     ? `<div class="result-box"><div class="price">${formatMoney(lead.calc_summary.price_from)} – ${formatMoney(lead.calc_summary.price_to)}</div><div class="hint">Точная сумма — предварительная</div></div>`
     : "";
   const optionsLine = lead.calc_summary && lead.calc_summary.selected_options && lead.calc_summary.selected_options.length
     ? `<div class="case-block"><div class="label">Опции</div><p>${lead.calc_summary.selected_options.map((o) => escapeHtml(o.name) + (o.qty > 1 ? ` ×${o.qty}` : "")).join(", ")}</p></div>`
     : "";
+
   // owner_messages — append-only ответы дизайнера (bot/handlers/admin.py::
   // lead_reply_send), отдельный поток, никак не связанный с payload/
   // supplements/materials. Блок вообще не рендерится, если ответов нет —
@@ -1886,15 +1920,48 @@ function renderMyLeadDetail(lead) {
     ownerCommentBlock = `
       <div class="case-block">
         <div class="label">Комментарий дизайнера</div>
-        <p>${escapeHtml(last.text)}</p>
+        <p><span class="hint">${escapeHtml((last.sent_at || "").slice(0, 10))}</span> — ${escapeHtml(last.text)}</p>
       </div>
       ${historyToggle}
       ${historyList}
     `;
   }
+
+  // supplements[] — append-only дополнения САМОГО клиента (bot/webserver.py::
+  // _handle_lead_supplement), не путать с owner_messages (ответы дизайнера) —
+  // отдельная секция, показываем только заполненные поля каждого дополнения.
+  const supplements = lead.supplements || [];
+  const supplementsBlock = supplements.length
+    ? `<div class="case-block"><div class="label">Дополнения (${supplements.length})</div>${supplements.map((s) => {
+        const fields = s.fields || {};
+        const fieldLines = Object.entries(MY_LEAD_SUPPLEMENT_FIELD_LABELS)
+          .filter(([key]) => fields[key])
+          .map(([key, label]) => `<p><b>${escapeHtml(label)}:</b> ${escapeHtml(fields[key])}</p>`)
+          .join("");
+        return `<div style="margin-top:8px"><span class="hint">${escapeHtml((s.created_at || "").slice(0, 10))}</span>${fieldLines}</div>`;
+      }).join("")}</div>`
+    : "";
+
+  // materials[] — присланные боту файлы/фото (bot/handlers/webapp.py::
+  // handle_tz_file). Пока только факт получения (тип + дата) — без preview/
+  // download, без привязки к конкретному облачному хранилищу (см. аудит).
+  const materials = lead.materials || [];
+  const materialsBlock = materials.length
+    ? `<div class="case-block"><div class="label">Материалы (${materials.length})</div>${materials.map((m) => {
+        const kindLabel = m.kind === "photo" ? "Фото" : "Файл";
+        const date = (m.received_at || "").slice(0, 10);
+        return `<p>${escapeHtml(kindLabel)} · <span class="hint">${escapeHtml(date)}</span></p>`;
+      }).join("")}</div>`
+    : "";
+
   return `
     <button class="btn btn-secondary" id="my-lead-back">← К списку заявок</button>
-    <div class="case-block"><div class="label">Заявка №${lead.id} · ${escapeHtml(date)}</div><p>${escapeHtml(status)}</p></div>
+    <div class="case-block">
+      <div class="label">Заявка №${lead.id}</div>
+      <p class="${myLeadStatusClass(lead.status)}">${escapeHtml(status)}</p>
+      ${updatedDiffers ? `<p class="hint">Обновлено ${escapeHtml(updatedDate)}</p>` : ""}
+      <p class="hint">Создана ${escapeHtml(createdDate)}</p>
+    </div>
     <div class="case-block"><div class="label">Услуга</div><p>${escapeHtml(p.service_name || "—")}</p></div>
     ${optionsLine}
     ${priceLine}
@@ -1902,7 +1969,10 @@ function renderMyLeadDetail(lead) {
     ${p.budget ? `<div class="case-block"><div class="label">Бюджет</div><p>${escapeHtml(BUDGET_OPTIONS.find((b) => b.id === p.budget)?.label || p.budget)}</p></div>` : ""}
     ${p.contact ? `<div class="case-block"><div class="label">Контакты</div><p>${escapeHtml(p.contact)}</p></div>` : ""}
     ${ownerCommentBlock}
+    ${supplementsBlock}
+    ${materialsBlock}
     <button class="btn btn-primary" id="my-lead-continue">Дополнить информацию</button>
+    <button class="btn btn-secondary" id="my-lead-start-new">Начать новую заявку</button>
   `;
 }
 
@@ -1927,6 +1997,18 @@ function attachMyLeadsEvents() {
   const continueBtn = document.getElementById("my-lead-continue");
   if (continueBtn) continueBtn.addEventListener("click", () => {
     openSupplementFor(state.myLeads.selected);
+  });
+
+  const startNewBtn = document.getElementById("my-lead-start-new");
+  if (startNewBtn) startNewBtn.addEventListener("click", () => {
+    // Осознанный уход в обычный Order Builder "с нуля" — та же семантика,
+    // что и "В начало"/supplement-screen "Начать новую заявку": НЕ
+    // supplement, НЕ трогает текущий lead, свежий draftId через уже
+    // существующий resetBriefState({hardReset:true}).
+    state.myLeads.selected = null;
+    state.myLeads.ownerHistoryExpanded = false;
+    state.history = [];
+    navigate("brief", { pushHistory: false, resetBrief: true, hardReset: true });
   });
 }
 

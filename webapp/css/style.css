@@ -336,3 +336,14 @@ textarea:focus, input[type="text"]:focus { outline: 2px solid var(--accent); }
 .lead-card-top { display: flex; justify-content: space-between; font-size: 12px; color: var(--hint); margin-bottom: 4px; }
 .lead-card-service { font-weight: 600; font-size: 14px; margin-bottom: 2px; }
 .lead-card-status { font-size: 13px; margin-top: 6px; }
+/* Визуальная иерархия статуса (список и деталь используют один и тот же
+   класс — см. myLeadStatusClass() в app.js) — только существующие
+   переменные темы, новой палитры не вводим:
+   --danger уже используется как "требует внимания" (char-counter.over,
+   error-text) — тот же смысл подходит WAITING_CLIENT; --accent уже значит
+   "положительное завершение" в .step-progress div.done — тот же принцип
+   для DONE; --hint — то, что и так везде "приглушённый" текст, для
+   CANCELLED. NEW/VIEWED/IN_PROGRESS остаются без класса (обычный --text). */
+.status-warning { color: var(--danger); font-weight: 600; }
+.status-success { color: var(--accent); font-weight: 600; }
+.status-muted { color: var(--hint); }
