@@ -16,6 +16,7 @@ actor_chat_id и сверяет его с DESIGNER_CHAT_ID сама, незав�
 
 import io
 import json
+import logging
 import os
 import tempfile
 import urllib.error
@@ -27,12 +28,27 @@ from typing import Any
 
 from bot import config
 
+logger = logging.getLogger(__name__)
+
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 IMG_PORTFOLIO_DIR = Path(__file__).resolve().parent.parent / "webapp" / "img" / "portfolio"
 IMG_ABOUT_DIR = Path(__file__).resolve().parent.parent / "webapp" / "img" / "about"
 
 class NotDesignerError(PermissionError):
     """Попытка вызвать мутирующую функцию content_store не от имени DESIGNER_CHAT_ID."""
+
+
+class UpstashKeyMissingError(RuntimeError):
+    """DATA_FILENAMES-ключ отсутствует в Upstash, хотя MARKER_KEY уже
+    подтверждает, что хранилище было полностью инициализировано раньше —
+    значит ключ не "ещё не создан", а ПРОПАЛ (ручная ошибка в Upstash
+    console, credentials указывают не на ту базу, потеря данных на стороне
+    Redis). Реседить его локальным seed'ом здесь нельзя — это тихо
+    потеряло бы production-данные (см. production-hardening аудит, P0-1)."""
+
+    def __init__(self, filename: str):
+        super().__init__(f"Upstash-ключ {filename!r} отсутствует, хотя storage уже был инициализирован ранее (marker присутствует)")
+        self.filename = filename
 
 
 def _require_designer(actor_chat_id: int | str) -> None:
@@ -48,6 +64,8 @@ def _require_designer(actor_chat_id: int | str) -> None:
 # JSON-блоб под ключом-именем файла в Redis, переживает любой redeploy.
 # Без них — поведение как раньше, обычные локальные файлы (не нужен
 # Upstash-аккаунт для локальной разработки).
+
+MARKER_KEY = "design_assistant:storage_initialized"
 
 def _upstash_enabled() -> bool:
     return bool(config.UPSTASH_REDIS_REST_URL and config.UPSTASH_REDIS_REST_TOKEN)
@@ -93,9 +111,19 @@ def _read(filename: str) -> Any:
         return _read_local(filename)
     raw = _upstash_command("GET", filename)
     if raw is None:
-        # Первый запуск с этим Redis (ключа ещё нет) — сеем стартовыми
-        # данными из репозитория и сразу сохраняем в Redis, чтобы дальше
-        # читать/писать только оттуда.
+        if _upstash_command("GET", MARKER_KEY) is not None:
+            # MARKER_KEY есть — значит хранилище уже было полностью
+            # инициализировано раньше (см. ensure_storage_initialized), а
+            # значит "ключа нет" здесь означает не "ещё не создан", а
+            # ПРОПАЛ. Реседить его локальным seed'ом нельзя — это тихо
+            # потеряло бы production-данные (P0-1). Fail loud вместо этого.
+            logger.error("Storage: missing production key detected: %s", filename)
+            raise UpstashKeyMissingError(filename)
+        # MARKER_KEY ещё нет — редкая гонка с ещё не завершившимся
+        # ensure_storage_initialized (например, самый первый запрос успел
+        # прийти раньше вызова на старте) — это тот же случай первичной
+        # инициализации, что и в ensure_storage_initialized, безопасно
+        # досеять именно этот файл.
         data = _read_local(filename)
         _upstash_command("SET", filename, json.dumps(data, ensure_ascii=False))
         return data
@@ -107,6 +135,47 @@ def _write(filename: str, data: Any) -> None:
         _write_local(filename, data)
         return
     _upstash_command("SET", filename, json.dumps(data, ensure_ascii=False))
+
+
+def ensure_storage_initialized() -> None:
+    """Вызывается один раз при старте процесса (bot/main.py::main), ДО
+    начала обработки апдейтов/HTTP-запросов. Eager batch-сид всех
+    DATA_FILENAMES под единым persistent MARKER_KEY — решает гонку, которую
+    давал бы ленивый per-file сид (как раньше в _read): разные файлы иначе
+    получали бы свой "первый" GET в разные, непредсказуемые моменты (при
+    первом реальном обращении к каждому конкретно), и общий marker,
+    выставленный по самому первому из них, ошибочно принимал бы ещё не
+    читанные файлы за "пропавшие" вместо "ещё не досеянные".
+
+    MARKER_KEY выставляется СТРОГО последним шагом, только если весь цикл
+    (проверка всех 6 ключей + досев отсутствующих) прошёл без единой
+    ошибки — иначе при сбое (сеть, SET) можно было бы получить marker,
+    который лжёт о том, что инициализация завершена, хотя часть файлов так
+    и не появилась в Redis.
+
+    Ни один уже существующий в Redis ключ не перезаписывается (SET —
+    только если GET вернул None) — на уже работающей production-базе, где
+    все 6 ключей реальны, это делает вызов идемпотентным no-op'ом,
+    добавляющим только сам marker (безопасная миграция для уже
+    задеплоенных инстансов, см. production-hardening аудит, P0-1)."""
+    if not _upstash_enabled():
+        return
+    logger.info("Storage: startup initialization started")
+    try:
+        if _upstash_command("GET", MARKER_KEY) is not None:
+            logger.info("Storage: marker already present, skipping seed")
+            return
+        seeded = []
+        for filename in DATA_FILENAMES:
+            if _upstash_command("GET", filename) is None:
+                data = _read_local(filename)
+                _upstash_command("SET", filename, json.dumps(data, ensure_ascii=False))
+                seeded.append(filename)
+        _upstash_command("SET", MARKER_KEY, datetime.now(timezone.utc).isoformat())
+    except Exception:
+        logger.exception("Storage: initialization failed, marker not set")
+        raise
+    logger.info("Storage: initialization completed, seeded=%s", seeded)
 
 
 # ---- Кейсы портфолио (чтение — без ограничений, пишет только в Mini App/бота) ----

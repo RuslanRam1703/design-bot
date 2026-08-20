@@ -12,7 +12,7 @@ from aiogram.types import (
 )
 from aiohttp import web
 
-from bot import config
+from bot import config, content_store
 from bot.handlers import admin, faq, start, webapp
 from bot.webserver import create_app
 
@@ -75,6 +75,12 @@ async def main() -> None:
     dp.include_router(webapp.router)
     dp.include_router(faq.router)
     dp.include_router(start.router)  # start — последним: содержит catch-all для текста
+
+    # До webserver.start()/polling — чтобы ни один HTTP-запрос Mini App и ни
+    # один апдейт от Telegram не мог попасть на ещё не проинициализированное
+    # хранилище (см. production-hardening аудит, P0-1). При выключенном
+    # Upstash — no-op (см. ensure_storage_initialized).
+    content_store.ensure_storage_initialized()
 
     app = create_app(bot)
     runner = web.AppRunner(app)

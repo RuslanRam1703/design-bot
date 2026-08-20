@@ -1096,16 +1096,24 @@ class AdminAboutResumeFieldsTests(unittest.IsolatedAsyncioTestCase):
 class FakeUpstash:
     """Имитирует Upstash Redis REST API в памяти (без сети) — команды
     GET/SET кодируются как JSON-массив в теле POST-запроса, ответ —
-    {"result": ...}, ровно как настоящий Upstash REST."""
+    {"result": ...}, ровно как настоящий Upstash REST.
 
-    def __init__(self):
+    fail_on — опциональный набор (cmd, key) пар, на которых urlopen должен
+    вместо ответа поднять исключение (симуляция сетевого сбоя/ошибки
+    Upstash) — используется тестами P0-1 storage-инициализации, чтобы
+    проверить, что MARKER_KEY не выставляется при сбое GET/SET."""
+
+    def __init__(self, fail_on: set[tuple[str, str]] | None = None):
         self.store: dict[str, str] = {}
         self.calls: list[tuple] = []
+        self.fail_on = fail_on or set()
 
     def urlopen(self, req, timeout=10):
         args = json.loads(req.data.decode("utf-8"))
         self.calls.append(tuple(args))
         cmd = args[0]
+        if (cmd, args[1]) in self.fail_on:
+            raise ConnectionError(f"simulated Upstash failure on {args[:2]}")
         if cmd == "GET":
             result = self.store.get(args[1])
         elif cmd == "SET":
@@ -1169,6 +1177,112 @@ class UpstashPersistenceTests(unittest.TestCase):
         # повторное чтение отдаёт то, что записали, а не переседевает заново
         self.assertEqual(content_store._read("ui_config.json"), {"menu": {"portfolio": False}})
         self.assertEqual(self.fake.calls.count(("GET", "ui_config.json")), 1)  # ровно одно чтение из Redis
+
+
+class StorageInitializationTests(unittest.TestCase):
+    """ensure_storage_initialized (P0-1, production-hardening аудит) —
+    eager batch-сид всех DATA_FILENAMES под единым persistent MARKER_KEY:
+    новая Upstash-база сеется целиком и сразу; уже проинициализированная —
+    никогда не реседится по одному ключу, если тот вдруг пропал (защита от
+    тихой потери production-данных при сбое/ошибке конфигурации Upstash —
+    см. UpstashKeyMissingError)."""
+
+    def setUp(self):
+        self.fake = FakeUpstash()
+        self._orig_url = content_store.config.UPSTASH_REDIS_REST_URL
+        self._orig_token = content_store.config.UPSTASH_REDIS_REST_TOKEN
+        content_store.config.UPSTASH_REDIS_REST_URL = "https://fake-upstash.example/"
+        content_store.config.UPSTASH_REDIS_REST_TOKEN = "fake-token"
+        self._patch = patch("bot.content_store.urllib.request.urlopen", side_effect=self.fake.urlopen)
+        self._patch.start()
+
+    def tearDown(self):
+        self._patch.stop()
+        content_store.config.UPSTASH_REDIS_REST_URL = self._orig_url
+        content_store.config.UPSTASH_REDIS_REST_TOKEN = self._orig_token
+
+    def test_empty_new_database_seeds_all_and_sets_marker(self):
+        content_store.ensure_storage_initialized()
+        for filename in content_store.DATA_FILENAMES:
+            self.assertIn(filename, self.fake.store)
+        self.assertIn(content_store.MARKER_KEY, self.fake.store)
+
+    def test_partially_initialized_database_seeds_only_missing_keys(self):
+        self.fake.store["leads.json"] = json.dumps({"leads": [{"id": 999, "custom": True}]})
+        content_store.ensure_storage_initialized()
+        # уже существовавший ключ не тронут
+        self.assertEqual(json.loads(self.fake.store["leads.json"]), {"leads": [{"id": 999, "custom": True}]})
+        # остальные — досеяны
+        for filename in content_store.DATA_FILENAMES:
+            self.assertIn(filename, self.fake.store)
+        self.assertIn(content_store.MARKER_KEY, self.fake.store)
+
+    def test_existing_production_data_without_marker_is_untouched(self):
+        # Симулируем уже давно работающий продакшн: реальные данные во всех
+        # 6 ключах, но marker ещё не существовал (появился только в этом
+        # фиксе) — критический тест безопасной миграции, см. аудит.
+        original = {}
+        for filename in content_store.DATA_FILENAMES:
+            value = json.dumps({"marker_test_sentinel": filename})
+            self.fake.store[filename] = value
+            original[filename] = value
+
+        content_store.ensure_storage_initialized()
+
+        for filename in content_store.DATA_FILENAMES:
+            self.assertEqual(self.fake.store[filename], original[filename])  # ни байта не изменилось
+        self.assertIn(content_store.MARKER_KEY, self.fake.store)
+
+    def test_marker_present_and_key_missing_raises_without_seeding(self):
+        self.fake.store[content_store.MARKER_KEY] = "2026-01-01T00:00:00+00:00"
+        with self.assertRaises(content_store.UpstashKeyMissingError):
+            content_store._read("leads.json")
+        self.assertNotIn("leads.json", self.fake.store)  # НЕ засеяно
+        self.assertFalse(any(c[0] == "SET" for c in self.fake.calls))  # ни одного SET
+
+    def test_marker_present_and_all_keys_present_reads_normally(self):
+        self.fake.store[content_store.MARKER_KEY] = "2026-01-01T00:00:00+00:00"
+        self.fake.store["ui_config.json"] = json.dumps({"menu": {"portfolio": True}})
+        data = content_store._read("ui_config.json")
+        self.assertEqual(data, {"menu": {"portfolio": True}})
+
+    def test_invalid_json_in_existing_key_still_fails_loud(self):
+        self.fake.store["ui_config.json"] = "{not valid json"
+        with self.assertRaises(json.JSONDecodeError):
+            content_store._read("ui_config.json")
+
+    def test_network_failure_during_init_leaves_marker_unset(self):
+        self.fake.fail_on = {("GET", "faq.json")}
+        with self.assertRaises(ConnectionError):
+            content_store.ensure_storage_initialized()
+        self.assertNotIn(content_store.MARKER_KEY, self.fake.store)
+
+    def test_set_failure_during_init_leaves_marker_unset(self):
+        self.fake.fail_on = {("SET", "about.json")}
+        with self.assertRaises(ConnectionError):
+            content_store.ensure_storage_initialized()
+        self.assertNotIn(content_store.MARKER_KEY, self.fake.store)
+
+    def test_last_key_failure_still_prevents_marker(self):
+        # DATA_FILENAMES = (portfolio, pricing, faq, about, ui_config, leads)
+        # — валим именно последний (6-й) ключ цикла: даже если первые 5
+        # успешно засеялись до него, marker всё равно не должен появиться.
+        last_filename = content_store.DATA_FILENAMES[-1]
+        self.fake.fail_on = {("SET", last_filename)}
+        with self.assertRaises(ConnectionError):
+            content_store.ensure_storage_initialized()
+        self.assertNotIn(content_store.MARKER_KEY, self.fake.store)
+        for filename in content_store.DATA_FILENAMES[:-1]:
+            self.assertIn(filename, self.fake.store)  # первые 5 уже успели засеяться — это ожидаемо
+
+    def test_upstash_disabled_is_noop(self):
+        content_store.config.UPSTASH_REDIS_REST_URL = ""
+        content_store.config.UPSTASH_REDIS_REST_TOKEN = ""
+        content_store.ensure_storage_initialized()
+        self.assertEqual(self.fake.calls, [])  # ни одного сетевого вызова — локальный dev не затронут
+
+    def test_marker_key_not_in_backup_filenames(self):
+        self.assertNotIn(content_store.MARKER_KEY, content_store.DATA_FILENAMES)
 
 
 class BackupExportImportTests(unittest.TestCase):
