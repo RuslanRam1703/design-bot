@@ -12,7 +12,6 @@ from bot.keyboards import (
     faq_list_keyboard,
     faq_price_answer_keyboard,
     faq_service_picker_keyboard,
-    reply_keyboard_for_chat,
 )
 
 router = Router(name="faq")
@@ -37,9 +36,11 @@ async def _send_faq_list(message: Message, state: FSMContext) -> None:
     # просто не был так заметен без persistent-кнопки "вернуться в корень").
     # Внутри самого FAQ (faq_back/faq_answer/faq_price_answer ниже) сообщение
     # редактируется на месте (callback.message.edit_text) — тот же anchor,
-    # тот же message_id, повторно регистрировать не нужно.
+    # тот же message_id, повторно регистрировать не нужно. reply-клавиатура
+    # "освежается" автоматически внутри open_flow (см. bot/flow.py) —
+    # отдельный вызов здесь больше не нужен (и раньше выполнялся уже ПОСЛЕ
+    # удаления предыдущего anchor — источник отдельного regression, см. аудит).
     await flow.open_root(message, state, texts.FAQ_INTRO, faq_list_keyboard(_client_faq_items()))
-    await flow.refresh_reply_keyboard(message, reply_keyboard_for_chat(message.chat.id))
 
 
 @router.message(F.text == texts.MENU_FAQ)

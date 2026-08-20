@@ -16,6 +16,8 @@ from aiogram.exceptions import TelegramAPIError
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, InlineKeyboardMarkup, Message, ReplyKeyboardMarkup
 
+from bot.keyboards import reply_keyboard_for_chat
+
 _ANCHOR_MSG_KEY = "_flow_msg_id"
 _ANCHOR_CHAT_KEY = "_flow_chat_id"
 
@@ -31,7 +33,22 @@ async def open_flow(
     было отмечено как текущий экран (RULE 2), затем триггер (RULE 1), затем
     отправляет новое сообщение и запоминает его как текущий экран — все
     дальнейшие шаги (через step_from_text/step_from_callback) будут
-    редактировать именно его, а не копиться новыми сообщениями."""
+    редактировать именно его, а не копиться новыми сообщениями.
+
+    Если сам этот новый экран несёт НЕ persistent reply-клавиатуру (то есть
+    inline или вообще без разметки) — ПЕРЕД удалением предыдущего anchor
+    сначала "освежаем" reply-клавиатуру (см. refresh_reply_keyboard ниже).
+    Раньше это было обязанностью каждого вызывающего кода по отдельности
+    (и /admin, например, эту обязанность и не выполнял вовсе — реальный
+    пробел, найденный при аудите) — и, что важнее, делалось уже ПОСЛЕ
+    удаления предыдущего anchor. Если этот anchor был последним сообщением,
+    подтверждавшим reply-клавиатуру клиенту, в этом промежутке клиент мог
+    остаться без нормальной reply-клавиатуры до следующего подтверждения
+    (см. UX-аудит, regression после интеграции FAQ в этот же lifecycle) —
+    порядок здесь важен, а не просто "сделать оба действия"."""
+    if not isinstance(reply_markup, ReplyKeyboardMarkup):
+        await refresh_reply_keyboard(message, reply_keyboard_for_chat(message.chat.id))
+
     data = await state.get_data()
     prev_id = data.get(_ANCHOR_MSG_KEY)
     prev_chat = data.get(_ANCHOR_CHAT_KEY)
@@ -109,14 +126,21 @@ async def delete_trigger(message: Message) -> None:
 
 
 async def refresh_reply_keyboard(message: Message, reply_markup: ReplyKeyboardMarkup) -> None:
-    """"Освежает" постоянную reply-клавиатуру после ответа, который нёс
-    InlineKeyboardMarkup (/portfolio, /about, /brief, /faq, "🚀 Открыть
-    приложение") — Bot API не позволяет одному сообщению нести оба типа
-    разметки сразу, поэтому шлём отдельное сообщение с невидимым текстом
-    (zero-width space) только чтобы Telegram-клиент подтвердил
-    reply-клавиатуру, и сразу его best-effort удаляем — не должно
-    оставлять следа в чате и не должно ронять вызывающий handler, если
-    отправка или удаление не удались (тот же принцип, что и delete_trigger)."""
+    """"Освежает" постоянную reply-клавиатуру после ответа, который несёт
+    (или сейчас понесёт) InlineKeyboardMarkup — Bot API не позволяет одному
+    сообщению нести оба типа разметки сразу, поэтому шлём отдельное
+    сообщение с невидимым текстом (zero-width space) только чтобы
+    Telegram-клиент подтвердил reply-клавиатуру, и сразу его best-effort
+    удаляем — не должно оставлять следа в чате и не должно ронять
+    вызывающий handler, если отправка или удаление не удались (тот же
+    принцип, что и delete_trigger).
+
+    Вызывается автоматически из open_flow (см. выше) для любого корневого
+    экрана без своей persistent-клавиатуры — отдельно вызывать эту функцию
+    для /portfolio, /about, /brief, /faq, /admin, "🚀 Открыть приложение" не
+    нужно, open_flow уже это делает. Остаётся публичной для случаев вне
+    open_flow (см. bot/handlers/start.py::main_menu_or_confirm — экран
+    подтверждения не создаёт новый anchor, поэтому не идёт через open_flow)."""
     try:
         sent = await message.answer("​", reply_markup=reply_markup)
     except TelegramAPIError:

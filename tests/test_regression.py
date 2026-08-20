@@ -313,14 +313,21 @@ class FlowUtilTests(unittest.IsolatedAsyncioTestCase):
     внутри сценария редактируют одно сообщение. Удаления — best-effort."""
 
     async def test_open_flow_deletes_previous_anchor_and_trigger_then_tracks_new_message(self):
+        # reply_markup=None (не ReplyKeyboardMarkup) -> open_flow сначала
+        # сам "освежает" reply-клавиатуру (см. UX-аудит про исчезающую
+        # клавиатуру после FAQ) — отсюда доп. answer()/delete_message() пара
+        # ДО основного сообщения, а не вместо него.
         state = make_state()
         await state.update_data(_flow_msg_id=111, _flow_chat_id=888)
         msg = make_flow_message()
 
         await flow.open_flow(msg, state, "Новый экран")
 
-        msg.bot.delete_message.assert_awaited_once_with(chat_id=888, message_id=111)  # RULE 2
-        msg.answer.assert_awaited_once_with("Новый экран", reply_markup=None)
+        self.assertEqual(msg.bot.delete_message.await_count, 2)  # refresh cleanup + RULE 2
+        msg.bot.delete_message.assert_any_await(chat_id=888, message_id=111)  # RULE 2 — старый anchor
+        self.assertEqual(msg.answer.await_count, 2)  # refresh (invisible) + основное сообщение
+        last_call = msg.answer.await_args_list[-1]
+        self.assertEqual(last_call.args[0] if last_call.args else last_call.kwargs.get("text"), "Новый экран")
         data = await state.get_data()
         self.assertEqual(data["_flow_msg_id"], 555)  # новое сообщение стало текущим экраном
 
@@ -332,7 +339,7 @@ class FlowUtilTests(unittest.IsolatedAsyncioTestCase):
 
         await flow.open_flow(msg, state, "Новый экран")  # не должно упасть
 
-        msg.answer.assert_awaited_once()
+        self.assertEqual(msg.answer.await_count, 2)  # refresh + основное сообщение, оба отправлены
 
     async def test_step_from_callback_edits_in_place_not_sending_new_message(self):
         state = make_state()
@@ -564,21 +571,25 @@ class EntryPointArchitectureTests(unittest.IsolatedAsyncioTestCase):
         state = make_state()
         msg = make_flow_message(text=texts.OPEN_APP_BUTTON)
         await start.open_app_button(msg, state)
-        # Первый вызов answer() — содержательный ответ (inline web_app-кнопка);
-        # второй — best-effort "освежение" reply-клавиатуры (см.
-        # bot/flow.py::refresh_reply_keyboard), проверяется отдельным тестом.
-        first_call = msg.answer.await_args_list[0]
-        sent_markup = first_call.kwargs.get("reply_markup") or first_call.args[1]
+        # open_flow теперь сам "освежает" reply-клавиатуру ДО отправки
+        # основного inline-ответа (см. bot/flow.py::open_flow, UX-аудит про
+        # исчезающую клавиатуру) — первый answer() это невидимый refresh,
+        # последний — содержательный ответ (inline web_app-кнопка).
+        last_call = msg.answer.await_args_list[-1]
+        sent_markup = last_call.kwargs.get("reply_markup") or last_call.args[1]
         self.assertIsInstance(sent_markup, InlineKeyboardMarkup)
         btn = sent_markup.inline_keyboard[0][0]
         self.assertIsInstance(btn.web_app, WebAppInfo)
         self.assertTrue(btn.web_app.url.endswith("/portfolio"))
 
     async def test_admin_button_triggers_same_as_admin_command(self):
+        # /admin отвечает inline-клавиатурой (admin_root_keyboard) -> теперь
+        # получает автоматический refresh reply-клавиатуры от open_flow,
+        # отсюда 2 answer() вместо 1 (см. UX-аудит про исчезающую клавиатуру).
         state = make_state(888)
         msg = make_flow_message(chat_id=888, text=texts.ADMIN_BUTTON)
         await admin.admin_button(msg, state)
-        msg.answer.assert_awaited_once()
+        self.assertEqual(msg.answer.await_count, 2)
 
     def test_client_commands_are_start_and_faq_only(self):
         # portfolio/about/brief убраны из видимого command list — Menu Button
@@ -743,11 +754,11 @@ class EntryPointArchitectureTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_portfolio_about_brief_still_use_inline_webapp_keyboard(self):
         # Не меняли и не должны были менять поведение inline WebApp-кнопок —
-        # эти хендлеры по-прежнему ПЕРВЫМ сообщением отвечают
-        # InlineKeyboardMarkup с web_app; ВТОРЫМ сообщением (best-effort,
-        # см. bot/flow.py::refresh_reply_keyboard) — освежают
-        # reply-клавиатуру, т.к. Telegram разрешает только один reply_markup
-        # на сообщение и не может нести оба типа сразу.
+        # эти хендлеры по-прежнему отвечают InlineKeyboardMarkup с web_app.
+        # ПЕРВЫМ теперь идёт best-effort "освежение" reply-клавиатуры (см.
+        # bot/flow.py::open_flow — вызывает refresh_reply_keyboard САМ,
+        # ДО отправки основного сообщения, см. UX-аудит про исчезающую
+        # клавиатуру после FAQ/admin), ВТОРЫМ — содержательный ответ.
         from aiogram.types import InlineKeyboardMarkup, ReplyKeyboardMarkup, WebAppInfo
 
         cases = [
@@ -760,29 +771,29 @@ class EntryPointArchitectureTests(unittest.IsolatedAsyncioTestCase):
             msg = make_flow_message(text=f"/{path}")
             await handler(msg, state)
             self.assertEqual(msg.answer.await_count, 2)
-            first_call, second_call = msg.answer.await_args_list
-            sent_markup = first_call.kwargs.get("reply_markup") or first_call.args[1]
+            refresh_call, content_call = msg.answer.await_args_list
+            refresh_markup = refresh_call.kwargs.get("reply_markup") or refresh_call.args[1]
+            self.assertIsInstance(refresh_markup, ReplyKeyboardMarkup)
+            sent_markup = content_call.kwargs.get("reply_markup") or content_call.args[1]
             self.assertIsInstance(sent_markup, InlineKeyboardMarkup)
             btn = sent_markup.inline_keyboard[0][0]
             self.assertIsInstance(btn.web_app, WebAppInfo)
-            refresh_markup = second_call.kwargs.get("reply_markup") or second_call.args[1]
-            self.assertIsInstance(refresh_markup, ReplyKeyboardMarkup)
             self.assertTrue(btn.web_app.url.endswith(f"/{path}"))
 
     async def test_faq_command_still_uses_inline_faq_keyboard(self):
-        # /faq тоже теперь шлёт второе, best-effort сообщение для
-        # "освежения" reply-клавиатуры (см. bot/flow.py::refresh_reply_keyboard,
-        # вызывается из faq.py::_send_faq_list) — answer() вызывается дважды.
+        # /faq тоже сначала получает best-effort "освежение" reply-клавиатуры
+        # (см. bot/flow.py::open_flow) — answer() вызывается дважды, порядок
+        # как у portfolio/about/brief выше.
         from aiogram.types import InlineKeyboardMarkup, ReplyKeyboardMarkup
 
         msg = make_flow_message(text="/faq")
         await faq.cmd_faq(msg, make_state())
         self.assertEqual(msg.answer.await_count, 2)
-        first_call, second_call = msg.answer.await_args_list
-        sent_markup = first_call.kwargs.get("reply_markup") or first_call.args[1]
-        self.assertIsInstance(sent_markup, InlineKeyboardMarkup)
-        refresh_markup = second_call.kwargs.get("reply_markup") or second_call.args[1]
+        refresh_call, content_call = msg.answer.await_args_list
+        refresh_markup = refresh_call.kwargs.get("reply_markup") or refresh_call.args[1]
         self.assertIsInstance(refresh_markup, ReplyKeyboardMarkup)
+        sent_markup = content_call.kwargs.get("reply_markup") or content_call.args[1]
+        self.assertIsInstance(sent_markup, InlineKeyboardMarkup)
 
     async def test_main_menu_button_stays_plain_text_not_web_app(self):
         # main_reply_keyboard() уже проверяется на отсутствие web_app в
@@ -818,14 +829,18 @@ class AdminCleanupFlowTests(unittest.IsolatedAsyncioTestCase):
         shutil.rmtree(self.tmpdir, ignore_errors=True)
 
     async def test_admin_command_deletes_trigger_and_previous_root(self):
+        # /admin отвечает inline-клавиатурой -> open_flow теперь сам
+        # "освежает" reply-клавиатуру (доп. answer()/delete_message() пара,
+        # см. UX-аудит про исчезающую клавиатуру после FAQ/admin).
         state = make_state(self.actor)
         msg1 = make_flow_message(chat_id=self.actor, text="/admin")
         await admin.cmd_admin(msg1, state)
-        msg1.answer.assert_awaited_once()
+        self.assertEqual(msg1.answer.await_count, 2)
 
         msg2 = make_flow_message(chat_id=self.actor, text="/admin")
         await admin.cmd_admin(msg2, state)
-        msg2.bot.delete_message.assert_awaited_once_with(chat_id=self.actor, message_id=555)
+        self.assertEqual(msg2.bot.delete_message.await_count, 2)  # refresh cleanup + RULE 2
+        msg2.bot.delete_message.assert_any_await(chat_id=self.actor, message_id=555)
 
     async def test_faq_add_wizard_edits_one_message_across_steps(self):
         state = make_state(self.actor)
@@ -1156,6 +1171,9 @@ class FaqCleanupRegressionTests(unittest.IsolatedAsyncioTestCase):
         start_msg.bot.delete_message.assert_awaited_once_with(chat_id=888, message_id=555)
 
     async def test_faq_then_admin_cleans_up_old_faq_message(self):
+        # /admin отвечает inline-клавиатурой -> open_flow сам ещё и
+        # "освежает" reply-клавиатуру (своя пара answer+delete) ПОМИМО
+        # удаления старого FAQ-anchor — отсюда 2 delete_message, не 1.
         state = make_state(888)
         faq_msg = make_flow_message(chat_id=888, text=texts.MENU_FAQ)
         await faq.show_faq_list(faq_msg, state)
@@ -1163,7 +1181,8 @@ class FaqCleanupRegressionTests(unittest.IsolatedAsyncioTestCase):
         admin_msg = make_flow_message(chat_id=888, text="/admin")
         await admin.cmd_admin(admin_msg, state)
 
-        admin_msg.bot.delete_message.assert_awaited_once_with(chat_id=888, message_id=555)
+        self.assertEqual(admin_msg.bot.delete_message.await_count, 2)
+        admin_msg.bot.delete_message.assert_any_await(chat_id=888, message_id=555)
 
     async def test_faq_then_cancel_cleans_up_old_faq_message(self):
         # Клиентский /cancel тоже идёт через open_root — тот же принцип.
@@ -1177,27 +1196,33 @@ class FaqCleanupRegressionTests(unittest.IsolatedAsyncioTestCase):
         cancel_msg.bot.delete_message.assert_awaited_once_with(chat_id=888, message_id=555)
 
     async def test_faq_list_still_refreshes_persistent_keyboard(self):
+        # open_flow теперь сам шлёт refresh ПЕРВЫМ (до основного FAQ-ответа,
+        # см. bot/flow.py::open_flow) — порядок обратный тому, что было
+        # раньше в _send_faq_list, но суть (клавиатура освежается) та же.
         from aiogram.types import InlineKeyboardMarkup, ReplyKeyboardMarkup
 
         state = make_state()
         msg = make_flow_message(text=texts.MENU_FAQ)
         await faq.show_faq_list(msg, state)
         self.assertEqual(msg.answer.await_count, 2)
-        first_call, second_call = msg.answer.await_args_list
-        sent_markup = first_call.kwargs.get("reply_markup") or first_call.args[1]
-        self.assertIsInstance(sent_markup, InlineKeyboardMarkup)
-        refresh_markup = second_call.kwargs.get("reply_markup") or second_call.args[1]
+        refresh_call, content_call = msg.answer.await_args_list
+        refresh_markup = refresh_call.kwargs.get("reply_markup") or refresh_call.args[1]
         self.assertIsInstance(refresh_markup, ReplyKeyboardMarkup)
         self.assertTrue(refresh_markup.is_persistent)
+        sent_markup = content_call.kwargs.get("reply_markup") or content_call.args[1]
+        self.assertIsInstance(sent_markup, InlineKeyboardMarkup)
 
     async def test_admin_transitions_do_not_break_when_no_faq_anchor_exists(self):
         # Regression-safety: если пользователь НЕ был на FAQ (anchor не
-        # установлен), /admin по-прежнему должен отрабатывать без ошибок —
-        # delete_message просто не должен вызываться (нечего удалять).
+        # установлен), /admin по-прежнему должен отрабатывать без ошибок.
+        # delete_message теперь ВСЁ РАВНО вызывается один раз — не для
+        # (несуществующего) FAQ-anchor, а для best-effort cleanup
+        # invisible-сообщения из refresh_reply_keyboard (см. open_flow) —
+        # это не regression, а часть уже принятого фикса.
         state = make_state(888)
         admin_msg = make_flow_message(chat_id=888, text="/admin")
         await admin.cmd_admin(admin_msg, state)
-        admin_msg.bot.delete_message.assert_not_awaited()
+        self.assertEqual(admin_msg.bot.delete_message.await_count, 1)
         admin_msg.answer.assert_awaited()
 
     async def test_faq_trigger_deletion_targets_only_the_trigger_message_itself(self):
@@ -1216,6 +1241,51 @@ class FaqCleanupRegressionTests(unittest.IsolatedAsyncioTestCase):
         msg.delete = _tracked_delete
         await faq.show_faq_list(msg, state)
         self.assertTrue(deleted["called"])  # именно сам триггер, best-effort, как и везде
+
+    async def test_client_faq_reply_keyboard_content_has_main_menu_and_faq(self):
+        # Второй production regression (после cleanup-фикса): persistent
+        # reply-клавиатура исчезала после FAQ. Проверяем не только ТИП
+        # (ReplyKeyboardMarkup), а конкретное СОДЕРЖИМОЕ, которое реально
+        # должно остаться доступным клиенту.
+        state = make_state(999)  # НЕ owner chat_id (888 занят DESIGNER_CHAT_ID в setUp)
+        msg = make_flow_message(chat_id=999, text=texts.MENU_FAQ)
+        await faq.show_faq_list(msg, state)
+        refresh_call = msg.answer.await_args_list[0]
+        refresh_markup = refresh_call.kwargs.get("reply_markup") or refresh_call.args[1]
+        button_texts = {btn.text for row in refresh_markup.keyboard for btn in row}
+        self.assertEqual(button_texts, {texts.MAIN_MENU_BUTTON, texts.MENU_FAQ})
+        self.assertNotIn(texts.ADMIN_BUTTON, button_texts)
+
+    async def test_owner_faq_reply_keyboard_content_has_admin_too(self):
+        state = make_state(888)  # 888 == DESIGNER_CHAT_ID (см. setUp)
+        msg = make_flow_message(chat_id=888, text=texts.MENU_FAQ)
+        await faq.show_faq_list(msg, state)
+        refresh_call = msg.answer.await_args_list[0]
+        refresh_markup = refresh_call.kwargs.get("reply_markup") or refresh_call.args[1]
+        button_texts = {btn.text for row in refresh_markup.keyboard for btn in row}
+        self.assertEqual(button_texts, {texts.MAIN_MENU_BUTTON, texts.MENU_FAQ, texts.ADMIN_BUTTON})
+
+    async def test_faq_inline_controls_still_work_after_the_fix(self):
+        # faq_back/faq_answer/faq_price_answer не менялись (edit_text того
+        # же anchor-сообщения) — явная regression-проверка, что это
+        # по-прежнему так после переноса _send_faq_list на open_root.
+        cb = make_callback("faq:back", chat_id=999)
+        await faq.faq_back(cb)
+        cb.message.edit_text.assert_awaited_once()
+        args, kwargs = cb.message.edit_text.call_args
+        self.assertEqual(args[0] if args else kwargs.get("text"), texts.FAQ_INTRO)
+
+    async def test_start_reply_keyboard_content_unchanged(self):
+        # /start передаёт reply-клавиатуру НАПРЯМУЮ (не через inline+refresh)
+        # — не должно внезапно приобрести лишний answer()-вызов или
+        # потерять кнопки из-за централизации refresh в open_flow.
+        state = make_state(999)
+        msg = make_flow_message(chat_id=999, text="/start")
+        await start.cmd_start(msg, state)
+        self.assertEqual(msg.answer.await_count, 1)
+        sent_markup = msg.answer.await_args.kwargs.get("reply_markup") or msg.answer.await_args.args[1]
+        button_texts = {btn.text for row in sent_markup.keyboard for btn in row}
+        self.assertEqual(button_texts, {texts.MAIN_MENU_BUTTON, texts.MENU_FAQ})
 
 
 class AdminCancelIntegrationTests(unittest.IsolatedAsyncioTestCase):

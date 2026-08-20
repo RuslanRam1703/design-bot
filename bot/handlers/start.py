@@ -32,20 +32,19 @@ async def cmd_id(message: Message) -> None:
 
 @router.message(Command("portfolio"))
 async def cmd_portfolio(message: Message, state: FSMContext) -> None:
+    # reply-клавиатура "освежается" автоматически внутри flow.open_root
+    # (см. bot/flow.py::open_flow) — отдельный вызов здесь больше не нужен.
     await flow.open_root(message, state, "Открыть портфолио:", webapp_open_keyboard(config.WEBAPP_URL, "portfolio", "📁 Открыть портфолио"))
-    await flow.refresh_reply_keyboard(message, _reply_keyboard_for(message))
 
 
 @router.message(Command("about"))
 async def cmd_about(message: Message, state: FSMContext) -> None:
     await flow.open_root(message, state, "Открыть «Обо мне»:", webapp_open_keyboard(config.WEBAPP_URL, "about", "👤 Открыть «Обо мне»"))
-    await flow.refresh_reply_keyboard(message, _reply_keyboard_for(message))
 
 
 @router.message(Command("brief"))
 async def cmd_brief(message: Message, state: FSMContext) -> None:
     await flow.open_root(message, state, "Открыть заявку:", webapp_open_keyboard(config.WEBAPP_URL, "brief", "✍️ Оставить заявку"))
-    await flow.refresh_reply_keyboard(message, _reply_keyboard_for(message))
 
 
 @router.message(Command("cancel"))
@@ -77,7 +76,6 @@ async def open_app_button(message: Message, state: FSMContext) -> None:
         "Открыть приложение:",
         webapp_open_keyboard(config.WEBAPP_URL, "portfolio", texts.OPEN_APP_BUTTON),
     )
-    await flow.refresh_reply_keyboard(message, _reply_keyboard_for(message))
 
 
 async def main_menu_or_confirm(message: Message, state: FSMContext) -> None:
