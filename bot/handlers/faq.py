@@ -2,6 +2,7 @@ import re
 
 from aiogram import F, Router
 from aiogram.filters import Command
+from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, Message
 
 from bot import flow, texts
@@ -26,19 +27,29 @@ def _client_faq_items() -> list[dict]:
     return [i for i in load_faq()["faq"] if not i.get("needs_review")]
 
 
-async def _send_faq_list(message: Message) -> None:
-    await message.answer(texts.FAQ_INTRO, reply_markup=faq_list_keyboard(_client_faq_items()))
+async def _send_faq_list(message: Message, state: FSMContext) -> None:
+    # flow.open_root (не голый message.answer) — FAQ-список сам по себе
+    # "корневой экран без FSM-состояния", в точности как /portfolio, /about,
+    # /brief, /admin (см. open_root docstring). Раньше этот список никогда
+    # не регистрировался как текущий anchor — "⌂ Главное меню"/"/start"
+    # после FAQ физически не могли найти его, чтобы удалить (см. UX-аудит,
+    # regression после 88acc40 — сам разрыв существовал с первого коммита,
+    # просто не был так заметен без persistent-кнопки "вернуться в корень").
+    # Внутри самого FAQ (faq_back/faq_answer/faq_price_answer ниже) сообщение
+    # редактируется на месте (callback.message.edit_text) — тот же anchor,
+    # тот же message_id, повторно регистрировать не нужно.
+    await flow.open_root(message, state, texts.FAQ_INTRO, faq_list_keyboard(_client_faq_items()))
     await flow.refresh_reply_keyboard(message, reply_keyboard_for_chat(message.chat.id))
 
 
 @router.message(F.text == texts.MENU_FAQ)
-async def show_faq_list(message: Message) -> None:
-    await _send_faq_list(message)
+async def show_faq_list(message: Message, state: FSMContext) -> None:
+    await _send_faq_list(message, state)
 
 
 @router.message(Command("faq"))
-async def cmd_faq(message: Message) -> None:
-    await _send_faq_list(message)
+async def cmd_faq(message: Message, state: FSMContext) -> None:
+    await _send_faq_list(message, state)
 
 
 @router.callback_query(F.data == "faq:back")

@@ -776,7 +776,7 @@ class EntryPointArchitectureTests(unittest.IsolatedAsyncioTestCase):
         from aiogram.types import InlineKeyboardMarkup, ReplyKeyboardMarkup
 
         msg = make_flow_message(text="/faq")
-        await faq.cmd_faq(msg)
+        await faq.cmd_faq(msg, make_state())
         self.assertEqual(msg.answer.await_count, 2)
         first_call, second_call = msg.answer.await_args_list
         sent_markup = first_call.kwargs.get("reply_markup") or first_call.args[1]
@@ -1099,6 +1099,123 @@ class MainMenuConfirmationTests(unittest.IsolatedAsyncioTestCase):
         await admin.admin_main_menu_button(msg, state)
         self.assertEqual(await state.get_state(), AdminStates.add_faq_answer.state)
         msg.answer.assert_awaited()
+
+
+class FaqCleanupRegressionTests(unittest.IsolatedAsyncioTestCase):
+    """Regression после 88acc40: FAQ-список никогда не регистрировался как
+    flow.py anchor (см. UX-аудит) — "⌂ Главное меню"/"/start"/выход в admin
+    после FAQ не могли найти его, чтобы удалить, старый список оставался в
+    чате. Разрыв существовал с первого коммита faq.py, просто не был
+    заметен без persistent-кнопки, чья явная задача — вернуть в чистый
+    корень. Фикс: _send_faq_list теперь идёт через flow.open_root, как
+    /portfolio, /about, /brief, /admin уже делают."""
+
+    def setUp(self):
+        self._orig_designer = admin.config.DESIGNER_CHAT_ID
+        admin.config.DESIGNER_CHAT_ID = "888"
+
+    def tearDown(self):
+        admin.config.DESIGNER_CHAT_ID = self._orig_designer
+
+    async def test_faq_then_main_menu_cleans_up_old_faq_message(self):
+        state = make_state(888)
+        faq_msg = make_flow_message(chat_id=888, text=texts.MENU_FAQ)
+        await faq.show_faq_list(faq_msg, state)
+
+        menu_msg = make_flow_message(chat_id=888, text=texts.MAIN_MENU_BUTTON)
+        await start.main_menu_button(menu_msg, state)
+
+        # Ровно один delete — именно старого FAQ-сообщения, ничего больше
+        # (в частности, ни одного другого/пользовательского сообщения).
+        menu_msg.bot.delete_message.assert_awaited_once_with(chat_id=888, message_id=555)
+
+    async def test_faq_then_main_menu_leaves_exactly_one_current_root_message(self):
+        state = make_state(888)
+        faq_msg = make_flow_message(chat_id=888, text=texts.MENU_FAQ)
+        await faq.show_faq_list(faq_msg, state)
+
+        menu_msg = make_flow_message(chat_id=888, text=texts.MAIN_MENU_BUTTON)
+        await start.main_menu_button(menu_msg, state)
+
+        sent_text = menu_msg.answer.await_args_list[0].args[0] if menu_msg.answer.await_args_list[0].args else menu_msg.answer.await_args_list[0].kwargs.get("text")
+        self.assertEqual(sent_text, texts.WELCOME)
+        data = await state.get_data()
+        self.assertEqual(data.get(flow._ANCHOR_MSG_KEY), 555)  # anchor указывает на новый welcome, не на FAQ
+        self.assertEqual(data.get(flow._ANCHOR_CHAT_KEY), 888)
+
+    async def test_faq_then_start_cleans_up_old_faq_message(self):
+        # /start не менялся в этом фиксе — тот же open_root, что и раньше,
+        # просто теперь находит реальный anchor, а не пустоту.
+        state = make_state(888)
+        faq_msg = make_flow_message(chat_id=888, text=texts.MENU_FAQ)
+        await faq.show_faq_list(faq_msg, state)
+
+        start_msg = make_flow_message(chat_id=888, text="/start")
+        await start.cmd_start(start_msg, state)
+
+        start_msg.bot.delete_message.assert_awaited_once_with(chat_id=888, message_id=555)
+
+    async def test_faq_then_admin_cleans_up_old_faq_message(self):
+        state = make_state(888)
+        faq_msg = make_flow_message(chat_id=888, text=texts.MENU_FAQ)
+        await faq.show_faq_list(faq_msg, state)
+
+        admin_msg = make_flow_message(chat_id=888, text="/admin")
+        await admin.cmd_admin(admin_msg, state)
+
+        admin_msg.bot.delete_message.assert_awaited_once_with(chat_id=888, message_id=555)
+
+    async def test_faq_then_cancel_cleans_up_old_faq_message(self):
+        # Клиентский /cancel тоже идёт через open_root — тот же принцип.
+        state = make_state(888)
+        faq_msg = make_flow_message(chat_id=888, text=texts.MENU_FAQ)
+        await faq.show_faq_list(faq_msg, state)
+
+        cancel_msg = make_flow_message(chat_id=888, text="/cancel")
+        await start.cmd_cancel(cancel_msg, state)
+
+        cancel_msg.bot.delete_message.assert_awaited_once_with(chat_id=888, message_id=555)
+
+    async def test_faq_list_still_refreshes_persistent_keyboard(self):
+        from aiogram.types import InlineKeyboardMarkup, ReplyKeyboardMarkup
+
+        state = make_state()
+        msg = make_flow_message(text=texts.MENU_FAQ)
+        await faq.show_faq_list(msg, state)
+        self.assertEqual(msg.answer.await_count, 2)
+        first_call, second_call = msg.answer.await_args_list
+        sent_markup = first_call.kwargs.get("reply_markup") or first_call.args[1]
+        self.assertIsInstance(sent_markup, InlineKeyboardMarkup)
+        refresh_markup = second_call.kwargs.get("reply_markup") or second_call.args[1]
+        self.assertIsInstance(refresh_markup, ReplyKeyboardMarkup)
+        self.assertTrue(refresh_markup.is_persistent)
+
+    async def test_admin_transitions_do_not_break_when_no_faq_anchor_exists(self):
+        # Regression-safety: если пользователь НЕ был на FAQ (anchor не
+        # установлен), /admin по-прежнему должен отрабатывать без ошибок —
+        # delete_message просто не должен вызываться (нечего удалять).
+        state = make_state(888)
+        admin_msg = make_flow_message(chat_id=888, text="/admin")
+        await admin.cmd_admin(admin_msg, state)
+        admin_msg.bot.delete_message.assert_not_awaited()
+        admin_msg.answer.assert_awaited()
+
+    async def test_faq_trigger_deletion_targets_only_the_trigger_message_itself(self):
+        # RULE 1 (см. bot/flow.py) — то же самое, уже давно происходящее для
+        # /portfolio, /about, /brief, /cancel, /start: удаляется СВОЁ же
+        # сообщение-триггер (тап по кнопке/команда), не произвольный чужой
+        # контент. delete() здесь — метод самого triggering message, не
+        # bot.delete_message с посторонним message_id.
+        state = make_state()
+        msg = make_flow_message(text=texts.MENU_FAQ)
+        deleted = {"called": False}
+
+        async def _tracked_delete():
+            deleted["called"] = True
+
+        msg.delete = _tracked_delete
+        await faq.show_faq_list(msg, state)
+        self.assertTrue(deleted["called"])  # именно сам триггер, best-effort, как и везде
 
 
 class AdminCancelIntegrationTests(unittest.IsolatedAsyncioTestCase):
