@@ -558,9 +558,15 @@ function attachCaseEvents() {
     el.addEventListener("click", () => openLightbox(c.images.map((s) => `/${s}`), Number(el.dataset.lightboxIndex)))
   );
   document.getElementById("want-similar").addEventListener("click", () => {
-    // order_template (см. bot/content_store.py) — снимок service_id + options
-    // конкретного кейса, используется только для предзаполнения нового
-    // заказа; сам кейс при этом не меняется (заказ — независимая копия).
+    // order_template.service_id (см. data/portfolio.json) — переносим ТОЛЬКО
+    // услугу, не опции. order_template.options — статические demo-данные:
+    // ни один код в bot/content_store.py их не создаёт и не обновляет, и
+    // поля order_template нет в bot/admin_keyboards.py::CASE_FIELD_LABELS —
+    // то есть дизайнер не может ни увидеть, ни осознанно задать их через
+    // /admin. Раз нет доказательства, что конкретная опция реально относится
+    // к этому кейсу, Order Builder не должен её предзаполнять (см. UX-аудит
+    // про самопроизвольно отмеченные чекбоксы) — сам кейс при этом не
+    // меняется, заказ — независимая копия.
     const template = c.order_template;
     const serviceId = template?.service_id || c.related_service;
     const service = state.pricing.services.find((s) => s.id === serviceId);
@@ -571,9 +577,6 @@ function attachCaseEvents() {
     state.brief.sourceCaseId = c.id;
     state.brief.sourceCaseTitle = c.title;
     state.brief.orderOptions = {};
-    if (template && service) {
-      for (const o of template.options || []) state.brief.orderOptions[o.option_id] = o.quantity || 1;
-    }
     state.brief.urgent = false;
     state.brief.complex = false;
     navigate("brief", { resetBrief: true });
