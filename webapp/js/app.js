@@ -91,182 +91,6 @@ function applyTheme() {
   if (realTG) document.documentElement.dataset.theme = TG.colorScheme();
 }
 
-// ---- ВРЕМЕННАЯ runtime-диагностика (см. аудит про stale step 7 в проде) ----
-// TODO(diag): удалить весь этот блок и debug-overlay ниже после того, как
-// источник состояния подтверждён — это не часть постоянной архитектуры,
-// только console.log/overlay без payload/user_id/контактов/содержимого
-// заявки/токенов, ничего не отправляется на сервер и никуда не сохраняется
-// (кроме самого факта "overlay включён" — см. DIAG_OVERLAY_KEY ниже).
-const DIAG_SESSION_ID = (window.crypto && window.crypto.randomUUID)
-  ? window.crypto.randomUUID()
-  : `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
-
-const DIAG_LOG_LIMIT = 20;
-const DIAG_LOG_BUFFER = [];
-
-function diagLog(event, data) {
-  DIAG_LOG_BUFFER.push({ event, data });
-  if (DIAG_LOG_BUFFER.length > DIAG_LOG_LIMIT) DIAG_LOG_BUFFER.shift();
-  try {
-    console.log(`[diag][${DIAG_SESSION_ID}] ${event}`, data);
-  } catch (e) {
-    // console недоступен — не критично, это только диагностика
-  }
-  diagRenderOverlay();
-}
-
-function diagLocalStoragePresent() {
-  try {
-    return localStorage.getItem(BRIEF_DRAFT_STORAGE_KEY) !== null;
-  } catch (e) {
-    return null;
-  }
-}
-
-// ---- ВРЕМЕННЫЙ debug-overlay ----
-// В Telegram Desktop нет удобного доступа к консоли WebView, поэтому те же
-// diagLog()-события дополнительно рисуются прямо поверх интерфейса — но
-// ТОЛЬКО если явно включено (см. активацию ниже), чтобы обычные
-// пользователи никогда его не видели.
-const DIAG_OVERLAY_KEY = "designAssistant.debugOverlay";
-
-function diagOverlayEnabled() {
-  try {
-    if (new URLSearchParams(location.search).get("debug") === "1") {
-      // ?debug=1 в URL — если такая ссылка когда-либо доступна — сразу
-      // запоминаем в localStorage, чтобы флаг пережил переход/перезаход
-      // без query-параметра (а именно это и нужно проверить в этом тесте).
-      localStorage.setItem(DIAG_OVERLAY_KEY, "1");
-      return true;
-    }
-    return localStorage.getItem(DIAG_OVERLAY_KEY) === "1";
-  } catch (e) {
-    return false;
-  }
-}
-
-function diagSetOverlayEnabled(on) {
-  try {
-    if (on) localStorage.setItem(DIAG_OVERLAY_KEY, "1");
-    else localStorage.removeItem(DIAG_OVERLAY_KEY);
-  } catch (e) {
-    // недоступен localStorage — просто не переживёт перезагрузку
-  }
-  diagRenderOverlay();
-}
-
-// Активация без URL: 5 тапов в любом месте экрана в течение 3 секунд —
-// не мешает обычным кликам (только считает, ничего не блокирует/не
-// останавливает всплытие событий).
-let diagTapCount = 0;
-let diagTapTimer = null;
-document.addEventListener("click", () => {
-  diagTapCount += 1;
-  if (diagTapTimer) clearTimeout(diagTapTimer);
-  diagTapTimer = setTimeout(() => { diagTapCount = 0; }, 3000);
-  if (diagTapCount >= 5) {
-    diagTapCount = 0;
-    diagSetOverlayEnabled(!diagOverlayEnabled());
-  }
-});
-
-// Тот же текст используется и для отрисовки, и для копирования — единственный
-// источник, чтобы кнопка "Скопировать" никогда не разошлась с тем, что видно
-// на экране. Только session_id/screen/step/booleans/лог событий (см. состав
-// diagLog() выше) — то же самое, что уже было в консоли/overlay, ничего нового.
-function diagBuildText() {
-  const header = [
-    `session ${DIAG_SESSION_ID}`,
-    `screen=${state.screen} step=${state.brief.step} draftId=${!!state.brief.draftId} localStorage=${diagLocalStoragePresent()}`,
-    "---",
-  ].join("\n");
-  const lines = DIAG_LOG_BUFFER
-    .map((e) => `${e.event} ${JSON.stringify(e.data)}`)
-    .join("\n");
-  return `${header}\n${lines}`;
-}
-
-function diagCopyText(text, statusEl) {
-  const showStatus = (ok) => {
-    if (!statusEl) return;
-    statusEl.textContent = ok ? "Скопировано" : "Не получилось скопировать";
-    setTimeout(() => { statusEl.textContent = ""; }, 2000);
-  };
-  if (navigator.clipboard && navigator.clipboard.writeText) {
-    navigator.clipboard.writeText(text).then(() => showStatus(true)).catch(() => diagCopyTextFallback(text, showStatus));
-  } else {
-    diagCopyTextFallback(text, showStatus);
-  }
-}
-
-// Фолбэк на случай, если navigator.clipboard недоступен/запрещён в
-// конкретном WebView (некоторые встроенные браузеры это режут) — тот же
-// старый приём через скрытый textarea + execCommand("copy").
-function diagCopyTextFallback(text, showStatus) {
-  try {
-    const ta = document.createElement("textarea");
-    ta.value = text;
-    ta.style.position = "fixed";
-    ta.style.opacity = "0";
-    document.body.appendChild(ta);
-    ta.focus();
-    ta.select();
-    const ok = document.execCommand("copy");
-    document.body.removeChild(ta);
-    showStatus(ok);
-  } catch (e) {
-    showStatus(false);
-  }
-}
-
-function diagRenderOverlay() {
-  const el = document.getElementById("diag-overlay");
-  if (!diagOverlayEnabled()) {
-    if (el) el.remove();
-    return;
-  }
-  let box = el;
-  let contentEl;
-  let statusEl;
-  if (!box) {
-    box = document.createElement("div");
-    box.id = "diag-overlay";
-    box.style.cssText = [
-      "position:fixed", "top:0", "left:0", "right:0", "z-index:99999",
-      "background:rgba(0,0,0,0.9)", "color:#0f0",
-      "font:11px/1.4 monospace", "padding:8px",
-      "max-height:55vh", "overflow-y:auto",
-    ].join(";");
-
-    const toolbar = document.createElement("div");
-    toolbar.style.cssText = "display:flex;align-items:center;gap:8px;margin-bottom:6px;";
-
-    const copyBtn = document.createElement("button");
-    copyBtn.id = "diag-copy-btn";
-    copyBtn.textContent = "Скопировать диагностику";
-    copyBtn.type = "button";
-    copyBtn.style.cssText = "font:11px monospace;padding:4px 8px;cursor:pointer;";
-    copyBtn.addEventListener("click", () => diagCopyText(diagBuildText(), document.getElementById("diag-copy-status")));
-    toolbar.appendChild(copyBtn);
-
-    statusEl = document.createElement("span");
-    statusEl.id = "diag-copy-status";
-    toolbar.appendChild(statusEl);
-
-    box.appendChild(toolbar);
-
-    contentEl = document.createElement("div");
-    contentEl.id = "diag-overlay-content";
-    contentEl.style.cssText = "white-space:pre-wrap;";
-    box.appendChild(contentEl);
-
-    document.body.appendChild(box);
-  } else {
-    contentEl = document.getElementById("diag-overlay-content");
-  }
-  contentEl.textContent = diagBuildText();
-}
-
 // ---- Состояние приложения ----
 const state = {
   pricing: null,
@@ -390,7 +214,6 @@ function persistBriefDraft() {
 // разбираемый черновик и он был влит в state.brief — это и есть сигнал
 // "существует восстановленный draft" для briefEntryPending (см. init()).
 function restoreBriefDraft() {
-  const present = diagLocalStoragePresent();
   let parseOk = null;
   try {
     const saved = localStorage.getItem(BRIEF_DRAFT_STORAGE_KEY);
@@ -402,12 +225,6 @@ function restoreBriefDraft() {
     // повреждённые данные в хранилище — остаёмся с дефолтным пустым брифом
     parseOk = false;
   }
-  diagLog("restoreBriefDraft", {
-    localStoragePresent: present,
-    localStorageParseOk: parseOk,
-    stepAfter: state.brief.step,
-    draftIdPresentAfter: !!state.brief.draftId,
-  });
   return parseOk === true;
 }
 
@@ -467,7 +284,6 @@ function resetBriefState({ hardReset = false } = {}) {
   // что экран выбора "Продолжить/Начать новую" для него неактуален —
   // решение по факту уже принято этим самым вызовом.
   state.briefEntryPending = false;
-  diagLog("resetBriefState", { hardReset, step: state.brief.step, draftIdPresent: !!state.brief.draftId });
 }
 
 // ---- Загрузка данных и старт ----
@@ -476,18 +292,12 @@ async function init() {
   TG.expand();
   applyTheme();
   TG.onThemeChanged(applyTheme);
-  diagLog("init:start", {
-    step: state.brief.step,
-    draftIdPresent: !!state.brief.draftId,
-    localStoragePresent: diagLocalStoragePresent(),
-  });
-  const restored = restoreBriefDraft(); // сама логирует "restoreBriefDraft" — present/parseOk/step/draftId после
+  const restored = restoreBriefDraft();
   if (!state.brief.draftId) state.brief.draftId = generateDraftId();
   // См. state.briefEntryPending — восстановленный черновик БЕЗ реального
   // прогресса (пустой шаг 1) не требует спрашивать "продолжить или новую":
   // спрашивать там нечего.
   state.briefEntryPending = restored && briefDraftHasProgress(state.brief);
-  diagLog("init:draftId_ensured", { step: state.brief.step, draftIdPresent: !!state.brief.draftId });
 
   const [pricing, portfolio, about, uiConfig] = await Promise.all([
     fetch("/data/pricing.json").then((r) => r.json()),
@@ -568,12 +378,6 @@ function attachTabBarEvents() {
         // и историю для корректного "назад"), а не как в свежий таб.
         // Осознанный сброс брифа уже есть отдельно — там, где он оправдан
         // намерением пользователя: CTA в кейсе/калькуляторе/about (resetBrief: true).
-        diagLog("tabClick:brief", {
-          stepBefore: state.brief.step,
-          draftIdPresentBefore: !!state.brief.draftId,
-          localStoragePresentBefore: diagLocalStoragePresent(),
-          resetPerformed: false, // navigate() ниже вызван БЕЗ resetBrief:true
-        });
         navigate(screen);
         return;
       }
@@ -1495,15 +1299,9 @@ async function submitBrief() {
     state.lastPayload = payload;
     state.lastLeadResult = result; // { lead_id, created, attach_tz, price_range }
     state.history = [];
-    const diagStepBeforeReset = state.brief.step;
     navigate("submitted", { pushHistory: false });
     clearBriefDraft();
     resetBriefState({ hardReset: true });
-    diagLog("submitBrief:success_reset", {
-      stepBefore: diagStepBeforeReset,
-      stepAfter: state.brief.step,
-      localStoragePresentAfterClear: diagLocalStoragePresent(),
-    });
   } catch (e) {
     // Черновик НЕ теряем при ошибке — пользователь остаётся на том же шаге
     // с уже заполненными полями и может просто попробовать ещё раз.
