@@ -8,7 +8,8 @@ from aiogram.types import (
     BotCommand,
     BotCommandScopeChat,
     BotCommandScopeDefault,
-    MenuButtonCommands,
+    MenuButtonWebApp,
+    WebAppInfo,
 )
 from aiohttp import web
 
@@ -22,9 +23,6 @@ logger = logging.getLogger(__name__)
 CLIENT_COMMANDS = [
     BotCommand(command="start", description="Начать / приветствие"),
     BotCommand(command="faq", description="Частые вопросы"),
-    BotCommand(command="portfolio", description="Портфолио"),
-    BotCommand(command="about", description="Обо мне"),
-    BotCommand(command="brief", description="Оставить заявку"),
 ]
 
 ADMIN_EXTRA_COMMANDS = [
@@ -48,20 +46,29 @@ async def _setup_bot_commands(bot: Bot) -> None:
 
 
 async def _setup_menu_button(bot: Bot) -> None:
-    # Системное Menu Telegram (иконка рядом с полем ввода) должно оставаться
-    # обычным списком команд (/start, /faq, /portfolio, /about, /brief, у
-    # владельца ещё /admin — см. CLIENT_COMMANDS/ADMIN_EXTRA_COMMANDS выше),
-    # а НЕ отдельной кнопкой запуска Mini App — ранее здесь стоял
-    # MenuButtonWebApp, из-за чего это системное меню вместо списка команд
-    # показывало "Открыть приложение" (регресс, обнаруженный в проде после
-    # commit ac09080). Запуск Mini App — только через reply-кнопку
-    # "🚀 Открыть приложение" (см. bot/keyboards.py::main_reply_keyboard,
-    # bot/handlers/start.py::open_app_button) и существующие inline
-    # web_app-кнопки — MenuButtonCommands этому не мешает и не дублирует.
-    # Вызов явный (не просто "ничего не делать"): Telegram запоминает
-    # последний заданный menu_button за бота, значение из предыдущего
-    # деплоя (MenuButtonWebApp) само не откатится без явного вызова.
-    await bot.set_chat_menu_button(menu_button=MenuButtonCommands())
+    # Системное Menu Telegram (иконка рядом с полем ввода) — прямой запуск
+    # Mini App (MenuButtonWebApp), корень WEBAPP_URL (без /portfolio и т.п.
+    # — портфолио/about/заказ/"Мои заявки" теперь только навигация ВНУТРИ
+    # уже открытого Mini App, см. webapp/js/app.js::TAB_SCREENS).
+    #
+    # РАНЕЕ здесь уже стоял MenuButtonWebApp и был откачен (commit ffe52ae,
+    # после регресса из commit ac09080) — по ДРУГОЙ причине: тогда список
+    # команд (/portfolio, /about, /brief) ещё оставался единственным
+    # быстрым доступом к этим разделам, и MenuButtonWebApp его вытеснял —
+    # клиенты теряли доступ к разделам, а не только к кнопке. Сейчас это
+    # осознанно другое решение: CLIENT_COMMANDS сокращён до /start, /faq —
+    # portfolio/about/brief остаются доступны (и НЕ удалены как handlers,
+    # см. bot/handlers/start.py::cmd_portfolio/cmd_about/cmd_brief), просто
+    # их основной путь теперь через сам Mini App, а не отдельные команды.
+    # MenuButtonCommands() и MenuButtonWebApp() взаимоисключающие (Telegram
+    # хранит только одно значение) — вызов явный при каждом старте, само
+    # предыдущее значение не откатится без него.
+    #
+    # inline "🚀 Открыть приложение" (bot/handlers/start.py::open_app_button)
+    # остаётся как fallback/contextual launch — не убран.
+    await bot.set_chat_menu_button(
+        menu_button=MenuButtonWebApp(text="Открыть приложение", web_app=WebAppInfo(url=config.WEBAPP_URL))
+    )
 
 
 async def main() -> None:

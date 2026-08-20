@@ -580,23 +580,35 @@ class EntryPointArchitectureTests(unittest.IsolatedAsyncioTestCase):
         await admin.admin_button(msg, state)
         msg.answer.assert_awaited_once()
 
-    def test_client_commands_include_faq_and_no_calculator(self):
+    def test_client_commands_are_start_and_faq_only(self):
+        # portfolio/about/brief убраны из видимого command list (см. UX-аудит
+        # "Telegram launch UX") — Menu Button теперь ведёт прямо в Mini App,
+        # где эти разделы доступны как навигация (webapp/js/app.js::TAB_SCREENS).
+        # Сами handlers НЕ удалены (см. test_legacy_command_handlers_still_registered).
         import bot.main as bot_main
 
         command_names = [c.command for c in bot_main.CLIENT_COMMANDS]
-        self.assertEqual(command_names, ["start", "faq", "portfolio", "about", "brief"])
+        self.assertEqual(command_names, ["start", "faq"])
+        self.assertNotIn("portfolio", command_names)
+        self.assertNotIn("about", command_names)
+        self.assertNotIn("brief", command_names)
+        self.assertNotIn("calculator", command_names)
 
     def test_owner_command_scope_is_client_commands_plus_admin(self):
         import bot.main as bot_main
 
         owner_names = [c.command for c in bot_main.CLIENT_COMMANDS + bot_main.ADMIN_EXTRA_COMMANDS]
-        self.assertEqual(owner_names, ["start", "faq", "portfolio", "about", "brief", "admin"])
+        self.assertEqual(owner_names, ["start", "faq", "admin"])
 
-    async def test_setup_menu_button_is_commands_not_webapp(self):
-        # Регресс commit ac09080: MenuButtonWebApp здесь подменял системное
-        # Telegram Menu (список команд) на кнопку запуска Mini App. Menu
-        # должно оставаться обычным списком команд — запуск Mini App теперь
-        # только через reply-кнопку "🚀 Открыть приложение" + inline-кнопки.
+    async def test_setup_menu_button_is_webapp_not_commands(self):
+        # UX-аудит "Telegram launch UX": Menu Button теперь запускает Mini
+        # App напрямую (MenuButtonWebApp), а не показывает список команд —
+        # список команд сокращён (см. test_client_commands_are_start_and_faq_only)
+        # именно чтобы portfolio/about/brief не "терялись" при этой смене
+        # (они остаются доступны как Mini App navigation). Более ранняя версия
+        # этого же MenuButtonWebApp была откачена (commit ffe52ae) по другой
+        # причине — тогда список команд ещё не был сокращён, и клиенты
+        # реально теряли доступ к разделам, а не только к кнопке.
         from aiogram.types import MenuButtonCommands, MenuButtonWebApp
 
         import bot.main as bot_main
@@ -606,8 +618,24 @@ class EntryPointArchitectureTests(unittest.IsolatedAsyncioTestCase):
         fake_bot.set_chat_menu_button.assert_awaited_once()
         _, call_kwargs = fake_bot.set_chat_menu_button.call_args
         menu_button = call_kwargs["menu_button"]
-        self.assertIsInstance(menu_button, MenuButtonCommands)
-        self.assertNotIsInstance(menu_button, MenuButtonWebApp)
+        self.assertIsInstance(menu_button, MenuButtonWebApp)
+        self.assertNotIsInstance(menu_button, MenuButtonCommands)
+        self.assertEqual(menu_button.text, "Открыть приложение")
+        self.assertEqual(menu_button.web_app.url, bot_main.config.WEBAPP_URL)
+
+    async def test_legacy_command_handlers_still_registered(self):
+        # /portfolio, /about, /brief убраны только из видимого command list —
+        # handlers остаются рабочими deep-link'ами (см. UX-аудит, явное
+        # требование "НЕ удалять сами handlers").
+        state = make_state()
+        for cmd, handler in (
+            ("/portfolio", start.cmd_portfolio),
+            ("/about", start.cmd_about),
+            ("/brief", start.cmd_brief),
+        ):
+            msg = make_flow_message(text=cmd)
+            await handler(msg, state)
+            msg.answer.assert_awaited()
 
     def test_client_reply_keyboard_has_no_admin_button(self):
         client_texts = {btn.text for row in keyboards.main_reply_keyboard(is_owner=False).keyboard for btn in row}
