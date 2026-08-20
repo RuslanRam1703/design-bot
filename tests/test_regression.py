@@ -10,6 +10,7 @@ content_store пишет в реальные data/*.json — тесты, кот�
 Настоящие файлы проекта не трогаются.
 """
 
+import asyncio
 import io
 import json
 import shutil
@@ -25,7 +26,7 @@ from unittest.mock import AsyncMock, patch
 from aiogram.exceptions import TelegramAPIError
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.base import StorageKey
-from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.fsm.storage.memory import MemoryStorage, SimpleEventIsolation
 from aiogram.utils.web_app import check_webapp_signature as aiogram_check_webapp_signature
 
 import bot.admin_keyboards as kb
@@ -490,6 +491,103 @@ class NavAnchorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(offenders, [])
 
 
+class NavAnchorRaceConditionTests(unittest.IsolatedAsyncioTestCase):
+    """Race condition при конкурентной обработке апдейтов ОДНОГО чата (см.
+    root-cause аудит): aiogram Dispatcher._polling(handle_as_tasks=True) —
+    default — создаёт независимый asyncio.Task на каждый update; без
+    events_isolation (DisabledEventIsolation, no-op lock, тоже default) они
+    НЕ сериализуются per StorageKey. ensure_nav_anchor делает check-then-act
+    (get_data() -> conditional answer()+update_data(), где answer() —
+    реальный сетевой round-trip) без защиты — два "нажатия", выполняющиеся
+    конкурентно, могли оба пройти check ДО того, как первая запись попадала
+    в state.data, создавая дублирующийся NAV anchor (воспроизведено в
+    production: несколько подряд "Главное меню" -> несколько новых WELCOME).
+    SimpleEventIsolation — штатный aiogram-механизм (per-StorageKey
+    asyncio.Lock из aiogram.fsm.storage.memory), не самодельный."""
+
+    def _make_delayed_msg(self, chat_id):
+        """Как make_flow_message, но answer() с искусственной asyncio.sleep
+        — имитирует реальный сетевой round-trip к Telegram Bot API,
+        открывая то же окно гонки, что и в проде (запись в state.data
+        происходит только ПОСЛЕ await message.answer(...) в _create_nav_anchor)."""
+        msg = make_flow_message(chat_id=chat_id)
+        call_counter = {"n": 0}
+
+        async def _slow_answer(text, reply_markup=None):
+            await asyncio.sleep(0.02)
+            call_counter["n"] += 1
+            return SimpleNamespace(message_id=9000 + call_counter["n"], chat=SimpleNamespace(id=chat_id))
+
+        msg.answer = AsyncMock(side_effect=_slow_answer)
+        return msg
+
+    async def test_concurrent_ensure_nav_anchor_without_isolation_can_duplicate(self):
+        # Демонстрация самой гонки (БЕЗ защиты) — подтверждает, что race
+        # реально воспроизводим на этом коде без events_isolation, а не
+        # гипотетичен. Это не regression исправления ниже, а доказательство
+        # того, что проблема, которую чинит SimpleEventIsolation, настоящая.
+        state = make_state(777)
+        msg1 = self._make_delayed_msg(777)
+        msg2 = self._make_delayed_msg(777)
+
+        await asyncio.gather(
+            flow.ensure_nav_anchor(msg1, state),
+            flow.ensure_nav_anchor(msg2, state),
+        )
+
+        # Без сериализации обе "конкурентные" таски успели пройти check ДО
+        # того, как первая записала anchor -> answer() вызван дважды.
+        self.assertEqual(msg1.answer.await_count + msg2.answer.await_count, 2)
+
+    async def test_simple_event_isolation_serializes_concurrent_ensure_nav_anchor(self):
+        # Тот же race setup, обёрнутый в SimpleEventIsolation.lock(key) —
+        # ровно так, как это делает сам aiogram Dispatcher для апдейтов
+        # одного чата при events_isolation=SimpleEventIsolation() (см.
+        # bot/main.py). Два конкурентных вызова на cold state должны
+        # создать РОВНО один NAV anchor.
+        chat_id = 778
+        state = make_state(chat_id)
+        key = StorageKey(bot_id=0, chat_id=chat_id, user_id=chat_id)
+        isolation = SimpleEventIsolation()
+
+        msg1 = self._make_delayed_msg(chat_id)
+        msg2 = self._make_delayed_msg(chat_id)
+
+        async def _isolated_call(msg):
+            async with isolation.lock(key):
+                await flow.ensure_nav_anchor(msg, state)
+
+        await asyncio.gather(_isolated_call(msg1), _isolated_call(msg2))
+
+        # Сериализовано -> ровно ОДИН answer() среди обоих вызовов, второй
+        # увидел уже существующий anchor и не создавал новый.
+        total_answer_calls = msg1.answer.await_count + msg2.answer.await_count
+        self.assertEqual(total_answer_calls, 1)
+        data = await state.get_data()
+        self.assertIsNotNone(data.get(flow._NAV_ANCHOR_MSG_KEY))
+        self.assertIsNotNone(data.get(flow._NAV_ANCHOR_CHAT_KEY))
+
+    async def test_repeated_calls_after_creation_reuse_same_message_id(self):
+        # Требование: повторные (не только конкурентные) вызовы ПОСЛЕ
+        # создания должны переиспользовать ОДИН message_id, а не плодить
+        # новые при каждом вызове.
+        state = make_state(779)
+        msg1 = make_flow_message(chat_id=779)
+        await flow.ensure_nav_anchor(msg1, state)
+        data = await state.get_data()
+        first_nav_id = data.get(flow._NAV_ANCHOR_MSG_KEY)
+        self.assertIsNotNone(first_nav_id)
+
+        for _ in range(3):
+            msg = make_flow_message(chat_id=779)
+            created = await flow.ensure_nav_anchor(msg, state)
+            self.assertFalse(created)
+            msg.answer.assert_not_awaited()
+
+        data = await state.get_data()
+        self.assertEqual(data.get(flow._NAV_ANCHOR_MSG_KEY), first_nav_id)
+
+
 class StartHandlerCleanupTests(unittest.IsolatedAsyncioTestCase):
     """Реальные хендлеры bot/handlers/start.py, переведённые на flow.py —
     /start реально пытается удалить триггер и предыдущий корневой экран,
@@ -757,6 +855,24 @@ class EntryPointArchitectureTests(unittest.IsolatedAsyncioTestCase):
         source = inspect.getsource(bot_main.main)
         self.assertIn("delete_webhook(drop_pending_updates=False)", source)
         self.assertNotIn("delete_webhook(drop_pending_updates=True)", source)
+
+    def test_dispatcher_uses_simple_event_isolation(self):
+        # См. UX-аудит race condition: Dispatcher по умолчанию (без
+        # events_isolation) использует DisabledEventIsolation (no-op lock) +
+        # polling(handle_as_tasks=True) — апдейты одного чата НЕ
+        # сериализуются, что позволяло двум быстрым подряд нажатиям
+        # "Главное меню" пройти check ensure_nav_anchor одновременно и
+        # создать дублирующийся NAV anchor. SimpleEventIsolation — штатный
+        # aiogram-механизм (per-StorageKey asyncio.Lock), не самодельный.
+        # main() нельзя безопасно вызвать напрямую (реально стартует polling)
+        # — проверяем исходный код, как и test_startup_does_not_drop_pending_updates.
+        import inspect
+
+        import bot.main as bot_main
+
+        source = inspect.getsource(bot_main.main)
+        self.assertIn("events_isolation=SimpleEventIsolation()", source)
+        self.assertIn("SimpleEventIsolation", inspect.getsource(bot_main))  # реально импортирован в модуле
 
     def test_owner_reply_keyboard_has_admin_button(self):
         owner_texts = {btn.text for row in keyboards.main_reply_keyboard(is_owner=True).keyboard for btn in row}

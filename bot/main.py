@@ -3,7 +3,7 @@ import logging
 
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
-from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.fsm.storage.memory import MemoryStorage, SimpleEventIsolation
 from aiogram.types import (
     BotCommand,
     BotCommandScopeChat,
@@ -89,7 +89,16 @@ async def _setup_bot_description(bot: Bot) -> None:
 
 async def main() -> None:
     bot = Bot(token=config.BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
-    dp = Dispatcher(storage=MemoryStorage())
+    # events_isolation=SimpleEventIsolation() — штатный aiogram-механизм,
+    # сериализует обработку апдейтов per StorageKey (per чат). Без него
+    # default — DisabledEventIsolation (no-op lock) + polling по умолчанию
+    # обрабатывает каждый update как независимый asyncio.Task
+    # (Dispatcher._polling(handle_as_tasks=True)) — два быстрых подряд
+    # нажатия одной кнопки в одном чате могли выполняться параллельно и
+    # обе гонки проходили check "nav anchor отсутствует" до того, как
+    # первая успевала записать результат (см. UX-аудит: race condition,
+    # приводивший к дублированию NAV anchor при повторных "Главное меню").
+    dp = Dispatcher(storage=MemoryStorage(), events_isolation=SimpleEventIsolation())
 
     # admin — первым: /admin не должен перехватываться catch-all из start.
     # webapp — тоже раньше faq/start, т.к. должен первым перехватывать
