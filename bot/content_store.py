@@ -22,6 +22,7 @@ import tempfile
 import urllib.error
 import urllib.request
 import zipfile
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -1094,15 +1095,123 @@ def delete_lead(actor_chat_id: int | str, lead_id: int) -> bool:
 
 DATA_FILENAMES = ("portfolio.json", "pricing.json", "faq.json", "about.json", "ui_config.json", "leads.json")
 
+# Минимальная structural-валидация бэкапа (P1-1, production-hardening
+# аудит) — только то, что остальной код content_store уже безусловно
+# предполагает (прямая индексация data["key"] без .get, см. list_cases/
+# list_faq/list_services/_read_leads/get_ui_config и т.п. выше). Намеренно
+# НЕ бизнес-валидация — лишняя строгость сделала бы старый легитимный
+# бэкап "несовместимым". about.json нигде не индексируется по
+# фиксированному обязательному ключу (только произвольный field через
+# data.get(...)/data[field]) — для него достаточно проверки "это object".
+_REQUIRED_SHAPE: dict[str, dict[str, type]] = {
+    "portfolio.json": {"cases": list, "types": list},
+    "pricing.json": {"services": list, "options": list, "coefficients": dict, "rounding": dict},
+    "faq.json": {"faq": list},
+    "ui_config.json": {"menu": dict},
+    "leads.json": {"leads": list},
+}
+
+_MISSING = object()  # sentinel для snapshot: ключа не было и до restore (P0-1) — откатывать нечего
+
+
+class BackupExportError(RuntimeError):
+    """export_backup_bytes не смог прочитать один или несколько
+    DATA_FILENAMES (обычно UpstashKeyMissingError после P0-1) — экспорт НЕ
+    формируется частично: явная ошибка лучше, чем ZIP без, например,
+    leads.json, который могли бы принять за полноценный бэкап
+    (P1-1, production-hardening аудит)."""
+
+    def __init__(self, missing_filenames: list[str]):
+        self.missing_filenames = missing_filenames
+        super().__init__(f"Резервная копия невозможна: отсутствуют данные {', '.join(missing_filenames)}")
+
+
+class BackupValidationError(ValueError):
+    """Post-parse валидация (JSON parse ИЛИ minimal shape) не прошла для
+    файла из архива restore — поднимается ДО единой записи (Phase 0).
+    Означает, что ВЕСЬ restore отменяется целиком (all-or-nothing) —
+    тихий skip одного битого файла с восстановлением остальных больше не
+    допускается (P1-1, production-hardening аудит)."""
+
+    def __init__(self, filename: str, reason: str, found_filenames: list[str]):
+        super().__init__(f"{filename}: {reason}")
+        self.filename = filename
+        self.reason = reason
+        self.found_filenames = found_filenames
+
+
+class BackupRestoreFailedError(RuntimeError):
+    """Запись JSON-файла (Phase 2) во время restore упала уже ПОСЛЕ
+    успешной Phase 0 (валидация) и Phase 1 (снапшот) — попытка отката уже
+    записанных файлов к снапшоту сделана; rollback_failed непустой значит,
+    что и сам откат не полностью удался, и часть production-данных могла
+    остаться в промежуточном состоянии — нужна ручная проверка
+    (P1-1, production-hardening аудит)."""
+
+    def __init__(self, failed_filename: str, rolled_back: list[str], rollback_failed: list[str]):
+        self.failed_filename = failed_filename
+        self.rolled_back = rolled_back
+        self.rollback_failed = rollback_failed
+        if rollback_failed:
+            msg = f"restore прерван на {failed_filename!r}, ОТКАТ НЕ УДАЛСЯ для: {rollback_failed}"
+        else:
+            msg = f"restore прерван на {failed_filename!r}, откат выполнен успешно для: {rolled_back}"
+        super().__init__(msg)
+
+
+@dataclass
+class BackupImportResult:
+    restored_json: list[str]
+    missing_json: list[str]
+    restored_images: list[str]
+    failed_images: list[str]
+
+
+def _validate_shape(filename: str, data: Any) -> str | None:
+    """Возвращает текст причины, если структура не проходит минимальную
+    проверку, иначе None. См. _REQUIRED_SHAPE — намеренно не проверяет
+    ничего сверх уже существующих допущений остального кода."""
+    if not isinstance(data, dict):
+        return "верхний уровень должен быть object (dict)"
+    for key, expected_type in _REQUIRED_SHAPE.get(filename, {}).items():
+        if key not in data:
+            return f"отсутствует обязательный ключ {key!r}"
+        if not isinstance(data[key], expected_type):
+            return f"ключ {key!r} должен быть {expected_type.__name__}"
+    return None
+
+
+def _write_image_atomic(dest: Path, content: bytes) -> None:
+    """Тот же паттерн, что и _write_local для JSON (temp-файл + os.replace)
+    — обрыв записи не оставляет старое фото заменённым наполовину
+    испорченными байтами: старый файл не трогается, пока новый полностью
+    не готов (P1-1, production-hardening аудит)."""
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(dir=dest.parent, prefix=f".{dest.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(content)
+        os.replace(tmp_path, dest)
+    except Exception:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+        raise
+
 
 def export_backup_bytes() -> bytes:
+    missing: list[str] = []
+    collected: dict[str, Any] = {}
+    for name in DATA_FILENAMES:
+        try:
+            collected[name] = _read(name)
+        except (FileNotFoundError, UpstashKeyMissingError):
+            missing.append(name)
+    if missing:
+        raise BackupExportError(missing)
+
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-        for name in DATA_FILENAMES:
-            try:
-                data = _read(name)
-            except FileNotFoundError:
-                continue
+        for name, data in collected.items():
             zf.writestr(f"data/{name}", json.dumps(data, ensure_ascii=False, indent=2))
         for img_dir, prefix in ((IMG_PORTFOLIO_DIR, "img/portfolio"), (IMG_ABOUT_DIR, "img/about")):
             if not img_dir.exists():
@@ -1113,35 +1222,118 @@ def export_backup_bytes() -> bytes:
     return buf.getvalue()
 
 
-def import_backup_bytes(actor_chat_id: int | str, zip_bytes: bytes) -> list[str]:
+def import_backup_bytes(actor_chat_id: int | str, zip_bytes: bytes) -> BackupImportResult:
     """Восстанавливает data/*.json и фото из .zip, созданного export_backup_bytes.
+
+    P1-1 (production-hardening аудит) — all-or-nothing restore:
+    Phase 0 — архив читается и полностью валидируется (parse + minimal
+    shape) ДО единой записи; любая ошибка отменяет ВЕСЬ restore.
+    Phase 1 — снапшот текущих значений файлов, которые будут перезаписаны
+    (тоже только чтение).
+    Phase 2 — сама запись JSON; при ошибке уже записанные файлы
+    откатываются к снапшоту (best-effort, без тяжёлой transaction-
+    инфраструктуры — Upstash REST не поддерживает multi-key транзакции).
+    Phase 3 — изображения, только после успешного завершения Phase 2
+    целиком; между собой не транзакционны (по решению аудита — не
+    изображать транзакционность там, где её нет), ошибка одного файла не
+    трогает остальные и не откатывает уже восстановленный JSON.
+
     Имена файлов в архиве берутся только по basename (без пути) и данные —
     только по белому списку DATA_FILENAMES, чтобы вредоносный/повреждённый
     .zip не мог записать что-то за пределами ожидаемых файлов (zip-slip)."""
     _require_designer(actor_chat_id)
-    restored: list[str] = []
+
+    # ---- Phase 0a: прочитать и классифицировать архив целиком — без
+    # парсинга JSON и без единой записи.
+    raw_json: dict[str, bytes] = {}
+    image_entries: list[tuple[str, Path, bytes]] = []
     with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
         for info in zf.infolist():
             if info.is_dir():
                 continue
             name = info.filename
-            content = zf.read(info)
             if name.startswith("data/") and name.endswith(".json"):
                 filename = name[len("data/"):]
                 if filename not in DATA_FILENAMES:
                     continue
-                try:
-                    data = json.loads(content.decode("utf-8"))
-                except (UnicodeDecodeError, json.JSONDecodeError):
-                    continue
-                _write(filename, data)
-                restored.append(name)
+                raw_json[filename] = zf.read(info)
             elif name.startswith("img/portfolio/"):
-                IMG_PORTFOLIO_DIR.mkdir(parents=True, exist_ok=True)
-                (IMG_PORTFOLIO_DIR / Path(name).name).write_bytes(content)
-                restored.append(name)
+                image_entries.append((name, IMG_PORTFOLIO_DIR / Path(name).name, zf.read(info)))
             elif name.startswith("img/about/"):
-                IMG_ABOUT_DIR.mkdir(parents=True, exist_ok=True)
-                (IMG_ABOUT_DIR / Path(name).name).write_bytes(content)
-                restored.append(name)
-    return restored
+                image_entries.append((name, IMG_ABOUT_DIR / Path(name).name, zf.read(info)))
+            # прочие записи в архиве — вне whitelist'а, безопасно игнорируются
+
+    found_json_filenames = list(raw_json.keys())
+
+    # ---- Phase 0b: parse + shape-валидация ВСЕХ найденных JSON — любая
+    # ошибка отменяет ВЕСЬ restore целиком, ни одной записи ещё не было.
+    json_plan: dict[str, Any] = {}
+    for filename, content in raw_json.items():
+        try:
+            data = json.loads(content.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as e:
+            raise BackupValidationError(filename, f"повреждённый JSON ({e})", found_json_filenames) from e
+        shape_error = _validate_shape(filename, data)
+        if shape_error:
+            raise BackupValidationError(filename, shape_error, found_json_filenames)
+        json_plan[filename] = data
+
+    missing_json = [f for f in DATA_FILENAMES if f not in json_plan]
+
+    # ---- Phase 1: снапшот текущих значений файлов, которые будут
+    # перезаписаны — тоже только чтение, ни одной записи.
+    snapshot: dict[str, Any] = {}
+    for filename in json_plan:
+        try:
+            snapshot[filename] = _read(filename)
+        except UpstashKeyMissingError:
+            snapshot[filename] = _MISSING
+
+    # ---- Phase 2: запись JSON. Ошибка -> откат уже записанных к снапшоту.
+    written: list[str] = []
+    failed_filename: str | None = None
+    write_error: Exception | None = None
+    for filename, data in json_plan.items():
+        try:
+            _write(filename, data)
+            written.append(filename)
+        except Exception as e:
+            failed_filename = filename
+            write_error = e
+            break
+
+    if write_error is not None:
+        rolled_back: list[str] = []
+        rollback_failed: list[str] = []
+        for filename in written:
+            if snapshot.get(filename) is _MISSING:
+                continue
+            try:
+                _write(filename, snapshot[filename])
+                rolled_back.append(filename)
+            except Exception:
+                logger.exception("Storage: backup rollback FAILED for %s — требуется ручная проверка данных", filename)
+                rollback_failed.append(filename)
+        if rollback_failed:
+            logger.error("Storage: backup restore aborted on %s, ROLLBACK INCOMPLETE for: %s", failed_filename, rollback_failed)
+        else:
+            logger.error("Storage: backup restore aborted on %s, rollback succeeded for: %s", failed_filename, rolled_back)
+        raise BackupRestoreFailedError(failed_filename, rolled_back, rollback_failed) from write_error
+
+    # ---- Phase 3: изображения — только после успешного JSON restore целиком.
+    restored_images: list[str] = []
+    failed_images: list[str] = []
+    for name, dest, content in image_entries:
+        try:
+            _write_image_atomic(dest, content)
+            restored_images.append(name)
+        except Exception:
+            logger.exception("Storage: backup image restore failed for %s (JSON restore already succeeded)", name)
+            failed_images.append(name)
+
+    return BackupImportResult(
+        restored_json=list(json_plan.keys()),
+        missing_json=missing_json,
+        restored_images=restored_images,
+        failed_images=failed_images,
+    )

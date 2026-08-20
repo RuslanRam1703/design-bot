@@ -980,7 +980,7 @@ class AdminBackupHandlersTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.tmpdir = tempfile.mkdtemp()
         real_data_dir = Path(__file__).resolve().parent.parent / "data"
-        for name in ("pricing.json", "portfolio.json", "faq.json", "about.json", "ui_config.json"):
+        for name in ("pricing.json", "portfolio.json", "faq.json", "about.json", "ui_config.json", "leads.json"):
             shutil.copy(real_data_dir / name, Path(self.tmpdir) / name)
         self._orig_data_dir = content_store.DATA_DIR
         self._orig_designer = content_store.config.DESIGNER_CHAT_ID
@@ -1000,6 +1000,7 @@ class AdminBackupHandlersTests(unittest.IsolatedAsyncioTestCase):
                 chat=SimpleNamespace(id=self.actor),
                 edit_text=AsyncMock(),
                 answer_document=AsyncMock(),
+                answer=AsyncMock(),
             ),
             answer=AsyncMock(),
         )
@@ -1285,6 +1286,18 @@ class StorageInitializationTests(unittest.TestCase):
         self.assertNotIn(content_store.MARKER_KEY, content_store.DATA_FILENAMES)
 
 
+def _make_zip(entries: dict[str, bytes]) -> bytes:
+    """Собирает .zip с произвольными записями напрямую (в обход
+    export_backup_bytes) — нужен тестам P1-1, которым нужно намеренно
+    подсунуть битый/неполный/посторонний контент, который сам
+    export_backup_bytes никогда бы не произвёл."""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for name, content in entries.items():
+            zf.writestr(name, content)
+    return buf.getvalue()
+
+
 class BackupExportImportTests(unittest.TestCase):
     """export_backup_bytes/import_backup_bytes — единственный бесплатный
     (без стороннего сервиса) способ пережить redeploy на Render: дизайнер
@@ -1357,6 +1370,220 @@ class BackupExportImportTests(unittest.TestCase):
     def test_import_rejects_non_zip_bytes(self):
         with self.assertRaises(zipfile.BadZipFile):
             content_store.import_backup_bytes(self.actor, b"not a zip file at all")
+
+    # ---- P1-1 (production-hardening аудит): all-or-nothing restore + snapshot/rollback ----
+
+    def test_full_valid_backup_restores_all_json_and_reports_no_missing(self):
+        zip_bytes = content_store.export_backup_bytes()
+        content_store.update_portfolio_type_related_service(self.actor, "landing", "SITE")  # мутируем после бэкапа
+
+        result = content_store.import_backup_bytes(self.actor, zip_bytes)
+
+        self.assertEqual(sorted(result.restored_json), sorted(content_store.DATA_FILENAMES))
+        self.assertEqual(result.missing_json, [])
+        self.assertEqual(result.failed_images, [])
+        self.assertIn("img/portfolio/case_1.jpg", result.restored_images)
+        self.assertEqual(content_store.default_related_service_for_type("landing"), "LEND")  # вернулось из бэкапа
+
+    def test_import_corrupted_json_writes_nothing(self):
+        original_faq = (Path(self.tmpdir) / "faq.json").read_bytes()
+        original_leads = (Path(self.tmpdir) / "leads.json").read_bytes()
+        zip_bytes = _make_zip({
+            "data/faq.json": original_faq,
+            "data/leads.json": b"{not valid json",
+        })
+
+        with self.assertRaises(content_store.BackupValidationError) as ctx:
+            content_store.import_backup_bytes(self.actor, zip_bytes)
+
+        self.assertEqual(ctx.exception.filename, "leads.json")
+        self.assertIn("leads.json", ctx.exception.found_filenames)
+        self.assertIn("faq.json", ctx.exception.found_filenames)
+        # all-or-nothing: 0 записей, оба файла на диске не изменились — даже
+        # заведомо валидный faq.json из того же архива не восстановлен
+        self.assertEqual((Path(self.tmpdir) / "faq.json").read_bytes(), original_faq)
+        self.assertEqual((Path(self.tmpdir) / "leads.json").read_bytes(), original_leads)
+
+    def test_import_invalid_shape_writes_nothing(self):
+        original_leads = (Path(self.tmpdir) / "leads.json").read_bytes()
+        bad_leads = json.dumps({"leads": "not-a-list"}).encode("utf-8")  # валидный JSON, неверная форма
+        zip_bytes = _make_zip({"data/leads.json": bad_leads})
+
+        with self.assertRaises(content_store.BackupValidationError) as ctx:
+            content_store.import_backup_bytes(self.actor, zip_bytes)
+
+        self.assertEqual(ctx.exception.filename, "leads.json")
+        self.assertIn("list", ctx.exception.reason)
+        self.assertEqual((Path(self.tmpdir) / "leads.json").read_bytes(), original_leads)
+
+    def test_import_missing_backup_file_does_not_break_others(self):
+        zip_bytes = content_store.export_backup_bytes()
+        with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
+            entries = {n: zf.read(n) for n in zf.namelist() if n != "data/about.json"}
+        trimmed_zip = _make_zip(entries)
+        content_store.update_portfolio_type_related_service(self.actor, "landing", "SITE")  # мутируем после бэкапа
+        original_about = (Path(self.tmpdir) / "about.json").read_bytes()
+
+        result = content_store.import_backup_bytes(self.actor, trimmed_zip)
+
+        self.assertIn("about.json", result.missing_json)
+        self.assertNotIn("about.json", result.restored_json)
+        self.assertEqual((Path(self.tmpdir) / "about.json").read_bytes(), original_about)  # не тронут
+        self.assertEqual(content_store.default_related_service_for_type("landing"), "LEND")  # остальное восстановлено
+
+    def test_import_ignores_unrelated_archive_file(self):
+        zip_bytes = content_store.export_backup_bytes()
+        with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
+            entries = {n: zf.read(n) for n in zf.namelist()}
+        entries["readme.txt"] = b"not a data file"
+        entries["data/unknown.json"] = b'{"whatever": true}'
+        combined_zip = _make_zip(entries)
+
+        result = content_store.import_backup_bytes(self.actor, combined_zip)
+
+        self.assertEqual(sorted(result.restored_json), sorted(content_store.DATA_FILENAMES))
+        self.assertEqual(result.missing_json, [])
+
+    def test_write_failure_on_first_json_leaves_no_state_change(self):
+        zip_bytes = content_store.export_backup_bytes()
+        content_store.update_portfolio_type_related_service(self.actor, "landing", "SITE")  # мутируем после бэкапа
+        pre_restore = {name: (Path(self.tmpdir) / name).read_bytes() for name in content_store.DATA_FILENAMES}
+
+        with patch("bot.content_store._write", side_effect=RuntimeError("simulated write failure")):
+            with self.assertRaises(content_store.BackupRestoreFailedError) as ctx:
+                content_store.import_backup_bytes(self.actor, zip_bytes)
+
+        self.assertEqual(ctx.exception.failed_filename, content_store.DATA_FILENAMES[0])  # portfolio.json — первый
+        self.assertEqual(ctx.exception.rolled_back, [])  # нечего было откатывать — ничего не успело записаться
+        self.assertEqual(ctx.exception.rollback_failed, [])
+        for name in content_store.DATA_FILENAMES:
+            self.assertEqual((Path(self.tmpdir) / name).read_bytes(), pre_restore[name])  # 0 изменений
+
+    def test_write_failure_on_nth_json_rolls_back_previous_byte_for_byte(self):
+        zip_bytes = content_store.export_backup_bytes()
+        content_store.update_portfolio_type_related_service(self.actor, "landing", "SITE")  # мутируем после бэкапа
+        # Сравниваем по распарсенному значению, а не сырым байтам: rollback
+        # идёт через _write() -> json.dump(indent=2), который канонически
+        # переформатирует JSON (переносы строк, отступы) независимо от
+        # исходного форматирования файла на диске — это не потеря данных
+        # (round-trip через json.loads/dumps уже происходит при КАЖДОЙ
+        # обычной записи в этом коде, не только при откате), поэтому
+        # "byte-for-byte" здесь означает содержимое, а не байты файла.
+        pre_restore = {name: json.loads((Path(self.tmpdir) / name).read_bytes()) for name in content_store.DATA_FILENAMES}
+
+        fail_on = "about.json"  # 4-й файл в DATA_FILENAMES — падение НЕ на первом
+        original_write = content_store._write
+
+        def fake_write(filename, data):
+            if filename == fail_on:
+                raise RuntimeError("simulated write failure")
+            return original_write(filename, data)
+
+        with patch("bot.content_store._write", side_effect=fake_write):
+            with self.assertRaises(content_store.BackupRestoreFailedError) as ctx:
+                content_store.import_backup_bytes(self.actor, zip_bytes)
+
+        self.assertEqual(ctx.exception.failed_filename, fail_on)
+        self.assertEqual(sorted(ctx.exception.rolled_back), ["faq.json", "portfolio.json", "pricing.json"])
+        self.assertEqual(ctx.exception.rollback_failed, [])
+
+        # ВСЕ 6 файлов — содержимое как ДО попытки restore: три успешно
+        # откатились, остальные (включая упавший) и не трогались
+        for name in content_store.DATA_FILENAMES:
+            self.assertEqual(json.loads((Path(self.tmpdir) / name).read_bytes()), pre_restore[name])
+
+    def test_rollback_failure_is_loud(self):
+        zip_bytes = content_store.export_backup_bytes()
+        content_store.update_portfolio_type_related_service(self.actor, "landing", "SITE")  # мутируем после бэкапа
+
+        fail_forward_on = "about.json"     # 4-й — здесь падает сама запись
+        fail_rollback_on = "pricing.json"  # 2-й — при откате его запись тоже падает
+        original_write = content_store._write
+        calls: dict[str, int] = {}
+
+        def fake_write(filename, data):
+            calls[filename] = calls.get(filename, 0) + 1
+            if filename == fail_forward_on:
+                raise RuntimeError("simulated forward write failure")
+            if filename == fail_rollback_on and calls[filename] == 2:
+                raise RuntimeError("simulated rollback write failure")
+            return original_write(filename, data)
+
+        with patch("bot.content_store._write", side_effect=fake_write):
+            with self.assertLogs("bot.content_store", level="ERROR") as log_ctx:
+                with self.assertRaises(content_store.BackupRestoreFailedError) as ctx:
+                    content_store.import_backup_bytes(self.actor, zip_bytes)
+
+        self.assertEqual(ctx.exception.failed_filename, fail_forward_on)
+        self.assertEqual(sorted(ctx.exception.rolled_back), ["faq.json", "portfolio.json"])
+        self.assertEqual(ctx.exception.rollback_failed, [fail_rollback_on])
+        self.assertTrue(any("ROLLBACK" in msg.upper() for msg in log_ctx.output))  # громкий лог о неудавшемся откате
+
+    def test_binary_write_happens_only_after_json_phase_succeeds(self):
+        zip_bytes = content_store.export_backup_bytes()
+        with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
+            entries = {n: zf.read(n) for n in zf.namelist()}
+        entries["img/portfolio/new_case.jpg"] = b"new-fake-image-bytes"
+        combined_zip = _make_zip(entries)
+
+        with patch("bot.content_store._write", side_effect=RuntimeError("simulated write failure")):
+            with self.assertRaises(content_store.BackupRestoreFailedError):
+                content_store.import_backup_bytes(self.actor, combined_zip)
+
+        self.assertFalse((content_store.IMG_PORTFOLIO_DIR / "new_case.jpg").exists())  # Phase 3 не запускался
+
+
+class BackupUpstashSafetyTests(unittest.TestCase):
+    """P1-1 (production-hardening аудит), пересечение с P0-1: export должен
+    полностью отказывать (не выдавать частичный ZIP), если хотя бы один
+    DATA_FILENAMES-ключ пропал (UpstashKeyMissingError) — никогда не
+    отдавать бэкап без leads.json под видом полноценного. Ни export, ни
+    import никогда не должны трогать MARKER_KEY."""
+
+    def setUp(self):
+        self.fake = FakeUpstash()
+        self._orig_url = content_store.config.UPSTASH_REDIS_REST_URL
+        self._orig_token = content_store.config.UPSTASH_REDIS_REST_TOKEN
+        self._orig_designer = content_store.config.DESIGNER_CHAT_ID
+        content_store.config.UPSTASH_REDIS_REST_URL = "https://fake-upstash.example/"
+        content_store.config.UPSTASH_REDIS_REST_TOKEN = "fake-token"
+        content_store.config.DESIGNER_CHAT_ID = "999"
+        self.actor = "999"
+        self._patch = patch("bot.content_store.urllib.request.urlopen", side_effect=self.fake.urlopen)
+        self._patch.start()
+        content_store.ensure_storage_initialized()  # "продакшн" Upstash с реальными данными + marker
+
+    def tearDown(self):
+        self._patch.stop()
+        content_store.config.UPSTASH_REDIS_REST_URL = self._orig_url
+        content_store.config.UPSTASH_REDIS_REST_TOKEN = self._orig_token
+        content_store.config.DESIGNER_CHAT_ID = self._orig_designer
+
+    def test_export_with_all_keys_present_succeeds(self):
+        zip_bytes = content_store.export_backup_bytes()
+        with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
+            names = zf.namelist()
+        self.assertIn("data/leads.json", names)
+
+    def test_export_with_missing_key_fails_completely(self):
+        del self.fake.store["leads.json"]  # ключ "пропал" уже ПОСЛЕ инициализации (P0-1 сценарий)
+        with self.assertRaises(content_store.BackupExportError) as ctx:
+            content_store.export_backup_bytes()
+        self.assertEqual(ctx.exception.missing_filenames, ["leads.json"])
+
+    def test_export_with_multiple_missing_keys_lists_all(self):
+        del self.fake.store["leads.json"]
+        del self.fake.store["faq.json"]
+        with self.assertRaises(content_store.BackupExportError) as ctx:
+            content_store.export_backup_bytes()
+        self.assertEqual(sorted(ctx.exception.missing_filenames), ["faq.json", "leads.json"])
+
+    def test_import_and_export_never_touch_marker(self):
+        calls_before = len(self.fake.calls)
+        zip_bytes = content_store.export_backup_bytes()
+        content_store.import_backup_bytes(self.actor, zip_bytes)
+        new_calls = self.fake.calls[calls_before:]
+        self.assertFalse(any(c[1] == content_store.MARKER_KEY for c in new_calls))
 
 
 class ReferentialIntegrityTests(unittest.TestCase):

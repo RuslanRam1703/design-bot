@@ -1600,7 +1600,16 @@ async def menu_backup(callback: CallbackQuery, state: FSMContext) -> None:
 
 @router.callback_query(F.data == "adminbackupaction:export")
 async def backup_export(callback: CallbackQuery, state: FSMContext) -> None:
-    zip_bytes = content_store.export_backup_bytes()
+    try:
+        zip_bytes = content_store.export_backup_bytes()
+    except content_store.BackupExportError as e:
+        await callback.message.answer(
+            f"❌ Резервная копия НЕ создана: отсутствуют данные — {', '.join(e.missing_filenames)}.\n\n"
+            "Архив не выдан, чтобы неполный бэкап случайно не приняли за полноценный.\n\nБэкап:",
+            reply_markup=kb.backup_menu_keyboard(),
+        )
+        await callback.answer()
+        return
     stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d_%H%M")
     filename = f"design-bot-backup-{stamp}.zip"
     await callback.message.answer_document(
@@ -1623,14 +1632,48 @@ async def backup_import_receive(message: Message, state: FSMContext) -> None:
     file = await message.bot.get_file(message.document.file_id)
     file_bytes_io = await message.bot.download_file(file.file_path)
     try:
-        restored = content_store.import_backup_bytes(message.chat.id, file_bytes_io.read())
+        result = content_store.import_backup_bytes(message.chat.id, file_bytes_io.read())
     except zipfile.BadZipFile:
         await message.answer("Файл повреждён или не .zip — пришлите другой файл.", reply_markup=kb.cancel_keyboard())
         return
-    if restored:
-        await message.answer(f"Восстановлено файлов: {len(restored)} ✅\n\nБэкап:", reply_markup=kb.backup_menu_keyboard())
-    else:
-        await message.answer("В архиве не нашлось знакомых файлов данных/фото — ничего не восстановлено.\n\nБэкап:", reply_markup=kb.backup_menu_keyboard())
+    except content_store.BackupValidationError as e:
+        found = ", ".join(e.found_filenames) if e.found_filenames else "—"
+        await message.answer(
+            "❌ Восстановление ПОЛНОСТЬЮ отменено, ничего не изменено.\n\n"
+            f"Файл: {e.filename}\nОшибка: {e.reason}\nНайдено в архиве: {found}",
+            reply_markup=kb.backup_menu_keyboard(),
+        )
+        await state.set_state(AdminStates.backup_menu)
+        return
+    except content_store.BackupRestoreFailedError as e:
+        if e.rollback_failed:
+            await message.answer(
+                f"🔴 КРИТИЧНО: восстановление прервано на файле {e.failed_filename}, "
+                f"откат НЕ полностью удался для: {', '.join(e.rollback_failed)}.\n\n"
+                "Требуется ручная проверка данных через /admin!",
+                reply_markup=kb.backup_menu_keyboard(),
+            )
+        else:
+            await message.answer(
+                f"⚠️ Восстановление отменено из-за ошибки записи ({e.failed_filename}). "
+                "Исходное состояние данных восстановлено.",
+                reply_markup=kb.backup_menu_keyboard(),
+            )
+        await state.set_state(AdminStates.backup_menu)
+        return
+
+    lines: list[str] = []
+    if result.restored_json:
+        lines.append(f"Восстановлено файлов данных: {len(result.restored_json)} — {', '.join(result.restored_json)}")
+    if result.missing_json:
+        lines.append(f"Отсутствовали в бэкапе (не восстановлены, текущие данные не тронуты): {', '.join(result.missing_json)}")
+    if result.restored_images:
+        lines.append(f"Восстановлено изображений: {len(result.restored_images)}")
+    if result.failed_images:
+        lines.append(f"⚠️ Не удалось восстановить {len(result.failed_images)} изображений (данные уже восстановлены): {', '.join(result.failed_images)}")
+    if not result.restored_json and not result.restored_images:
+        lines.append("В архиве не нашлось знакомых файлов данных/фото — ничего не восстановлено.")
+    await message.answer("\n".join(lines) + "\n\nБэкап:", reply_markup=kb.backup_menu_keyboard())
     await state.set_state(AdminStates.backup_menu)
 
 
