@@ -91,6 +91,31 @@ function applyTheme() {
   if (realTG) document.documentElement.dataset.theme = TG.colorScheme();
 }
 
+// ---- ВРЕМЕННАЯ runtime-диагностика (см. аудит про stale step 7 в проде) ----
+// TODO(diag): удалить после того, как источник состояния подтверждён —
+// это не часть постоянной архитектуры, только console.log без payload/
+// user_id/контактов/содержимого заявки/токенов, ничего не отправляется
+// на сервер и никуда не сохраняется.
+const DIAG_SESSION_ID = (window.crypto && window.crypto.randomUUID)
+  ? window.crypto.randomUUID()
+  : `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+
+function diagLog(event, data) {
+  try {
+    console.log(`[diag][${DIAG_SESSION_ID}] ${event}`, data);
+  } catch (e) {
+    // console недоступен — не критично, это только диагностика
+  }
+}
+
+function diagLocalStoragePresent() {
+  try {
+    return localStorage.getItem(BRIEF_DRAFT_STORAGE_KEY) !== null;
+  } catch (e) {
+    return null;
+  }
+}
+
 // ---- Состояние приложения ----
 const state = {
   pricing: null,
@@ -200,12 +225,24 @@ function persistBriefDraft() {
 }
 
 function restoreBriefDraft() {
+  const present = diagLocalStoragePresent();
+  let parseOk = null;
   try {
     const saved = localStorage.getItem(BRIEF_DRAFT_STORAGE_KEY);
-    if (saved) state.brief = { ...state.brief, ...JSON.parse(saved) };
+    if (saved) {
+      state.brief = { ...state.brief, ...JSON.parse(saved) };
+      parseOk = true;
+    }
   } catch (e) {
     // повреждённые данные в хранилище — остаёмся с дефолтным пустым брифом
+    parseOk = false;
   }
+  diagLog("restoreBriefDraft", {
+    localStoragePresent: present,
+    localStorageParseOk: parseOk,
+    stepAfter: state.brief.step,
+    draftIdPresentAfter: !!state.brief.draftId,
+  });
 }
 
 function clearBriefDraft() {
@@ -251,6 +288,7 @@ function resetBriefState({ hardReset = false } = {}) {
     // предыдущую, уже отправленную заявку при следующем submit.
     draftId: generateDraftId(),
   };
+  diagLog("resetBriefState", { hardReset, step: state.brief.step, draftIdPresent: !!state.brief.draftId });
 }
 
 // ---- Загрузка данных и старт ----
@@ -259,8 +297,14 @@ async function init() {
   TG.expand();
   applyTheme();
   TG.onThemeChanged(applyTheme);
-  restoreBriefDraft();
+  diagLog("init:start", {
+    step: state.brief.step,
+    draftIdPresent: !!state.brief.draftId,
+    localStoragePresent: diagLocalStoragePresent(),
+  });
+  restoreBriefDraft(); // сама логирует "restoreBriefDraft" — present/parseOk/step/draftId после
   if (!state.brief.draftId) state.brief.draftId = generateDraftId();
+  diagLog("init:draftId_ensured", { step: state.brief.step, draftIdPresent: !!state.brief.draftId });
 
   const [pricing, portfolio, about, uiConfig] = await Promise.all([
     fetch("/data/pricing.json").then((r) => r.json()),
@@ -341,6 +385,12 @@ function attachTabBarEvents() {
         // и историю для корректного "назад"), а не как в свежий таб.
         // Осознанный сброс брифа уже есть отдельно — там, где он оправдан
         // намерением пользователя: CTA в кейсе/калькуляторе/about (resetBrief: true).
+        diagLog("tabClick:brief", {
+          stepBefore: state.brief.step,
+          draftIdPresentBefore: !!state.brief.draftId,
+          localStoragePresentBefore: diagLocalStoragePresent(),
+          resetPerformed: false, // navigate() ниже вызван БЕЗ resetBrief:true
+        });
         navigate(screen);
         return;
       }
@@ -1245,9 +1295,15 @@ async function submitBrief() {
     state.lastPayload = payload;
     state.lastLeadResult = result; // { lead_id, created, attach_tz, price_range }
     state.history = [];
+    const diagStepBeforeReset = state.brief.step;
     navigate("submitted", { pushHistory: false });
     clearBriefDraft();
     resetBriefState({ hardReset: true });
+    diagLog("submitBrief:success_reset", {
+      stepBefore: diagStepBeforeReset,
+      stepAfter: state.brief.step,
+      localStoragePresentAfterClear: diagLocalStoragePresent(),
+    });
   } catch (e) {
     // Черновик НЕ теряем при ошибке — пользователь остаётся на том же шаге
     // с уже заполненными полями и может просто попробовать ещё раз.
