@@ -320,6 +320,17 @@ const state = {
   // restoreBriefDraft()/clearBriefDraft() — обычный черновик новой заявки
   // не должен ни читаться, ни перезаписываться этим режимом.
   supplement: null, // { leadId, comment, additionalRequirements, references, contact, wantsFile, submitting, error, sent, supplementId }
+  // briefEntryPending — true только сразу после того, как init() восстановил
+  // из localStorage РЕАЛЬНО начатый черновик (см. briefDraftHasProgress).
+  // Пока true, вкладка "Заказать" показывает выбор "Продолжить"/"Начать
+  // новую" вместо того, чтобы сразу открыть Order Builder на сохранённом
+  // шаге — иначе клиент, не желающий продолжать старую заявку, не имел
+  // понятного способа начать новую (см. UX-аудит про восстановленный
+  // step 7). НЕ персистится — это чисто сессионное "решение ещё не
+  // принято", не часть самого черновика. Осознанные "новый заход"-пути
+  // (CTA из кейса/калькулятора/about, "В начало", "Начать новую заявку" из
+  // supplement) сбрасывают этот флаг сами — см. resetBriefState().
+  briefEntryPending: false,
 };
 
 function generateDraftId() {
@@ -375,6 +386,9 @@ function persistBriefDraft() {
   }
 }
 
+// Возвращает true, только если в localStorage реально лежал корректно
+// разбираемый черновик и он был влит в state.brief — это и есть сигнал
+// "существует восстановленный draft" для briefEntryPending (см. init()).
 function restoreBriefDraft() {
   const present = diagLocalStoragePresent();
   let parseOk = null;
@@ -394,6 +408,15 @@ function restoreBriefDraft() {
     stepAfter: state.brief.step,
     draftIdPresentAfter: !!state.brief.draftId,
   });
+  return parseOk === true;
+}
+
+// "Есть реальный прогресс" — иначе экран выбора "Продолжить/Начать новую"
+// показывался бы даже для нетронутого дефолтного черновика (шаг 1, ничего
+// не выбрано), что не несёт клиенту никакой пользы и выглядело бы как
+// лишний вопрос на пустом месте.
+function briefDraftHasProgress(b) {
+  return b.step > 1 || !!b.serviceId;
 }
 
 function clearBriefDraft() {
@@ -439,6 +462,11 @@ function resetBriefState({ hardReset = false } = {}) {
     // предыдущую, уже отправленную заявку при следующем submit.
     draftId: generateDraftId(),
   };
+  // Любой resetBriefState() — это уже осознанный выбор пользователя (CTA
+  // из кейса/калькулятора/about, "В начало", "Начать новую заявку"), так
+  // что экран выбора "Продолжить/Начать новую" для него неактуален —
+  // решение по факту уже принято этим самым вызовом.
+  state.briefEntryPending = false;
   diagLog("resetBriefState", { hardReset, step: state.brief.step, draftIdPresent: !!state.brief.draftId });
 }
 
@@ -453,8 +481,12 @@ async function init() {
     draftIdPresent: !!state.brief.draftId,
     localStoragePresent: diagLocalStoragePresent(),
   });
-  restoreBriefDraft(); // сама логирует "restoreBriefDraft" — present/parseOk/step/draftId после
+  const restored = restoreBriefDraft(); // сама логирует "restoreBriefDraft" — present/parseOk/step/draftId после
   if (!state.brief.draftId) state.brief.draftId = generateDraftId();
+  // См. state.briefEntryPending — восстановленный черновик БЕЗ реального
+  // прогресса (пустой шаг 1) не требует спрашивать "продолжить или новую":
+  // спрашивать там нечего.
+  state.briefEntryPending = restored && briefDraftHasProgress(state.brief);
   diagLog("init:draftId_ensured", { step: state.brief.step, draftIdPresent: !!state.brief.draftId });
 
   const [pricing, portfolio, about, uiConfig] = await Promise.all([
@@ -1149,6 +1181,23 @@ function renderCalculator() {
 const BRIEF_TOTAL_STEPS = 7;
 
 function attachBriefEvents() {
+  if (state.briefEntryPending) {
+    const continueBtn = document.getElementById("brief-entry-continue");
+    if (continueBtn) continueBtn.addEventListener("click", () => {
+      // "Продолжить" — ничего в самом черновике не трогаем (тот же
+      // draftId, те же ответы, тот же шаг), просто снимаем вопрос.
+      state.briefEntryPending = false;
+      render();
+    });
+    const newBtn = document.getElementById("brief-entry-new");
+    if (newBtn) newBtn.addEventListener("click", () => {
+      clearBriefDraft();
+      resetBriefState({ hardReset: true }); // сама снимает briefEntryPending
+      render();
+    });
+    return;
+  }
+
   const backBtn = document.getElementById("back");
   if (backBtn) backBtn.addEventListener("click", goBack);
 
@@ -1472,7 +1521,33 @@ function renderProgress(step) {
   return `<div class="step-progress">${dots}</div>`;
 }
 
+// Отдельный экран-развилка перед Order Builder — показывается только если
+// init() восстановил реально начатый черновик (см. state.briefEntryPending)
+// и клиент зашёл сюда обычной вкладкой "Заказать" (а не осознанным CTA,
+// который сам уже сбросил флаг через resetBriefState()). Без этого экрана
+// у клиента, не желающего продолжать старую заявку, не было понятного
+// способа начать новую — единственный "В начало" жил только на экране
+// "Готово", которого к этому моменту уже нет (см. UX-аудит).
+function renderBriefEntryChoice() {
+  return `
+    <div class="topbar"><h1>✍️ Заказать</h1></div>
+    <div class="case-block">
+      <p>У вас есть незавершённая заявка. Продолжить её или начать новую?</p>
+    </div>
+    <div class="btn-row">
+      <button class="btn btn-primary" id="brief-entry-continue">Продолжить</button>
+    </div>
+    <div class="btn-row">
+      <button class="btn btn-secondary" id="brief-entry-new">Начать новую заявку</button>
+    </div>
+  `;
+}
+
 function renderBrief() {
+  if (state.briefEntryPending) {
+    return renderBriefEntryChoice();
+  }
+
   const b = state.brief;
   const step = b.step;
 
