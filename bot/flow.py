@@ -10,44 +10,56 @@ RULE 3 — шаги внутри одного сценария редактир�
 (edit_text) вместо отправки нового сообщения на каждый шаг.
 
 Все удаления — best-effort (try/except): Telegram может отказать (сообщение
-старше 48 часов, уже удалено и т.п.) — это не должно ронять бота."""
+старше 48 часов, уже удалено и т.п.) — это не должно ронять бота.
+
+ДВА НЕЗАВИСИМЫХ ANCHOR'а (см. UX-аудит про исчезающую persistent
+reply-клавиатуру после FAQ/admin — zero-width-хак refresh_reply_keyboard
+оказался ненадёжен в реальном Telegram Desktop: удаление carrier-сообщения
+сбрасывало клавиатуру, несмотря на is_persistent=True):
+
+- NAV anchor (_NAV_ANCHOR_*) — persistent navigation: ОДНО сообщение на весь
+  чат, несущее ReplyKeyboardMarkup. Создаётся один раз лениво (см.
+  ensure_nav_anchor), никогда не удаляется RULE 1/2/3, редактируется только
+  при явном возврате в главное меню (см. reset_nav_screen).
+- TRANSIENT anchor (_ANCHOR_*, прежнее имя, теперь только для этого) — то,
+  чем управляют RULE 1/2/3 ниже: FAQ/Admin/Portfolio/... экраны и шаги
+  сценариев. Несёт InlineKeyboardMarkup или ничего — никогда persistent
+  reply-клавиатуру."""
 
 from aiogram.exceptions import TelegramAPIError
 from aiogram.fsm.context import FSMContext
-from aiogram.types import CallbackQuery, InlineKeyboardMarkup, Message, ReplyKeyboardMarkup
+from aiogram.types import CallbackQuery, InlineKeyboardMarkup, Message
 
+from bot import texts
 from bot.keyboards import reply_keyboard_for_chat
 
 _ANCHOR_MSG_KEY = "_flow_msg_id"
 _ANCHOR_CHAT_KEY = "_flow_chat_id"
+_NAV_ANCHOR_MSG_KEY = "_nav_msg_id"
+_NAV_ANCHOR_CHAT_KEY = "_nav_chat_id"
 
 
 async def open_flow(
     message: Message,
     state: FSMContext,
     text: str,
-    reply_markup: InlineKeyboardMarkup | ReplyKeyboardMarkup | None = None,
+    reply_markup: InlineKeyboardMarkup | None = None,
 ) -> None:
-    """Показать новый корневой экран/сценарий (нет предыдущего сообщения
-    бота, которое можно было бы отредактировать). Сначала удаляет то, что
-    было отмечено как текущий экран (RULE 2), затем триггер (RULE 1), затем
-    отправляет новое сообщение и запоминает его как текущий экран — все
-    дальнейшие шаги (через step_from_text/step_from_callback) будут
+    """Показать новый TRANSIENT корневой экран/сценарий (нет предыдущего
+    сообщения бота, которое можно было бы отредактировать). Сначала
+    гарантирует persistent navigation anchor (см. ensure_nav_anchor —
+    no-op, если он уже существует; никогда не пересекается с тем, что
+    делает этот метод дальше), затем удаляет то, что было отмечено как
+    текущий TRANSIENT экран (RULE 2), затем триггер (RULE 1), затем
+    отправляет новое сообщение и запоминает его как текущий TRANSIENT экран
+    — все дальнейшие шаги (через step_from_text/step_from_callback) будут
     редактировать именно его, а не копиться новыми сообщениями.
 
-    Если сам этот новый экран несёт НЕ persistent reply-клавиатуру (то есть
-    inline или вообще без разметки) — ПЕРЕД удалением предыдущего anchor
-    сначала "освежаем" reply-клавиатуру (см. refresh_reply_keyboard ниже).
-    Раньше это было обязанностью каждого вызывающего кода по отдельности
-    (и /admin, например, эту обязанность и не выполнял вовсе — реальный
-    пробел, найденный при аудите) — и, что важнее, делалось уже ПОСЛЕ
-    удаления предыдущего anchor. Если этот anchor был последним сообщением,
-    подтверждавшим reply-клавиатуру клиенту, в этом промежутке клиент мог
-    остаться без нормальной reply-клавиатуры до следующего подтверждения
-    (см. UX-аудит, regression после интеграции FAQ в этот же lifecycle) —
-    порядок здесь важен, а не просто "сделать оба действия"."""
-    if not isinstance(reply_markup, ReplyKeyboardMarkup):
-        await refresh_reply_keyboard(message, reply_keyboard_for_chat(message.chat.id))
+    reply_markup здесь — ТОЛЬКО InlineKeyboardMarkup или None. Persistent
+    reply-клавиатура — исключительно забота nav anchor'а (см. модуль-level
+    docstring, ensure_nav_anchor, reset_nav_screen); TRANSIENT экран её
+    никогда не несёт и не обязан её "освежать"."""
+    await ensure_nav_anchor(message, state)
 
     data = await state.get_data()
     prev_id = data.get(_ANCHOR_MSG_KEY)
@@ -125,30 +137,72 @@ async def delete_trigger(message: Message) -> None:
         pass
 
 
-async def refresh_reply_keyboard(message: Message, reply_markup: ReplyKeyboardMarkup) -> None:
-    """"Освежает" постоянную reply-клавиатуру после ответа, который несёт
-    (или сейчас понесёт) InlineKeyboardMarkup — Bot API не позволяет одному
-    сообщению нести оба типа разметки сразу, поэтому шлём отдельное
-    сообщение с невидимым текстом (zero-width space) только чтобы
-    Telegram-клиент подтвердил reply-клавиатуру, и сразу его best-effort
-    удаляем — не должно оставлять следа в чате и не должно ронять
-    вызывающий handler, если отправка или удаление не удались (тот же
-    принцип, что и delete_trigger).
+async def ensure_nav_anchor(message: Message, state: FSMContext) -> bool:
+    """Гарантирует существование persistent NAV anchor'а — единственного
+    источника постоянной reply-клавиатуры в чате (см. модуль-level
+    docstring). Если anchor уже отслеживается в state.data — no-op: ничего
+    не отправляет и не удаляет. Иначе — отправляет texts.WELCOME с
+    reply_keyboard_for_chat() и запоминает его.
 
-    Вызывается автоматически из open_flow (см. выше) для любого корневого
-    экрана без своей persistent-клавиатуры — отдельно вызывать эту функцию
-    для /portfolio, /about, /brief, /faq, /admin, "🚀 Открыть приложение" не
-    нужно, open_flow уже это делает. Остаётся публичной для случаев вне
-    open_flow (см. bot/handlers/start.py::main_menu_or_confirm — экран
-    подтверждения не создаёт новый anchor, поэтому не идёт через open_flow)."""
+    НЕ использует zero-width-сообщения (см. UX-аудит: send-then-delete
+    carrier оказался ненадёжен в реальном Telegram Desktop даже с
+    is_persistent=True) — nav anchor остаётся живым сообщением всегда.
+
+    Возвращает True, если anchor был только что создан этим вызовом (и
+    поэтому уже показывает WELCOME — см. reset_nav_screen, которому не
+    нужно затем ещё и редактировать его)."""
+    data = await state.get_data()
+    if data.get(_NAV_ANCHOR_MSG_KEY) and data.get(_NAV_ANCHOR_CHAT_KEY):
+        return False
+    await _create_nav_anchor(message, state)
+    return True
+
+
+async def _create_nav_anchor(message: Message, state: FSMContext) -> None:
+    sent = await message.answer(texts.WELCOME, reply_markup=reply_keyboard_for_chat(message.chat.id))
+    await state.update_data(**{_NAV_ANCHOR_MSG_KEY: sent.message_id, _NAV_ANCHOR_CHAT_KEY: sent.chat.id})
+
+
+async def reset_nav_screen(message: Message, state: FSMContext) -> None:
+    """"⌂ Главное меню" / /start — полный возврат к чистому persistent
+    navigation. Завершает любой активный сценарий (аварийный выход — тот же
+    смысл, что раньше был у open_root через finish_flow), удаляет текущий
+    TRANSIENT экран и триггер, затем показывает приветствие ЧЕРЕЗ уже
+    существующий NAV anchor (edit_message_text), а не новым сообщением —
+    то самое сообщение, что несёт reply-клавиатуру, никогда не
+    пересоздаётся без необходимости (см. ensure_nav_anchor).
+
+    Если редактирование не удалось из-за того, что anchor реально пропал
+    (например, пользователь удалил его вручную — Telegram это разрешает в
+    приватных чатах) — best-effort пересоздаёт anchor, не роняя handler.
+    "message is not modified" (двойное нажатие "Главное меню" подряд) —
+    штатный, не ошибочный случай, отдельно не пересоздаёт anchor."""
+    await finish_flow(state)
+
+    data = await state.get_data()
+    transient_id = data.get(_ANCHOR_MSG_KEY)
+    transient_chat = data.get(_ANCHOR_CHAT_KEY)
+    if transient_id and transient_chat:
+        try:
+            await message.bot.delete_message(chat_id=transient_chat, message_id=transient_id)
+        except TelegramAPIError:
+            pass
+        await state.update_data(**{_ANCHOR_MSG_KEY: None, _ANCHOR_CHAT_KEY: None})
+
+    await delete_trigger(message)
+
+    if await ensure_nav_anchor(message, state):
+        return  # только что отправлен этим же вызовом — уже показывает WELCOME
+
+    data = await state.get_data()
+    nav_id = data.get(_NAV_ANCHOR_MSG_KEY)
+    nav_chat = data.get(_NAV_ANCHOR_CHAT_KEY)
     try:
-        sent = await message.answer("​", reply_markup=reply_markup)
-    except TelegramAPIError:
-        return
-    try:
-        await message.bot.delete_message(chat_id=sent.chat.id, message_id=sent.message_id)
-    except TelegramAPIError:
-        pass
+        await message.bot.edit_message_text(texts.WELCOME, chat_id=nav_chat, message_id=nav_id)
+    except TelegramAPIError as exc:
+        if "not modified" in exc.message.lower():
+            return
+        await _create_nav_anchor(message, state)
 
 
 async def finish_flow(state: FSMContext) -> None:
@@ -161,7 +215,7 @@ async def open_root(
     message: Message,
     state: FSMContext,
     text: str,
-    reply_markup: InlineKeyboardMarkup | ReplyKeyboardMarkup | None = None,
+    reply_markup: InlineKeyboardMarkup | None = None,
 ) -> None:
     """Как open_flow, но для входных точек нижнего меню/команд, которые
     показывают корневой экран без собственного FSM-состояния (Портфолио,

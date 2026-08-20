@@ -313,23 +313,23 @@ class FlowUtilTests(unittest.IsolatedAsyncioTestCase):
     внутри сценария редактируют одно сообщение. Удаления — best-effort."""
 
     async def test_open_flow_deletes_previous_anchor_and_trigger_then_tracks_new_message(self):
-        # reply_markup=None (не ReplyKeyboardMarkup) -> open_flow сначала
-        # сам "освежает" reply-клавиатуру (см. UX-аудит про исчезающую
-        # клавиатуру после FAQ) — отсюда доп. answer()/delete_message() пара
-        # ДО основного сообщения, а не вместо него.
+        # Свежий state (нет NAV anchor'а) -> ensure_nav_anchor сам создаёт
+        # его первым answer()-вызовом (см. bot/flow.py) — это ЧИСТАЯ
+        # отправка, без единого delete_message. Единственный delete_message
+        # здесь — RULE 2 (удаление предыдущего TRANSIENT anchor, заранее
+        # положенного в state.data).
         state = make_state()
         await state.update_data(_flow_msg_id=111, _flow_chat_id=888)
         msg = make_flow_message()
 
         await flow.open_flow(msg, state, "Новый экран")
 
-        self.assertEqual(msg.bot.delete_message.await_count, 2)  # refresh cleanup + RULE 2
-        msg.bot.delete_message.assert_any_await(chat_id=888, message_id=111)  # RULE 2 — старый anchor
-        self.assertEqual(msg.answer.await_count, 2)  # refresh (invisible) + основное сообщение
+        msg.bot.delete_message.assert_awaited_once_with(chat_id=888, message_id=111)  # RULE 2 — старый TRANSIENT anchor
+        self.assertEqual(msg.answer.await_count, 2)  # NAV anchor (создан) + новый TRANSIENT экран
         last_call = msg.answer.await_args_list[-1]
         self.assertEqual(last_call.args[0] if last_call.args else last_call.kwargs.get("text"), "Новый экран")
         data = await state.get_data()
-        self.assertEqual(data["_flow_msg_id"], 555)  # новое сообщение стало текущим экраном
+        self.assertEqual(data["_flow_msg_id"], 555)  # новое TRANSIENT-сообщение стало текущим экраном
 
     async def test_open_flow_survives_delete_failures_best_effort(self):
         state = make_state()
@@ -339,7 +339,7 @@ class FlowUtilTests(unittest.IsolatedAsyncioTestCase):
 
         await flow.open_flow(msg, state, "Новый экран")  # не должно упасть
 
-        self.assertEqual(msg.answer.await_count, 2)  # refresh + основное сообщение, оба отправлены
+        self.assertEqual(msg.answer.await_count, 2)  # NAV anchor + новый TRANSIENT экран, оба отправлены
 
     async def test_step_from_callback_edits_in_place_not_sending_new_message(self):
         state = make_state()
@@ -377,44 +377,117 @@ class FlowUtilTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIsNone(await state.get_state())
 
-    async def test_refresh_reply_keyboard_sends_invisible_text_and_deletes_it(self):
+
+class NavAnchorTests(unittest.IsolatedAsyncioTestCase):
+    """NAV anchor (persistent reply-клавиатура) — независим от TRANSIENT
+    anchor'а, которым управляют RULE 1-3 (см. UX-аудит про исчезающую
+    клавиатуру после FAQ/admin: zero-width send-then-delete carrier
+    оказался ненадёжен в реальном Telegram Desktop даже с is_persistent=
+    True — удаление carrier-сообщения сбрасывало клавиатуру). NAV anchor
+    никогда не удаляется — только создаётся один раз лениво и, при
+    необходимости, редактируется на месте."""
+
+    async def test_ensure_nav_anchor_creates_when_missing(self):
         from aiogram.types import ReplyKeyboardMarkup
 
-        markup = ReplyKeyboardMarkup(keyboard=[[]], resize_keyboard=True)
+        state = make_state()
         msg = make_flow_message()
 
-        await flow.refresh_reply_keyboard(msg, markup)
+        created = await flow.ensure_nav_anchor(msg, state)
 
+        self.assertTrue(created)
         msg.answer.assert_awaited_once()
         call = msg.answer.await_args
         sent_text = call.args[0] if call.args else call.kwargs.get("text")
-        self.assertEqual(sent_text, "​")
-        self.assertIs(call.kwargs.get("reply_markup"), markup)
-        # answer() в make_flow_message всегда возвращает message_id=555 —
-        # именно это сообщение и должно быть удалено.
-        msg.bot.delete_message.assert_awaited_once_with(chat_id=888, message_id=555)
+        self.assertEqual(sent_text, texts.WELCOME)
+        sent_markup = call.kwargs.get("reply_markup") or call.args[1]
+        self.assertIsInstance(sent_markup, ReplyKeyboardMarkup)
+        data = await state.get_data()
+        self.assertEqual(data[flow._NAV_ANCHOR_MSG_KEY], 555)
+        self.assertEqual(data[flow._NAV_ANCHOR_CHAT_KEY], 888)
 
-    async def test_refresh_reply_keyboard_survives_send_failure(self):
-        from aiogram.types import ReplyKeyboardMarkup
-
-        markup = ReplyKeyboardMarkup(keyboard=[[]], resize_keyboard=True)
+    async def test_ensure_nav_anchor_noop_when_already_exists(self):
+        state = make_state()
+        await state.update_data(**{flow._NAV_ANCHOR_MSG_KEY: 111, flow._NAV_ANCHOR_CHAT_KEY: 888})
         msg = make_flow_message()
-        msg.answer = AsyncMock(side_effect=TelegramAPIError(method=None, message="blocked by user"))
 
-        await flow.refresh_reply_keyboard(msg, markup)  # не должно упасть
+        created = await flow.ensure_nav_anchor(msg, state)
 
-        msg.bot.delete_message.assert_not_awaited()  # нечего удалять — отправка не удалась
+        self.assertFalse(created)
+        msg.answer.assert_not_awaited()
+        msg.bot.delete_message.assert_not_awaited()
 
-    async def test_refresh_reply_keyboard_survives_delete_failure(self):
-        from aiogram.types import ReplyKeyboardMarkup
-
-        markup = ReplyKeyboardMarkup(keyboard=[[]], resize_keyboard=True)
+    async def test_reset_nav_screen_edits_existing_anchor_instead_of_new_message(self):
+        state = make_state()
+        await state.update_data(**{flow._NAV_ANCHOR_MSG_KEY: 111, flow._NAV_ANCHOR_CHAT_KEY: 888})
         msg = make_flow_message()
-        msg.bot.delete_message = AsyncMock(side_effect=TelegramAPIError(method=None, message="message not found"))
 
-        await flow.refresh_reply_keyboard(msg, markup)  # не должно упасть — best-effort
+        await flow.reset_nav_screen(msg, state)
 
-        msg.answer.assert_awaited_once()
+        msg.answer.assert_not_awaited()  # ни одного нового сообщения — только edit
+        msg.bot.edit_message_text.assert_awaited_once_with(texts.WELCOME, chat_id=888, message_id=111)
+
+    async def test_reset_nav_screen_deletes_transient_and_keeps_nav_anchor(self):
+        state = make_state()
+        await state.update_data(**{
+            flow._NAV_ANCHOR_MSG_KEY: 111, flow._NAV_ANCHOR_CHAT_KEY: 888,
+            flow._ANCHOR_MSG_KEY: 222, flow._ANCHOR_CHAT_KEY: 888,
+        })
+        msg = make_flow_message()
+
+        await flow.reset_nav_screen(msg, state)
+
+        msg.bot.delete_message.assert_awaited_once_with(chat_id=888, message_id=222)  # TRANSIENT удалён
+        data = await state.get_data()
+        self.assertIsNone(data.get(flow._ANCHOR_MSG_KEY))
+        self.assertEqual(data.get(flow._NAV_ANCHOR_MSG_KEY), 111)  # NAV anchor не тронут
+
+    async def test_reset_nav_screen_ignores_message_not_modified(self):
+        # Двойное нажатие "Главное меню" подряд — WELCOME уже показан,
+        # edit_message_text бросает "message is not modified": штатный
+        # случай, НЕ повод пересоздавать anchor.
+        state = make_state()
+        await state.update_data(**{flow._NAV_ANCHOR_MSG_KEY: 111, flow._NAV_ANCHOR_CHAT_KEY: 888})
+        msg = make_flow_message()
+        msg.bot.edit_message_text = AsyncMock(
+            side_effect=TelegramAPIError(method=None, message="Bad Request: message is not modified")
+        )
+
+        await flow.reset_nav_screen(msg, state)  # не должно упасть
+
+        msg.answer.assert_not_awaited()
+        data = await state.get_data()
+        self.assertEqual(data.get(flow._NAV_ANCHOR_MSG_KEY), 111)  # anchor не пересоздан
+
+    async def test_reset_nav_screen_recreates_anchor_when_manually_deleted(self):
+        # Пользователь мог вручную удалить NAV anchor (Telegram это
+        # разрешает в приватных чатах) — edit_message_text падает с ДРУГОЙ
+        # ошибкой (не "not modified") -> best-effort пересоздаём, не роняя
+        # handler.
+        state = make_state()
+        await state.update_data(**{flow._NAV_ANCHOR_MSG_KEY: 111, flow._NAV_ANCHOR_CHAT_KEY: 888})
+        msg = make_flow_message()
+        msg.bot.edit_message_text = AsyncMock(
+            side_effect=TelegramAPIError(method=None, message="Bad Request: message to edit not found")
+        )
+
+        await flow.reset_nav_screen(msg, state)  # не должно упасть
+
+        msg.answer.assert_awaited_once()  # новый NAV anchor создан
+        data = await state.get_data()
+        self.assertEqual(data.get(flow._NAV_ANCHOR_MSG_KEY), 555)  # обновлён на новый message_id
+
+    def test_refresh_reply_keyboard_removed(self):
+        self.assertFalse(hasattr(flow, "refresh_reply_keyboard"))
+
+    def test_zero_width_sentinel_not_used_anywhere_in_bot_package(self):
+        zero_width_space = "​"
+        bot_dir = Path(__file__).resolve().parent.parent / "bot"
+        offenders = [
+            str(path) for path in bot_dir.rglob("*.py")
+            if zero_width_space in path.read_text(encoding="utf-8")
+        ]
+        self.assertEqual(offenders, [])
 
 
 class StartHandlerCleanupTests(unittest.IsolatedAsyncioTestCase):
@@ -423,33 +496,36 @@ class StartHandlerCleanupTests(unittest.IsolatedAsyncioTestCase):
     а не просто существует в коде."""
 
     async def test_cmd_start_deletes_trigger_and_tracks_new_root_screen(self):
+        # /start теперь идёт через flow.reset_nav_screen — на свежем state
+        # это создание NAV anchor'а (единственный answer()), а не отдельного
+        # TRANSIENT-экрана (см. bot/flow.py — WELCOME сам и есть anchor).
         state = make_state()
         msg = make_flow_message(text="/start")
         await start.cmd_start(msg, state)
         msg.answer.assert_awaited_once()
         data = await state.get_data()
-        self.assertEqual(data["_flow_msg_id"], 555)
+        self.assertEqual(data[flow._NAV_ANCHOR_MSG_KEY], 555)
 
     async def test_second_root_command_deletes_first_root_screen(self):
+        # /start больше не создаёт TRANSIENT-экран (он ушёл в NAV anchor,
+        # см. test_cmd_start_deletes_trigger... выше) — RULE 2 здесь
+        # проверяется на двух TRANSIENT root-командах подряд.
         state = make_state()
-        msg1 = make_flow_message(text="/start")
-        await start.cmd_start(msg1, state)
+        msg1 = make_flow_message(text="/portfolio")
+        await start.cmd_portfolio(msg1, state)
 
-        msg2 = make_flow_message(text="/portfolio")
-        await start.cmd_portfolio(msg2, state)
+        msg2 = make_flow_message(text="/about")
+        await start.cmd_about(msg2, state)
 
-        # cmd_portfolio теперь дополнительно вызывает refresh_reply_keyboard
-        # (см. bot/flow.py), которая сама шлёт и best-effort удаляет ещё одно
-        # сообщение — delete_message вызывается больше одного раза, но
-        # RULE 2 (удаление старого корневого экрана) всё равно должна была
-        # сработать среди этих вызовов.
-        msg2.bot.delete_message.assert_any_await(chat_id=888, message_id=555)
+        msg2.bot.delete_message.assert_awaited_once_with(chat_id=888, message_id=555)
 
     async def test_fallback_text_deletes_stray_message_and_shows_menu(self):
         state = make_state()
         msg = make_flow_message(text="случайный текст")
         await start.fallback_text(msg, state)
-        msg.answer.assert_awaited_once()
+        # Свежий state -> первый answer() создаёт NAV anchor, второй — сам
+        # fallback TRANSIENT-текст.
+        self.assertEqual(msg.answer.await_count, 2)
 
     def test_calculator_command_has_no_registered_handler(self):
         # Раньше был отдельный /calculator с заглушкой "теперь это часть
@@ -473,8 +549,9 @@ class StartHandlerCleanupTests(unittest.IsolatedAsyncioTestCase):
         state = make_state()
         msg = make_flow_message(text="/calculator")
         await start.fallback_text(msg, state)
-        msg.answer.assert_awaited_once()
-        sent_text = msg.answer.await_args.args[0]
+        # Свежий state -> NAV anchor (1) + fallback TRANSIENT-текст (2).
+        self.assertEqual(msg.answer.await_count, 2)
+        sent_text = msg.answer.await_args.args[0]  # последний вызов — сам fallback-текст
         for banned in ("калькулятор", "расчёт стоимости", "теперь это", "переехал"):
             self.assertNotIn(banned, sent_text.lower())
 
@@ -528,9 +605,9 @@ class EntryPointArchitectureTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(owner_texts, {texts.MAIN_MENU_BUTTON, texts.MENU_FAQ, texts.ADMIN_BUTTON})
 
     def test_reply_keyboard_for_chat_picks_correct_variant(self):
-        # Общий helper (bot/keyboards.py) — используется и в start.py, и в
-        # faq.py, и в bot/flow.py::refresh_reply_keyboard. Сравнение с
-        # DESIGNER_CHAT_ID — та же проверка, что и в
+        # Общий helper (bot/keyboards.py) — используется исключительно
+        # persistent NAV anchor'ом (bot/flow.py::_create_nav_anchor).
+        # Сравнение с DESIGNER_CHAT_ID — та же проверка, что и в
         # bot/handlers/admin.py::_is_designer_message, но здесь она только
         # выбирает, что показать, не влияет на авторизацию.
         owner_markup = keyboards.reply_keyboard_for_chat(888)
@@ -746,19 +823,29 @@ class EntryPointArchitectureTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(owner_markup.is_persistent)
 
     async def test_cancel_sends_persistent_reply_keyboard(self):
+        from aiogram.types import ReplyKeyboardMarkup
+
         state = make_state()
         msg = make_flow_message(text="/cancel")
         await start.cmd_cancel(msg, state)
-        sent_markup = msg.answer.await_args.kwargs.get("reply_markup") or msg.answer.await_args.args[1]
-        self.assertTrue(sent_markup.is_persistent)
+        # Свежий state -> первый answer() создаёт NAV anchor (persistent
+        # клавиатура); сам cancel-TRANSIENT-текст (последний вызов) её НЕ
+        # несёт — reply_markup=None, клавиатуру уже обеспечивает NAV anchor
+        # (см. bot/flow.py, UX-аудит про исчезающую клавиатуру после FAQ/admin).
+        self.assertEqual(msg.answer.await_count, 2)
+        nav_call = msg.answer.await_args_list[0]
+        nav_markup = nav_call.kwargs.get("reply_markup") or nav_call.args[1]
+        self.assertIsInstance(nav_markup, ReplyKeyboardMarkup)
+        self.assertTrue(nav_markup.is_persistent)
+        content_call = msg.answer.await_args_list[-1]
+        self.assertIsNone(content_call.kwargs.get("reply_markup"))
 
     async def test_portfolio_about_brief_still_use_inline_webapp_keyboard(self):
         # Не меняли и не должны были менять поведение inline WebApp-кнопок —
         # эти хендлеры по-прежнему отвечают InlineKeyboardMarkup с web_app.
-        # ПЕРВЫМ теперь идёт best-effort "освежение" reply-клавиатуры (см.
-        # bot/flow.py::open_flow — вызывает refresh_reply_keyboard САМ,
-        # ДО отправки основного сообщения, см. UX-аудит про исчезающую
-        # клавиатуру после FAQ/admin), ВТОРЫМ — содержательный ответ.
+        # ПЕРВЫМ теперь идёт создание NAV anchor'а (см. bot/flow.py::
+        # open_flow -> ensure_nav_anchor, свежий state — anchor'а ещё нет),
+        # ВТОРЫМ — содержательный TRANSIENT-ответ.
         from aiogram.types import InlineKeyboardMarkup, ReplyKeyboardMarkup, WebAppInfo
 
         cases = [
@@ -771,9 +858,9 @@ class EntryPointArchitectureTests(unittest.IsolatedAsyncioTestCase):
             msg = make_flow_message(text=f"/{path}")
             await handler(msg, state)
             self.assertEqual(msg.answer.await_count, 2)
-            refresh_call, content_call = msg.answer.await_args_list
-            refresh_markup = refresh_call.kwargs.get("reply_markup") or refresh_call.args[1]
-            self.assertIsInstance(refresh_markup, ReplyKeyboardMarkup)
+            nav_call, content_call = msg.answer.await_args_list
+            nav_markup = nav_call.kwargs.get("reply_markup") or nav_call.args[1]
+            self.assertIsInstance(nav_markup, ReplyKeyboardMarkup)
             sent_markup = content_call.kwargs.get("reply_markup") or content_call.args[1]
             self.assertIsInstance(sent_markup, InlineKeyboardMarkup)
             btn = sent_markup.inline_keyboard[0][0]
@@ -781,17 +868,17 @@ class EntryPointArchitectureTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(btn.web_app.url.endswith(f"/{path}"))
 
     async def test_faq_command_still_uses_inline_faq_keyboard(self):
-        # /faq тоже сначала получает best-effort "освежение" reply-клавиатуры
-        # (см. bot/flow.py::open_flow) — answer() вызывается дважды, порядок
-        # как у portfolio/about/brief выше.
+        # /faq на свежем state тоже сначала создаёт NAV anchor (см.
+        # bot/flow.py::open_flow -> ensure_nav_anchor) — answer() вызывается
+        # дважды, порядок как у portfolio/about/brief выше.
         from aiogram.types import InlineKeyboardMarkup, ReplyKeyboardMarkup
 
         msg = make_flow_message(text="/faq")
         await faq.cmd_faq(msg, make_state())
         self.assertEqual(msg.answer.await_count, 2)
-        refresh_call, content_call = msg.answer.await_args_list
-        refresh_markup = refresh_call.kwargs.get("reply_markup") or refresh_call.args[1]
-        self.assertIsInstance(refresh_markup, ReplyKeyboardMarkup)
+        nav_call, content_call = msg.answer.await_args_list
+        nav_markup = nav_call.kwargs.get("reply_markup") or nav_call.args[1]
+        self.assertIsInstance(nav_markup, ReplyKeyboardMarkup)
         sent_markup = content_call.kwargs.get("reply_markup") or content_call.args[1]
         self.assertIsInstance(sent_markup, InlineKeyboardMarkup)
 
@@ -829,18 +916,20 @@ class AdminCleanupFlowTests(unittest.IsolatedAsyncioTestCase):
         shutil.rmtree(self.tmpdir, ignore_errors=True)
 
     async def test_admin_command_deletes_trigger_and_previous_root(self):
-        # /admin отвечает inline-клавиатурой -> open_flow теперь сам
-        # "освежает" reply-клавиатуру (доп. answer()/delete_message() пара,
-        # см. UX-аудит про исчезающую клавиатуру после FAQ/admin).
+        # /admin отвечает inline-клавиатурой -> на свежем state open_flow
+        # сам создаёт NAV anchor первым answer() (см. bot/flow.py::
+        # ensure_nav_anchor), вторым — сам admin-контент.
         state = make_state(self.actor)
         msg1 = make_flow_message(chat_id=self.actor, text="/admin")
         await admin.cmd_admin(msg1, state)
         self.assertEqual(msg1.answer.await_count, 2)
 
+        # Второй /admin в том же чате: NAV anchor уже существует (no-op) —
+        # единственный delete_message здесь — RULE 2 (старый TRANSIENT admin-
+        # экран из msg1).
         msg2 = make_flow_message(chat_id=self.actor, text="/admin")
         await admin.cmd_admin(msg2, state)
-        self.assertEqual(msg2.bot.delete_message.await_count, 2)  # refresh cleanup + RULE 2
-        msg2.bot.delete_message.assert_any_await(chat_id=self.actor, message_id=555)
+        msg2.bot.delete_message.assert_awaited_once_with(chat_id=self.actor, message_id=555)
 
     async def test_faq_add_wizard_edits_one_message_across_steps(self):
         state = make_state(self.actor)
@@ -1145,18 +1234,28 @@ class FaqCleanupRegressionTests(unittest.IsolatedAsyncioTestCase):
         menu_msg.bot.delete_message.assert_awaited_once_with(chat_id=888, message_id=555)
 
     async def test_faq_then_main_menu_leaves_exactly_one_current_root_message(self):
+        # NAV anchor уже существует после FAQ -> Главное меню РЕДАКТИРУЕТ
+        # его обратно в WELCOME (edit-in-place), а не шлёт новое сообщение
+        # (см. bot/flow.py::reset_nav_screen — main_menu_or_confirm/cmd_start
+        # больше не проходит через открытие нового TRANSIENT-экрана для
+        # этого случая).
         state = make_state(888)
         faq_msg = make_flow_message(chat_id=888, text=texts.MENU_FAQ)
         await faq.show_faq_list(faq_msg, state)
+        data = await state.get_data()
+        nav_id_after_faq = data.get(flow._NAV_ANCHOR_MSG_KEY)
+        self.assertIsNotNone(nav_id_after_faq)
 
         menu_msg = make_flow_message(chat_id=888, text=texts.MAIN_MENU_BUTTON)
         await start.main_menu_button(menu_msg, state)
 
-        sent_text = menu_msg.answer.await_args_list[0].args[0] if menu_msg.answer.await_args_list[0].args else menu_msg.answer.await_args_list[0].kwargs.get("text")
-        self.assertEqual(sent_text, texts.WELCOME)
+        menu_msg.answer.assert_not_awaited()  # ни одного нового сообщения
+        menu_msg.bot.edit_message_text.assert_awaited_once_with(
+            texts.WELCOME, chat_id=888, message_id=nav_id_after_faq
+        )
         data = await state.get_data()
-        self.assertEqual(data.get(flow._ANCHOR_MSG_KEY), 555)  # anchor указывает на новый welcome, не на FAQ
-        self.assertEqual(data.get(flow._ANCHOR_CHAT_KEY), 888)
+        self.assertIsNone(data.get(flow._ANCHOR_MSG_KEY))  # старый FAQ TRANSIENT-anchor очищен
+        self.assertEqual(data.get(flow._NAV_ANCHOR_MSG_KEY), nav_id_after_faq)  # NAV anchor тот же самый
 
     async def test_faq_then_start_cleans_up_old_faq_message(self):
         # /start не менялся в этом фиксе — тот же open_root, что и раньше,
@@ -1171,18 +1270,22 @@ class FaqCleanupRegressionTests(unittest.IsolatedAsyncioTestCase):
         start_msg.bot.delete_message.assert_awaited_once_with(chat_id=888, message_id=555)
 
     async def test_faq_then_admin_cleans_up_old_faq_message(self):
-        # /admin отвечает inline-клавиатурой -> open_flow сам ещё и
-        # "освежает" reply-клавиатуру (своя пара answer+delete) ПОМИМО
-        # удаления старого FAQ-anchor — отсюда 2 delete_message, не 1.
+        # NAV anchor уже существует после FAQ -> /admin его не трогает
+        # вообще (ни delete, ни edit, ни новое сообщение) — единственный
+        # delete_message здесь — RULE 2 (старый FAQ TRANSIENT-anchor).
         state = make_state(888)
         faq_msg = make_flow_message(chat_id=888, text=texts.MENU_FAQ)
         await faq.show_faq_list(faq_msg, state)
+        data = await state.get_data()
+        nav_id_after_faq = data.get(flow._NAV_ANCHOR_MSG_KEY)
 
         admin_msg = make_flow_message(chat_id=888, text="/admin")
         await admin.cmd_admin(admin_msg, state)
 
-        self.assertEqual(admin_msg.bot.delete_message.await_count, 2)
-        admin_msg.bot.delete_message.assert_any_await(chat_id=888, message_id=555)
+        admin_msg.bot.delete_message.assert_awaited_once_with(chat_id=888, message_id=555)
+        admin_msg.answer.assert_awaited_once()  # только admin-контент, NAV anchor не пересоздан
+        data = await state.get_data()
+        self.assertEqual(data.get(flow._NAV_ANCHOR_MSG_KEY), nav_id_after_faq)
 
     async def test_faq_then_cancel_cleans_up_old_faq_message(self):
         # Клиентский /cancel тоже идёт через open_root — тот же принцип.
@@ -1196,33 +1299,33 @@ class FaqCleanupRegressionTests(unittest.IsolatedAsyncioTestCase):
         cancel_msg.bot.delete_message.assert_awaited_once_with(chat_id=888, message_id=555)
 
     async def test_faq_list_still_refreshes_persistent_keyboard(self):
-        # open_flow теперь сам шлёт refresh ПЕРВЫМ (до основного FAQ-ответа,
-        # см. bot/flow.py::open_flow) — порядок обратный тому, что было
-        # раньше в _send_faq_list, но суть (клавиатура освежается) та же.
+        # Свежий state -> открытие FAQ само создаёт NAV anchor ПЕРВЫМ
+        # answer()-вызовом (см. bot/flow.py::open_flow -> ensure_nav_anchor),
+        # ВТОРЫМ — сам FAQ-список.
         from aiogram.types import InlineKeyboardMarkup, ReplyKeyboardMarkup
 
         state = make_state()
         msg = make_flow_message(text=texts.MENU_FAQ)
         await faq.show_faq_list(msg, state)
         self.assertEqual(msg.answer.await_count, 2)
-        refresh_call, content_call = msg.answer.await_args_list
-        refresh_markup = refresh_call.kwargs.get("reply_markup") or refresh_call.args[1]
-        self.assertIsInstance(refresh_markup, ReplyKeyboardMarkup)
-        self.assertTrue(refresh_markup.is_persistent)
+        nav_call, content_call = msg.answer.await_args_list
+        nav_markup = nav_call.kwargs.get("reply_markup") or nav_call.args[1]
+        self.assertIsInstance(nav_markup, ReplyKeyboardMarkup)
+        self.assertTrue(nav_markup.is_persistent)
         sent_markup = content_call.kwargs.get("reply_markup") or content_call.args[1]
         self.assertIsInstance(sent_markup, InlineKeyboardMarkup)
 
     async def test_admin_transitions_do_not_break_when_no_faq_anchor_exists(self):
-        # Regression-safety: если пользователь НЕ был на FAQ (anchor не
-        # установлен), /admin по-прежнему должен отрабатывать без ошибок.
-        # delete_message теперь ВСЁ РАВНО вызывается один раз — не для
-        # (несуществующего) FAQ-anchor, а для best-effort cleanup
-        # invisible-сообщения из refresh_reply_keyboard (см. open_flow) —
-        # это не regression, а часть уже принятого фикса.
+        # Regression-safety: если пользователь НЕ был на FAQ (TRANSIENT
+        # anchor не установлен), /admin по-прежнему должен отрабатывать без
+        # ошибок. На свежем state NAV anchor тоже ещё не существует — его
+        # создание НЕ вызывает delete_message вообще (это чистая отправка,
+        # см. bot/flow.py::ensure_nav_anchor), а удалять несуществующий
+        # TRANSIENT-anchor нечего — delete_message не вызывается вовсе.
         state = make_state(888)
         admin_msg = make_flow_message(chat_id=888, text="/admin")
         await admin.cmd_admin(admin_msg, state)
-        self.assertEqual(admin_msg.bot.delete_message.await_count, 1)
+        admin_msg.bot.delete_message.assert_not_awaited()
         admin_msg.answer.assert_awaited()
 
     async def test_faq_trigger_deletion_targets_only_the_trigger_message_itself(self):
@@ -1250,9 +1353,9 @@ class FaqCleanupRegressionTests(unittest.IsolatedAsyncioTestCase):
         state = make_state(999)  # НЕ owner chat_id (888 занят DESIGNER_CHAT_ID в setUp)
         msg = make_flow_message(chat_id=999, text=texts.MENU_FAQ)
         await faq.show_faq_list(msg, state)
-        refresh_call = msg.answer.await_args_list[0]
-        refresh_markup = refresh_call.kwargs.get("reply_markup") or refresh_call.args[1]
-        button_texts = {btn.text for row in refresh_markup.keyboard for btn in row}
+        nav_call = msg.answer.await_args_list[0]
+        nav_markup = nav_call.kwargs.get("reply_markup") or nav_call.args[1]
+        button_texts = {btn.text for row in nav_markup.keyboard for btn in row}
         self.assertEqual(button_texts, {texts.MAIN_MENU_BUTTON, texts.MENU_FAQ})
         self.assertNotIn(texts.ADMIN_BUTTON, button_texts)
 
@@ -1260,9 +1363,9 @@ class FaqCleanupRegressionTests(unittest.IsolatedAsyncioTestCase):
         state = make_state(888)  # 888 == DESIGNER_CHAT_ID (см. setUp)
         msg = make_flow_message(chat_id=888, text=texts.MENU_FAQ)
         await faq.show_faq_list(msg, state)
-        refresh_call = msg.answer.await_args_list[0]
-        refresh_markup = refresh_call.kwargs.get("reply_markup") or refresh_call.args[1]
-        button_texts = {btn.text for row in refresh_markup.keyboard for btn in row}
+        nav_call = msg.answer.await_args_list[0]
+        nav_markup = nav_call.kwargs.get("reply_markup") or nav_call.args[1]
+        button_texts = {btn.text for row in nav_markup.keyboard for btn in row}
         self.assertEqual(button_texts, {texts.MAIN_MENU_BUTTON, texts.MENU_FAQ, texts.ADMIN_BUTTON})
 
     async def test_faq_inline_controls_still_work_after_the_fix(self):
@@ -1276,9 +1379,9 @@ class FaqCleanupRegressionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(args[0] if args else kwargs.get("text"), texts.FAQ_INTRO)
 
     async def test_start_reply_keyboard_content_unchanged(self):
-        # /start передаёт reply-клавиатуру НАПРЯМУЮ (не через inline+refresh)
-        # — не должно внезапно приобрести лишний answer()-вызов или
-        # потерять кнопки из-за централизации refresh в open_flow.
+        # /start на свежем state создаёт NAV anchor единственным answer() —
+        # не должно внезапно приобрести лишний вызов или потерять кнопки
+        # из-за разделения NAV/TRANSIENT anchor'ов в open_flow.
         state = make_state(999)
         msg = make_flow_message(chat_id=999, text="/start")
         await start.cmd_start(msg, state)
@@ -1286,6 +1389,62 @@ class FaqCleanupRegressionTests(unittest.IsolatedAsyncioTestCase):
         sent_markup = msg.answer.await_args.kwargs.get("reply_markup") or msg.answer.await_args.args[1]
         button_texts = {btn.text for row in sent_markup.keyboard for btn in row}
         self.assertEqual(button_texts, {texts.MAIN_MENU_BUTTON, texts.MENU_FAQ})
+
+    async def test_cold_state_faq_creates_nav_anchor_separately_from_transient(self):
+        # Cold state (никогда не было /start) -> прямой FAQ обязан сам
+        # создать NAV anchor (WELCOME + persistent-клавиатура) ПЕРЕД
+        # собственным TRANSIENT-контентом, а не оставить клиента без
+        # клавиатуры вовсе (см. bot/flow.py::ensure_nav_anchor).
+        state = make_state(999)
+        msg = make_flow_message(chat_id=999, text=texts.MENU_FAQ)
+
+        await faq.show_faq_list(msg, state)
+
+        self.assertEqual(msg.answer.await_count, 2)
+        nav_call, content_call = msg.answer.await_args_list
+        nav_text = nav_call.args[0] if nav_call.args else nav_call.kwargs.get("text")
+        self.assertEqual(nav_text, texts.WELCOME)
+        data = await state.get_data()
+        self.assertIsNotNone(data.get(flow._NAV_ANCHOR_MSG_KEY))
+        self.assertIsNotNone(data.get(flow._ANCHOR_MSG_KEY))  # TRANSIENT (FAQ) тоже отслеживается — отдельно
+
+    async def test_main_menu_faq_main_menu_faq_keeps_same_nav_anchor_id(self):
+        # Главное меню -> FAQ -> Главное меню -> FAQ: один и тот же NAV
+        # anchor message_id на всём протяжении, TRANSIENT anchor меняется.
+        state = make_state(999)
+        faq_msg1 = make_flow_message(chat_id=999, text=texts.MENU_FAQ)
+        await faq.show_faq_list(faq_msg1, state)
+        data = await state.get_data()
+        nav_id = data.get(flow._NAV_ANCHOR_MSG_KEY)
+        self.assertIsNotNone(nav_id)
+
+        menu_msg = make_flow_message(chat_id=999, text=texts.MAIN_MENU_BUTTON)
+        await start.main_menu_button(menu_msg, state)
+        data = await state.get_data()
+        self.assertEqual(data.get(flow._NAV_ANCHOR_MSG_KEY), nav_id)
+
+        faq_msg2 = make_flow_message(chat_id=999, text=texts.MENU_FAQ)
+        await faq.show_faq_list(faq_msg2, state)
+        data = await state.get_data()
+        self.assertEqual(data.get(flow._NAV_ANCHOR_MSG_KEY), nav_id)  # тот же NAV anchor всё время
+
+    async def test_cancel_transient_message_carries_no_keyboard_and_keeps_nav_anchor(self):
+        # FAQ, затем /cancel — TRANSIENT informational-сообщение НЕ несёт
+        # reply-клавиатуру (её обеспечивает NAV anchor), а сам NAV anchor,
+        # созданный на шаге FAQ, остаётся нетронутым.
+        state = make_state(999)
+        faq_msg = make_flow_message(chat_id=999, text=texts.MENU_FAQ)
+        await faq.show_faq_list(faq_msg, state)
+        data = await state.get_data()
+        nav_id_after_faq = data.get(flow._NAV_ANCHOR_MSG_KEY)
+
+        cancel_msg = make_flow_message(chat_id=999, text="/cancel")
+        await start.cmd_cancel(cancel_msg, state)
+
+        cancel_msg.answer.assert_awaited_once()  # только сам cancel-текст, NAV anchor не пересоздан
+        self.assertIsNone(cancel_msg.answer.await_args.kwargs.get("reply_markup"))
+        data = await state.get_data()
+        self.assertEqual(data.get(flow._NAV_ANCHOR_MSG_KEY), nav_id_after_faq)
 
 
 class AdminCancelIntegrationTests(unittest.IsolatedAsyncioTestCase):

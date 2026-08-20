@@ -5,18 +5,19 @@ from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, Message
 
 from bot import config, content_store, flow, texts
-from bot.keyboards import main_menu_confirm_keyboard, reply_keyboard_for_chat, webapp_open_keyboard
+from bot.keyboards import main_menu_confirm_keyboard, webapp_open_keyboard
 
 router = Router(name="start")
 
 
-def _reply_keyboard_for(message: Message):
-    return reply_keyboard_for_chat(message.chat.id)
-
-
 @router.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext) -> None:
-    await flow.open_root(message, state, texts.WELCOME, _reply_keyboard_for(message))
+    # NAV anchor (persistent reply-клавиатура) и TRANSIENT-экран — теперь
+    # разделены (см. bot/flow.py, UX-аудит про исчезающую клавиатуру после
+    # FAQ/admin). /start не отправляет WELCOME отдельным сообщением — он
+    # либо создаёт NAV anchor с этим текстом (первое взаимодействие в
+    # чате), либо просто редактирует уже существующий обратно в WELCOME.
+    await flow.reset_nav_screen(message, state)
 
 
 @router.message(Command("id"))
@@ -32,8 +33,9 @@ async def cmd_id(message: Message) -> None:
 
 @router.message(Command("portfolio"))
 async def cmd_portfolio(message: Message, state: FSMContext) -> None:
-    # reply-клавиатура "освежается" автоматически внутри flow.open_root
-    # (см. bot/flow.py::open_flow) — отдельный вызов здесь больше не нужен.
+    # NAV anchor (persistent-клавиатура) гарантируется автоматически внутри
+    # flow.open_root/open_flow (см. bot/flow.py::ensure_nav_anchor) —
+    # отдельно заботиться о ней здесь не нужно.
     await flow.open_root(message, state, "Открыть портфолио:", webapp_open_keyboard(config.WEBAPP_URL, "portfolio", "📁 Открыть портфолио"))
 
 
@@ -60,7 +62,9 @@ async def cmd_cancel(message: Message, state: FSMContext) -> None:
         text = "Хорошо, отменил ожидание файла."
     else:
         text = "Отменять было нечего."
-    await flow.open_root(message, state, text, _reply_keyboard_for(message))
+    # reply_markup=None — TRANSIENT-экран не несёт persistent-клавиатуру,
+    # её уже обеспечивает NAV anchor (см. bot/flow.py).
+    await flow.open_root(message, state, text, None)
 
 
 @router.message(F.text == texts.OPEN_APP_BUTTON)
@@ -93,8 +97,8 @@ async def main_menu_or_confirm(message: Message, state: FSMContext) -> None:
         await cmd_start(message, state)
         return
     await flow.delete_trigger(message)
+    # NAV anchor не затронут этим экраном — освежать нечего (см. bot/flow.py).
     await message.answer(texts.MAIN_MENU_CONFIRM_TEXT, reply_markup=main_menu_confirm_keyboard())
-    await flow.refresh_reply_keyboard(message, _reply_keyboard_for(message))
 
 
 @router.message(F.text == texts.MAIN_MENU_BUTTON)
@@ -105,8 +109,9 @@ async def main_menu_button(message: Message, state: FSMContext) -> None:
 @router.callback_query(F.data == "mainmenu:confirm")
 async def main_menu_confirm(callback: CallbackQuery, state: FSMContext) -> None:
     # callback.message — то самое confirmation-сообщение; cmd_start() сам
-    # удалит его как "триггер" (RULE 1) и пришлёт свежий /start поверх —
-    # ровно то, что просили: "выполнить существующую /start logic".
+    # удалит его как "триггер" (RULE 1) и вернёт NAV anchor к WELCOME
+    # (edit-in-place, см. bot/flow.py::reset_nav_screen) — ровно то, что
+    # просили: "выполнить существующую /start logic".
     await cmd_start(callback.message, state)
     await callback.answer()
 
@@ -128,5 +133,5 @@ async def fallback_text(message: Message, state: FSMContext) -> None:
     await flow.open_root(
         message, state,
         "Не совсем поняла 🙂 Воспользуйтесь кнопками ниже.",
-        _reply_keyboard_for(message),
+        None,
     )
