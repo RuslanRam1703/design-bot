@@ -297,6 +297,35 @@ async def reset_state_keep_nav(state: FSMContext) -> None:
     await state.set_data(preserved)
 
 
+async def set_data_keep_nav(state: FSMContext, data: dict) -> None:
+    """Безопасная замена state.set_data(data) там, где вызывающий код сам
+    строит НОВЫЙ, полный data dict "с нуля" (не через update_data, который
+    и так уже мержит, см. reset_state_keep_nav's докстринг) — но должен при
+    этом сохранить NAV anchor bookkeeping (P1-3 аудит, продолжение Batch 0).
+
+    В отличие от reset_state_keep_nav (которая отбрасывает ВСЁ, кроме NAV —
+    подходит для "сценарий полностью завершён/отменён, локальный контекст
+    больше не нужен"), эта функция для случая, где вызывающий код explicitly
+    хочет сохранить СВОИ СОБСТВЕННЫЕ ключи (например, _resolve_cancel в
+    bot/handlers/admin.py возвращает {"service_id": ...} или {"case_id": ...}
+    — cancel должен вернуть на родительский экран С ЭТИМ контекстом, а не
+    в пустоту) — reset_state_keep_nav здесь неприменима, она стёрла бы и
+    их тоже (проверено эмпирически при аудите).
+
+    Результат — ровно data ∪ {сохранённые NAV-ключи, если были}, НЕ обычный
+    merge (текущие ключи, которых нет ни в data, ни среди NAV-ключей,
+    отбрасываются — ровно то же поведение, что и у прямого
+    state.set_data(data) сегодня, плюс сохранение NAV). Если NAV-ключей в
+    текущем state не было — они не создаются искусственно."""
+    current = await state.get_data()
+    preserved = {
+        key: current[key]
+        for key in (_NAV_ANCHOR_MSG_KEY, _NAV_ANCHOR_CHAT_KEY)
+        if key in current
+    }
+    await state.set_data({**data, **preserved})
+
+
 async def open_root(
     message: Message,
     state: FSMContext,

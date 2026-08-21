@@ -1913,7 +1913,12 @@ class AdminCancelIntegrationTests(unittest.IsolatedAsyncioTestCase):
     service_id, а не в корень /admin."""
 
     async def test_cancel_from_nested_option_add_returns_to_options_with_service_id(self):
+        # NAV anchor засеян заранее — до P1-3 (_resolve_cancel bug class,
+        # продолжение Batch 0) admin_cancel уничтожал бы его через
+        # state.set_data(next_data); теперь flow.set_data_keep_nav должен
+        # сохранить И cancel context (service_id), И NAV anchor одновременно.
         state = make_state()
+        await state.update_data(**{flow._NAV_ANCHOR_MSG_KEY: 1001, flow._NAV_ANCHOR_CHAT_KEY: 555})
 
         await admin.price_edit_start(make_callback("adminpriceaction:edit"), state)
         await admin.price_edit_picked(make_callback("admineditservice:LEND"), state)
@@ -1930,9 +1935,113 @@ class AdminCancelIntegrationTests(unittest.IsolatedAsyncioTestCase):
         await admin.admin_cancel(cancel_cb, state)
 
         self.assertEqual(await state.get_state(), AdminStates.edit_service_field_pick)
-        self.assertEqual(await state.get_data(), {"service_id": "LEND"})
+        data_after_cancel = await state.get_data()
+        self.assertEqual(data_after_cancel.get("service_id"), "LEND")  # cancel context сохранён
+        self.assertEqual(data_after_cancel.get(flow._NAV_ANCHOR_MSG_KEY), 1001)  # NAV anchor сохранён
+        self.assertEqual(data_after_cancel.get(flow._NAV_ANCHOR_CHAT_KEY), 555)
+        # ровно эти 3 ключа — "cancel_to" (уже неактуальный) реально исчез,
+        # ничего постороннего не протекло
+        self.assertEqual(set(data_after_cancel.keys()), {"service_id", flow._NAV_ANCHOR_MSG_KEY, flow._NAV_ANCHOR_CHAT_KEY})
         cancel_cb.message.edit_text.assert_awaited_once()
         self.assertIn("Опции", cancel_cb.message.edit_text.await_args.args[0])
+
+
+class AdminCancelNavAnchorTests(unittest.IsolatedAsyncioTestCase):
+    """P1-3 аудит, продолжение Batch 0: admin_cancel/admin_cancel_command
+    оба вызывали _resolve_cancel(...) -> state.set_data(next_data), что
+    полностью заменяло FSM data и уничтожало flow._NAV_ANCHOR_MSG_KEY/
+    _NAV_ANCHOR_CHAT_KEY, хотя физический NAV anchor оставался в Telegram.
+    flow.reset_state_keep_nav здесь НЕ подходит (она стёрла бы и cancel
+    context — service_id/case_id, подтверждено эмпирически при аудите) —
+    новый flow.set_data_keep_nav сохраняет NAV anchor ПОВЕРХ next_data, не
+    вместо него: cancel context и NAV tracking сохраняются одновременно."""
+
+    def setUp(self):
+        # sections/images ветки _resolve_cancel читают content_store.list_cases()
+        # — изолируем, как и остальные admin-тесты в этом файле, а не
+        # полагаемся на реальный data/portfolio.json проекта.
+        self.tmpdir = tempfile.mkdtemp()
+        real_data_dir = Path(__file__).resolve().parent.parent / "data"
+        for name in ("pricing.json", "portfolio.json", "faq.json", "about.json", "ui_config.json"):
+            shutil.copy(real_data_dir / name, Path(self.tmpdir) / name)
+        self._orig_data_dir = content_store.DATA_DIR
+        content_store.DATA_DIR = Path(self.tmpdir)
+        self.actor = 888
+
+    def tearDown(self):
+        content_store.DATA_DIR = self._orig_data_dir
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    async def _state_with_nav(self, nav_msg_id: int = 1001, **extra_data) -> FSMContext:
+        state = make_state(self.actor)
+        await state.update_data(**{
+            flow._NAV_ANCHOR_MSG_KEY: nav_msg_id,
+            flow._NAV_ANCHOR_CHAT_KEY: self.actor,
+            **extra_data,
+        })
+        return state
+
+    # ---- A. Inline "❌ Отмена" с контекстом ----
+    async def test_inline_cancel_preserves_nav_and_service_id_context(self):
+        state = await self._state_with_nav(service_id="LEND", cancel_to="options")
+        cb = make_callback("admincancel", chat_id=self.actor)
+        await admin.admin_cancel(cb, state)
+
+        data = await state.get_data()
+        self.assertEqual(data.get("service_id"), "LEND")  # cancel context сохранён
+        self.assertEqual(data.get(flow._NAV_ANCHOR_MSG_KEY), 1001)  # NAV anchor сохранён
+        self.assertEqual(data.get(flow._NAV_ANCHOR_CHAT_KEY), self.actor)
+        self.assertNotIn("cancel_to", data)  # старый нерелевантный key реально исчез
+        self.assertEqual(await state.get_state(), AdminStates.edit_service_field_pick.state)
+
+    # ---- B. Текстовый /cancel ----
+    async def test_cancel_command_preserves_nav_and_context(self):
+        state = await self._state_with_nav(case_id="case_1", cancel_to="sections")
+        msg = make_text_message(self.actor, "/cancel")
+        await admin.admin_cancel_command(msg, state)
+
+        data = await state.get_data()
+        self.assertEqual(data.get("case_id"), "case_1")
+        self.assertEqual(data.get(flow._NAV_ANCHOR_MSG_KEY), 1001)
+        self.assertEqual(data.get(flow._NAV_ANCHOR_CHAT_KEY), self.actor)
+        self.assertNotIn("cancel_to", data)
+        self.assertEqual(await state.get_state(), AdminStates.case_sections_menu.state)
+        msg.answer.assert_awaited_once()  # тот же next_state/next_data behavior, что и раньше
+
+    # ---- C. Context-free cancel (root/cases/faq/pricing/categories/backup) ----
+    async def test_context_free_cancel_preserves_only_nav(self):
+        state = await self._state_with_nav(cancel_to="faq", junk="must disappear")
+        cb = make_callback("admincancel", chat_id=self.actor)
+        await admin.admin_cancel(cb, state)
+
+        data = await state.get_data()
+        self.assertEqual(data, {flow._NAV_ANCHOR_MSG_KEY: 1001, flow._NAV_ANCHOR_CHAT_KEY: self.actor})
+        self.assertIsNone(await state.get_state())
+
+    # ---- D. Context-bearing cancel: images -> case_id ----
+    async def test_images_cancel_preserves_case_id_and_nav(self):
+        state = await self._state_with_nav(case_id="case_7", cancel_to="images")
+        cb = make_callback("admincancel", chat_id=self.actor)
+        await admin.admin_cancel(cb, state)
+
+        data = await state.get_data()
+        self.assertEqual(data.get("case_id"), "case_7")
+        self.assertEqual(data.get(flow._NAV_ANCHOR_MSG_KEY), 1001)
+        self.assertEqual(await state.get_state(), AdminStates.case_images_menu.state)
+
+    # ---- E. ensure_nav_anchor после cancel ничего не пересоздаёт ----
+    async def test_ensure_nav_anchor_after_cancel_does_not_recreate(self):
+        state = await self._state_with_nav(cancel_to="pricing")
+        cb = make_callback("admincancel", chat_id=self.actor)
+        await admin.admin_cancel(cb, state)
+
+        probe = make_flow_message_factory(chat_id=self.actor, start_id=6000)()
+        created = await flow.ensure_nav_anchor(probe, state)
+
+        self.assertFalse(created)  # anchor уже "существует" по мнению ensure_nav_anchor
+        probe.answer.assert_not_awaited()  # ни одного нового WELCOME
+        data = await state.get_data()
+        self.assertEqual(data.get(flow._NAV_ANCHOR_MSG_KEY), 1001)  # id не изменился
 
 
 def make_photo_message(chat_id: int) -> SimpleNamespace:

@@ -141,7 +141,7 @@ async def admin_cancel(callback: CallbackQuery, state: FSMContext) -> None:
     разделу, с которого начался конкретный мастер (см. _resolve_cancel),
     а не всегда в корень."""
     text, markup, next_state, next_data = await _resolve_cancel(await state.get_data())
-    await state.set_data(next_data)
+    await flow.set_data_keep_nav(state, next_data)
     await state.set_state(next_state)
     await callback.message.edit_text(text, reply_markup=markup)
     await callback.answer()
@@ -154,7 +154,7 @@ async def admin_cancel_command(message: Message, state: FSMContext) -> None:
     админка была единственным местом без него: набранный /cancel просто
     сохранялся как введённые данные (текст вопроса FAQ, название кейса...)."""
     text, markup, next_state, next_data = await _resolve_cancel(await state.get_data())
-    await state.set_data(next_data)
+    await flow.set_data_keep_nav(state, next_data)
     await state.set_state(next_state)
     await message.answer(text, reply_markup=markup)
 
