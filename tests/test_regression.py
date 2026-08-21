@@ -1996,8 +1996,12 @@ class AdminCancelNavAnchorTests(unittest.IsolatedAsyncioTestCase):
 
     # ---- B. Текстовый /cancel ----
     async def test_cancel_command_preserves_nav_and_context(self):
+        # make_flow_message_factory, а не make_text_message: с Batch про
+        # message lifecycle (см. ниже, item F) admin_cancel_command реально
+        # вызывает message.delete()/message.bot.delete_message() через
+        # flow.cancel_transient — make_text_message их не предоставляет.
         state = await self._state_with_nav(case_id="case_1", cancel_to="sections")
-        msg = make_text_message(self.actor, "/cancel")
+        msg = make_flow_message_factory(chat_id=self.actor, start_id=2900)(text="/cancel")
         await admin.admin_cancel_command(msg, state)
 
         data = await state.get_data()
@@ -2042,6 +2046,125 @@ class AdminCancelNavAnchorTests(unittest.IsolatedAsyncioTestCase):
         probe.answer.assert_not_awaited()  # ни одного нового WELCOME
         data = await state.get_data()
         self.assertEqual(data.get(flow._NAV_ANCHOR_MSG_KEY), 1001)  # id не изменился
+
+    # ---- F. /cancel: message lifecycle (P1-3, задача про orphan messages) ----
+    # Inline "❌ Отмена" избегает orphan-сообщений структурно — редактирует
+    # callback.message на месте (см. admin_cancel), поэтому там нечего
+    # чистить. У текстового /cancel такой прямой ссылки нет, поэтому он
+    # опирается на flow.cancel_transient (best-effort по _ANCHOR_MSG_KEY/
+    # _ANCHOR_CHAT_KEY) — см. её докстринг в bot/flow.py про архитектурную
+    # границу: надёжно работает только пока сценарий ещё не прошёл ни
+    # одного своего текстового/фото шага (первый вопрос после чистой
+    # inline-навигации, и весь FAQ-add wizard).
+
+    async def test_cancel_command_deletes_tracked_transient_and_trigger(self):
+        """Plain root cancel, TRANSIENT-сообщение отслеживается (типичный
+        случай — /cancel на первом текстовом шаге мастера): /cancel должен
+        удалить и старый prompt, и сам себя (триггер), сохранив NAV."""
+        state = await self._state_with_nav(
+            cancel_to="root",
+            **{flow._ANCHOR_MSG_KEY: 2001, flow._ANCHOR_CHAT_KEY: self.actor},
+        )
+        msg = make_flow_message_factory(chat_id=self.actor, start_id=3000)(text="/cancel")
+        msg.delete = AsyncMock(wraps=msg.delete)
+
+        await admin.admin_cancel_command(msg, state)
+
+        msg.bot.delete_message.assert_awaited_once_with(chat_id=self.actor, message_id=2001)
+        msg.delete.assert_awaited_once()  # RULE 1: сам /cancel тоже удалён
+        data = await state.get_data()
+        self.assertEqual(data.get(flow._NAV_ANCHOR_MSG_KEY), 1001)
+        self.assertEqual(data.get(flow._NAV_ANCHOR_CHAT_KEY), self.actor)
+        self.assertNotIn(flow._ANCHOR_MSG_KEY, data)  # старый transient-ключ дальше не протёк
+        self.assertIsNone(await state.get_state())
+        msg.answer.assert_awaited_once()
+
+    async def test_cancel_command_context_service_id_cleans_messages(self):
+        """Контекстный cancel (service_id/options) — тот же lifecycle
+        cleanup, плюс сохранённый context и корректный next_state."""
+        state = await self._state_with_nav(
+            service_id="LEND", cancel_to="options",
+            **{flow._ANCHOR_MSG_KEY: 2002, flow._ANCHOR_CHAT_KEY: self.actor},
+        )
+        msg = make_flow_message_factory(chat_id=self.actor, start_id=3100)(text="/cancel")
+        msg.delete = AsyncMock(wraps=msg.delete)
+
+        await admin.admin_cancel_command(msg, state)
+
+        msg.bot.delete_message.assert_awaited_once_with(chat_id=self.actor, message_id=2002)
+        msg.delete.assert_awaited_once()
+        data = await state.get_data()
+        self.assertEqual(data.get("service_id"), "LEND")
+        self.assertEqual(data.get(flow._NAV_ANCHOR_MSG_KEY), 1001)
+        self.assertEqual(await state.get_state(), AdminStates.edit_service_field_pick.state)
+        msg.answer.assert_awaited_once()
+
+    async def test_cancel_command_context_case_id_cleans_messages(self):
+        """Контекстный cancel (case_id/images) — тот же lifecycle cleanup,
+        context/next_state как и раньше (Batch 1)."""
+        state = await self._state_with_nav(
+            case_id="case_9", cancel_to="images",
+            **{flow._ANCHOR_MSG_KEY: 2003, flow._ANCHOR_CHAT_KEY: self.actor},
+        )
+        msg = make_flow_message_factory(chat_id=self.actor, start_id=3200)(text="/cancel")
+        msg.delete = AsyncMock(wraps=msg.delete)
+
+        await admin.admin_cancel_command(msg, state)
+
+        msg.bot.delete_message.assert_awaited_once_with(chat_id=self.actor, message_id=2003)
+        msg.delete.assert_awaited_once()
+        data = await state.get_data()
+        self.assertEqual(data.get("case_id"), "case_9")
+        self.assertEqual(data.get(flow._NAV_ANCHOR_MSG_KEY), 1001)
+        self.assertEqual(await state.get_state(), AdminStates.case_images_menu.state)
+
+    async def test_ensure_nav_anchor_after_cancel_command_does_not_recreate(self):
+        """/cancel не должен приводить к дублированию NAV anchor при
+        следующем ensure_nav_anchor — тот же принцип, что и для inline
+        cancel выше (item E)."""
+        state = await self._state_with_nav(cancel_to="pricing")
+        msg = make_flow_message_factory(chat_id=self.actor, start_id=3300)(text="/cancel")
+        await admin.admin_cancel_command(msg, state)
+
+        probe = make_flow_message_factory(chat_id=self.actor, start_id=6100)()
+        created = await flow.ensure_nav_anchor(probe, state)
+
+        self.assertFalse(created)
+        probe.answer.assert_not_awaited()
+        data = await state.get_data()
+        self.assertEqual(data.get(flow._NAV_ANCHOR_MSG_KEY), 1001)
+
+    async def test_cancel_command_without_tracked_transient_only_deletes_trigger(self):
+        """Для большинства admin.py-мастеров _ANCHOR_MSG_KEY НЕ
+        отслеживается (см. P1-3 диагностику — только /admin root и
+        FAQ-add wizard используют flow.py) — /cancel не должен ни падать,
+        ни пытаться удалить несуществующий id; триггер всё равно
+        удаляется (RULE 1 применим независимо от tracking) — это и есть
+        документированная архитектурная граница cancel_transient, а не
+        баг: полное решение требует миграции остальных хендлеров на
+        flow.py (вне scope этой задачи)."""
+        state = await self._state_with_nav(cancel_to="root")  # без _ANCHOR_MSG_KEY
+        msg = make_flow_message_factory(chat_id=self.actor, start_id=3400)(text="/cancel")
+        msg.delete = AsyncMock(wraps=msg.delete)
+
+        await admin.admin_cancel_command(msg, state)
+
+        msg.bot.delete_message.assert_not_awaited()  # нечего было удалять
+        msg.delete.assert_awaited_once()  # но триггер всё равно чистится
+        data = await state.get_data()
+        self.assertEqual(data.get(flow._NAV_ANCHOR_MSG_KEY), 1001)
+        self.assertIsNone(await state.get_state())
+
+    async def test_inline_cancel_does_not_invoke_cancel_transient(self):
+        """Регрессия: cancel_transient (новая message-lifecycle логика
+        текстового /cancel) не должна затрагивать inline "❌ Отмена" — она
+        продолжает работать как раньше, просто edit_text на месте."""
+        state = await self._state_with_nav(cancel_to="root")
+        cb = make_callback("admincancel", chat_id=self.actor)
+        with patch("bot.handlers.admin.flow.cancel_transient", new=AsyncMock()) as mocked:
+            await admin.admin_cancel(cb, state)
+        mocked.assert_not_awaited()
+        cb.message.edit_text.assert_awaited_once()
 
 
 def make_photo_message(chat_id: int) -> SimpleNamespace:

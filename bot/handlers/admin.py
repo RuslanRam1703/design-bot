@@ -152,8 +152,16 @@ async def admin_cancel_command(message: Message, state: FSMContext) -> None:
     """Текстовый /cancel как альтернатива инлайн-кнопке "❌ Отмена" — в
     клиентском флоу (bot/handlers/start.py) /cancel уже работает так,
     админка была единственным местом без него: набранный /cancel просто
-    сохранялся как введённые данные (текст вопроса FAQ, название кейса...)."""
+    сохранялся как введённые данные (текст вопроса FAQ, название кейса...).
+
+    В отличие от инлайн "❌ Отмена" (admin_cancel — редактирует
+    callback.message на месте, orphan структурно невозможен), у текстовой
+    команды нет прямой ссылки на предыдущее сообщение бота — сначала
+    best-effort чистим то, что реально отслеживается (см.
+    flow.cancel_transient и её докстринг про архитектурные границы этого
+    best-effort), и только затем показываем новый экран."""
     text, markup, next_state, next_data = await _resolve_cancel(await state.get_data())
+    await flow.cancel_transient(message, state)
     await flow.set_data_keep_nav(state, next_data)
     await state.set_state(next_state)
     await message.answer(text, reply_markup=markup)

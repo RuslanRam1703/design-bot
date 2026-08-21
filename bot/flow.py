@@ -178,13 +178,12 @@ async def _create_nav_anchor(message: Message, state: FSMContext) -> None:
     await state.update_data(**{_NAV_ANCHOR_MSG_KEY: sent.message_id, _NAV_ANCHOR_CHAT_KEY: sent.chat.id})
 
 
-async def _cleanup_transient(message: Message, state: FSMContext) -> None:
-    """Общая часть для reset_nav_screen и main_menu_cleanup: завершить
-    активный сценарий (аварийный выход — RULE 2-совместимо), удалить
-    текущий TRANSIENT экран (если был) и триггер. НЕ трогает NAV anchor
-    вообще — это исключительно забота вызывающей стороны."""
-    await finish_flow(state)
-
+async def _delete_tracked_transient(message: Message, state: FSMContext) -> None:
+    """Общая часть _cleanup_transient/cancel_transient: best-effort удалить
+    ТОЛЬКО то TRANSIENT-сообщение, что реально отслеживается в state.data
+    (если оно есть) и забыть его id. НЕ трогает FSM-состояние и не удаляет
+    триггер — вызывающие стороны расходятся именно в этом (см. finish_flow
+    в _cleanup_transient и его отсутствие в cancel_transient)."""
     data = await state.get_data()
     transient_id = data.get(_ANCHOR_MSG_KEY)
     transient_chat = data.get(_ANCHOR_CHAT_KEY)
@@ -195,6 +194,51 @@ async def _cleanup_transient(message: Message, state: FSMContext) -> None:
             pass
         await state.update_data(**{_ANCHOR_MSG_KEY: None, _ANCHOR_CHAT_KEY: None})
 
+
+async def _cleanup_transient(message: Message, state: FSMContext) -> None:
+    """Общая часть для reset_nav_screen и main_menu_cleanup: завершить
+    активный сценарий (аварийный выход — RULE 2-совместимо), удалить
+    текущий TRANSIENT экран (если был) и триггер. НЕ трогает NAV anchor
+    вообще — это исключительно забота вызывающей стороны."""
+    await finish_flow(state)
+    await _delete_tracked_transient(message, state)
+    await delete_trigger(message)
+
+
+async def cancel_transient(message: Message, state: FSMContext) -> None:
+    """Текстовый /cancel (см. bot/handlers/admin.py::admin_cancel_command)
+    — best-effort очистка сообщений, аналог того, что инлайн "❌ Отмена"
+    получает бесплатно за счёт callback.message.edit_text (см. admin_cancel:
+    callback ВСЕГДА указывает на реальное текущее сообщение и редактирует
+    его на месте — orphan там структурно невозможен). У текстовой команды
+    такого указателя нет: Bot API не даёт message ссылку на "предыдущее
+    сообщение бота, на которое это ответ", если пользователь не использовал
+    явный Telegram reply (мастера admin на reply-цепочки не рассчитаны).
+    Поэтому опираться можно только на то, что уже отслеживается в
+    state.data (_ANCHOR_MSG_KEY/_ANCHOR_CHAT_KEY).
+
+    В отличие от _cleanup_transient НЕ вызывает finish_flow(): вызывающий
+    код (admin_cancel_command) сам ставит next_state из _resolve_cancel,
+    который может быть НЕ None (например, AdminStates.edit_service_field_pick
+    с сохранённым service_id) — принудительный сброс state здесь сломал бы
+    это контекстное возвращение.
+
+    Архитектурная граница (см. P1-3 диагностику): _ANCHOR_MSG_KEY сегодня
+    обновляется только в open_root (/admin) и FAQ-add wizard (см.
+    bot/handlers/admin.py) — остальные экраны используют прямой
+    callback.message.edit_text/message.answer в обход flow.py и никогда
+    его не обновляют. Поэтому эта функция гарантированно попадает в
+    актуальный prompt, только пока сценарий ещё не прошёл ни одного
+    СВОЕГО текстового/фото шага (первый вопрос мастера после чистой
+    inline-навигации, и весь FAQ-add wizard). Если /cancel набран на
+    втором и далее текстовом шаге одного мастера, _ANCHOR_MSG_KEY
+    указывает на более старое, уже отработавшее сообщение, а не на
+    actually текущий prompt — функция всё равно удаляет то, что
+    отслеживается (устраняя хотя бы этот более старый "хвост"), но не
+    способна закрыть более свежий orphan, чей id ей просто неоткуда
+    узнать без миграции остальных admin.py-хендлеров на flow.py
+    (сознательно вне scope этой задачи)."""
+    await _delete_tracked_transient(message, state)
     await delete_trigger(message)
 
 
