@@ -273,14 +273,20 @@ class AdminRouterOrderingTests(unittest.TestCase):
         self.assertEqual(names[-1], "admin_unexpected_input")
 
 
-def make_callback(data: str, chat_id: int = 777, bot: AsyncMock | None = None) -> SimpleNamespace:
+def make_callback(data: str, chat_id: int = 777, bot: AsyncMock | None = None, message_id: int = 555) -> SimpleNamespace:
     """Достаточно для admin.py callback-хендлеров: callback.data,
     callback.message.chat.id, callback.message.edit_text (async),
     callback.answer (async), callback.bot (async send_message — нужен
-    lead_change_status для уведомления клиента о смене статуса)."""
+    lead_change_status для уведомления клиента о смене статуса).
+
+    message_id (P1-3, Batch 1) — нужен flow.step_from_callback
+    (callback.message.message_id, теперь вызывается из menu_* section
+    navigation); дефолт 555 сохраняет прежнее поведение для тестов,
+    которым конкретное значение не важно — lifecycle-тесты передают
+    уникальный message_id явно, чтобы отличить edit от send нового."""
     return SimpleNamespace(
         data=data,
-        message=SimpleNamespace(chat=SimpleNamespace(id=chat_id), edit_text=AsyncMock()),
+        message=SimpleNamespace(chat=SimpleNamespace(id=chat_id), message_id=message_id, edit_text=AsyncMock()),
         answer=AsyncMock(),
         bot=bot if bot is not None else AsyncMock(),
     )
@@ -2153,6 +2159,180 @@ class AdminNavAnchorResetTests(unittest.IsolatedAsyncioTestCase):
         mm_msg.bot.edit_message_text.assert_not_awaited()  # NAV anchor не тронут ни одним сетевым вызовом
         data = await state.get_data()
         self.assertEqual(data.get(flow._NAV_ANCHOR_MSG_KEY), 111)
+
+
+class AdminSectionNavigationAnchorTests(unittest.IsolatedAsyncioTestCase):
+    """P1-3, Batch 1: верхнеуровневая admin-навигация (9 adminmenu:*
+    entry points). flow.reset_state_keep_nav() стирает _flow_msg_id/
+    _flow_chat_id (сохраняет только NAV), а следовавший за ним raw
+    callback.message.edit_text() ничего не ставил взамен — экран
+    физически корректен (тот же message_id), но TRANSIENT anchor на него
+    больше не указывает. Это НЕ retry (Batch 2) и НЕ successor-staleness
+    отдельного wizard'а (Batch 3) — это staleness самой section navigation,
+    воспроизводимая при заходе в ЛЮБОЙ раздел админки. Все 9 handlers
+    переведены на flow.step_from_callback, которая делает тот же
+    edit_text и дополнительно фиксирует anchor."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        real_data_dir = Path(__file__).resolve().parent.parent / "data"
+        for name in ("pricing.json", "portfolio.json", "faq.json", "about.json", "ui_config.json"):
+            shutil.copy(real_data_dir / name, Path(self.tmpdir) / name)
+        self._orig_data_dir = content_store.DATA_DIR
+        self._orig_designer = content_store.config.DESIGNER_CHAT_ID
+        content_store.DATA_DIR = Path(self.tmpdir)
+        content_store.config.DESIGNER_CHAT_ID = "222"
+        self.actor = 222
+
+    def tearDown(self):
+        content_store.DATA_DIR = self._orig_data_dir
+        content_store.config.DESIGNER_CHAT_ID = self._orig_designer
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    async def _state_with_nav(self, nav_msg_id: int = 111) -> FSMContext:
+        state = make_state(self.actor)
+        await state.update_data(**{
+            flow._NAV_ANCHOR_MSG_KEY: nav_msg_id,
+            flow._NAV_ANCHOR_CHAT_KEY: self.actor,
+        })
+        return state
+
+    # ---- 1-4: все 9 entry points фиксируют текущий экран как anchor, NAV не тронут ----
+    async def test_all_nine_sections_track_current_screen_and_preserve_nav(self):
+        sections = [
+            ("adminmenu:root", admin.menu_root),
+            ("adminmenu:cases", admin.menu_cases),
+            ("adminmenu:faq", admin.menu_faq),
+            ("adminmenu:pricing", admin.menu_pricing),
+            ("adminmenu:categories", admin.menu_categories),
+            ("adminmenu:nav", admin.menu_nav),
+            ("adminmenu:about", admin.menu_about),
+            ("adminmenu:leads", admin.menu_leads),  # без заявок -> ветка "Заявок пока нет."
+            ("adminmenu:backup", admin.menu_backup),
+        ]
+        for i, (data, handler) in enumerate(sections):
+            with self.subTest(section=data):
+                msg_id = 3000 + i
+                state = await self._state_with_nav()
+                cb = make_callback(data, chat_id=self.actor, message_id=msg_id)
+                await handler(cb, state)
+
+                cb.message.edit_text.assert_awaited_once()  # экран реально показан (edit, не send)
+                result = await state.get_data()
+                self.assertEqual(result.get(flow._ANCHOR_MSG_KEY), msg_id)  # anchor -> этот экран
+                self.assertEqual(result.get(flow._ANCHOR_CHAT_KEY), self.actor)
+                self.assertEqual(result.get(flow._NAV_ANCHOR_MSG_KEY), 111)  # NAV не тронут
+                self.assertEqual(result.get(flow._NAV_ANCHOR_CHAT_KEY), self.actor)
+
+    async def test_menu_leads_with_active_leads_tracks_current_screen(self):
+        # Второй call site внутри menu_leads (непустой список) — не
+        # покрыт предыдущим тестом, у которого заявок нет.
+        await content_store.add_lead(
+            {"service_name": "Лендинг", "task_description": "Задача"},
+            {"user_id": 66666, "username": "client", "first_name": "Клиент"},
+        )
+        state = await self._state_with_nav()
+        msg_id = 3900
+        cb = make_callback("adminmenu:leads", chat_id=self.actor, message_id=msg_id)
+        await admin.menu_leads(cb, state)
+
+        cb.message.edit_text.assert_awaited_once()
+        self.assertEqual(await state.get_state(), AdminStates.leads_list.state)
+        data = await state.get_data()
+        self.assertEqual(data.get(flow._ANCHOR_MSG_KEY), msg_id)
+        self.assertEqual(data.get(flow._NAV_ANCHOR_MSG_KEY), 111)
+
+    # ---- Переход между секциями: реалистично один физический message_id ----
+    async def test_section_transition_keeps_same_message_id_and_nav(self):
+        # Telegram callback-кнопки живут на конкретном сообщении — переход
+        # между секциями в реальности редактирует ОДНО и то же сообщение
+        # (пока не встретится текстовый/фото шаг мастера, вне scope этой
+        # задачи), а не создаёт новое на каждый клик.
+        state = await self._state_with_nav()
+        msg_id = 4000
+        await admin.menu_cases(make_callback("adminmenu:cases", chat_id=self.actor, message_id=msg_id), state)
+        data = await state.get_data()
+        self.assertEqual(data.get(flow._ANCHOR_MSG_KEY), msg_id)
+
+        await admin.menu_faq(make_callback("adminmenu:faq", chat_id=self.actor, message_id=msg_id), state)
+        data = await state.get_data()
+        self.assertEqual(data.get(flow._ANCHOR_MSG_KEY), msg_id)  # anchor не уехал
+        self.assertEqual(data.get(flow._NAV_ANCHOR_MSG_KEY), 111)  # NAV не создан заново
+
+        await admin.menu_pricing(make_callback("adminmenu:pricing", chat_id=self.actor, message_id=msg_id), state)
+        data = await state.get_data()
+        self.assertEqual(data.get(flow._ANCHOR_MSG_KEY), msg_id)
+        self.assertEqual(data.get(flow._NAV_ANCHOR_MSG_KEY), 111)
+
+    # ---- Повторный вход A -> B -> A: без накопления orphan ----
+    async def test_repeated_reentry_does_not_accumulate_orphans(self):
+        state = await self._state_with_nav()
+        msg_id = 4100
+        cb_a1 = make_callback("adminmenu:cases", chat_id=self.actor, message_id=msg_id)
+        cb_b = make_callback("adminmenu:faq", chat_id=self.actor, message_id=msg_id)
+        cb_a2 = make_callback("adminmenu:cases", chat_id=self.actor, message_id=msg_id)
+
+        await admin.menu_cases(cb_a1, state)
+        await admin.menu_faq(cb_b, state)
+        await admin.menu_cases(cb_a2, state)
+
+        # Все три перехода — edit_text ОДНОГО и того же сообщения (RULE 3):
+        # anchor остаётся тем же id через весь цикл, ни разу не "уехав" на
+        # новое сообщение — именно так выглядело бы накопление orphan.
+        cb_a1.message.edit_text.assert_awaited_once()
+        cb_b.message.edit_text.assert_awaited_once()
+        cb_a2.message.edit_text.assert_awaited_once()
+        data = await state.get_data()
+        self.assertEqual(data.get(flow._ANCHOR_MSG_KEY), msg_id)
+        self.assertEqual(data.get(flow._NAV_ANCHOR_MSG_KEY), 111)
+
+    # ---- Main Menu после admin-раздела: текущий экран удаляется, NAV сохраняется ----
+    async def test_main_menu_after_admin_section_deletes_current_screen(self):
+        state = await self._state_with_nav()
+        msg_id = 4200
+        await admin.menu_cases(make_callback("adminmenu:cases", chat_id=self.actor, message_id=msg_id), state)
+        self.assertIsNone(await state.get_state())  # reset_state_keep_nav -> None
+
+        trigger = make_flow_message_factory(chat_id=self.actor, start_id=4300)(text=texts.MAIN_MENU_BUTTON)
+        await admin.admin_main_menu_button(trigger, state)
+
+        # До миграции anchor был бы absent -> ничего не удалялось бы, и
+        # экран "Кейсы портфолио:" оставался бы orphan навсегда.
+        trigger.bot.delete_message.assert_awaited_once_with(chat_id=self.actor, message_id=msg_id)
+        trigger.answer.assert_not_awaited()  # нет нового WELCOME
+        data = await state.get_data()
+        self.assertEqual(data.get(flow._NAV_ANCHOR_MSG_KEY), 111)
+
+    # ---- /cancel из раздела, где он архитектурно доступен (menu_about -> active state) ----
+    async def test_cancel_from_about_section_deletes_current_screen(self):
+        state = await self._state_with_nav()
+        msg_id = 4400
+        await admin.menu_about(make_callback("adminmenu:about", chat_id=self.actor, message_id=msg_id), state)
+        self.assertEqual(await state.get_state(), AdminStates.edit_about_field_pick.state)
+
+        cancel_msg = make_flow_message_factory(chat_id=self.actor, start_id=4500)(text="/cancel")
+        await admin.admin_cancel_command(cancel_msg, state)
+
+        # До миграции cancel_transient не находил бы отслеживаемый anchor
+        # (absent) и не удалял бы вообще ничего — текущий экран оставался
+        # бы висеть рядом с новым "Отменено..." сообщением.
+        cancel_msg.bot.delete_message.assert_awaited_once_with(chat_id=self.actor, message_id=msg_id)
+        data = await state.get_data()
+        self.assertEqual(data.get(flow._NAV_ANCHOR_MSG_KEY), 111)
+
+    # ---- IMPORTANT ARCHITECTURAL CHECK: existing NAV -> section nav -> ensure_nav_anchor -> reused, no duplicate ----
+    async def test_ensure_nav_anchor_after_section_visit_does_not_recreate(self):
+        state = await self._state_with_nav()
+        await admin.menu_pricing(make_callback("adminmenu:pricing", chat_id=self.actor, message_id=4600), state)
+
+        probe = make_flow_message_factory(chat_id=self.actor, start_id=4700)()
+        created = await flow.ensure_nav_anchor(probe, state)
+
+        self.assertFalse(created)  # существующий NAV переиспользован
+        probe.answer.assert_not_awaited()  # ни одного нового WELCOME/NAV
+        data = await state.get_data()
+        self.assertEqual(data.get(flow._NAV_ANCHOR_MSG_KEY), 111)
+        self.assertEqual(data.get(flow._NAV_ANCHOR_CHAT_KEY), self.actor)
 
 
 class AdminLeadsFullSequenceTests(unittest.IsolatedAsyncioTestCase):

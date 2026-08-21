@@ -185,36 +185,43 @@ async def admin_main_menu_button(message: Message, state: FSMContext) -> None:
 
 @router.callback_query(F.data == "adminmenu:root")
 async def menu_root(callback: CallbackQuery, state: FSMContext) -> None:
+    # flow.step_from_callback вместо raw callback.message.edit_text (P1-3,
+    # Batch 1) — reset_state_keep_nav выше стирает _flow_msg_id/_flow_chat_id
+    # (сохраняет только NAV-ключи), и raw edit_text ничего не ставило взамен:
+    # экран физически корректен (тот же message_id), но TRANSIENT anchor
+    # больше на него не указывает. step_from_callback правит именно это —
+    # редактирует то же сообщение и заново фиксирует его как текущий экран,
+    # чтобы /cancel и "⌂ Главное меню" знали, что удалять.
     await flow.reset_state_keep_nav(state)
-    await callback.message.edit_text(await _admin_root_text(), reply_markup=kb.admin_root_keyboard())
+    await flow.step_from_callback(callback, state, await _admin_root_text(), kb.admin_root_keyboard())
     await callback.answer()
 
 
 @router.callback_query(F.data == "adminmenu:cases")
 async def menu_cases(callback: CallbackQuery, state: FSMContext) -> None:
     await flow.reset_state_keep_nav(state)
-    await callback.message.edit_text("Кейсы портфолио:", reply_markup=kb.admin_cases_menu_keyboard())
+    await flow.step_from_callback(callback, state, "Кейсы портфолио:", kb.admin_cases_menu_keyboard())
     await callback.answer()
 
 
 @router.callback_query(F.data == "adminmenu:faq")
 async def menu_faq(callback: CallbackQuery, state: FSMContext) -> None:
     await flow.reset_state_keep_nav(state)
-    await callback.message.edit_text("FAQ:", reply_markup=kb.admin_faq_menu_keyboard())
+    await flow.step_from_callback(callback, state, "FAQ:", kb.admin_faq_menu_keyboard())
     await callback.answer()
 
 
 @router.callback_query(F.data == "adminmenu:pricing")
 async def menu_pricing(callback: CallbackQuery, state: FSMContext) -> None:
     await flow.reset_state_keep_nav(state)
-    await callback.message.edit_text("Услуги и цены:", reply_markup=kb.pricing_menu_keyboard())
+    await flow.step_from_callback(callback, state, "Услуги и цены:", kb.pricing_menu_keyboard())
     await callback.answer()
 
 
 @router.callback_query(F.data == "adminmenu:categories")
 async def menu_categories(callback: CallbackQuery, state: FSMContext) -> None:
     await flow.reset_state_keep_nav(state)
-    await callback.message.edit_text("Категории портфолио:", reply_markup=kb.categories_menu_keyboard())
+    await flow.step_from_callback(callback, state, "Категории портфолио:", kb.categories_menu_keyboard())
     await callback.answer()
 
 
@@ -222,9 +229,10 @@ async def menu_categories(callback: CallbackQuery, state: FSMContext) -> None:
 async def menu_nav(callback: CallbackQuery, state: FSMContext) -> None:
     await flow.reset_state_keep_nav(state)
     ui_config = await content_store.get_ui_config()
-    await callback.message.edit_text(
+    await flow.step_from_callback(
+        callback, state,
         "Меню и навигация — нажмите пункт, чтобы включить/выключить:",
-        reply_markup=kb.nav_menu_keyboard(ui_config),
+        kb.nav_menu_keyboard(ui_config),
     )
     await callback.answer()
 
@@ -246,9 +254,10 @@ async def nav_toggle(callback: CallbackQuery, state: FSMContext) -> None:
 async def menu_about(callback: CallbackQuery, state: FSMContext) -> None:
     await flow.reset_state_keep_nav(state)
     about = await content_store.get_about()
-    await callback.message.edit_text(
+    await flow.step_from_callback(
+        callback, state,
         "Что изменить в разделе «Обо мне»?",
-        reply_markup=kb.about_field_keyboard(about.get("needs_review_fields")),
+        kb.about_field_keyboard(about.get("needs_review_fields")),
     )
     await state.set_state(AdminStates.edit_about_field_pick)
     await callback.answer()
@@ -1521,13 +1530,13 @@ async def menu_leads(callback: CallbackQuery, state: FSMContext) -> None:
     await flow.reset_state_keep_nav(state)
     all_leads = await content_store.list_leads("ALL")
     if not all_leads:
-        await callback.message.edit_text("Заявок пока нет.", reply_markup=kb.admin_root_keyboard())
+        await flow.step_from_callback(callback, state, "Заявок пока нет.", kb.admin_root_keyboard())
         await callback.answer()
         return
     leads = await content_store.list_leads("ACTIVE")
     await state.update_data(lead_filter="ACTIVE")
     text = f"Заявки — активные ({len(leads)}):" if leads else "Активных заявок нет."
-    await callback.message.edit_text(text, reply_markup=kb.leads_list_keyboard(leads, "ACTIVE"))
+    await flow.step_from_callback(callback, state, text, kb.leads_list_keyboard(leads, "ACTIVE"))
     await state.set_state(AdminStates.leads_list)
     await callback.answer()
 
@@ -1697,9 +1706,10 @@ async def lead_delete_do(callback: CallbackQuery, state: FSMContext) -> None:
 @router.callback_query(F.data == "adminmenu:backup")
 async def menu_backup(callback: CallbackQuery, state: FSMContext) -> None:
     await flow.reset_state_keep_nav(state)
-    await callback.message.edit_text(
+    await flow.step_from_callback(
+        callback, state,
         "Бэкап данных (заявки, кейсы, «Обо мне», услуги, FAQ, фото) — переживает деплой, только если вы его восстановите после каждого обновления бота:",
-        reply_markup=kb.backup_menu_keyboard(),
+        kb.backup_menu_keyboard(),
     )
     await callback.answer()
 
