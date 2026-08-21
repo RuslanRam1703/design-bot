@@ -757,6 +757,18 @@ function attachAboutEvents() {
 
   const cta = document.getElementById("about-cta");
   if (cta) cta.addEventListener("click", () => {
+    // resetBrief:true (см. resetBriefState) переносит serviceId/serviceName/
+    // calc/orderOptions/urgent/complex как есть, если явно не обнулить —
+    // без этого сюда протекла бы конфигурация, оставшаяся от предыдущего
+    // "Похожий заказ" в кейсе (см. production-аудит, P2-9). У About своей
+    // услуги нет, так что просто обнуляем — как и Case CTA чуть выше по
+    // файлу обнуляет sourceCaseId/sourceCaseTitle для своего source.
+    state.brief.serviceId = null;
+    state.brief.serviceName = null;
+    state.brief.calc = null;
+    state.brief.orderOptions = {};
+    state.brief.urgent = false;
+    state.brief.complex = false;
     state.brief.source = "about";
     state.brief.sourceCaseId = null;
     state.brief.sourceCaseTitle = null;
@@ -1013,8 +1025,17 @@ function attachBriefEvents() {
       const id = el.dataset.servicePick;
       if (id === "unknown") {
         // Нет услуги — конфигурировать нечего, сразу к вопросу о задаче.
+        // calc/orderOptions/urgent/complex явно сбрасываем: этот путь идёт
+        // напрямую в briefNext(), минуя order-next (где calc обычно
+        // пересчитывается заново) — без сброса здесь конфигурация ранее
+        // выбранной и брошенной услуги тихо уехала бы в payload (см.
+        // production-аудит, P1-4).
         state.brief.serviceId = null;
         state.brief.serviceName = "Не определился с услугой";
+        state.brief.calc = null;
+        state.brief.orderOptions = {};
+        state.brief.urgent = false;
+        state.brief.complex = false;
         briefNext();
       } else {
         // Услуга выбрана — остаёмся на шаге 1, он сразу покажет её
@@ -1084,8 +1105,15 @@ function attachBriefEvents() {
   const orderChangeService = document.getElementById("order-change-service");
   if (orderChangeService) orderChangeService.addEventListener("click", (e) => {
     e.preventDefault();
+    // Тот же сброс, что и в ветке "unknown" выше, и по той же причине:
+    // "изменить услугу" возвращает на экран выбора без прохода через
+    // order-next, где calc обычно пересчитывается (см. P1-4).
     state.brief.serviceId = null;
     state.brief.serviceName = null;
+    state.brief.calc = null;
+    state.brief.orderOptions = {};
+    state.brief.urgent = false;
+    state.brief.complex = false;
     render();
   });
   const orderNext = document.getElementById("order-next");

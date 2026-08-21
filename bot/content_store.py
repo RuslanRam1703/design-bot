@@ -893,6 +893,14 @@ def add_lead(payload: dict, telegram: dict, calc_summary: dict | None = None, dr
     if draft_id:
         existing = next((l for l in leads if l.get("draft_id") == draft_id), None)
         if existing is not None:
+            # draft_id — обычная строка из localStorage клиента, ничем не
+            # подписана. Без этой проверки чужой (совпавший или подобранный)
+            # draft_id тихо перезаписал бы payload/identity уже существующей
+            # заявки (см. production-аудит, P1-2) — тот же класс ошибки, что
+            # add_lead_supplement ниже уже ловит по lead_id; здесь то же самое
+            # для draft_id-апсерта. Ничего не меняем и не пишем при коллизии.
+            if existing.get("telegram", {}).get("user_id") != telegram.get("user_id"):
+                raise NotLeadOwnerError(existing["id"])
             existing.update(
                 payload=payload,
                 telegram=telegram,

@@ -3869,6 +3869,43 @@ class SubmitIdempotencyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(content_store.list_leads_by_user(42)), 1)
         fake_bot.send_message.assert_awaited_once()
 
+    async def test_different_user_same_draft_id_is_rejected(self):
+        # См. production-аудит, P1-2: draft_id — обычная строка из
+        # localStorage клиента, ничем не подписана. Совпадение (или подбор)
+        # чужого draft_id не должно перезаписывать чужую заявку.
+        from aiohttp.test_utils import TestClient, TestServer
+
+        fake_bot = AsyncMock()
+        app = webserver.create_app(fake_bot)
+        async with TestClient(TestServer(app)) as client:
+            first = await client.post(
+                "/api/leads",
+                headers={"X-Telegram-Init-Data": self._init_data(user_id=42), "Content-Type": "application/json"},
+                json={"service_name": "Лендинг", "task_description": "заявка user 42", "draft_id": "collide-1"},
+            )
+            self.assertEqual(first.status, 200)
+            lead_id = (await first.json())["lead_id"]
+
+            second = await client.post(
+                "/api/leads",
+                headers={"X-Telegram-Init-Data": self._init_data(user_id=999), "Content-Type": "application/json"},
+                json={"service_name": "Брендинг", "task_description": "попытка user 999", "draft_id": "collide-1"},
+            )
+            self.assertEqual(second.status, 403)
+            self.assertEqual(await second.json(), {"error": "forbidden"})
+
+        # Исходная заявка не изменилась ни в payload, ни в identity.
+        lead = content_store.get_lead(lead_id)
+        self.assertEqual(lead["payload"]["task_description"], "заявка user 42")
+        self.assertEqual(lead["telegram"]["user_id"], 42)
+        # user 999 не получил чужую заявку в своём списке, и новой заявки
+        # под тем же draft_id не появилось.
+        self.assertEqual(content_store.list_leads_by_user(999), [])
+        self.assertEqual(len(content_store.list_leads_by_user(42)), 1)
+        # Уведомление владельцу ушло РОВНО один раз (за первую, настоящую
+        # заявку) — отклонённая коллизия не притворилась новой заявкой.
+        fake_bot.send_message.assert_awaited_once()
+
 
 class LeadSupplementTests(unittest.IsolatedAsyncioTestCase):
     """mode="supplement" — дополнение к уже существующей заявке, адресуется
@@ -3938,7 +3975,13 @@ class LeadSupplementTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertEqual(resp.status, 404)
 
-    async def test_supplement_to_someone_elses_lead_is_403(self):
+    async def test_supplement_to_someone_elses_lead_is_404(self):
+        # См. production-аудит, P2-11: чужой lead_id больше не отличим
+        # снаружи от несуществующего (раньше был 403 vs 404 у
+        # несуществующего — перебором lead_id можно было узнать, какие ID
+        # вообще существуют у других клиентов). Внутри content_store
+        # NotLeadOwnerError/LeadNotFoundError остались раздельными типами —
+        # унифицирован только HTTP-ответ, см. webserver.py::_handle_lead_supplement.
         from aiohttp.test_utils import TestClient, TestServer
 
         app = webserver.create_app(AsyncMock())
@@ -3949,10 +3992,36 @@ class LeadSupplementTests(unittest.IsolatedAsyncioTestCase):
                 headers={"X-Telegram-Init-Data": self._init_data(user_id=999), "Content-Type": "application/json"},
                 json={"mode": "supplement", "lead_id": lead_id, "fields": {"comment": "чужое дополнение"}},
             )
-            self.assertEqual(resp.status, 403)
+            self.assertEqual(resp.status, 404)
+            body = await resp.json()
+            self.assertEqual(body, {"error": "not_found"})
 
         lead = content_store.get_lead(lead_id)
         self.assertEqual(lead.get("supplements", []), [])  # чужая попытка ничего не добавила
+
+    async def test_wrong_owner_and_nonexistent_lead_responses_are_identical(self):
+        # Прямое доказательство неразличимости "не мой lead" vs "нет такого
+        # lead" — не просто "оба дают 404 по отдельности", а буквально
+        # идентичный status+body для обоих случаев.
+        from aiohttp.test_utils import TestClient, TestServer
+
+        app = webserver.create_app(AsyncMock())
+        async with TestClient(TestServer(app)) as client:
+            lead_id = await self._create_lead(client, user_id=42)
+
+            wrong_owner_resp = await client.post(
+                "/api/leads",
+                headers={"X-Telegram-Init-Data": self._init_data(user_id=999), "Content-Type": "application/json"},
+                json={"mode": "supplement", "lead_id": lead_id, "fields": {"comment": "x"}},
+            )
+            nonexistent_resp = await client.post(
+                "/api/leads",
+                headers={"X-Telegram-Init-Data": self._init_data(user_id=999), "Content-Type": "application/json"},
+                json={"mode": "supplement", "lead_id": 999999, "fields": {"comment": "x"}},
+            )
+
+            self.assertEqual(wrong_owner_resp.status, nonexistent_resp.status)
+            self.assertEqual(await wrong_owner_resp.json(), await nonexistent_resp.json())
 
     async def test_supplement_does_not_change_original_payload(self):
         from aiohttp.test_utils import TestClient, TestServer
@@ -4027,6 +4096,69 @@ class LeadSupplementTests(unittest.IsolatedAsyncioTestCase):
                 json={"mode": "supplement", "lead_id": lead_id, "user_id": 999999, "fields": {"comment": "..."}},
             )
             self.assertEqual(resp.status, 200)  # user_id в body просто игнорируется, не читается вообще
+
+
+class PublicDataRouteTests(unittest.IsolatedAsyncioTestCase):
+    """См. production-аудит, P0-1: /data/ раньше отдавал ВСЮ директорию
+    (add_static), включая leads.json — реальные контакты клиентов при
+    выключенном Upstash. Теперь /data/{filename} — explicit whitelist
+    (PUBLIC_DATA_FILES), не blacklist: файл публичен, только если явно в
+    списке; всё остальное — обычный 404, как будто файла не существует."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        real_data_dir = Path(__file__).resolve().parent.parent / "data"
+        for name in ("pricing.json", "portfolio.json", "faq.json", "about.json", "ui_config.json"):
+            shutil.copy(real_data_dir / name, Path(self.tmpdir) / name)
+        # leads.json — намеренно с реалистичным непустым содержимым, чтобы
+        # тест реально доказывал "не отдаётся", а не "файла просто нет".
+        (Path(self.tmpdir) / "leads.json").write_text(
+            json.dumps({"leads": [{"id": 1, "telegram": {"user_id": 42}, "payload": {"contact": "+7 900 000-00-00"}}]}),
+            encoding="utf-8",
+        )
+        self._orig_data_dir = content_store.DATA_DIR
+        self._orig_webserver_data_dir = webserver.DATA_DIR
+        content_store.DATA_DIR = Path(self.tmpdir)
+        webserver.DATA_DIR = Path(self.tmpdir)
+
+    def tearDown(self):
+        content_store.DATA_DIR = self._orig_data_dir
+        webserver.DATA_DIR = self._orig_webserver_data_dir
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    async def test_leads_json_is_not_publicly_reachable(self):
+        from aiohttp.test_utils import TestClient, TestServer
+
+        app = webserver.create_app(AsyncMock())
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.get("/data/leads.json")
+            self.assertEqual(resp.status, 404)
+            body = await resp.text()
+            self.assertNotIn("+7 900", body)  # содержимое реально не утекло в тело ответа
+
+    async def test_arbitrary_filename_under_data_is_404_not_500(self):
+        # Whitelist, не только исключение leads.json — любое незнакомое имя
+        # (в т.ч. гипотетический будущий файл) тоже не публикуется.
+        from aiohttp.test_utils import TestClient, TestServer
+
+        app = webserver.create_app(AsyncMock())
+        async with TestClient(TestServer(app)) as client:
+            for name in ("faq.json", "secrets.json", "..%2fconfig.py", "leads.json.bak"):
+                resp = await client.get(f"/data/{name}")
+                self.assertEqual(resp.status, 404, f"{name} should not be publicly served")
+
+    async def test_public_config_files_still_load(self):
+        # Mini App init() делает fetch() ровно этих четырёх файлов
+        # (webapp/js/app.js) — они обязаны продолжать работать без изменений.
+        from aiohttp.test_utils import TestClient, TestServer
+
+        app = webserver.create_app(AsyncMock())
+        async with TestClient(TestServer(app)) as client:
+            for name in ("pricing.json", "portfolio.json", "about.json", "ui_config.json"):
+                resp = await client.get(f"/data/{name}")
+                self.assertEqual(resp.status, 200, f"{name} should still be publicly served")
+                body = await resp.json()
+                self.assertIsInstance(body, dict)
 
 
 class LeadMaterialTests(unittest.IsolatedAsyncioTestCase):

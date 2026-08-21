@@ -18,6 +18,16 @@ WEBAPP_DIR = Path(__file__).resolve().parent.parent / "webapp"
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 logger = logging.getLogger(__name__)
 
+# Whitelist, не blacklist: только эти файлы Mini App реально запрашивает
+# (см. webapp/js/app.js::init() — ровно эти 4 fetch()). leads.json (реальные
+# контакты клиентов при выключенном Upstash — см. content_store.py) и
+# faq.json (Mini App его вообще не читает, FAQ — только бот) никогда не
+# становятся доступны просто потому, что лежат в той же директории — раньше
+# add_static("/data/", DATA_DIR) отдавал ВСЮ директорию целиком (см.
+# production-аудит, P0-1). Любой новый файл, который когда-нибудь появится
+# в data/, по умолчанию НЕ публичен, пока явно не добавлен сюда.
+PUBLIC_DATA_FILES = ("pricing.json", "portfolio.json", "about.json", "ui_config.json")
+
 
 async def handle_index(request: web.Request) -> web.Response:
     response = web.FileResponse(WEBAPP_DIR / "index.html")
@@ -32,6 +42,17 @@ async def handle_index(request: web.Request) -> web.Response:
 
 async def handle_health(request: web.Request) -> web.Response:
     return web.Response(text="ok")
+
+
+async def handle_public_data(request: web.Request) -> web.Response:
+    """Отдаёт ТОЛЬКО файлы из PUBLIC_DATA_FILES (см. её докстринг выше) —
+    любое другое имя, включая leads.json, получает обычный 404, как если
+    бы файла не существовало вовсе (не 403 — не подтверждаем и не
+    опровергаем существование чего-либо за пределами whitelist)."""
+    filename = request.match_info["filename"]
+    if filename not in PUBLIC_DATA_FILES:
+        raise web.HTTPNotFound()
+    return web.FileResponse(DATA_DIR / filename)
 
 
 async def handle_my_leads(request: web.Request) -> web.Response:
@@ -140,7 +161,12 @@ async def _handle_lead_create(payload: dict, telegram_identity: dict, bot: Bot) 
         )
     calc_summary = dataclasses.asdict(calc_result) if calc_result and calc_result.valid else None
 
-    lead = content_store.add_lead(payload, telegram_identity, calc_summary, draft_id=payload.get("draft_id"))
+    try:
+        lead = content_store.add_lead(payload, telegram_identity, calc_summary, draft_id=payload.get("draft_id"))
+    except content_store.NotLeadOwnerError:
+        # draft_id совпал с чужой заявкой (см. content_store.add_lead,
+        # production-аудит P1-2) — ничего не создано и не изменено.
+        return web.json_response({"error": "forbidden"}, status=403)
     created = lead["created"]
 
     # Уведомляем владельца ТОЛЬКО при реальном создании — повторный/
@@ -196,10 +222,14 @@ async def _handle_lead_supplement(payload: dict, telegram_identity: dict, bot: B
 
     try:
         lead, supplement_id = content_store.add_lead_supplement(lead_id, telegram_identity, fields, wants_file=wants_file)
-    except content_store.LeadNotFoundError:
+    except (content_store.LeadNotFoundError, content_store.NotLeadOwnerError):
+        # Единый внешне наблюдаемый ответ для "такого lead_id нет" и "lead_id
+        # чужой" (см. production-аудит, P2-11) — иначе разница 404 vs 403
+        # позволяла бы перебором lead_id узнавать, какие ID вообще существуют
+        # у других клиентов. Сами exception-типы внутри content_store не
+        # менялись — различие полезно для логики/логов, наружу его просто не
+        # показываем.
         return web.json_response({"error": "not_found"}, status=404)
-    except content_store.NotLeadOwnerError:
-        return web.json_response({"error": "forbidden"}, status=403)
 
     text = format_lead_supplement_message(lead_id, fields)
     if config.DESIGNER_CHAT_ID:
@@ -247,5 +277,5 @@ def create_app(bot: Bot) -> web.Application:
     app.router.add_static("/css/", WEBAPP_DIR / "css")
     app.router.add_static("/js/", WEBAPP_DIR / "js")
     app.router.add_static("/img/", WEBAPP_DIR / "img")
-    app.router.add_static("/data/", DATA_DIR)
+    app.router.add_get("/data/{filename}", handle_public_data)
     return app

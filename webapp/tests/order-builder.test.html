@@ -61,6 +61,21 @@ const CASE_WITHOUT_ORDER_TEMPLATE = {
   related_service: "LEND",
 };
 
+// Форма зеркалит data/about.json — минимальный набор полей, которые
+// renderAbout() читает безусловно (specialization/tools/experience_years/
+// experience_text/approach/avatar/name/tagline).
+const FIXTURE_ABOUT = {
+  avatar: "img/avatar.png",
+  name: "Тест Тестов",
+  tagline: "Тестовый дизайнер",
+  specialization: ["UX/UI"],
+  tools: ["Figma"],
+  experience_years: "5 лет",
+  experience_text: "т",
+  approach: "т",
+  experience: [],
+};
+
 const results = [];
 function check(name, condition, detail) {
   results.push({ name, pass: !!condition, detail });
@@ -70,7 +85,7 @@ function resetGlobalState() {
   state.pricing = FIXTURE_PRICING;
   state.portfolio = { cases: [CASE_WITH_ORDER_TEMPLATE, CASE_WITHOUT_ORDER_TEMPLATE], types: [] };
   state.uiConfig = { menu: {} };
-  state.about = { experience: [] };
+  state.about = FIXTURE_ABOUT;
   state.screen = "portfolio";
   state.history = [];
   state.filter = "all";
@@ -240,12 +255,130 @@ function testDraftPersistenceUnaffected() {
   clearBriefDraft();
 }
 
+// ---- Тест 7 (P1-4): "Изменить услугу" сбрасывает calc/orderOptions/urgent/
+// complex от прежней, уже покинутой услуги — не только serviceId/serviceName ----
+function testChangeServiceLinkResetsStaleCalc() {
+  resetGlobalState();
+  state.screen = "brief";
+  render();
+  document.querySelector('[data-service-pick="BRAND"]').click(); // услуга выбрана, показан Order Builder
+  // Симулируем состояние "уже донастроил и прошёл дальше" (order-next
+  // выставляет calc) и затем вернулся на шаг 1 с этой же услугой — сам
+  // механизм возврата к шагу 1 здесь не тестируется, важно только то, что
+  // calc/orderOptions/urgent/complex к моменту клика "изменить" непустые.
+  state.brief.calc = { service_id: "BRAND", options: [{ id: "BRAND_1", qty: 1 }], urgent: true, complex: true };
+  state.brief.orderOptions = { BRAND_1: 1 };
+  state.brief.urgent = true;
+  state.brief.complex = true;
+  render();
+
+  document.getElementById("order-change-service").click();
+
+  check(
+    "изменить услугу: serviceId/serviceName сброшены (поведение не менялось)",
+    state.brief.serviceId === null && state.brief.serviceName === null,
+    `serviceId=${state.brief.serviceId} serviceName=${state.brief.serviceName}`
+  );
+  check(
+    "изменить услугу: calc от прежней услуги сброшен (P1-4)",
+    state.brief.calc === null,
+    `calc=${JSON.stringify(state.brief.calc)}`
+  );
+  check(
+    "изменить услугу: orderOptions/urgent/complex от прежней услуги сброшены (P1-4)",
+    Object.keys(state.brief.orderOptions).length === 0 && state.brief.urgent === false && state.brief.complex === false,
+    `orderOptions=${JSON.stringify(state.brief.orderOptions)} urgent=${state.brief.urgent} complex=${state.brief.complex}`
+  );
+}
+
+// ---- Тест 8 (P1-4): "Не знаю, что нужно" тоже сбрасывает calc/orderOptions/
+// urgent/complex — изолированно от теста 7 (стейл-состояние подставляется
+// уже ПОСЛЕ клика по "изменить", так что проверяется именно ветка "unknown") ----
+function testUnknownPickResetsStaleCalc() {
+  resetGlobalState();
+  state.screen = "brief";
+  render();
+  document.querySelector('[data-service-pick="BRAND"]').click();
+  document.getElementById("order-change-service").click(); // назад к списку услуг, serviceId=null
+
+  state.brief.calc = { service_id: "BRAND", options: [{ id: "BRAND_1", qty: 1 }], urgent: true, complex: true };
+  state.brief.orderOptions = { BRAND_1: 1 };
+  state.brief.urgent = true;
+  state.brief.complex = true;
+  render();
+
+  document.querySelector('[data-service-pick="unknown"]').click();
+
+  check(
+    "Не знаю, что нужно: serviceId=null, serviceName проставлен (поведение не менялось)",
+    state.brief.serviceId === null && state.brief.serviceName === "Не определился с услугой",
+    `serviceId=${state.brief.serviceId} serviceName=${state.brief.serviceName}`
+  );
+  check(
+    "Не знаю, что нужно: calc от прежней услуги не протекает дальше (P1-4)",
+    state.brief.calc === null,
+    `calc=${JSON.stringify(state.brief.calc)}`
+  );
+  check(
+    "Не знаю, что нужно: orderOptions/urgent/complex от прежней услуги сброшены (P1-4)",
+    Object.keys(state.brief.orderOptions).length === 0 && state.brief.urgent === false && state.brief.complex === false,
+    `orderOptions=${JSON.stringify(state.brief.orderOptions)} urgent=${state.brief.urgent} complex=${state.brief.complex}`
+  );
+}
+
+// ---- Тест 9 (P2-9): About CTA не наследует service/calc/options от кейса,
+// покинутого через Case -> "Хочу похожий проект" -> назад -> About ----
+function testAboutCtaDoesNotInheritCaseState() {
+  resetGlobalState();
+  state.currentCase = CASE_WITH_ORDER_TEMPLATE;
+  state.screen = "case";
+  render();
+  document.getElementById("want-similar").click(); // brief: serviceId=BRAND, source=case, sourceCaseId=case_test_brand
+  state.brief.calc = { service_id: "BRAND", options: [{ id: "BRAND_1", qty: 1 }], urgent: true, complex: true };
+  state.brief.orderOptions = { BRAND_1: 1 };
+  state.brief.urgent = true;
+  state.brief.complex = true;
+
+  state.screen = "about"; // пользователь ушёл из брифа, не отправив его, в About
+  render();
+  document.getElementById("about-cta").click();
+
+  check(
+    "About CTA: переход в brief произошёл",
+    state.screen === "brief",
+    `screen=${state.screen}`
+  );
+  check(
+    "About CTA: serviceId/serviceName от кейса не наследуются (P2-9)",
+    state.brief.serviceId === null && state.brief.serviceName === null,
+    `serviceId=${state.brief.serviceId} serviceName=${state.brief.serviceName}`
+  );
+  check(
+    "About CTA: calc от кейса не наследуется (P2-9)",
+    state.brief.calc === null,
+    `calc=${JSON.stringify(state.brief.calc)}`
+  );
+  check(
+    "About CTA: orderOptions/urgent/complex от кейса не наследуются (P2-9)",
+    Object.keys(state.brief.orderOptions).length === 0 && state.brief.urgent === false && state.brief.complex === false,
+    `orderOptions=${JSON.stringify(state.brief.orderOptions)} urgent=${state.brief.urgent} complex=${state.brief.complex}`
+  );
+  check(
+    "About CTA: source=about сохранён корректно, sourceCaseId/sourceCaseTitle не протекают (P2-9)",
+    state.brief.source === "about" && state.brief.sourceCaseId === null && state.brief.sourceCaseTitle === null,
+    `source=${state.brief.source} sourceCaseId=${state.brief.sourceCaseId} sourceCaseTitle=${state.brief.sourceCaseTitle}`
+  );
+}
+
 testWantSimilarWithOrderTemplate();
 testWantSimilarWithoutOrderTemplate();
 testDirectServicePickUnaffected();
 testDirectCalculatorPickUnaffected();
 testUserCanStillCheckOption();
 testDraftPersistenceUnaffected();
+testChangeServiceLinkResetsStaleCalc();
+testUnknownPickResetsStaleCalc();
+testAboutCtaDoesNotInheritCaseState();
 
 const passCount = results.filter((r) => r.pass).length;
 const failCount = results.length - passCount;
