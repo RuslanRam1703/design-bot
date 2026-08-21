@@ -276,9 +276,14 @@ async def cases_add_category(callback: CallbackQuery, state: FSMContext) -> None
 
 @router.message(AdminStates.add_case_title, F.text)
 async def cases_add_title(message: Message, state: FSMContext) -> None:
+    # flow.step_from_text вместо message.answer (P1-3, Batch 1) — редактирует
+    # тот же flow message вместо отправки нового (RULE 3), чтобы _flow_msg_id
+    # не устаревал и /cancel на следующем шаге удалял актуальный prompt, а не
+    # осиротевшее "Название кейса". См. bot/flow.py про архитектурную
+    # границу primitives.
     case_id = await content_store.next_case_id()
     await state.update_data(title=message.text.strip(), case_id=case_id)
-    await message.answer("Пришлите фото кейса (как фото):", reply_markup=kb.cancel_keyboard())
+    await flow.step_from_text(message, state, "Пришлите фото кейса (как фото):", kb.cancel_keyboard())
     await state.set_state(AdminStates.add_case_photo)
 
 
@@ -288,13 +293,13 @@ async def cases_add_photo(message: Message, state: FSMContext) -> None:
     file_id = message.photo[-1].file_id if message.photo else message.document.file_id
     cover = await content_store.save_case_photo(message.chat.id, message.bot, file_id, data["case_id"])
     await state.update_data(cover=cover)
-    await message.answer("Короткое описание задачи (пара предложений):", reply_markup=kb.cancel_keyboard())
+    await flow.step_from_text(message, state, "Короткое описание задачи (пара предложений):", kb.cancel_keyboard())
     await state.set_state(AdminStates.add_case_description)
 
 
 @router.message(AdminStates.add_case_photo)
-async def cases_add_photo_wrong(message: Message) -> None:
-    await message.answer("Нужно фото 📎.", reply_markup=kb.cancel_keyboard())
+async def cases_add_photo_wrong(message: Message, state: FSMContext) -> None:
+    await flow.step_from_text(message, state, "Нужно фото 📎.", kb.cancel_keyboard())
 
 
 @router.message(AdminStates.add_case_description, F.text)
@@ -310,12 +315,18 @@ async def cases_add_description(message: Message, state: FSMContext) -> None:
         task=message.text.strip(),
         related_service=related_service,
     )
-    await flow.reset_state_keep_nav(state)
-    await message.answer(
+    # step_from_text ДО reset_state_keep_nav — иначе последний перестаёт
+    # видеть tracked _flow_msg_id (reset уже стёр бы его) и просто шлёт
+    # новое сообщение, теряя смысл миграции. reset_state_keep_nav ниже
+    # по-прежнему стирает то же самое, что и раньше — порядок не меняет
+    # итоговые state/data, только то, каким сообщением показан результат.
+    await flow.step_from_text(
+        message, state,
         f"Кейс «{case['title']}» добавлен и уже виден в Mini App ✅\n\n"
         "Поля «Решение» и «Результат» пока пустые — заполнить можно через «✏️ Редактировать».",
-        reply_markup=kb.admin_cases_menu_keyboard(),
+        kb.admin_cases_menu_keyboard(),
     )
+    await flow.reset_state_keep_nav(state)
 
 
 @router.callback_query(F.data == "admincasesaction:edit")
@@ -510,19 +521,24 @@ async def case_section_add_type(callback: CallbackQuery, state: FSMContext) -> N
 
 @router.message(AdminStates.case_section_add_title, F.text)
 async def case_section_add_title(message: Message, state: FSMContext) -> None:
+    # flow.step_from_text (P1-3, Batch 1) в обеих ветках — gallery
+    # завершает сценарий здесь же, non-gallery продолжает в
+    # case_section_add_content, которому нужен актуальный _flow_msg_id,
+    # а не тот, что оставил бы raw message.answer.
     data = await state.get_data()
     title = message.text.strip()
     if data["section_type"] == "gallery":
         await content_store.add_case_section(message.chat.id, data["case_id"], section_type="gallery", title=title, images=[])
         case = await _current_case(data["case_id"])
-        await message.answer(
+        await flow.step_from_text(
+            message, state,
             "Раздел-галерея добавлен ✅ Добавьте в него изображения через список разделов.\n\nРазделы кейса:",
-            reply_markup=kb.case_sections_menu_keyboard(case.get("sections", []) if case else []),
+            kb.case_sections_menu_keyboard(case.get("sections", []) if case else []),
         )
         await state.set_state(AdminStates.case_sections_menu)
         return
     await state.update_data(section_title=title)
-    await message.answer("Текст раздела:", reply_markup=kb.cancel_keyboard())
+    await flow.step_from_text(message, state, "Текст раздела:", kb.cancel_keyboard())
     await state.set_state(AdminStates.case_section_add_content)
 
 
@@ -531,7 +547,7 @@ async def case_section_add_content(message: Message, state: FSMContext) -> None:
     data = await state.get_data()
     await content_store.add_case_section(message.chat.id, data["case_id"], section_type="text", title=data["section_title"], content=message.text.strip())
     case = await _current_case(data["case_id"])
-    await message.answer("Раздел добавлен ✅\n\nРазделы кейса:", reply_markup=kb.case_sections_menu_keyboard(case.get("sections", []) if case else []))
+    await flow.step_from_text(message, state, "Раздел добавлен ✅\n\nРазделы кейса:", kb.case_sections_menu_keyboard(case.get("sections", []) if case else []))
     await state.set_state(AdminStates.case_sections_menu)
 
 
@@ -851,22 +867,26 @@ async def about_experience_add_start(callback: CallbackQuery, state: FSMContext)
 
 @router.message(AdminStates.about_experience_add_role, F.text)
 async def about_experience_add_role(message: Message, state: FSMContext) -> None:
+    # flow.step_from_text (P1-3, Batch 1) — не названа явно в scope Batch 1,
+    # но без неё _flow_msg_id устаревал бы уже на шаге 1→2 (company), и
+    # исправление about_experience_add_company ниже было бы бессмысленным:
+    # оно бы редактировало ЭТО сообщение, только если оно и так актуально.
     await state.update_data(exp_role=message.text.strip())
-    await message.answer("Компания / проект:", reply_markup=kb.cancel_keyboard())
+    await flow.step_from_text(message, state, "Компания / проект:", kb.cancel_keyboard())
     await state.set_state(AdminStates.about_experience_add_company)
 
 
 @router.message(AdminStates.about_experience_add_company, F.text)
 async def about_experience_add_company(message: Message, state: FSMContext) -> None:
     await state.update_data(exp_company=message.text.strip())
-    await message.answer("Период (например «2019 — настоящее время»):", reply_markup=kb.cancel_keyboard())
+    await flow.step_from_text(message, state, "Период (например «2019 — настоящее время»):", kb.cancel_keyboard())
     await state.set_state(AdminStates.about_experience_add_period)
 
 
 @router.message(AdminStates.about_experience_add_period, F.text)
 async def about_experience_add_period(message: Message, state: FSMContext) -> None:
     await state.update_data(exp_period=message.text.strip())
-    await message.answer("Короткое описание (необязательно — можно отправить «-»):", reply_markup=kb.cancel_keyboard())
+    await flow.step_from_text(message, state, "Короткое описание (необязательно — можно отправить «-»):", kb.cancel_keyboard())
     await state.set_state(AdminStates.about_experience_add_description)
 
 
@@ -882,7 +902,7 @@ async def about_experience_add_description(message: Message, state: FSMContext) 
         description="" if description == "-" else description,
     )
     entries = (await content_store.get_about()).get("experience", [])
-    await message.answer("Запись добавлена ✅\n\nОпыт работы:", reply_markup=kb.about_experience_menu_keyboard(entries))
+    await flow.step_from_text(message, state, "Запись добавлена ✅\n\nОпыт работы:", kb.about_experience_menu_keyboard(entries))
     await state.set_state(AdminStates.about_experience_menu)
 
 
@@ -960,8 +980,12 @@ async def price_add_start(callback: CallbackQuery, state: FSMContext) -> None:
 
 @router.message(AdminStates.add_service_name, F.text)
 async def price_add_name(message: Message, state: FSMContext) -> None:
+    # flow.step_from_text (P1-3, Batch 1) на каждом шаге, включая
+    # invalid-retry ветки ниже — без них retry-сообщение тоже создавало бы
+    # новый неотслеживаемый prompt, и /cancel сразу после неудачной
+    # попытки по-прежнему удалял бы не тот message.
     await state.update_data(name=message.text.strip())
-    await message.answer("Базовая цена, ₽ (число):", reply_markup=kb.cancel_keyboard())
+    await flow.step_from_text(message, state, "Базовая цена, ₽ (число):", kb.cancel_keyboard())
     await state.set_state(AdminStates.add_service_price)
 
 
@@ -969,10 +993,10 @@ async def price_add_name(message: Message, state: FSMContext) -> None:
 async def price_add_price(message: Message, state: FSMContext) -> None:
     value = _parse_number(message.text)
     if value is None:
-        await message.answer("Нужно число, например 25000. Попробуйте ещё раз:", reply_markup=kb.cancel_keyboard())
+        await flow.step_from_text(message, state, "Нужно число, например 25000. Попробуйте ещё раз:", kb.cancel_keyboard())
         return
     await state.update_data(base_price=value)
-    await message.answer("Минимальный срок, дней (число):", reply_markup=kb.cancel_keyboard())
+    await flow.step_from_text(message, state, "Минимальный срок, дней (число):", kb.cancel_keyboard())
     await state.set_state(AdminStates.add_service_term_min)
 
 
@@ -980,10 +1004,10 @@ async def price_add_price(message: Message, state: FSMContext) -> None:
 async def price_add_term_min(message: Message, state: FSMContext) -> None:
     value = _parse_number(message.text)
     if value is None:
-        await message.answer("Нужно число. Попробуйте ещё раз:", reply_markup=kb.cancel_keyboard())
+        await flow.step_from_text(message, state, "Нужно число. Попробуйте ещё раз:", kb.cancel_keyboard())
         return
     await state.update_data(term_min=value)
-    await message.answer("Максимальный срок, дней (число):", reply_markup=kb.cancel_keyboard())
+    await flow.step_from_text(message, state, "Максимальный срок, дней (число):", kb.cancel_keyboard())
     await state.set_state(AdminStates.add_service_term_max)
 
 
@@ -991,10 +1015,10 @@ async def price_add_term_min(message: Message, state: FSMContext) -> None:
 async def price_add_term_max(message: Message, state: FSMContext) -> None:
     value = _parse_number(message.text)
     if value is None:
-        await message.answer("Нужно число. Попробуйте ещё раз:", reply_markup=kb.cancel_keyboard())
+        await flow.step_from_text(message, state, "Нужно число. Попробуйте ещё раз:", kb.cancel_keyboard())
         return
     await state.update_data(term_max=value)
-    await message.answer("Что входит в базовую стоимость (коротко текстом):", reply_markup=kb.cancel_keyboard())
+    await flow.step_from_text(message, state, "Что входит в базовую стоимость (коротко текстом):", kb.cancel_keyboard())
     await state.set_state(AdminStates.add_service_includes)
 
 
@@ -1011,8 +1035,10 @@ async def price_add_includes(message: Message, state: FSMContext) -> None:
         term_max=data["term_max"],
         includes=message.text.strip(),
     )
+    # step_from_text ДО reset_state_keep_nav — см. то же обоснование в
+    # cases_add_description выше.
+    await flow.step_from_text(message, state, f"Услуга «{service['name']}» добавлена ✅", kb.pricing_menu_keyboard())
     await flow.reset_state_keep_nav(state)
-    await message.answer(f"Услуга «{service['name']}» добавлена ✅", reply_markup=kb.pricing_menu_keyboard())
 
 
 # ---- Редактировать услугу (+ опции внутри) ----
@@ -1200,8 +1226,11 @@ async def option_back_to_menu(callback: CallbackQuery, state: FSMContext) -> Non
 
 @router.message(AdminStates.option_add_name, F.text)
 async def option_add_name(message: Message, state: FSMContext) -> None:
+    # flow.step_from_text (P1-3, Batch 1) — не названа явно в scope Batch 1,
+    # но нужна по той же причине, что и about_experience_add_role: без неё
+    # option_add_price ниже редактировало бы уже устаревший message.
     await state.update_data(opt_name=message.text.strip())
-    await message.answer("Цена опции, +₽ (число):", reply_markup=kb.cancel_keyboard())
+    await flow.step_from_text(message, state, "Цена опции, +₽ (число):", kb.cancel_keyboard())
     await state.set_state(AdminStates.option_add_price)
 
 
@@ -1209,10 +1238,10 @@ async def option_add_name(message: Message, state: FSMContext) -> None:
 async def option_add_price(message: Message, state: FSMContext) -> None:
     value = _parse_number(message.text)
     if value is None:
-        await message.answer("Нужно число. Попробуйте ещё раз:", reply_markup=kb.cancel_keyboard())
+        await flow.step_from_text(message, state, "Нужно число. Попробуйте ещё раз:", kb.cancel_keyboard())
         return
     await state.update_data(opt_price=value)
-    await message.answer("Срок опции, +дней (число, можно дробное, например 0.5):", reply_markup=kb.cancel_keyboard())
+    await flow.step_from_text(message, state, "Срок опции, +дней (число, можно дробное, например 0.5):", kb.cancel_keyboard())
     await state.set_state(AdminStates.option_add_days)
 
 
@@ -1220,12 +1249,13 @@ async def option_add_price(message: Message, state: FSMContext) -> None:
 async def option_add_days(message: Message, state: FSMContext) -> None:
     value = _parse_number(message.text)
     if value is None:
-        await message.answer("Нужно число. Попробуйте ещё раз:", reply_markup=kb.cancel_keyboard())
+        await flow.step_from_text(message, state, "Нужно число. Попробуйте ещё раз:", kb.cancel_keyboard())
         return
     await state.update_data(opt_days=value)
-    await message.answer(
+    await flow.step_from_text(
+        message, state,
         "Можно выбирать эту опцию несколько раз (умножается на количество)?",
-        reply_markup=kb.yes_no_keyboard("adminoptmultipliable"),
+        kb.yes_no_keyboard("adminoptmultipliable"),
     )
     await state.set_state(AdminStates.option_add_multipliable)
 

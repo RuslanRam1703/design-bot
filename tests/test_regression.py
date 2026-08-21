@@ -1184,6 +1184,285 @@ class AdminCleanupFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(any(i["question"] == "Сколько стоит лендинг?" and i["answer"] == "От 25 000 рублей" for i in faq_items))
 
 
+class AdminMultiStepWizardAnchorTests(unittest.IsolatedAsyncioTestCase):
+    """P1-3 аудит (read-only на commit 7c52a1d), Batch 1: 5 multi-step
+    wizard'ов, гарантированно получавших stale _flow_msg_id уже на
+    ВАЛИДНОМ пути (не только на retry) — их continuation message.answer()
+    заменены на flow.step_from_text (тот же RULE 3 primitive, что уже
+    работает в FAQ-add wizard, см. AdminCleanupFlowTests выше). Здесь — не
+    сам primitive (уже покрыт FlowUtilTests/AdminCleanupFlowTests), а то,
+    что РЕАЛЬНЫЕ хендлеры используют его так, что anchor остаётся
+    синхронизирован через 2+ шага и /cancel после второго шага удаляет
+    актуальный prompt, а не осиротевшее сообщение с первого шага.
+
+    about_experience_add_role и option_add_name мигрированы вместе со
+    своими соседями по цепочке, хотя явно не были названы в scope Batch 1:
+    без них company/price (уже названные) редактировали бы сообщение,
+    точно так же, как раньше — их правка была бы no-op. См. финальный
+    отчёт коммита."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        real_data_dir = Path(__file__).resolve().parent.parent / "data"
+        for name in ("pricing.json", "portfolio.json", "faq.json", "about.json", "ui_config.json"):
+            shutil.copy(real_data_dir / name, Path(self.tmpdir) / name)
+        self._orig_data_dir = content_store.DATA_DIR
+        self._orig_designer = content_store.config.DESIGNER_CHAT_ID
+        content_store.DATA_DIR = Path(self.tmpdir)
+        content_store.config.DESIGNER_CHAT_ID = "777"
+        self.actor = 777
+
+    def tearDown(self):
+        content_store.DATA_DIR = self._orig_data_dir
+        content_store.config.DESIGNER_CHAT_ID = self._orig_designer
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    async def _state_with_anchor(self, anchor_id: int = 500, nav_msg_id: int = 111, **extra_data) -> FSMContext:
+        # anchor_id имитирует _flow_msg_id, уже установленный /admin (open_root)
+        # и сохраняемый в неизменном виде через чисто callback-навигацию —
+        # именно такое состояние застаёт первый TEXT-хендлер мастера в проде
+        # (см. аудит: raw callback.message.edit_text не трогает этот ключ,
+        # но сохраняет message_id физически тем же).
+        state = make_state(self.actor)
+        await state.update_data(**{
+            flow._ANCHOR_MSG_KEY: anchor_id,
+            flow._ANCHOR_CHAT_KEY: self.actor,
+            flow._NAV_ANCHOR_MSG_KEY: nav_msg_id,
+            flow._NAV_ANCHOR_CHAT_KEY: self.actor,
+            **extra_data,
+        })
+        return state
+
+    # ---- 1. Case add: callback prompt A -> text -> prompt B -> /cancel ----
+    async def test_case_add_cancel_after_photo_step_deletes_current_prompt(self):
+        state = await self._state_with_anchor(anchor_id=500, cancel_to="cases")
+        await admin.cases_add_start(make_callback("admincasesaction:add", chat_id=self.actor), state)
+        await admin.cases_add_category(make_callback("admincat:landing", chat_id=self.actor), state)
+
+        title_msg = make_flow_message_factory(chat_id=self.actor, start_id=4000)(text="Новый лендинг")
+        await admin.cases_add_title(title_msg, state)
+        title_msg.bot.edit_message_text.assert_awaited_once_with(
+            "Пришлите фото кейса (как фото):", chat_id=self.actor, message_id=500, reply_markup=kb.cancel_keyboard()
+        )
+        title_msg.answer.assert_not_awaited()  # RULE 3: редактирование на месте, не новое сообщение
+
+        photo_msg = make_photo_message(self.actor)
+        await admin.cases_add_photo(photo_msg, state)
+        photo_msg.bot.edit_message_text.assert_awaited_once_with(
+            "Короткое описание задачи (пара предложений):", chat_id=self.actor, message_id=500, reply_markup=kb.cancel_keyboard()
+        )
+        photo_msg.answer.assert_not_awaited()
+
+        data = await state.get_data()
+        self.assertEqual(data.get(flow._ANCHOR_MSG_KEY), 500)  # anchor не уехал за 2 шага
+
+        cancel_msg = make_flow_message_factory(chat_id=self.actor, start_id=4100)(text="/cancel")
+        await admin.admin_cancel_command(cancel_msg, state)
+        # актуальный prompt (500) удалён, а не какое-то стороннее сообщение —
+        # именно та проверка, которую старое поведение (raw message.answer)
+        # не прошло бы: см. discriminating-эксперимент в отчёте.
+        cancel_msg.bot.delete_message.assert_awaited_once_with(chat_id=self.actor, message_id=500)
+        data_after = await state.get_data()
+        self.assertEqual(data_after.get(flow._NAV_ANCHOR_MSG_KEY), 111)  # NAV не задет
+
+    # ---- 2. Service add: 2+ последовательных text step (+ retry) -> /cancel ----
+    async def test_service_add_retry_and_multistep_cancel_deletes_current_prompt(self):
+        state = await self._state_with_anchor(anchor_id=600, cancel_to="pricing")
+        await admin.price_add_start(make_callback("adminpriceaction:add", chat_id=self.actor), state)
+
+        name_msg = make_flow_message_factory(chat_id=self.actor, start_id=4200)(text="Лендинг")
+        await admin.price_add_name(name_msg, state)
+        name_msg.bot.edit_message_text.assert_awaited_once_with(
+            "Базовая цена, ₽ (число):", chat_id=self.actor, message_id=600, reply_markup=kb.cancel_keyboard()
+        )
+
+        invalid_price_msg = make_flow_message_factory(chat_id=self.actor, start_id=4300)(text="не число")
+        await admin.price_add_price(invalid_price_msg, state)
+        invalid_price_msg.bot.edit_message_text.assert_awaited_once_with(
+            "Нужно число, например 25000. Попробуйте ещё раз:", chat_id=self.actor, message_id=600, reply_markup=kb.cancel_keyboard()
+        )
+        invalid_price_msg.answer.assert_not_awaited()  # retry тоже не создаёт orphan
+
+        price_msg = make_flow_message_factory(chat_id=self.actor, start_id=4400)(text="25000")
+        await admin.price_add_price(price_msg, state)
+        price_msg.bot.edit_message_text.assert_awaited_once_with(
+            "Минимальный срок, дней (число):", chat_id=self.actor, message_id=600, reply_markup=kb.cancel_keyboard()
+        )
+
+        data = await state.get_data()
+        self.assertEqual(data.get(flow._ANCHOR_MSG_KEY), 600)
+
+        cancel_msg = make_flow_message_factory(chat_id=self.actor, start_id=4500)(text="/cancel")
+        await admin.admin_cancel_command(cancel_msg, state)
+        cancel_msg.bot.delete_message.assert_awaited_once_with(chat_id=self.actor, message_id=600)
+        data_after = await state.get_data()
+        self.assertEqual(data_after.get(flow._NAV_ANCHOR_MSG_KEY), 111)
+
+    # ---- 3. Case sections add: continuation step -> /cancel ----
+    async def test_case_sections_add_cancel_after_title_step_deletes_current_prompt(self):
+        state = await self._state_with_anchor(anchor_id=700, case_id="case_x", cancel_to="sections")
+        await admin.case_section_add_start(make_callback("admincasesecaction:add", chat_id=self.actor), state)
+        await admin.case_section_add_type(make_callback("admincasesectype:text", chat_id=self.actor), state)
+
+        title_msg = make_flow_message_factory(chat_id=self.actor, start_id=4600)(text="Задача")
+        await admin.case_section_add_title(title_msg, state)
+        title_msg.bot.edit_message_text.assert_awaited_once_with(
+            "Текст раздела:", chat_id=self.actor, message_id=700, reply_markup=kb.cancel_keyboard()
+        )
+
+        data = await state.get_data()
+        self.assertEqual(data.get(flow._ANCHOR_MSG_KEY), 700)
+
+        cancel_msg = make_flow_message_factory(chat_id=self.actor, start_id=4700)(text="/cancel")
+        await admin.admin_cancel_command(cancel_msg, state)
+        cancel_msg.bot.delete_message.assert_awaited_once_with(chat_id=self.actor, message_id=700)
+        data_after = await state.get_data()
+        self.assertEqual(data_after.get(flow._NAV_ANCHOR_MSG_KEY), 111)
+
+    # ---- 4. About experience add: 2+ последовательных text step -> /cancel ----
+    async def test_about_experience_add_cancel_after_two_steps_deletes_current_prompt(self):
+        state = await self._state_with_anchor(anchor_id=800, cancel_to="root")
+        await admin.about_experience_add_start(make_callback("adminaboutexpaction:add", chat_id=self.actor), state)
+
+        role_msg = make_flow_message_factory(chat_id=self.actor, start_id=4800)(text="Дизайнер")
+        await admin.about_experience_add_role(role_msg, state)
+        role_msg.bot.edit_message_text.assert_awaited_once_with(
+            "Компания / проект:", chat_id=self.actor, message_id=800, reply_markup=kb.cancel_keyboard()
+        )
+
+        company_msg = make_flow_message_factory(chat_id=self.actor, start_id=4900)(text="Acme")
+        await admin.about_experience_add_company(company_msg, state)
+        company_msg.bot.edit_message_text.assert_awaited_once_with(
+            "Период (например «2019 — настоящее время»):", chat_id=self.actor, message_id=800, reply_markup=kb.cancel_keyboard()
+        )
+
+        data = await state.get_data()
+        self.assertEqual(data.get(flow._ANCHOR_MSG_KEY), 800)
+
+        cancel_msg = make_flow_message_factory(chat_id=self.actor, start_id=5000)(text="/cancel")
+        await admin.admin_cancel_command(cancel_msg, state)
+        cancel_msg.bot.delete_message.assert_awaited_once_with(chat_id=self.actor, message_id=800)
+        data_after = await state.get_data()
+        self.assertEqual(data_after.get(flow._NAV_ANCHOR_MSG_KEY), 111)
+
+    # ---- 5. Option add: последовательные text step -> /cancel ----
+    async def test_option_add_cancel_after_two_steps_deletes_current_prompt(self):
+        state = await self._state_with_anchor(anchor_id=900, service_id="LEND", cancel_to="options")
+        await state.set_state(AdminStates.edit_service_field_pick)
+        await admin.option_action(make_callback("adminoptaction:add", chat_id=self.actor), state)
+
+        name_msg = make_flow_message_factory(chat_id=self.actor, start_id=5100)(text="Доп. страница")
+        await admin.option_add_name(name_msg, state)
+        name_msg.bot.edit_message_text.assert_awaited_once_with(
+            "Цена опции, +₽ (число):", chat_id=self.actor, message_id=900, reply_markup=kb.cancel_keyboard()
+        )
+
+        price_msg = make_flow_message_factory(chat_id=self.actor, start_id=5200)(text="3000")
+        await admin.option_add_price(price_msg, state)
+        price_msg.bot.edit_message_text.assert_awaited_once_with(
+            "Срок опции, +дней (число, можно дробное, например 0.5):", chat_id=self.actor, message_id=900, reply_markup=kb.cancel_keyboard()
+        )
+
+        data = await state.get_data()
+        self.assertEqual(data.get(flow._ANCHOR_MSG_KEY), 900)
+
+        cancel_msg = make_flow_message_factory(chat_id=self.actor, start_id=5300)(text="/cancel")
+        await admin.admin_cancel_command(cancel_msg, state)
+        cancel_msg.bot.delete_message.assert_awaited_once_with(chat_id=self.actor, message_id=900)
+        data_after = await state.get_data()
+        self.assertEqual(data_after.get(flow._NAV_ANCHOR_MSG_KEY), 111)
+
+    # ---- 7. ensure_nav_anchor() после multi-step cancel не дублирует WELCOME ----
+    async def test_ensure_nav_anchor_after_multistep_cancel_does_not_recreate(self):
+        state = await self._state_with_anchor(anchor_id=500, cancel_to="cases")
+        await admin.cases_add_start(make_callback("admincasesaction:add", chat_id=self.actor), state)
+        await admin.cases_add_category(make_callback("admincat:landing", chat_id=self.actor), state)
+        title_msg = make_flow_message_factory(chat_id=self.actor, start_id=5400)(text="Тест")
+        await admin.cases_add_title(title_msg, state)
+
+        cancel_msg = make_flow_message_factory(chat_id=self.actor, start_id=5500)(text="/cancel")
+        await admin.admin_cancel_command(cancel_msg, state)
+
+        probe = make_flow_message_factory(chat_id=self.actor, start_id=5600)()
+        created = await flow.ensure_nav_anchor(probe, state)
+        self.assertFalse(created)
+        probe.answer.assert_not_awaited()
+        data = await state.get_data()
+        self.assertEqual(data.get(flow._NAV_ANCHOR_MSG_KEY), 111)
+
+    # ---- 8. Успешное завершение каждого мастера — бизнес-результат/state не сломаны ----
+    # (case add и case-sections add уже покрыты существующими
+    # AdminNavAnchorResetTests.test_completing_add_case_wizard_preserves_nav_anchor
+    # и AdminCaseConstructorTests.test_opening_sections_menu_does_not_crash_and_add_edit_works
+    # — оба обновлены под make_flow_message_factory в этом же батче и
+    # продолжают проходить. Ниже — недостающее покрытие для трёх остальных.)
+
+    async def test_service_add_full_wizard_completes_with_correct_business_result(self):
+        state = make_state(self.actor)
+        await admin.price_add_start(make_callback("adminpriceaction:add", chat_id=self.actor), state)
+        make_msg = make_flow_message_factory(chat_id=self.actor, start_id=6000)
+        await admin.price_add_name(make_msg(text="Тестовая услуга"), state)
+        await admin.price_add_price(make_msg(text="15000"), state)
+        await admin.price_add_term_min(make_msg(text="3"), state)
+        await admin.price_add_term_max(make_msg(text="10"), state)
+        await admin.price_add_includes(make_msg(text="Дизайн + вёрстка"), state)
+
+        self.assertIsNone(await state.get_state())
+        services = await content_store.list_services()
+        added = next((s for s in services if s["name"] == "Тестовая услуга"), None)
+        self.assertIsNotNone(added)
+        self.assertEqual(added["base_price"], 15000)
+        self.assertEqual(added["term_min"], 3)
+        self.assertEqual(added["term_max"], 10)
+        self.assertEqual(added["includes"], "Дизайн + вёрстка")
+
+    async def test_about_experience_add_full_wizard_completes_with_correct_business_result(self):
+        state = make_state(self.actor)
+        await admin.about_experience_add_start(make_callback("adminaboutexpaction:add", chat_id=self.actor), state)
+        make_msg = make_flow_message_factory(chat_id=self.actor, start_id=6100)
+        await admin.about_experience_add_role(make_msg(text="Дизайнер"), state)
+        await admin.about_experience_add_company(make_msg(text="Acme"), state)
+        await admin.about_experience_add_period(make_msg(text="2020 — 2022"), state)
+        await admin.about_experience_add_description(make_msg(text="-"), state)
+
+        self.assertEqual(await state.get_state(), AdminStates.about_experience_menu.state)
+        entries = (await content_store.get_about()).get("experience", [])
+        added = next((e for e in entries if e["role"] == "Дизайнер" and e["company"] == "Acme"), None)
+        self.assertIsNotNone(added)
+        self.assertEqual(added["period"], "2020 — 2022")
+        self.assertEqual(added["description"], "")  # "-" -> пустая строка, как и раньше
+
+    async def test_option_add_full_wizard_completes_with_correct_business_result(self):
+        services = await content_store.list_services()
+        service_id = services[0]["id"]
+        state = make_state(self.actor)
+        await state.update_data(service_id=service_id)
+        await state.set_state(AdminStates.edit_service_field_pick)
+        await admin.option_action(make_callback("adminoptaction:add", chat_id=self.actor), state)
+        make_msg = make_flow_message_factory(chat_id=self.actor, start_id=6200)
+        await admin.option_add_name(make_msg(text="Доп. страница"), state)
+        await admin.option_add_price(make_msg(text="3000"), state)
+        await admin.option_add_days(make_msg(text="2"), state)
+        await admin.option_add_multipliable(make_callback("adminoptmultipliable:yes", chat_id=self.actor), state)
+
+        self.assertEqual(await state.get_state(), AdminStates.edit_service_field_pick.state)
+        options = await content_store.list_options(service_id)
+        added = next((o for o in options if o["name"] == "Доп. страница"), None)
+        self.assertIsNotNone(added)
+        self.assertEqual(added["price"], 3000)
+        self.assertEqual(added["days"], 2)
+        self.assertTrue(added["multipliable"])
+
+    # ---- 9. Inline "❌ Отмена" не затронута миграцией этих 5 мастеров ----
+    async def test_inline_cancel_unaffected_by_multistep_wizard_migration(self):
+        state = await self._state_with_anchor(anchor_id=500, cancel_to="cases")
+        cb = make_callback("admincancel", chat_id=self.actor)
+        await admin.admin_cancel(cb, state)
+        cb.message.edit_text.assert_awaited_once()
+        data = await state.get_data()
+        self.assertEqual(data.get(flow._NAV_ANCHOR_MSG_KEY), 111)
+
+
 class AdminNavAnchorResetTests(unittest.IsolatedAsyncioTestCase):
     """P1-3 аудит, Batch 0: aiogram FSMContext.clear() == set_state(None) +
     set_data({}) — стирает ВЕСЬ per-chat data dict, включая
@@ -2168,14 +2447,22 @@ class AdminCancelNavAnchorTests(unittest.IsolatedAsyncioTestCase):
 
 
 def make_photo_message(chat_id: int) -> SimpleNamespace:
+    # delete/bot.delete_message/bot.edit_message_text (P1-3, Batch 1) —
+    # нужны для photo-хендлеров, переведённых на flow.step_from_text
+    # (сейчас только cases_add_photo); хендлеры, которые их не вызывают
+    # (например case_image_add_receive, всё ещё raw message.answer),
+    # этот довесок не задевает.
     return SimpleNamespace(
         chat=SimpleNamespace(id=chat_id),
         photo=[SimpleNamespace(file_id="fake_file_id")],
         document=None,
         text=None,
+        delete=AsyncMock(),
         bot=SimpleNamespace(
             get_file=AsyncMock(return_value=SimpleNamespace(file_path="photos/fake.jpg")),
             download_file=AsyncMock(),
+            delete_message=AsyncMock(),
+            edit_message_text=AsyncMock(),
         ),
         answer=AsyncMock(),
     )
@@ -2250,10 +2537,15 @@ class AdminCaseConstructorTests(unittest.IsolatedAsyncioTestCase):
         await admin.cases_edit_field(cb, state)  # раньше падало здесь с TypeError
         self.assertEqual(await state.get_state(), AdminStates.case_sections_menu.state)
 
+        # make_flow_message_factory, а не make_text_message (P1-3, Batch 1):
+        # оба хендлера теперь реально вызывают flow.step_from_text
+        # (message.delete()/message.bot.edit_message_text) — make_text_message
+        # их не предоставляет.
+        make_sec_msg = make_flow_message_factory(chat_id=self.actor, start_id=5000)
         await admin.case_section_add_start(make_callback("admincasesecaction:add", chat_id=self.actor), state)
         await admin.case_section_add_type(make_callback("admincasesectype:text", chat_id=self.actor), state)
-        await admin.case_section_add_title(make_text_message(self.actor, "Задача"), state)
-        await admin.case_section_add_content(make_text_message(self.actor, "Описание задачи"), state)
+        await admin.case_section_add_title(make_sec_msg(text="Задача"), state)
+        await admin.case_section_add_content(make_sec_msg(text="Описание задачи"), state)
         self.assertEqual((await self._case())["sections"][0], {"type": "text", "title": "Задача", "content": "Описание задачи"})
 
         await admin.case_section_picked(make_callback("admincasesecpick:0", chat_id=self.actor), state)
