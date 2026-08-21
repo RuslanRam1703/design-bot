@@ -4116,14 +4116,14 @@ class PublicDataRouteTests(unittest.IsolatedAsyncioTestCase):
             json.dumps({"leads": [{"id": 1, "telegram": {"user_id": 42}, "payload": {"contact": "+7 900 000-00-00"}}]}),
             encoding="utf-8",
         )
+        # webserver.py больше не хранит собственный DATA_DIR — handle_public_data
+        # читает через content_store.read_async, единственный source of truth
+        # для пути к данным теперь только content_store.DATA_DIR.
         self._orig_data_dir = content_store.DATA_DIR
-        self._orig_webserver_data_dir = webserver.DATA_DIR
         content_store.DATA_DIR = Path(self.tmpdir)
-        webserver.DATA_DIR = Path(self.tmpdir)
 
     def tearDown(self):
         content_store.DATA_DIR = self._orig_data_dir
-        webserver.DATA_DIR = self._orig_webserver_data_dir
         shutil.rmtree(self.tmpdir, ignore_errors=True)
 
     async def test_leads_json_is_not_publicly_reachable(self):
@@ -4159,6 +4159,99 @@ class PublicDataRouteTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(resp.status, 200, f"{name} should still be publicly served")
                 body = await resp.json()
                 self.assertIsInstance(body, dict)
+
+    async def test_cache_control_is_no_store_for_public_data(self):
+        # _no_cache middleware (webserver.py) применяется по префиксу пути
+        # "/data/" безусловно, независимо от того, что именно отдаёт хендлер
+        # — эта проверка не менялась в этой фазе, но фиксирует текущую
+        # модель явно (см. отчёт, раздел G — freshness bug был НЕ про
+        # браузерный кэш, Cache-Control тут уже был максимально строгим).
+        from aiohttp.test_utils import TestClient, TestServer
+
+        app = webserver.create_app(AsyncMock())
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.get("/data/pricing.json")
+            self.assertEqual(resp.status, 200)
+            self.assertEqual(resp.headers.get("Cache-Control"), "no-store, no-cache, must-revalidate")
+
+
+class PublicDataRouteUpstashTests(unittest.IsolatedAsyncioTestCase):
+    """См. production-freshness-аудит: /data/{filename} раньше отдавал файл
+    напрямую с локального диска (web.FileResponse), а /admin в Upstash-
+    режиме пишет ТОЛЬКО в Redis (см. content_store._write) — Mini App
+    показывал устаревший deploy-time снапшот после любой правки в /admin.
+    handle_public_data теперь читает через content_store.read_async — тот
+    же backend, что и /admin. См. PublicDataRouteTests выше для
+    local-режима (не изменился этой фазой)."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        real_data_dir = Path(__file__).resolve().parent.parent / "data"
+        for name in ("pricing.json", "portfolio.json", "about.json", "ui_config.json"):
+            shutil.copy(real_data_dir / name, Path(self.tmpdir) / name)
+        self._orig_data_dir = content_store.DATA_DIR
+        content_store.DATA_DIR = Path(self.tmpdir)
+
+        self.fake = FakeUpstash()
+        self._orig_url = content_store.config.UPSTASH_REDIS_REST_URL
+        self._orig_token = content_store.config.UPSTASH_REDIS_REST_TOKEN
+        content_store.config.UPSTASH_REDIS_REST_URL = "https://fake-upstash.example/"
+        content_store.config.UPSTASH_REDIS_REST_TOKEN = "fake-token"
+        self._patch = patch("bot.content_store.urllib.request.urlopen", side_effect=self.fake.urlopen)
+        self._patch.start()
+
+    def tearDown(self):
+        self._patch.stop()
+        content_store.config.UPSTASH_REDIS_REST_URL = self._orig_url
+        content_store.config.UPSTASH_REDIS_REST_TOKEN = self._orig_token
+        content_store.DATA_DIR = self._orig_data_dir
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    async def test_route_returns_upstash_version_not_stale_local_seed(self):
+        # Локальный диск содержит СТАРУЮ версию (реальный сид-файл из data/),
+        # Upstash — НОВУЮ (как будто дизайнер только что отредактировал
+        # через /admin). До фикса маршрут отдал бы локальную (старую) версию
+        # — именно это и было production freshness bug.
+        self.fake.store["pricing.json"] = json.dumps(
+            {"services": [], "options": [], "coefficients": {}, "rounding": {}, "_marker": "NEW_FROM_ADMIN"}
+        )
+        from aiohttp.test_utils import TestClient, TestServer
+
+        app = webserver.create_app(AsyncMock())
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.get("/data/pricing.json")
+            self.assertEqual(resp.status, 200)
+            body = await resp.json()
+            self.assertEqual(body.get("_marker"), "NEW_FROM_ADMIN")
+
+        # локальный файл не тронут и по-прежнему БЕЗ маркера — доказывает,
+        # что источником ответа был именно Upstash, а не локальный диск.
+        with open(Path(self.tmpdir) / "pricing.json", encoding="utf-8") as f:
+            local_content = json.load(f)
+        self.assertNotIn("_marker", local_content)
+
+    async def test_leads_json_still_404_in_upstash_mode(self):
+        from aiohttp.test_utils import TestClient, TestServer
+
+        app = webserver.create_app(AsyncMock())
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.get("/data/leads.json")
+            self.assertEqual(resp.status, 404)
+
+    async def test_all_four_public_files_served_from_upstash(self):
+        from aiohttp.test_utils import TestClient, TestServer
+
+        app = webserver.create_app(AsyncMock())
+        async with TestClient(TestServer(app)) as client:
+            for name in ("pricing.json", "portfolio.json", "about.json", "ui_config.json"):
+                resp = await client.get(f"/data/{name}")
+                self.assertEqual(resp.status, 200, f"{name} should be served (seeded from local on first read)")
+                body = await resp.json()
+                self.assertIsInstance(body, dict)
+                # первое чтение засеивает Upstash из локального файла (см.
+                # content_store._read) — второй запрос должен вернуть то же
+                # самое без повторного локального чтения.
+                self.assertIn(name, self.fake.store)
 
 
 class LeadMaterialTests(unittest.IsolatedAsyncioTestCase):

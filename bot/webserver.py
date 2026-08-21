@@ -15,7 +15,6 @@ from bot.telegram_auth import diagnose_init_data, validate_init_data
 SUPPLEMENT_FIELD_KEYS = ("comment", "additional_requirements", "references", "contact")
 
 WEBAPP_DIR = Path(__file__).resolve().parent.parent / "webapp"
-DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 logger = logging.getLogger(__name__)
 
 # Whitelist, не blacklist: только эти файлы Mini App реально запрашивает
@@ -48,11 +47,25 @@ async def handle_public_data(request: web.Request) -> web.Response:
     """Отдаёт ТОЛЬКО файлы из PUBLIC_DATA_FILES (см. её докстринг выше) —
     любое другое имя, включая leads.json, получает обычный 404, как если
     бы файла не существовало вовсе (не 403 — не подтверждаем и не
-    опровергаем существование чего-либо за пределами whitelist)."""
+    опровергаем существование чего-либо за пределами whitelist).
+
+    Читает через content_store.read_async — тот же backend, что и /admin
+    (Upstash, если включён, иначе локальный файл): раньше эта ручка отдавала
+    файл напрямую с локального диска (web.FileResponse), а /admin в
+    Upstash-режиме пишет ТОЛЬКО в Redis — Mini App продолжал показывать
+    устаревший deploy-time снапшот после любой правки в /admin (production
+    freshness bug). Второго source of truth для этих 4 файлов больше нет."""
     filename = request.match_info["filename"]
     if filename not in PUBLIC_DATA_FILES:
         raise web.HTTPNotFound()
-    return web.FileResponse(DATA_DIR / filename)
+    try:
+        data = await content_store.read_async(filename)
+    except FileNotFoundError:
+        raise web.HTTPNotFound()
+    except Exception:
+        logger.exception("Не удалось прочитать публичный /data/%s", filename)
+        return web.json_response({"error": "internal"}, status=500)
+    return web.json_response(data, dumps=lambda d: json.dumps(d, ensure_ascii=False))
 
 
 async def handle_my_leads(request: web.Request) -> web.Response:

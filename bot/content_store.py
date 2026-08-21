@@ -14,6 +14,7 @@ actor_chat_id и сверяет его с DESIGNER_CHAT_ID сама, незав�
 который забудут защитить) запись в данные без прав физически невозможна.
 """
 
+import asyncio
 import io
 import json
 import logging
@@ -152,6 +153,20 @@ def _write(filename: str, data: Any) -> None:
         _write_local(filename, data)
         return
     _upstash_command("SET", filename, json.dumps(data, ensure_ascii=False))
+
+
+async def read_async(filename: str) -> Any:
+    """Тонкая asyncio.to_thread-обёртка вокруг _read — НЕ часть общей async-
+    миграции content_store (P1-1, production-hardening аудит, отдельная,
+    ещё не реализованная задача). Единственная цель: дать
+    webserver.py::handle_public_data читать ИЗ ТОГО ЖЕ backend, что и /admin
+    (Upstash, если включён, иначе локальный файл — то есть ровно то же
+    ветвление, что уже внутри _read), не блокируя event loop этим одним
+    вызовом, и не переписывая остальные ~50 синхронных функций хранилища.
+    Когда P1-1 будет реализована для content_store целиком, эта обёртка
+    станет не нужна — вызывающий код сможет просто await content_store._read
+    напрямую."""
+    return await asyncio.to_thread(_read, filename)
 
 
 def ensure_storage_initialized() -> None:
