@@ -1549,8 +1549,12 @@ class AdminRetryFragileFlowAnchorTests(unittest.IsolatedAsyncioTestCase):
         await admin.price_edit_value(make_flow_message_factory(chat_id=self.actor, start_id=7300)(text="не число"), state)
         good = make_flow_message_factory(chat_id=self.actor, start_id=7400)(text="99000")
         await admin.price_edit_value(good, state)
-        # success-ветка (Type C) сознательно НЕ мигрирована — остаётся raw answer
-        good.answer.assert_awaited_once_with("Обновлено ✅\n\nЧто изменить?", reply_markup=kb.service_field_keyboard())
+        # success-ветка теперь тоже flow.step_from_text (P1-3, Batch 3) —
+        # редактирует тот же anchor (500), а не отправляет новое сообщение.
+        good.bot.edit_message_text.assert_awaited_once_with(
+            "Обновлено ✅\n\nЧто изменить?", chat_id=self.actor, message_id=500, reply_markup=kb.service_field_keyboard()
+        )
+        good.answer.assert_not_awaited()
         self.assertEqual(await state.get_state(), AdminStates.edit_service_field_pick.state)
         updated = await content_store.get_service(service_id)
         self.assertEqual(updated["base_price"], 99000)
@@ -1735,6 +1739,277 @@ class AdminRetryFragileFlowAnchorTests(unittest.IsolatedAsyncioTestCase):
 
     # ---- Inline "❌ Отмена" не затронута этим batch'ем ----
     async def test_inline_cancel_unaffected_by_retry_fix(self):
+        state = await self._state_with_anchor(anchor_id=500, cancel_to="cases")
+        cb = make_callback("admincancel", chat_id=self.actor)
+        with patch("bot.handlers.admin.flow.cancel_transient", new=AsyncMock()) as mocked:
+            await admin.admin_cancel(cb, state)
+        mocked.assert_not_awaited()
+        cb.message.edit_text.assert_awaited_once()
+
+
+class AdminSuccessorStalenessAnchorTests(unittest.IsolatedAsyncioTestCase):
+    """P1-3, Batch 3 (read-only audit confirmed on commit 599071e): 11
+    handlers whose SUCCESS/terminal message.answer() (not a retry — Batch 2
+    already covers retries) transitions into an active AdminStates state
+    with a persisted cancel_to, so _flow_msg_id went stale on the normal,
+    valid path — the exact mechanism Batch 1 fixed for multi-step wizards,
+    here occurring in single-response wizards. All 15 call sites now use
+    flow.step_from_text instead of raw message.answer.
+
+    Deliberately NOT touched (confirmed false positives / no practical
+    effect during the audit, see report): admin_unexpected_input (never
+    replaces the actual awaited prompt — a supplementary aside, not a
+    competing screen), cat_add_label/cat_rename_value/lead_reply_send's
+    "lead not found" branch (all call flow.reset_state_keep_nav, so state
+    is None afterward and /cancel's StateFilter(AdminStates) no longer
+    matches), backup_export's BackupExportError branch (rare failure mode,
+    never replaces callback.message as the current screen)."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        real_data_dir = Path(__file__).resolve().parent.parent / "data"
+        for name in ("pricing.json", "portfolio.json", "faq.json", "about.json", "ui_config.json"):
+            shutil.copy(real_data_dir / name, Path(self.tmpdir) / name)
+        self._orig_data_dir = content_store.DATA_DIR
+        self._orig_designer = content_store.config.DESIGNER_CHAT_ID
+        content_store.DATA_DIR = Path(self.tmpdir)
+        content_store.config.DESIGNER_CHAT_ID = "333"
+        self.actor = 333
+
+    def tearDown(self):
+        content_store.DATA_DIR = self._orig_data_dir
+        content_store.config.DESIGNER_CHAT_ID = self._orig_designer
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    async def _state_with_anchor(self, anchor_id: int = 500, nav_msg_id: int = 111, **extra_data) -> FSMContext:
+        state = make_state(self.actor)
+        await state.update_data(**{
+            flow._ANCHOR_MSG_KEY: anchor_id,
+            flow._ANCHOR_CHAT_KEY: self.actor,
+            flow._NAV_ANCHOR_MSG_KEY: nav_msg_id,
+            flow._NAV_ANCHOR_CHAT_KEY: self.actor,
+            **extra_data,
+        })
+        return state
+
+    # ---- case_image_add_receive ----
+    async def test_case_image_add_receive_cancel_deletes_current_prompt(self):
+        await content_store.add_case(
+            str(self.actor), case_id="case_img", title="Тест", type_id="landing",
+            cover="img/portfolio/seed.svg", task="t", related_service=None,
+        )
+        state = await self._state_with_anchor(anchor_id=500, case_id="case_img", cancel_to="images")
+        photo = make_photo_message(self.actor)
+        await admin.case_image_add_receive(photo, state)
+        photo.bot.edit_message_text.assert_awaited_once()
+        self.assertEqual(photo.bot.edit_message_text.await_args.kwargs["chat_id"], self.actor)
+        self.assertEqual(photo.bot.edit_message_text.await_args.kwargs["message_id"], 500)
+        photo.answer.assert_not_awaited()
+        self.assertEqual(await state.get_state(), AdminStates.case_images_menu.state)
+
+        cancel_msg = make_flow_message_factory(chat_id=self.actor, start_id=9300)(text="/cancel")
+        await admin.admin_cancel_command(cancel_msg, state)
+        cancel_msg.bot.delete_message.assert_awaited_once_with(chat_id=self.actor, message_id=500)
+        data_after = await state.get_data()
+        self.assertEqual(data_after.get(flow._NAV_ANCHOR_MSG_KEY), 111)
+
+    # ---- case_section_edit_value / cases_edit_value (success) ----
+    async def test_case_section_edit_value_success_keeps_anchor_synced(self):
+        await content_store.add_case(
+            str(self.actor), case_id="case_sec", title="Тест", type_id="landing",
+            cover="img/portfolio/seed.svg", task="t", related_service=None,
+        )
+        await content_store.add_case_section(str(self.actor), "case_sec", section_type="text", title="Задача", content="старый")
+        state = await self._state_with_anchor(
+            anchor_id=600, case_id="case_sec", section_index=0, section_field="content", cancel_to="sections",
+        )
+        msg = make_flow_message_factory(chat_id=self.actor, start_id=9400)(text="новый текст")
+        await admin.case_section_edit_value(msg, state)
+        msg.bot.edit_message_text.assert_awaited_once()
+        self.assertEqual(msg.bot.edit_message_text.await_args.kwargs["message_id"], 600)
+        msg.answer.assert_not_awaited()
+        data = await state.get_data()
+        self.assertEqual(data.get(flow._ANCHOR_MSG_KEY), 600)
+
+    async def test_cases_edit_value_success_keeps_anchor_synced(self):
+        await content_store.add_case(
+            str(self.actor), case_id="case_val", title="Тест", type_id="landing",
+            cover="img/portfolio/seed.svg", task="t", related_service=None,
+        )
+        state = await self._state_with_anchor(anchor_id=610, case_id="case_val", field="title", cancel_to="cases")
+        msg = make_flow_message_factory(chat_id=self.actor, start_id=9500)(text="Новое название")
+        await admin.cases_edit_value(msg, state)
+        msg.bot.edit_message_text.assert_awaited_once_with(
+            "Обновлено ✅\n\nЧто ещё изменить?", chat_id=self.actor, message_id=610, reply_markup=kb.case_field_keyboard()
+        )
+        data = await state.get_data()
+        self.assertEqual(data.get(flow._ANCHOR_MSG_KEY), 610)
+
+    # ---- faq_edit_value ----
+    async def test_faq_edit_value_success_keeps_anchor_synced(self):
+        item = await content_store.add_faq(str(self.actor), "Старый вопрос?", "Старый ответ")
+        state = await self._state_with_anchor(anchor_id=620, faq_id=item["id"], field="answer", cancel_to="faq")
+        msg = make_flow_message_factory(chat_id=self.actor, start_id=9600)(text="Новый ответ")
+        await admin.faq_edit_value(msg, state)
+        msg.bot.edit_message_text.assert_awaited_once_with(
+            "Обновлено ✅\n\nЧто ещё изменить?", chat_id=self.actor, message_id=620, reply_markup=kb.faq_field_keyboard()
+        )
+        data = await state.get_data()
+        self.assertEqual(data.get(flow._ANCHOR_MSG_KEY), 620)
+
+    # ---- about_edit_photo / about_edit_value ----
+    async def test_about_edit_photo_success_deletes_current_prompt_on_cancel(self):
+        state = await self._state_with_anchor(anchor_id=630, field="avatar")
+        photo = make_photo_message(self.actor)
+        await admin.about_edit_photo(photo, state)
+        photo.bot.edit_message_text.assert_awaited_once()
+        self.assertEqual(photo.bot.edit_message_text.await_args.kwargs["message_id"], 630)
+        self.assertEqual(await state.get_state(), AdminStates.edit_about_field_pick.state)
+
+        cancel_msg = make_flow_message_factory(chat_id=self.actor, start_id=9700)(text="/cancel")
+        await admin.admin_cancel_command(cancel_msg, state)
+        cancel_msg.bot.delete_message.assert_awaited_once_with(chat_id=self.actor, message_id=630)
+
+    async def test_about_edit_value_success_keeps_anchor_synced(self):
+        state = await self._state_with_anchor(anchor_id=640, field="location")
+        msg = make_flow_message_factory(chat_id=self.actor, start_id=9800)(text="Москва")
+        await admin.about_edit_value(msg, state)
+        msg.bot.edit_message_text.assert_awaited_once()
+        self.assertEqual(msg.bot.edit_message_text.await_args.kwargs["message_id"], 640)
+        data = await state.get_data()
+        self.assertEqual(data.get(flow._ANCHOR_MSG_KEY), 640)
+
+    # ---- price_edit_value / price_coef_value / option_edit_value_text (success) ----
+    async def test_price_coef_value_success_keeps_anchor_synced(self):
+        state = await self._state_with_anchor(anchor_id=650, kind="coef", key="urgency", cancel_to="pricing")
+        msg = make_flow_message_factory(chat_id=self.actor, start_id=9900)(text="1.3")
+        await admin.price_coef_value(msg, state)
+        msg.bot.edit_message_text.assert_awaited_once_with(
+            "Обновлено ✅\n\nЧто ещё изменить?", chat_id=self.actor, message_id=650, reply_markup=kb.coefficients_menu_keyboard()
+        )
+        data = await state.get_data()
+        self.assertEqual(data.get(flow._ANCHOR_MSG_KEY), 650)
+
+    async def test_option_edit_value_text_success_keeps_anchor_synced(self):
+        services = await content_store.list_services()
+        service_id = services[0]["id"]
+        option_id = await content_store.next_option_id(service_id)
+        await content_store.add_option(
+            str(self.actor), option_id=option_id, service_id=service_id,
+            name="Тест опция", price=1000, days=1, multipliable=False,
+        )
+        state = await self._state_with_anchor(anchor_id=660, option_id=option_id, field="price", cancel_to="options")
+        msg = make_flow_message_factory(chat_id=self.actor, start_id=10000)(text="2000")
+        await admin.option_edit_value_text(msg, state)
+        msg.bot.edit_message_text.assert_awaited_once_with(
+            "Обновлено ✅\n\nЧто изменить?", chat_id=self.actor, message_id=660, reply_markup=kb.option_field_keyboard()
+        )
+        data = await state.get_data()
+        self.assertEqual(data.get(flow._ANCHOR_MSG_KEY), 660)
+
+    # ---- lead_reply_send (success) ----
+    async def test_lead_reply_send_success_deletes_current_prompt_on_cancel(self):
+        lead = await content_store.add_lead(
+            {"service_name": "Лендинг", "task_description": "Задача"},
+            {"user_id": 55555, "username": "client", "first_name": "Клиент"},
+        )
+        state = await self._state_with_anchor(anchor_id=670, lead_id=lead["id"], cancel_to="root")
+        msg = make_flow_message_factory(chat_id=self.actor, start_id=10100)(text="Ответ клиенту")
+        msg.bot.send_message = AsyncMock()
+        await admin.lead_reply_send(msg, state)
+        msg.bot.edit_message_text.assert_awaited_once()
+        self.assertEqual(msg.bot.edit_message_text.await_args.kwargs["message_id"], 670)
+        self.assertEqual(await state.get_state(), AdminStates.lead_detail.state)
+
+        cancel_msg = make_flow_message_factory(chat_id=self.actor, start_id=10200)(text="/cancel")
+        await admin.admin_cancel_command(cancel_msg, state)
+        cancel_msg.bot.delete_message.assert_awaited_once_with(chat_id=self.actor, message_id=670)
+
+    # ---- backup_import_receive: остальные 4 не-retry ветки (BadZipFile уже в Batch 2) ----
+    def _backup_message(self, anchor_id: int) -> SimpleNamespace:
+        msg = make_flow_message_factory(chat_id=self.actor, start_id=anchor_id * 10)()
+        msg.document = SimpleNamespace(file_id="fake_zip_id")
+        msg.bot.get_file = AsyncMock(return_value=SimpleNamespace(file_path="documents/backup.zip"))
+        msg.bot.download_file = AsyncMock(return_value=io.BytesIO(b"irrelevant, import_backup_bytes is mocked"))
+        return msg
+
+    async def test_backup_import_validation_error_keeps_anchor_synced(self):
+        state = await self._state_with_anchor(anchor_id=680, cancel_to="backup")
+        msg = self._backup_message(680)
+        with patch(
+            "bot.content_store.import_backup_bytes",
+            new=AsyncMock(side_effect=content_store.BackupValidationError("pricing.json", "not valid JSON", ["pricing.json"])),
+        ):
+            await admin.backup_import_receive(msg, state)
+        msg.bot.edit_message_text.assert_awaited_once()
+        self.assertEqual(msg.bot.edit_message_text.await_args.kwargs["message_id"], 680)
+        self.assertEqual(await state.get_state(), AdminStates.backup_menu.state)
+
+    async def test_backup_import_snapshot_error_keeps_anchor_synced(self):
+        state = await self._state_with_anchor(anchor_id=690, cancel_to="backup")
+        msg = self._backup_message(690)
+        with patch(
+            "bot.content_store.import_backup_bytes",
+            new=AsyncMock(side_effect=content_store.BackupSnapshotError("pricing.json")),
+        ):
+            await admin.backup_import_receive(msg, state)
+        msg.bot.edit_message_text.assert_awaited_once()
+        self.assertEqual(msg.bot.edit_message_text.await_args.kwargs["message_id"], 690)
+
+    async def test_backup_import_restore_failed_rollback_failed_keeps_anchor_synced(self):
+        state = await self._state_with_anchor(anchor_id=700, cancel_to="backup")
+        msg = self._backup_message(700)
+        with patch(
+            "bot.content_store.import_backup_bytes",
+            new=AsyncMock(side_effect=content_store.BackupRestoreFailedError("pricing.json", ["faq.json"], ["pricing.json"])),
+        ):
+            await admin.backup_import_receive(msg, state)
+        msg.bot.edit_message_text.assert_awaited_once()
+        self.assertEqual(msg.bot.edit_message_text.await_args.kwargs["message_id"], 700)
+
+    async def test_backup_import_restore_failed_rollback_ok_keeps_anchor_synced(self):
+        state = await self._state_with_anchor(anchor_id=710, cancel_to="backup")
+        msg = self._backup_message(710)
+        with patch(
+            "bot.content_store.import_backup_bytes",
+            new=AsyncMock(side_effect=content_store.BackupRestoreFailedError("pricing.json", ["faq.json"], [])),
+        ):
+            await admin.backup_import_receive(msg, state)
+        msg.bot.edit_message_text.assert_awaited_once()
+        self.assertEqual(msg.bot.edit_message_text.await_args.kwargs["message_id"], 710)
+
+    async def test_backup_import_success_deletes_current_prompt_on_cancel(self):
+        state = await self._state_with_anchor(anchor_id=720, cancel_to="backup")
+        msg = self._backup_message(720)
+        fake_result = SimpleNamespace(restored_json=["pricing.json"], missing_json=[], restored_images=[], failed_images=[])
+        with patch("bot.content_store.import_backup_bytes", new=AsyncMock(return_value=fake_result)):
+            await admin.backup_import_receive(msg, state)
+        msg.bot.edit_message_text.assert_awaited_once()
+        self.assertEqual(msg.bot.edit_message_text.await_args.kwargs["message_id"], 720)
+        self.assertEqual(await state.get_state(), AdminStates.backup_menu.state)
+
+        cancel_msg = make_flow_message_factory(chat_id=self.actor, start_id=10300)(text="/cancel")
+        await admin.admin_cancel_command(cancel_msg, state)
+        cancel_msg.bot.delete_message.assert_awaited_once_with(chat_id=self.actor, message_id=720)
+        data_after = await state.get_data()
+        self.assertEqual(data_after.get(flow._NAV_ANCHOR_MSG_KEY), 111)
+
+    # ---- ensure_nav_anchor() после cancel не дублирует WELCOME ----
+    async def test_ensure_nav_anchor_after_successor_staleness_cancel_does_not_recreate(self):
+        state = await self._state_with_anchor(anchor_id=630, field="avatar")
+        await admin.about_edit_photo(make_photo_message(self.actor), state)
+        cancel_msg = make_flow_message_factory(chat_id=self.actor, start_id=10400)(text="/cancel")
+        await admin.admin_cancel_command(cancel_msg, state)
+
+        probe = make_flow_message_factory(chat_id=self.actor, start_id=10500)()
+        created = await flow.ensure_nav_anchor(probe, state)
+        self.assertFalse(created)
+        probe.answer.assert_not_awaited()
+        data = await state.get_data()
+        self.assertEqual(data.get(flow._NAV_ANCHOR_MSG_KEY), 111)
+
+    # ---- Inline "❌ Отмена" не затронута этим batch'ем ----
+    async def test_inline_cancel_unaffected_by_successor_staleness_fix(self):
         state = await self._state_with_anchor(anchor_id=500, cancel_to="cases")
         cb = make_callback("admincancel", chat_id=self.actor)
         with patch("bot.handlers.admin.flow.cancel_transient", new=AsyncMock()) as mocked:
@@ -2830,7 +3105,10 @@ class AdminCaseConstructorTests(unittest.IsolatedAsyncioTestCase):
 
         await admin.case_section_picked(make_callback("admincasesecpick:0", chat_id=self.actor), state)
         await admin.case_section_action(make_callback("admincasesecact:title", chat_id=self.actor), state)
-        await admin.case_section_edit_value(make_text_message(self.actor, "Задача проекта"), state)
+        # make_flow_message_factory, а не make_text_message (P1-3, Batch 3):
+        # case_section_edit_value теперь вызывает flow.step_from_text и на
+        # success-ветке, не только на retry.
+        await admin.case_section_edit_value(make_flow_message_factory(chat_id=self.actor, start_id=5100)(text="Задача проекта"), state)
         self.assertEqual((await self._case())["sections"][0]["title"], "Задача проекта")
 
     async def test_category_and_external_url_edit_via_real_handlers(self):
@@ -2841,7 +3119,10 @@ class AdminCaseConstructorTests(unittest.IsolatedAsyncioTestCase):
 
         await admin.cases_edit_field(make_callback("admineditfield:external_url", chat_id=self.actor), state)
         self.assertEqual(await state.get_state(), AdminStates.edit_case_value.state)
-        await admin.cases_edit_value(make_text_message(self.actor, "https://behance.net/gallery/x"), state)
+        # make_flow_message_factory, а не make_text_message (P1-3, Batch 3):
+        # cases_edit_value теперь вызывает flow.step_from_text и на
+        # success-ветке, не только на retry.
+        await admin.cases_edit_value(make_flow_message_factory(chat_id=self.actor, start_id=5200)(text="https://behance.net/gallery/x"), state)
         self.assertEqual((await self._case())["external_url"], "https://behance.net/gallery/x")
 
 
@@ -2981,11 +3262,14 @@ class AdminAboutResumeFieldsTests(unittest.IsolatedAsyncioTestCase):
         return state
 
     async def test_location_edit_via_real_handler_and_clears_needs_review(self):
+        # make_flow_message_factory, а не make_text_message (P1-3, Batch 3):
+        # about_edit_value теперь реально вызывает flow.step_from_text
+        # (message.delete()/message.bot.edit_message_text) на success-ветке.
         self.assertIn("location", (await content_store.get_about())["needs_review_fields"])
         state = await self._state()
         await admin.about_edit_field(make_callback("admineditabout:location", chat_id=self.actor), state)
         self.assertEqual(await state.get_state(), AdminStates.edit_about_value.state)
-        await admin.about_edit_value(make_text_message(self.actor, "Москва, удалённо"), state)
+        await admin.about_edit_value(make_flow_message_factory(chat_id=self.actor, start_id=9100)(text="Москва, удалённо"), state)
         about = await content_store.get_about()
         self.assertEqual(about["location"], "Москва, удалённо")
         self.assertNotIn("location", about["needs_review_fields"])
@@ -2993,7 +3277,7 @@ class AdminAboutResumeFieldsTests(unittest.IsolatedAsyncioTestCase):
     async def test_skills_edit_is_comma_split_list_separate_from_tools(self):
         state = await self._state()
         await admin.about_edit_field(make_callback("admineditabout:skills", chat_id=self.actor), state)
-        await admin.about_edit_value(make_text_message(self.actor, "UX-исследования, Прототипирование"), state)
+        await admin.about_edit_value(make_flow_message_factory(chat_id=self.actor, start_id=9200)(text="UX-исследования, Прототипирование"), state)
         about = await content_store.get_about()
         self.assertEqual(about["skills"], ["UX-исследования", "Прототипирование"])
         self.assertNotEqual(about["skills"], about["tools"])
@@ -5645,11 +5929,15 @@ class LeadMaterialTests(unittest.IsolatedAsyncioTestCase):
 def make_reply_message(chat_id: int, text: str, send_message: AsyncMock) -> SimpleNamespace:
     """Достаточно для lead_reply_send: message.text, message.chat.id (actor
     для _require_designer), message.bot.send_message (контролируемый —
-    успех/исключение задаёт сам тест), message.answer."""
+    успех/исключение задаёт сам тест), message.answer. delete/
+    bot.delete_message/bot.edit_message_text (P1-3, Batch 3) — success-ветка
+    теперь вызывает flow.step_from_text; без seeded-anchor в этих тестах
+    она падает на message.answer() тем же способом, что и раньше."""
     return SimpleNamespace(
         text=text,
         chat=SimpleNamespace(id=chat_id),
-        bot=SimpleNamespace(send_message=send_message),
+        delete=AsyncMock(),
+        bot=SimpleNamespace(send_message=send_message, delete_message=AsyncMock(), edit_message_text=AsyncMock()),
         answer=AsyncMock(),
     )
 

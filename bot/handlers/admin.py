@@ -440,9 +440,14 @@ async def case_image_add_receive(message: Message, state: FSMContext) -> None:
     path = await content_store.save_case_photo(message.chat.id, message.bot, file_id, f"{data['case_id']}_{uuid.uuid4().hex[:8]}")
     await content_store.add_case_image(message.chat.id, data["case_id"], path)
     case = await _current_case(data["case_id"])
-    await message.answer(
+    # flow.step_from_text (P1-3, Batch 3) — success-переход в case_images_menu
+    # (AdminStates-активное, cancel_to="images" сохраняется) — без него
+    # /cancel из case_images_menu удалял бы устаревший "Пришлите фото..."
+    # prompt, оставляя этот, актуальный, экран осиротевшим (см. аудит).
+    await flow.step_from_text(
+        message, state,
         "Добавлено ✅\n\nИзображения кейса:",
-        reply_markup=kb.case_images_menu_keyboard(case.get("images", []), case.get("cover")),
+        kb.case_images_menu_keyboard(case.get("images", []), case.get("cover")),
     )
     await state.set_state(AdminStates.case_images_menu)
 
@@ -664,7 +669,9 @@ async def case_section_edit_value(message: Message, state: FSMContext) -> None:
         await content_store.update_case_section(message.chat.id, case_id, index, **{field: message.text.strip()})
 
     section = (await _current_case(case_id))["sections"][index]
-    await message.answer(f"Обновлено ✅\n\n«{section['title']}»:", reply_markup=kb.case_section_action_keyboard(section["type"]))
+    # flow.step_from_text (P1-3, Batch 3) — success-переход в
+    # case_section_edit_field_pick (cancel_to="sections" сохраняется).
+    await flow.step_from_text(message, state, f"Обновлено ✅\n\n«{section['title']}»:", kb.case_section_action_keyboard(section["type"]))
     await state.set_state(AdminStates.case_section_edit_field_pick)
 
 
@@ -691,7 +698,9 @@ async def cases_edit_value(message: Message, state: FSMContext) -> None:
             await flow.step_from_text(message, state, "Нужен текст.", kb.cancel_keyboard())
             return
         await content_store.update_case(message.chat.id, data["case_id"], **{field: message.text.strip()})
-    await message.answer("Обновлено ✅\n\nЧто ещё изменить?", reply_markup=kb.case_field_keyboard())
+    # flow.step_from_text (P1-3, Batch 3) — success-переход в
+    # edit_case_field_pick (cancel_to="cases" сохраняется).
+    await flow.step_from_text(message, state, "Обновлено ✅\n\nЧто ещё изменить?", kb.case_field_keyboard())
     await state.set_state(AdminStates.edit_case_field_pick)
 
 
@@ -798,7 +807,9 @@ async def faq_edit_field(callback: CallbackQuery, state: FSMContext) -> None:
 async def faq_edit_value(message: Message, state: FSMContext) -> None:
     data = await state.get_data()
     await content_store.update_faq(message.chat.id, data["faq_id"], **{data["field"]: message.text.strip()})
-    await message.answer("Обновлено ✅\n\nЧто ещё изменить?", reply_markup=kb.faq_field_keyboard())
+    # flow.step_from_text (P1-3, Batch 3) — success-переход в
+    # edit_faq_field_pick (cancel_to="faq" сохраняется).
+    await flow.step_from_text(message, state, "Обновлено ✅\n\nЧто ещё изменить?", kb.faq_field_keyboard())
     await state.set_state(AdminStates.edit_faq_field_pick)
 
 
@@ -946,9 +957,13 @@ async def about_edit_photo(message: Message, state: FSMContext) -> None:
     path = await content_store.save_about_photo(message.chat.id, message.bot, file_id)
     await content_store.update_about_field(message.chat.id, "avatar", path)
     about = await content_store.get_about()
-    await message.answer(
+    # flow.step_from_text (P1-3, Batch 3) — success-переход в
+    # edit_about_field_pick (AdminStates-активное, /cancel остаётся
+    # доступен даже без явного cancel_to — резолвится в "root").
+    await flow.step_from_text(
+        message, state,
         "Фото обновлено ✅\n\nЧто ещё изменить?",
-        reply_markup=kb.about_field_keyboard(about.get("needs_review_fields")),
+        kb.about_field_keyboard(about.get("needs_review_fields")),
     )
     await state.set_state(AdminStates.edit_about_field_pick)
 
@@ -968,9 +983,11 @@ async def about_edit_value(message: Message, state: FSMContext) -> None:
     else:
         await content_store.update_about_field(message.chat.id, field, message.text.strip())
     about = await content_store.get_about()
-    await message.answer(
+    # flow.step_from_text (P1-3, Batch 3) — success-переход в edit_about_field_pick.
+    await flow.step_from_text(
+        message, state,
         "Обновлено ✅\n\nЧто ещё изменить?",
-        reply_markup=kb.about_field_keyboard(about.get("needs_review_fields")),
+        kb.about_field_keyboard(about.get("needs_review_fields")),
     )
     await state.set_state(AdminStates.edit_about_field_pick)
 
@@ -1098,7 +1115,9 @@ async def price_edit_value(message: Message, state: FSMContext) -> None:
         await content_store.update_service(message.chat.id, data["service_id"], **{field: value})
     else:
         await content_store.update_service(message.chat.id, data["service_id"], **{field: message.text.strip()})
-    await message.answer("Обновлено ✅\n\nЧто изменить?", reply_markup=kb.service_field_keyboard())
+    # flow.step_from_text (P1-3, Batch 3) — success-переход в
+    # edit_service_field_pick (cancel_to="pricing" сохраняется).
+    await flow.step_from_text(message, state, "Обновлено ✅\n\nЧто изменить?", kb.service_field_keyboard())
     await state.set_state(AdminStates.edit_service_field_pick)
 
 
@@ -1183,7 +1202,9 @@ async def price_coef_value(message: Message, state: FSMContext) -> None:
         await content_store.update_coefficient(message.chat.id, data["key"], value)
     else:
         await content_store.update_rounding(message.chat.id, data["key"], value)
-    await message.answer("Обновлено ✅\n\nЧто ещё изменить?", reply_markup=kb.coefficients_menu_keyboard())
+    # flow.step_from_text (P1-3, Batch 3) — success-переход в
+    # edit_coefficients_pick (cancel_to="pricing" сохраняется).
+    await flow.step_from_text(message, state, "Обновлено ✅\n\nЧто ещё изменить?", kb.coefficients_menu_keyboard())
     await state.set_state(AdminStates.edit_coefficients_pick)
 
 
@@ -1335,7 +1356,9 @@ async def option_edit_value_text(message: Message, state: FSMContext) -> None:
         await content_store.update_option(message.chat.id, data["option_id"], **{field: value})
     else:
         await content_store.update_option(message.chat.id, data["option_id"], **{field: message.text.strip()})
-    await message.answer("Обновлено ✅\n\nЧто изменить?", reply_markup=kb.option_field_keyboard())
+    # flow.step_from_text (P1-3, Batch 3) — success-переход в
+    # option_edit_field_pick (cancel_to="options" сохраняется).
+    await flow.step_from_text(message, state, "Обновлено ✅\n\nЧто изменить?", kb.option_field_keyboard())
     await state.set_state(AdminStates.option_edit_field_pick)
 
 
@@ -1623,7 +1646,11 @@ async def lead_reply_send(message: Message, state: FSMContext) -> None:
     # доставка (клиент заблокировал бота) стирала бы сам факт, что дизайнер
     # вообще отвечал, см. аудит.
     lead = await content_store.add_owner_message(message.chat.id, lead["id"], text, delivery_status) or lead
-    await message.answer(f"{result_text}\n\n{lead_format.format_lead_admin_detail(lead)}", reply_markup=kb.lead_detail_keyboard(lead))
+    # flow.step_from_text (P1-3, Batch 3) — success-переход в lead_detail
+    # (cancel_to="root" сохраняется). "Заявка не найдена" веткой выше НЕ
+    # мигрирована сознательно — reset_state_keep_nav сразу после неё
+    # переводит state в None, /cancel там уже недостижим (см. аудит).
+    await flow.step_from_text(message, state, f"{result_text}\n\n{lead_format.format_lead_admin_detail(lead)}", kb.lead_detail_keyboard(lead))
     await state.set_state(AdminStates.lead_detail)
 
 
@@ -1714,18 +1741,22 @@ async def backup_import_receive(message: Message, state: FSMContext) -> None:
         result = await content_store.import_backup_bytes(message.chat.id, file_bytes_io.read())
     except zipfile.BadZipFile:
         # flow.step_from_text (P1-3, Batch 2) — единственная ветка этого
-        # handler'а, что реально остаётся в том же AdminStates.
-        # backup_restore_wait_file (ждёт другой файл): остальные ветки
-        # ниже переводят в AdminStates.backup_menu — это terminal-результат
-        # (RULE 3 к ним не относится), не retry, и мигрировать их не нужно.
+        # handler'а, что остаётся в том же AdminStates.backup_restore_wait_file
+        # (ждёт другой файл, настоящий retry). Остальные ветки ниже переводят
+        # в AdminStates.backup_menu — не retry, но AdminStates-активное
+        # состояние с сохранённым cancel_to="backup", поэтому тоже мигрированы
+        # (P1-3, Batch 3) — без этого /cancel из backup_menu удалял бы
+        # устаревший "Пришлите .zip файл..." prompt, оставляя этот
+        # результат-экран (с backup_menu_keyboard) осиротевшим.
         await flow.step_from_text(message, state, "Файл повреждён или не .zip — пришлите другой файл.", kb.cancel_keyboard())
         return
     except content_store.BackupValidationError as e:
         found = ", ".join(e.found_filenames) if e.found_filenames else "—"
-        await message.answer(
+        await flow.step_from_text(
+            message, state,
             "❌ Восстановление ПОЛНОСТЬЮ отменено, ничего не изменено.\n\n"
             f"Файл: {e.filename}\nОшибка: {e.reason}\nНайдено в архиве: {found}",
-            reply_markup=kb.backup_menu_keyboard(),
+            kb.backup_menu_keyboard(),
         )
         await state.set_state(AdminStates.backup_menu)
         return
@@ -1736,26 +1767,29 @@ async def backup_import_receive(message: Message, state: FSMContext) -> None:
         # исключения клиенту — только имя файла и факт отмены (полная
         # причина уже залогирована через logger.exception внутри
         # content_store.import_backup_bytes).
-        await message.answer(
+        await flow.step_from_text(
+            message, state,
             "❌ Восстановление отменено: не удалось прочитать текущее значение "
             f"{e.filename!r} перед записью. Ничего не изменено — попробуйте ещё раз.",
-            reply_markup=kb.backup_menu_keyboard(),
+            kb.backup_menu_keyboard(),
         )
         await state.set_state(AdminStates.backup_menu)
         return
     except content_store.BackupRestoreFailedError as e:
         if e.rollback_failed:
-            await message.answer(
+            await flow.step_from_text(
+                message, state,
                 f"🔴 КРИТИЧНО: восстановление прервано на файле {e.failed_filename}, "
                 f"откат НЕ полностью удался для: {', '.join(e.rollback_failed)}.\n\n"
                 "Требуется ручная проверка данных через /admin!",
-                reply_markup=kb.backup_menu_keyboard(),
+                kb.backup_menu_keyboard(),
             )
         else:
-            await message.answer(
+            await flow.step_from_text(
+                message, state,
                 f"⚠️ Восстановление отменено из-за ошибки записи ({e.failed_filename}). "
                 "Исходное состояние данных восстановлено.",
-                reply_markup=kb.backup_menu_keyboard(),
+                kb.backup_menu_keyboard(),
             )
         await state.set_state(AdminStates.backup_menu)
         return
@@ -1771,7 +1805,7 @@ async def backup_import_receive(message: Message, state: FSMContext) -> None:
         lines.append(f"⚠️ Не удалось восстановить {len(result.failed_images)} изображений (данные уже восстановлены): {', '.join(result.failed_images)}")
     if not result.restored_json and not result.restored_images:
         lines.append("В архиве не нашлось знакомых файлов данных/фото — ничего не восстановлено.")
-    await message.answer("\n".join(lines) + "\n\nБэкап:", reply_markup=kb.backup_menu_keyboard())
+    await flow.step_from_text(message, state, "\n".join(lines) + "\n\nБэкап:", kb.backup_menu_keyboard())
     await state.set_state(AdminStates.backup_menu)
 
 
