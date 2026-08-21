@@ -265,6 +265,38 @@ async def finish_flow(state: FSMContext) -> None:
     await state.set_state(None)
 
 
+async def reset_state_keep_nav(state: FSMContext) -> None:
+    """Безопасная замена state.clear() там, где вызывающему коду нужно
+    сбросить FSM-состояние и ЛОКАЛЬНЫЕ данные сценария до "чистого листа",
+    но НЕ трогать NAV anchor bookkeeping (P1-3 аудит, Batch 0).
+
+    aiogram FSMContext.clear() == set_state(None) + set_data({}) — это
+    стирает ВЕСЬ per-chat data dict, включая _NAV_ANCHOR_MSG_KEY/
+    _NAV_ANCHOR_CHAT_KEY, хотя физическое NAV-сообщение (persistent
+    reply-клавиатура) при этом никуда не девается. Следующий вызов
+    ensure_nav_anchor() в любом месте этого же чата (следующий /start,
+    /admin, /portfolio...) видел бы оба ключа отсутствующими и создавал бы
+    ВТОРОЙ, дублирующий WELCOME с собственной reply-клавиатурой поверх уже
+    существующего — ровно тот класс бага, ради которого вообще был
+    разделён NAV/TRANSIENT anchor (см. докстринг модуля).
+
+    Сохраняет ТОЛЬКО эти два ключа — TRANSIENT anchor
+    (_ANCHOR_MSG_KEY/_ANCHOR_CHAT_KEY) стирается точно так же, как и раньше
+    при state.clear(): ни один существующий вызывающий код в admin.py не
+    полагается на его сохранность после сброса (единственное место,
+    которому это было бы важно — FAQ-add wizard — уже сознательно
+    использует state.set_state(None) вместо state.clear(), не эту
+    функцию, см. bot/handlers/admin.py::faq_add_answer)."""
+    data = await state.get_data()
+    preserved = {
+        key: data[key]
+        for key in (_NAV_ANCHOR_MSG_KEY, _NAV_ANCHOR_CHAT_KEY)
+        if key in data
+    }
+    await state.set_state(None)
+    await state.set_data(preserved)
+
+
 async def open_root(
     message: Message,
     state: FSMContext,

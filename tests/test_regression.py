@@ -307,6 +307,43 @@ def make_flow_message(chat_id: int = 888, text: str | None = "/start", delete_ra
     )
 
 
+def make_flow_message_factory(chat_id: int = 888, start_id: int = 1000):
+    """P1-3 аудит, Batch 0: make_flow_message() всегда возвращает
+    message_id=555 из .answer() — тест не может отличить "отредактировал
+    то же сообщение" от "отправил N новых сообщений", потому что все они
+    выглядят одинаково (один и тот же фейковый id). Эта фабрика — для
+    сценариев, где важно доказать обратное: каждый вызов .answer() у ЛЮБОГО
+    сообщения, порождённого этой фабрикой, увеличивает общий counter и
+    возвращает УНИКАЛЬНЫЙ message_id — orphan-message регрессия (новое
+    сообщение вместо edit) становится видна в тесте как рост числа
+    различных id, а не остаётся замаскированной.
+
+    Возвращает callable make(text=..., delete_raises=...) — каждый вызов
+    make() создаёт НОВОЕ "входящее" сообщение (например, следующий шаг
+    того же сценария), но все они делят один и тот же counter."""
+    counter = {"n": start_id}
+
+    def make(text: str | None = "/start", delete_raises: bool = False) -> SimpleNamespace:
+        async def _delete():
+            if delete_raises:
+                raise TelegramAPIError(method=None, message="can't delete")
+
+        def _next_sent(*args, **kwargs):
+            counter["n"] += 1
+            return SimpleNamespace(message_id=counter["n"], chat=SimpleNamespace(id=chat_id))
+
+        return SimpleNamespace(
+            chat=SimpleNamespace(id=chat_id),
+            from_user=SimpleNamespace(id=chat_id, username=None, first_name="Тест", last_name=None),
+            text=text,
+            delete=_delete,
+            answer=AsyncMock(side_effect=_next_sent),
+            bot=SimpleNamespace(delete_message=AsyncMock(), edit_message_text=AsyncMock()),
+        )
+
+    return make
+
+
 class FlowUtilTests(unittest.IsolatedAsyncioTestCase):
     """bot/flow.py — принцип перенесён из Personal Assistant
     (src/bot/utils/flow.py), не придуман заново. Все три правила: триггер
@@ -1145,6 +1182,143 @@ class AdminCleanupFlowTests(unittest.IsolatedAsyncioTestCase):
 
         faq_items = await content_store.list_faq()
         self.assertTrue(any(i["question"] == "Сколько стоит лендинг?" and i["answer"] == "От 25 000 рублей" for i in faq_items))
+
+
+class AdminNavAnchorResetTests(unittest.IsolatedAsyncioTestCase):
+    """P1-3 аудит, Batch 0: aiogram FSMContext.clear() == set_state(None) +
+    set_data({}) — стирает ВЕСЬ per-chat data dict, включая
+    flow._NAV_ANCHOR_MSG_KEY/_NAV_ANCHOR_CHAT_KEY, хотя физическое
+    NAV-сообщение (persistent reply-клавиатура) никуда не девается —
+    следующий flow.ensure_nav_anchor() создавал бы дублирующий WELCOME.
+    Все 24 call site'а state.clear() в admin.py заменены на
+    flow.reset_state_keep_nav — здесь проверяется каждый КЛАСС сценария
+    через реальные хендлеры (не сам helper в изоляции): простая навигация,
+    завершение мастера, отмена, удаление/редактирование, и что именно
+    происходит ПОСЛЕ сброса (ensure_nav_anchor, "Главное меню")."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        real_data_dir = Path(__file__).resolve().parent.parent / "data"
+        for name in ("pricing.json", "portfolio.json", "faq.json", "about.json", "ui_config.json"):
+            shutil.copy(real_data_dir / name, Path(self.tmpdir) / name)
+        self._orig_data_dir = content_store.DATA_DIR
+        self._orig_designer = content_store.config.DESIGNER_CHAT_ID
+        content_store.DATA_DIR = Path(self.tmpdir)
+        content_store.config.DESIGNER_CHAT_ID = "888"
+        self.actor = 888
+
+    def tearDown(self):
+        content_store.DATA_DIR = self._orig_data_dir
+        content_store.config.DESIGNER_CHAT_ID = self._orig_designer
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    async def _state_with_nav(self, nav_msg_id: int = 111, **extra_data) -> FSMContext:
+        state = make_state(self.actor)
+        await state.update_data(**{
+            flow._NAV_ANCHOR_MSG_KEY: nav_msg_id,
+            flow._NAV_ANCHOR_CHAT_KEY: self.actor,
+            **extra_data,
+        })
+        return state
+
+    # ---- 1/6/7 (сценарий A): простая admin-навигация ----
+    async def test_simple_admin_navigation_preserves_nav_anchor(self):
+        state = await self._state_with_nav(case_id="stale-value", cancel_to="cases")
+        cb = make_callback("adminmenu:cases", chat_id=self.actor)
+        await admin.menu_cases(cb, state)
+
+        self.assertIsNone(await state.get_state())
+        data = await state.get_data()
+        self.assertEqual(data.get(flow._NAV_ANCHOR_MSG_KEY), 111)  # 6: тот же message_id
+        self.assertEqual(data.get(flow._NAV_ANCHOR_CHAT_KEY), self.actor)
+        self.assertNotIn("case_id", data)  # 7: admin-local данные реально стёрты
+        self.assertNotIn("cancel_to", data)
+
+    # ---- 2: завершение полного мастера (add case, 4 шага: callback×2, text, photo, text) ----
+    async def test_completing_add_case_wizard_preserves_nav_anchor(self):
+        make_msg = make_flow_message_factory(chat_id=self.actor, start_id=2000)
+        state = await self._state_with_nav()
+
+        await admin.cases_add_start(make_callback("admincasesaction:add", chat_id=self.actor), state)
+        await admin.cases_add_category(make_callback("admincat:landing", chat_id=self.actor), state)
+        await admin.cases_add_title(make_msg(text="Новый лендинг"), state)
+        await admin.cases_add_photo(make_photo_message(self.actor), state)
+        await admin.cases_add_description(make_msg(text="Короткое описание задачи"), state)  # один из 24 сайтов
+
+        self.assertIsNone(await state.get_state())
+        data = await state.get_data()
+        self.assertEqual(data.get(flow._NAV_ANCHOR_MSG_KEY), 111)
+        self.assertNotIn("case_id", data)
+        self.assertNotIn("title", data)
+        self.assertNotIn("type_id", data)
+        # сама бизнес-операция не пострадала — кейс реально создан
+        cases = await content_store.list_cases()
+        self.assertTrue(any(c["title"] == "Новый лендинг" for c in cases))
+
+    # ---- 3 (сценарий, близкий к B): отмена внутри confirm-диалога ("Нет") ----
+    async def test_cancelling_delete_confirmation_preserves_nav_anchor(self):
+        cases = await content_store.list_cases()
+        target_id = cases[0]["id"]
+        state = await self._state_with_nav(case_id=target_id)
+        await admin.cases_delete_do(make_callback("admindelcaseconfirm:no", chat_id=self.actor), state)
+
+        self.assertIsNone(await state.get_state())
+        data = await state.get_data()
+        self.assertEqual(data.get(flow._NAV_ANCHOR_MSG_KEY), 111)
+        self.assertNotIn("case_id", data)
+        # это отмена, не удаление — кейс должен остаться на месте
+        still_there = next((c for c in await content_store.list_cases() if c["id"] == target_id), None)
+        self.assertIsNotNone(still_there)
+
+    # ---- 4: удаление ----
+    async def test_delete_faq_preserves_nav_anchor(self):
+        item = await content_store.add_faq(str(self.actor), "Тестовый вопрос?", "Тестовый ответ.")
+        state = await self._state_with_nav(faq_id=item["id"])
+        await admin.faq_delete_do(make_callback("admindelfaqconfirm:yes", chat_id=self.actor), state)
+
+        self.assertIsNone(await state.get_state())
+        data = await state.get_data()
+        self.assertEqual(data.get(flow._NAV_ANCHOR_MSG_KEY), 111)
+        self.assertNotIn("faq_id", data)
+        # удаление реально произошло — поведение бизнес-операции не изменилось
+        remaining = await content_store.list_faq()
+        self.assertFalse(any(i["id"] == item["id"] for i in remaining))
+
+    # ---- 4b: редактирование (завершение через "Готово") ----
+    async def test_finishing_about_edit_preserves_nav_anchor(self):
+        state = await self._state_with_nav(field="tagline")
+        await admin.about_edit_field(make_callback("admineditabout:done", chat_id=self.actor), state)
+
+        self.assertIsNone(await state.get_state())
+        data = await state.get_data()
+        self.assertEqual(data.get(flow._NAV_ANCHOR_MSG_KEY), 111)
+        self.assertNotIn("field", data)
+
+    # ---- 5/6 (сценарий B): ensure_nav_anchor после сброса ничего не пересоздаёт ----
+    async def test_ensure_nav_anchor_after_reset_does_not_recreate(self):
+        state = await self._state_with_nav()
+        await admin.menu_faq(make_callback("adminmenu:faq", chat_id=self.actor), state)  # один из 24 сайтов
+
+        probe = make_flow_message_factory(chat_id=self.actor, start_id=3000)()
+        created = await flow.ensure_nav_anchor(probe, state)
+
+        self.assertFalse(created)  # anchor уже "существует" по мнению ensure_nav_anchor
+        probe.answer.assert_not_awaited()  # ни одного нового WELCOME
+        data = await state.get_data()
+        self.assertEqual(data.get(flow._NAV_ANCHOR_MSG_KEY), 111)  # id не изменился
+
+    # ---- 8 (сценарий C): "Главное меню" после admin-действия не шлёт новый WELCOME ----
+    async def test_main_menu_after_admin_action_sends_no_new_welcome(self):
+        state = await self._state_with_nav()
+        await admin.menu_pricing(make_callback("adminmenu:pricing", chat_id=self.actor), state)  # один из 24 сайтов
+
+        mm_msg = make_flow_message_factory(chat_id=self.actor, start_id=4000)(text=texts.MAIN_MENU_BUTTON)
+        await admin.admin_main_menu_button(mm_msg, state)
+
+        mm_msg.answer.assert_not_awaited()  # main_menu_cleanup, не confirmation и не WELCOME
+        mm_msg.bot.edit_message_text.assert_not_awaited()  # NAV anchor не тронут ни одним сетевым вызовом
+        data = await state.get_data()
+        self.assertEqual(data.get(flow._NAV_ANCHOR_MSG_KEY), 111)
 
 
 class AdminLeadsFullSequenceTests(unittest.IsolatedAsyncioTestCase):
