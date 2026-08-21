@@ -94,25 +94,25 @@ class BriefLifecycleTests(unittest.IsolatedAsyncioTestCase):
 
         # Заявка (draft_id="d1"): "пришлю файл" -> заявка должна ждать файл.
         await webapp._handle_brief_submission(message, {"service_name": "Лендинг", "attach_tz": True, "draft_id": "d1"})
-        self.assertIsNotNone(content_store.find_lead_awaiting_file(message.from_user.id))
+        self.assertIsNotNone(await content_store.find_lead_awaiting_file(message.from_user.id))
 
         # Тот же draft_id (клиент передумал через "Дополнить информацию" и
         # убрал "пришлю файл") -> upsert той же заявки, флаг должен сняться,
         # а не остаться висеть от предыдущей отправки.
         await webapp._handle_brief_submission(message, {"service_name": "Лендинг", "attach_tz": False, "draft_id": "d1"})
-        self.assertIsNone(content_store.find_lead_awaiting_file(message.from_user.id))
+        self.assertIsNone(await content_store.find_lead_awaiting_file(message.from_user.id))
 
     async def test_repeat_submission_with_tz_again_still_ends_clean_without_file(self):
         message = make_message()
 
         await webapp._handle_brief_submission(message, {"service_name": "Лендинг", "attach_tz": True, "draft_id": "d2"})
         await webapp._handle_brief_submission(message, {"service_name": "Лендинг", "attach_tz": True, "draft_id": "d2"})
-        self.assertIsNotNone(content_store.find_lead_awaiting_file(message.from_user.id))
+        self.assertIsNotNone(await content_store.find_lead_awaiting_file(message.from_user.id))
 
         # Присланный файл закрывает ожидание (тот же путь, что и в проде).
         message.document = make_fake_document()
         await webapp.handle_tz_file(message)
-        self.assertIsNone(content_store.find_lead_awaiting_file(message.from_user.id))
+        self.assertIsNone(await content_store.find_lead_awaiting_file(message.from_user.id))
 
     async def test_file_from_different_user_does_not_close_someone_elses_wait(self):
         # Security: файл от чужого user_id не должен закрывать чужое
@@ -126,7 +126,7 @@ class BriefLifecycleTests(unittest.IsolatedAsyncioTestCase):
         stranger_message.from_user = SimpleNamespace(id=999, username="stranger", first_name="Чужой", last_name=None)
         await webapp.handle_tz_file(stranger_message)
 
-        self.assertIsNotNone(content_store.find_lead_awaiting_file(1))  # заявка владельца всё ещё ждёт файл
+        self.assertIsNotNone(await content_store.find_lead_awaiting_file(1))  # заявка владельца всё ещё ждёт файл
         stranger_message.forward.assert_not_awaited()
         stranger_message.answer.assert_not_awaited()  # чужому отправителю тоже ничего не отвечаем
 
@@ -140,7 +140,7 @@ class BriefLifecycleTests(unittest.IsolatedAsyncioTestCase):
 
         # "Рестарт" — работаем со свежим вызовом, ничего не переиспользуем
         # из предыдущего процесса/переменных, кроме самого файла на диске.
-        lead = content_store.find_lead_awaiting_file(message.from_user.id)
+        lead = await content_store.find_lead_awaiting_file(message.from_user.id)
         self.assertIsNotNone(lead)
         self.assertTrue(lead["awaiting_tz_file"])
 
@@ -192,7 +192,7 @@ class LeadNotificationContentTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Бюджет:</b> 40 000–70 000 ₽", text)
         self.assertNotIn("ТЗ:</b> клиент пришлёт файл", text)  # attach_tz=False
         message.answer.assert_awaited_once()
-        self.assertIsNone(content_store.find_lead_awaiting_file(message.from_user.id))  # attach_tz=False -> ничего не ждём
+        self.assertIsNone(await content_store.find_lead_awaiting_file(message.from_user.id))  # attach_tz=False -> ничего не ждём
 
     async def test_direct_brief_has_no_source_noise_in_notification(self):
         message = make_message()
@@ -218,38 +218,38 @@ class LeadNotificationContentTests(unittest.IsolatedAsyncioTestCase):
 
         text = message.bot.send_message.await_args.kwargs["text"]
         self.assertNotIn("Источник", text)  # "direct" осознанно не показываем — см. lead.py
-        self.assertIsNotNone(content_store.find_lead_awaiting_file(message.from_user.id))  # attach_tz=True
+        self.assertIsNotNone(await content_store.find_lead_awaiting_file(message.from_user.id))  # attach_tz=True
 
 
-class AdminCancelContextTests(unittest.TestCase):
+class AdminCancelContextTests(unittest.IsolatedAsyncioTestCase):
     """_resolve_cancel — сердце Механизма 2: "Отмена" должна возвращать к
     разделу, с которого начался мастер, а не всегда в корень."""
 
-    def test_options_target_preserves_service_id_and_returns_to_options_menu(self):
-        text, markup, next_state, next_data = admin._resolve_cancel(
+    async def test_options_target_preserves_service_id_and_returns_to_options_menu(self):
+        text, markup, next_state, next_data = await admin._resolve_cancel(
             {"cancel_to": "options", "service_id": "LEND", "opt_name": "черновик, должен быть отброшен"}
         )
         self.assertEqual(next_state, AdminStates.edit_service_field_pick)
         self.assertEqual(next_data, {"service_id": "LEND"})
         self.assertIn("Опции", text)
 
-    def test_options_target_without_service_id_falls_back_to_root(self):
+    async def test_options_target_without_service_id_falls_back_to_root(self):
         # Защита от испорченных данных состояния — cancel_to="options" без
         # service_id не должен приводить к сломанному экрану.
-        text, markup, next_state, next_data = admin._resolve_cancel({"cancel_to": "options"})
+        text, markup, next_state, next_data = await admin._resolve_cancel({"cancel_to": "options"})
         self.assertIsNone(next_state)
         self.assertIn("Админ-меню", text)
 
-    def test_section_targets_clear_state_and_data(self):
+    async def test_section_targets_clear_state_and_data(self):
         for target in ("cases", "faq", "pricing", "categories"):
             with self.subTest(target=target):
-                text, markup, next_state, next_data = admin._resolve_cancel({"cancel_to": target, "junk": 1})
+                text, markup, next_state, next_data = await admin._resolve_cancel({"cancel_to": target, "junk": 1})
                 self.assertIsNone(next_state)
                 self.assertEqual(next_data, {})
 
-    def test_unknown_or_missing_target_defaults_to_root(self):
-        default_text, *_ = admin._resolve_cancel({})
-        unknown_text, *_ = admin._resolve_cancel({"cancel_to": "does-not-exist"})
+    async def test_unknown_or_missing_target_defaults_to_root(self):
+        default_text, *_ = await admin._resolve_cancel({})
+        unknown_text, *_ = await admin._resolve_cancel({"cancel_to": "does-not-exist"})
         self.assertEqual(default_text, unknown_text)
         self.assertIn("Админ-меню", default_text)
 
@@ -1143,7 +1143,7 @@ class AdminCleanupFlowTests(unittest.IsolatedAsyncioTestCase):
         a_msg.bot.edit_message_text.assert_awaited_once()
         a_msg.answer.assert_not_awaited()
 
-        faq_items = content_store.list_faq()
+        faq_items = await content_store.list_faq()
         self.assertTrue(any(i["question"] == "Сколько стоит лендинг?" and i["answer"] == "От 25 000 рублей" for i in faq_items))
 
 
@@ -1152,7 +1152,7 @@ class AdminLeadsFullSequenceTests(unittest.IsolatedAsyncioTestCase):
     вернуться, одной непрерывной последовательностью реальных хендлеров
     (не по отдельности), с проверкой persistence на каждом шаге."""
 
-    def setUp(self):
+    async def asyncSetUp(self):
         self.tmpdir = tempfile.mkdtemp()
         real_data_dir = Path(__file__).resolve().parent.parent / "data"
         for name in ("pricing.json", "portfolio.json", "faq.json", "about.json", "ui_config.json"):
@@ -1162,7 +1162,7 @@ class AdminLeadsFullSequenceTests(unittest.IsolatedAsyncioTestCase):
         content_store.DATA_DIR = Path(self.tmpdir)
         content_store.config.DESIGNER_CHAT_ID = "888"
         self.actor = 888
-        self.lead = content_store.add_lead(
+        self.lead = await content_store.add_lead(
             {"service_name": "Лендинг", "task_description": "Тест"},
             {"user_id": 55555, "username": "client", "first_name": "Клиент"},
         )
@@ -1183,16 +1183,16 @@ class AdminLeadsFullSequenceTests(unittest.IsolatedAsyncioTestCase):
         # Открытие карточки NEW-заявки автоматически переводит её в VIEWED
         # (см. UX-аудит "Заявки как рабочая очередь") — раньше здесь
         # оставался NEW, статус менялся только явным кликом по кнопке.
-        self.assertEqual(content_store.get_lead(self.lead["id"])["status"], "VIEWED")
+        self.assertEqual((await content_store.get_lead(self.lead["id"]))["status"], "VIEWED")
 
         await admin.lead_change_status(make_callback("adminleadstatus:IN_PROGRESS", chat_id=self.actor), state)
-        self.assertEqual(content_store.get_lead(self.lead["id"])["status"], "IN_PROGRESS")  # реально сохранилось
+        self.assertEqual((await content_store.get_lead(self.lead["id"]))["status"], "IN_PROGRESS")  # реально сохранилось
 
         await admin.lead_back_to_list(make_callback("adminleadaction:back", chat_id=self.actor), state)
         self.assertEqual(await state.get_state(), AdminStates.leads_list.state)
 
         # Статус пережил весь проход, не только момент смены
-        self.assertEqual(content_store.get_lead(self.lead["id"])["status"], "IN_PROGRESS")
+        self.assertEqual((await content_store.get_lead(self.lead["id"]))["status"], "IN_PROGRESS")
 
 
 class AdminLeadsQueueUxTests(unittest.IsolatedAsyncioTestCase):
@@ -1221,11 +1221,11 @@ class AdminLeadsQueueUxTests(unittest.IsolatedAsyncioTestCase):
         return [btn.text for row in markup.inline_keyboard for btn in row]
 
     async def test_default_filter_excludes_done_and_cancelled(self):
-        active_lead = content_store.add_lead({"service_name": "Активная"}, self.telegram)
-        done_lead = content_store.add_lead({"service_name": "Завершённая"}, self.telegram)
-        content_store.update_lead_status(self.actor, done_lead["id"], "DONE")
-        cancelled_lead = content_store.add_lead({"service_name": "Отменённая"}, self.telegram)
-        content_store.update_lead_status(self.actor, cancelled_lead["id"], "CANCELLED")
+        active_lead = await content_store.add_lead({"service_name": "Активная"}, self.telegram)
+        done_lead = await content_store.add_lead({"service_name": "Завершённая"}, self.telegram)
+        await content_store.update_lead_status(self.actor, done_lead["id"], "DONE")
+        cancelled_lead = await content_store.add_lead({"service_name": "Отменённая"}, self.telegram)
+        await content_store.update_lead_status(self.actor, cancelled_lead["id"], "CANCELLED")
 
         state = make_state(self.actor)
         cb = make_callback("adminmenu:leads", chat_id=self.actor)
@@ -1238,9 +1238,9 @@ class AdminLeadsQueueUxTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(f"#{cancelled_lead['id']}", texts)
 
     async def test_explicit_filter_still_works(self):
-        content_store.add_lead({"service_name": "Новая"}, self.telegram)
-        done_lead = content_store.add_lead({"service_name": "Завершённая"}, self.telegram)
-        content_store.update_lead_status(self.actor, done_lead["id"], "DONE")
+        await content_store.add_lead({"service_name": "Новая"}, self.telegram)
+        done_lead = await content_store.add_lead({"service_name": "Завершённая"}, self.telegram)
+        await content_store.update_lead_status(self.actor, done_lead["id"], "DONE")
 
         state = make_state(self.actor)
         cb = make_callback("adminleadfilter:DONE", chat_id=self.actor)
@@ -1250,10 +1250,10 @@ class AdminLeadsQueueUxTests(unittest.IsolatedAsyncioTestCase):
         texts = " ".join(self._button_texts(cb.message.edit_text.await_args.kwargs["reply_markup"]))
         self.assertIn(f"#{done_lead['id']}", texts)
 
-    def test_list_keyboard_shows_status_and_updated_at(self):
-        lead = content_store.add_lead({"service_name": "Лендинг"}, self.telegram)
-        content_store.update_lead_status(self.actor, lead["id"], "WAITING_CLIENT")
-        lead = content_store.get_lead(lead["id"])
+    async def test_list_keyboard_shows_status_and_updated_at(self):
+        lead = await content_store.add_lead({"service_name": "Лендинг"}, self.telegram)
+        await content_store.update_lead_status(self.actor, lead["id"], "WAITING_CLIENT")
+        lead = await content_store.get_lead(lead["id"])
 
         markup = kb.leads_list_keyboard([lead], "ACTIVE")
         text = markup.inline_keyboard[0][0].text
@@ -1263,42 +1263,42 @@ class AdminLeadsQueueUxTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(lead["updated_at"][5:16].replace("T", " "), text)  # "MM-DD HH:MM"
 
     async def test_new_lead_opened_once_becomes_viewed_and_updates_timestamp(self):
-        lead = content_store.add_lead({"service_name": "Лендинг"}, self.telegram)
+        lead = await content_store.add_lead({"service_name": "Лендинг"}, self.telegram)
         self.assertIsNone(lead["updated_at"])
 
         state = make_state(self.actor)
         await admin.lead_open_detail(make_callback(f"adminleadpick:{lead['id']}", chat_id=self.actor), state)
 
-        updated = content_store.get_lead(lead["id"])
+        updated = await content_store.get_lead(lead["id"])
         self.assertEqual(updated["status"], "VIEWED")
         self.assertIsNotNone(updated["updated_at"])  # реально обновилось — заявка "просмотрена по-настоящему"
 
     async def test_already_viewed_lead_opened_again_no_extra_update(self):
-        lead = content_store.add_lead({"service_name": "Лендинг"}, self.telegram)
-        content_store.update_lead_status(self.actor, lead["id"], "VIEWED")
-        before = content_store.get_lead(lead["id"])["updated_at"]
+        lead = await content_store.add_lead({"service_name": "Лендинг"}, self.telegram)
+        await content_store.update_lead_status(self.actor, lead["id"], "VIEWED")
+        before = (await content_store.get_lead(lead["id"]))["updated_at"]
 
         state = make_state(self.actor)
         await admin.lead_open_detail(make_callback(f"adminleadpick:{lead['id']}", chat_id=self.actor), state)
 
-        after = content_store.get_lead(lead["id"])
+        after = await content_store.get_lead(lead["id"])
         self.assertEqual(after["status"], "VIEWED")
         self.assertEqual(after["updated_at"], before)  # ни одной лишней записи
 
     async def test_non_new_status_untouched_on_open(self):
-        lead = content_store.add_lead({"service_name": "Лендинг"}, self.telegram)
-        content_store.update_lead_status(self.actor, lead["id"], "DONE")
-        before = content_store.get_lead(lead["id"])["updated_at"]
+        lead = await content_store.add_lead({"service_name": "Лендинг"}, self.telegram)
+        await content_store.update_lead_status(self.actor, lead["id"], "DONE")
+        before = (await content_store.get_lead(lead["id"]))["updated_at"]
 
         state = make_state(self.actor)
         await admin.lead_open_detail(make_callback(f"adminleadpick:{lead['id']}", chat_id=self.actor), state)
 
-        after = content_store.get_lead(lead["id"])
+        after = await content_store.get_lead(lead["id"])
         self.assertEqual(after["status"], "DONE")
         self.assertEqual(after["updated_at"], before)
 
     async def test_auto_viewed_does_not_send_client_notification(self):
-        lead = content_store.add_lead({"service_name": "Лендинг"}, self.telegram)
+        lead = await content_store.add_lead({"service_name": "Лендинг"}, self.telegram)
         state = make_state(self.actor)
         cb = make_callback(f"adminleadpick:{lead['id']}", chat_id=self.actor)
 
@@ -1307,12 +1307,12 @@ class AdminLeadsQueueUxTests(unittest.IsolatedAsyncioTestCase):
         cb.bot.send_message.assert_not_awaited()  # смена статуса кликом уведомляет, авто-VIEWED — нет
 
     async def test_auto_viewed_does_not_create_owner_message(self):
-        lead = content_store.add_lead({"service_name": "Лендинг"}, self.telegram)
+        lead = await content_store.add_lead({"service_name": "Лендинг"}, self.telegram)
         state = make_state(self.actor)
 
         await admin.lead_open_detail(make_callback(f"adminleadpick:{lead['id']}", chat_id=self.actor), state)
 
-        updated = content_store.get_lead(lead["id"])
+        updated = await content_store.get_lead(lead["id"])
         self.assertEqual(updated.get("owner_messages", []), [])
 
 
@@ -1790,7 +1790,7 @@ class AdminCaseConstructorTests(unittest.IsolatedAsyncioTestCase):
     await внутри генератора неявно делает его async-генератором, и next()
     падает с TypeError на КАЖДОМ открытии этих пунктов меню в реальном боте."""
 
-    def setUp(self):
+    async def asyncSetUp(self):
         self.tmpdir = tempfile.mkdtemp()
         real_data_dir = Path(__file__).resolve().parent.parent / "data"
         for name in ("pricing.json", "portfolio.json", "faq.json", "about.json", "ui_config.json"):
@@ -1800,7 +1800,7 @@ class AdminCaseConstructorTests(unittest.IsolatedAsyncioTestCase):
         content_store.DATA_DIR = Path(self.tmpdir)
         content_store.config.DESIGNER_CHAT_ID = "999"
         self.actor = 999
-        content_store.add_case(
+        await content_store.add_case(
             str(self.actor), case_id="case_ctor_test", title="Тест", type_id="landing",
             cover="img/portfolio/seed.svg", task="t", related_service=None,
         )
@@ -1810,8 +1810,8 @@ class AdminCaseConstructorTests(unittest.IsolatedAsyncioTestCase):
         content_store.config.DESIGNER_CHAT_ID = self._orig_designer
         shutil.rmtree(self.tmpdir, ignore_errors=True)
 
-    def _case(self):
-        return next(c for c in content_store.list_cases() if c["id"] == "case_ctor_test")
+    async def _case(self):
+        return next(c for c in await content_store.list_cases() if c["id"] == "case_ctor_test")
 
     async def _state(self):
         state = make_state(self.actor)
@@ -1827,15 +1827,16 @@ class AdminCaseConstructorTests(unittest.IsolatedAsyncioTestCase):
 
         await admin.case_image_add_start(make_callback("admincaseimgaction:add", chat_id=self.actor), state)
         await admin.case_image_add_receive(make_photo_message(self.actor), state)
-        self.assertEqual(len(self._case()["images"]), 2)
+        self.assertEqual(len((await self._case())["images"]), 2)
 
         await admin.case_image_picked(make_callback("admincaseimgpick:1", chat_id=self.actor), state)
         await admin.case_image_action(make_callback("admincaseimgact:cover", chat_id=self.actor), state)
-        self.assertEqual(self._case()["cover"], self._case()["images"][1])
+        case = await self._case()
+        self.assertEqual(case["cover"], case["images"][1])
 
         await admin.case_image_picked(make_callback("admincaseimgpick:1", chat_id=self.actor), state)
         await admin.case_image_action(make_callback("admincaseimgact:delete", chat_id=self.actor), state)
-        self.assertEqual(len(self._case()["images"]), 1)
+        self.assertEqual(len((await self._case())["images"]), 1)
 
     async def test_opening_sections_menu_does_not_crash_and_add_edit_works(self):
         state = await self._state()
@@ -1847,23 +1848,23 @@ class AdminCaseConstructorTests(unittest.IsolatedAsyncioTestCase):
         await admin.case_section_add_type(make_callback("admincasesectype:text", chat_id=self.actor), state)
         await admin.case_section_add_title(make_text_message(self.actor, "Задача"), state)
         await admin.case_section_add_content(make_text_message(self.actor, "Описание задачи"), state)
-        self.assertEqual(self._case()["sections"][0], {"type": "text", "title": "Задача", "content": "Описание задачи"})
+        self.assertEqual((await self._case())["sections"][0], {"type": "text", "title": "Задача", "content": "Описание задачи"})
 
         await admin.case_section_picked(make_callback("admincasesecpick:0", chat_id=self.actor), state)
         await admin.case_section_action(make_callback("admincasesecact:title", chat_id=self.actor), state)
         await admin.case_section_edit_value(make_text_message(self.actor, "Задача проекта"), state)
-        self.assertEqual(self._case()["sections"][0]["title"], "Задача проекта")
+        self.assertEqual((await self._case())["sections"][0]["title"], "Задача проекта")
 
     async def test_category_and_external_url_edit_via_real_handlers(self):
         state = await self._state()
         await admin.cases_edit_field(make_callback("admineditfield:category", chat_id=self.actor), state)
         await admin.cases_edit_category(make_callback("admincasenewcat:site", chat_id=self.actor), state)
-        self.assertEqual(self._case()["type"], "site")
+        self.assertEqual((await self._case())["type"], "site")
 
         await admin.cases_edit_field(make_callback("admineditfield:external_url", chat_id=self.actor), state)
         self.assertEqual(await state.get_state(), AdminStates.edit_case_value.state)
         await admin.cases_edit_value(make_text_message(self.actor, "https://behance.net/gallery/x"), state)
-        self.assertEqual(self._case()["external_url"], "https://behance.net/gallery/x")
+        self.assertEqual((await self._case())["external_url"], "https://behance.net/gallery/x")
 
 
 class AdminBackupHandlersTests(unittest.IsolatedAsyncioTestCase):
@@ -1921,9 +1922,9 @@ class AdminBackupHandlersTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("data/portfolio.json", zf.namelist())
 
     async def test_import_via_real_handler_restores_changed_data(self):
-        zip_bytes = content_store.export_backup_bytes()
-        content_store.update_portfolio_type_related_service(str(self.actor), "landing", "SITE")
-        self.assertEqual(content_store.default_related_service_for_type("landing"), "SITE")
+        zip_bytes = await content_store.export_backup_bytes()
+        await content_store.update_portfolio_type_related_service(str(self.actor), "landing", "SITE")
+        self.assertEqual(await content_store.default_related_service_for_type("landing"), "SITE")
 
         state = make_state(self.actor)
         await admin.backup_import_start(make_callback("adminbackupaction:import", chat_id=self.actor), state)
@@ -1931,7 +1932,7 @@ class AdminBackupHandlersTests(unittest.IsolatedAsyncioTestCase):
 
         await admin.backup_import_receive(self._make_zip_document_message(zip_bytes), state)
 
-        self.assertEqual(content_store.default_related_service_for_type("landing"), "LEND")
+        self.assertEqual(await content_store.default_related_service_for_type("landing"), "LEND")
         self.assertEqual(await state.get_state(), AdminStates.backup_menu.state)
 
     async def test_import_bad_zip_via_real_handler_does_not_crash(self):
@@ -1940,6 +1941,28 @@ class AdminBackupHandlersTests(unittest.IsolatedAsyncioTestCase):
         await admin.backup_import_receive(msg, state)
         msg.answer.assert_awaited_once()
         self.assertIn("повреждён", msg.answer.await_args.args[0])
+
+    async def test_import_snapshot_failure_via_real_handler_gives_clear_message_and_resets_state(self):
+        # P2-6, второй design review: Phase 1 (снапшот) падает НЕ из-за
+        # UpstashKeyMissingError — реальная сетевая/Upstash-ошибка при
+        # чтении текущего значения перед записью. Phase 2 не должен
+        # начаться (zero writes), админ должен получить понятное сообщение
+        # без утечки внутренних деталей исходного исключения, а FSM-state
+        # должен сброситься к backup_menu, а не зависнуть.
+        zip_bytes = await content_store.export_backup_bytes()
+        original_before = (Path(self.tmpdir) / "leads.json").read_bytes()
+        state = make_state(self.actor)
+        msg = self._make_zip_document_message(zip_bytes)
+
+        with patch("bot.content_store._read", side_effect=RuntimeError("simulated snapshot read failure")):
+            await admin.backup_import_receive(msg, state)
+
+        msg.answer.assert_awaited_once()
+        reply_text = msg.answer.await_args.args[0]
+        self.assertIn("отменено", reply_text.lower())
+        self.assertNotIn("simulated snapshot read failure", reply_text)  # деталь исходного исключения не утекает
+        self.assertEqual(await state.get_state(), AdminStates.backup_menu.state)
+        self.assertEqual((Path(self.tmpdir) / "leads.json").read_bytes(), original_before)  # ничего не записано
 
 
 class AdminAboutResumeFieldsTests(unittest.IsolatedAsyncioTestCase):
@@ -1971,12 +1994,12 @@ class AdminAboutResumeFieldsTests(unittest.IsolatedAsyncioTestCase):
         return state
 
     async def test_location_edit_via_real_handler_and_clears_needs_review(self):
-        self.assertIn("location", content_store.get_about()["needs_review_fields"])
+        self.assertIn("location", (await content_store.get_about())["needs_review_fields"])
         state = await self._state()
         await admin.about_edit_field(make_callback("admineditabout:location", chat_id=self.actor), state)
         self.assertEqual(await state.get_state(), AdminStates.edit_about_value.state)
         await admin.about_edit_value(make_text_message(self.actor, "Москва, удалённо"), state)
-        about = content_store.get_about()
+        about = await content_store.get_about()
         self.assertEqual(about["location"], "Москва, удалённо")
         self.assertNotIn("location", about["needs_review_fields"])
 
@@ -1984,7 +2007,7 @@ class AdminAboutResumeFieldsTests(unittest.IsolatedAsyncioTestCase):
         state = await self._state()
         await admin.about_edit_field(make_callback("admineditabout:skills", chat_id=self.actor), state)
         await admin.about_edit_value(make_text_message(self.actor, "UX-исследования, Прототипирование"), state)
-        about = content_store.get_about()
+        about = await content_store.get_about()
         self.assertEqual(about["skills"], ["UX-исследования", "Прототипирование"])
         self.assertNotEqual(about["skills"], about["tools"])
 
@@ -2045,7 +2068,7 @@ class _FakeUpstashResponse:
         return False
 
 
-class UpstashPersistenceTests(unittest.TestCase):
+class UpstashPersistenceTests(unittest.IsolatedAsyncioTestCase):
     """content_store._read/_write должны переключаться на Upstash Redis
     (REST) вместо локальных файлов, когда заданы креды — конкретно чтобы
     заявки и правки /admin переживали redeploy на бесплатном Render, где
@@ -2066,13 +2089,13 @@ class UpstashPersistenceTests(unittest.TestCase):
         content_store.config.UPSTASH_REDIS_REST_URL = self._orig_url
         content_store.config.UPSTASH_REDIS_REST_TOKEN = self._orig_token
 
-    def test_first_read_seeds_from_local_file_and_persists_to_redis(self):
-        data = content_store._read("ui_config.json")
+    async def test_first_read_seeds_from_local_file_and_persists_to_redis(self):
+        data = await content_store._read("ui_config.json")
         self.assertIn("menu", data)
         self.assertIn("ui_config.json", self.fake.store)  # засеяно в Redis сразу
 
-    def test_write_then_read_round_trips_through_redis_not_local_disk(self):
-        content_store._write("ui_config.json", {"menu": {"portfolio": False}})
+    async def test_write_then_read_round_trips_through_redis_not_local_disk(self):
+        await content_store._write("ui_config.json", {"menu": {"portfolio": False}})
         self.assertEqual(json.loads(self.fake.store["ui_config.json"]), {"menu": {"portfolio": False}})
 
         # локальный файл на диске НЕ тронут — вся мутация ушла только в Redis
@@ -2081,11 +2104,11 @@ class UpstashPersistenceTests(unittest.TestCase):
         self.assertNotEqual(real_local, {"menu": {"portfolio": False}})
 
         # повторное чтение отдаёт то, что записали, а не переседевает заново
-        self.assertEqual(content_store._read("ui_config.json"), {"menu": {"portfolio": False}})
+        self.assertEqual(await content_store._read("ui_config.json"), {"menu": {"portfolio": False}})
         self.assertEqual(self.fake.calls.count(("GET", "ui_config.json")), 1)  # ровно одно чтение из Redis
 
 
-class StorageInitializationTests(unittest.TestCase):
+class StorageInitializationTests(unittest.IsolatedAsyncioTestCase):
     """ensure_storage_initialized (P0-1, production-hardening аудит) —
     eager batch-сид всех DATA_FILENAMES под единым persistent MARKER_KEY:
     новая Upstash-база сеется целиком и сразу; уже проинициализированная —
@@ -2107,15 +2130,15 @@ class StorageInitializationTests(unittest.TestCase):
         content_store.config.UPSTASH_REDIS_REST_URL = self._orig_url
         content_store.config.UPSTASH_REDIS_REST_TOKEN = self._orig_token
 
-    def test_empty_new_database_seeds_all_and_sets_marker(self):
-        content_store.ensure_storage_initialized()
+    async def test_empty_new_database_seeds_all_and_sets_marker(self):
+        await content_store.ensure_storage_initialized()
         for filename in content_store.DATA_FILENAMES:
             self.assertIn(filename, self.fake.store)
         self.assertIn(content_store.MARKER_KEY, self.fake.store)
 
-    def test_partially_initialized_database_seeds_only_missing_keys(self):
+    async def test_partially_initialized_database_seeds_only_missing_keys(self):
         self.fake.store["leads.json"] = json.dumps({"leads": [{"id": 999, "custom": True}]})
-        content_store.ensure_storage_initialized()
+        await content_store.ensure_storage_initialized()
         # уже существовавший ключ не тронут
         self.assertEqual(json.loads(self.fake.store["leads.json"]), {"leads": [{"id": 999, "custom": True}]})
         # остальные — досеяны
@@ -2123,7 +2146,7 @@ class StorageInitializationTests(unittest.TestCase):
             self.assertIn(filename, self.fake.store)
         self.assertIn(content_store.MARKER_KEY, self.fake.store)
 
-    def test_existing_production_data_without_marker_is_untouched(self):
+    async def test_existing_production_data_without_marker_is_untouched(self):
         # Симулируем уже давно работающий продакшн: реальные данные во всех
         # 6 ключах, но marker ещё не существовал (появился только в этом
         # фиксе) — критический тест безопасной миграции, см. аудит.
@@ -2133,65 +2156,65 @@ class StorageInitializationTests(unittest.TestCase):
             self.fake.store[filename] = value
             original[filename] = value
 
-        content_store.ensure_storage_initialized()
+        await content_store.ensure_storage_initialized()
 
         for filename in content_store.DATA_FILENAMES:
             self.assertEqual(self.fake.store[filename], original[filename])  # ни байта не изменилось
         self.assertIn(content_store.MARKER_KEY, self.fake.store)
 
-    def test_marker_present_and_key_missing_raises_without_seeding(self):
+    async def test_marker_present_and_key_missing_raises_without_seeding(self):
         self.fake.store[content_store.MARKER_KEY] = "2026-01-01T00:00:00+00:00"
         with self.assertRaises(content_store.UpstashKeyMissingError):
-            content_store._read("leads.json")
+            await content_store._read("leads.json")
         self.assertNotIn("leads.json", self.fake.store)  # НЕ засеяно
         self.assertFalse(any(c[0] == "SET" for c in self.fake.calls))  # ни одного SET
 
-    def test_marker_present_and_all_keys_present_reads_normally(self):
+    async def test_marker_present_and_all_keys_present_reads_normally(self):
         self.fake.store[content_store.MARKER_KEY] = "2026-01-01T00:00:00+00:00"
         self.fake.store["ui_config.json"] = json.dumps({"menu": {"portfolio": True}})
-        data = content_store._read("ui_config.json")
+        data = await content_store._read("ui_config.json")
         self.assertEqual(data, {"menu": {"portfolio": True}})
 
-    def test_invalid_json_in_existing_key_still_fails_loud(self):
+    async def test_invalid_json_in_existing_key_still_fails_loud(self):
         self.fake.store["ui_config.json"] = "{not valid json"
         with self.assertRaises(json.JSONDecodeError):
-            content_store._read("ui_config.json")
+            await content_store._read("ui_config.json")
 
-    def test_network_failure_during_init_leaves_marker_unset(self):
+    async def test_network_failure_during_init_leaves_marker_unset(self):
         self.fake.fail_on = {("GET", "faq.json")}
         with self.assertRaises(ConnectionError):
-            content_store.ensure_storage_initialized()
+            await content_store.ensure_storage_initialized()
         self.assertNotIn(content_store.MARKER_KEY, self.fake.store)
 
-    def test_set_failure_during_init_leaves_marker_unset(self):
+    async def test_set_failure_during_init_leaves_marker_unset(self):
         self.fake.fail_on = {("SET", "about.json")}
         with self.assertRaises(ConnectionError):
-            content_store.ensure_storage_initialized()
+            await content_store.ensure_storage_initialized()
         self.assertNotIn(content_store.MARKER_KEY, self.fake.store)
 
-    def test_last_key_failure_still_prevents_marker(self):
+    async def test_last_key_failure_still_prevents_marker(self):
         # DATA_FILENAMES = (portfolio, pricing, faq, about, ui_config, leads)
         # — валим именно последний (6-й) ключ цикла: даже если первые 5
         # успешно засеялись до него, marker всё равно не должен появиться.
         last_filename = content_store.DATA_FILENAMES[-1]
         self.fake.fail_on = {("SET", last_filename)}
         with self.assertRaises(ConnectionError):
-            content_store.ensure_storage_initialized()
+            await content_store.ensure_storage_initialized()
         self.assertNotIn(content_store.MARKER_KEY, self.fake.store)
         for filename in content_store.DATA_FILENAMES[:-1]:
             self.assertIn(filename, self.fake.store)  # первые 5 уже успели засеяться — это ожидаемо
 
-    def test_upstash_disabled_is_noop(self):
+    async def test_upstash_disabled_is_noop(self):
         content_store.config.UPSTASH_REDIS_REST_URL = ""
         content_store.config.UPSTASH_REDIS_REST_TOKEN = ""
-        content_store.ensure_storage_initialized()
+        await content_store.ensure_storage_initialized()
         self.assertEqual(self.fake.calls, [])  # ни одного сетевого вызова — локальный dev не затронут
 
     def test_marker_key_not_in_backup_filenames(self):
         self.assertNotIn(content_store.MARKER_KEY, content_store.DATA_FILENAMES)
 
 
-class UpstashLoggingTests(unittest.TestCase):
+class UpstashLoggingTests(unittest.IsolatedAsyncioTestCase):
     """_upstash_command centralized structured logging (P2, production-
     hardening аудит): любой сбой GET/SET должен быть однозначно виден в
     Render logs — операция + ключ, без содержимого/секретов — и не должен
@@ -2215,55 +2238,55 @@ class UpstashLoggingTests(unittest.TestCase):
         content_store.config.UPSTASH_REDIS_REST_URL = self._orig_url
         content_store.config.UPSTASH_REDIS_REST_TOKEN = self._orig_token
 
-    def test_get_network_failure_logs_one_warning(self):
+    async def test_get_network_failure_logs_one_warning(self):
         self.fake.fail_on = {("GET", "leads.json")}
         with self.assertLogs("bot.content_store", level="WARNING") as log_ctx:
             with self.assertRaises(ConnectionError):
-                content_store._read("leads.json")
+                await content_store._read("leads.json")
         self.assertEqual(len(log_ctx.output), 1)
         self.assertIn("Upstash GET failed: leads.json", log_ctx.output[0])
 
-    def test_set_network_failure_logs_one_warning(self):
+    async def test_set_network_failure_logs_one_warning(self):
         self.fake.fail_on = {("SET", "leads.json")}
         with self.assertLogs("bot.content_store", level="WARNING") as log_ctx:
             with self.assertRaises(ConnectionError):
-                content_store._write("leads.json", {"leads": []})
+                await content_store._write("leads.json", {"leads": []})
         self.assertEqual(len(log_ctx.output), 1)
         self.assertIn("Upstash SET failed: leads.json", log_ctx.output[0])
 
-    def test_upstash_explicit_error_response_logs_warning_and_raises_runtime_error(self):
+    async def test_upstash_explicit_error_response_logs_warning_and_raises_runtime_error(self):
         self.fake.error_on = {("GET", "leads.json")}
         with self.assertLogs("bot.content_store", level="WARNING") as log_ctx:
             with self.assertRaises(RuntimeError) as ctx:
-                content_store._read("leads.json")
+                await content_store._read("leads.json")
         self.assertEqual(len(log_ctx.output), 1)
         self.assertIn("Upstash GET failed: leads.json", log_ctx.output[0])
         self.assertIn("Upstash error on GET", str(ctx.exception))  # текст существующего исключения не изменился
 
-    def test_successful_get_and_set_log_no_warning(self):
+    async def test_successful_get_and_set_log_no_warning(self):
         self.fake.store["ui_config.json"] = json.dumps({"menu": {"portfolio": True}})
         with self.assertNoLogs("bot.content_store", level="WARNING"):
-            content_store._read("ui_config.json")
-            content_store._write("ui_config.json", {"menu": {"portfolio": False}})
+            await content_store._read("ui_config.json")
+            await content_store._write("ui_config.json", {"menu": {"portfolio": False}})
 
-    def test_key_missing_logs_error_only_no_extra_warning(self):
+    async def test_key_missing_logs_error_only_no_extra_warning(self):
         self.fake.store[content_store.MARKER_KEY] = "2026-01-01T00:00:00+00:00"
         with self.assertLogs("bot.content_store", level="WARNING") as log_ctx:
             with self.assertRaises(content_store.UpstashKeyMissingError):
-                content_store._read("leads.json")
+                await content_store._read("leads.json")
         self.assertEqual(len(log_ctx.output), 1)  # ровно одна запись, не две
         self.assertTrue(log_ctx.output[0].startswith("ERROR"))
         self.assertIn("Upstash key missing: leads.json", log_ctx.output[0])
 
-    def test_initialization_failure_logs_warning_and_high_level_exception(self):
+    async def test_initialization_failure_logs_warning_and_high_level_exception(self):
         self.fake.fail_on = {("SET", "about.json")}
         with self.assertLogs("bot.content_store", level="WARNING") as log_ctx:
             with self.assertRaises(ConnectionError):
-                content_store.ensure_storage_initialized()
+                await content_store.ensure_storage_initialized()
         self.assertTrue(any("Upstash SET failed: about.json" in msg for msg in log_ctx.output))
         self.assertTrue(any("Upstash initialization failed" in msg for msg in log_ctx.output))
 
-    def test_local_mode_unaffected_no_warnings(self):
+    async def test_local_mode_unaffected_no_warnings(self):
         # Локальный режим пишет на реальный диск (_write_local) — реальный
         # data/ трогать нельзя, изолируем DATA_DIR отдельным tempdir'ом
         # только для этого теста (остальные тесты класса работают через
@@ -2277,7 +2300,7 @@ class UpstashLoggingTests(unittest.TestCase):
         content_store.config.UPSTASH_REDIS_REST_TOKEN = ""
         try:
             with self.assertNoLogs("bot.content_store", level="WARNING"):
-                content_store._write("ui_config.json", content_store._read("ui_config.json"))
+                await content_store._write("ui_config.json", await content_store._read("ui_config.json"))
         finally:
             content_store.DATA_DIR = orig_data_dir
             shutil.rmtree(tmpdir, ignore_errors=True)
@@ -2285,7 +2308,7 @@ class UpstashLoggingTests(unittest.TestCase):
 
     # ---- Secret-safety (P2, явное требование аудита) ----
 
-    def test_no_secrets_or_content_in_logs_across_all_failure_scenarios(self):
+    async def test_no_secrets_or_content_in_logs_across_all_failure_scenarios(self):
         real_payload = {
             "leads": [{
                 "id": 1,
@@ -2298,14 +2321,14 @@ class UpstashLoggingTests(unittest.TestCase):
         self.fake.fail_on = {("GET", "leads.json")}
         with self.assertLogs("bot.content_store", level="WARNING") as log_ctx:
             with self.assertRaises(ConnectionError):
-                content_store._read("leads.json")
+                await content_store._read("leads.json")
         all_output += log_ctx.output
 
         # SET-сбой с реальным чувствительным контентом в args[2]
         self.fake.fail_on = {("SET", "leads.json")}
         with self.assertLogs("bot.content_store", level="WARNING") as log_ctx:
             with self.assertRaises(ConnectionError):
-                content_store._write("leads.json", real_payload)
+                await content_store._write("leads.json", real_payload)
         all_output += log_ctx.output
 
         # explicit error-ответ Upstash тоже с реальным контентом в запросе
@@ -2313,7 +2336,7 @@ class UpstashLoggingTests(unittest.TestCase):
         self.fake.error_on = {("SET", "leads.json")}
         with self.assertLogs("bot.content_store", level="WARNING") as log_ctx:
             with self.assertRaises(RuntimeError):
-                content_store._write("leads.json", real_payload)
+                await content_store._write("leads.json", real_payload)
         all_output += log_ctx.output
 
         combined = "\n".join(all_output)
@@ -2335,7 +2358,7 @@ def _make_zip(entries: dict[str, bytes]) -> bytes:
     return buf.getvalue()
 
 
-class BackupExportImportTests(unittest.TestCase):
+class BackupExportImportTests(unittest.IsolatedAsyncioTestCase):
     """export_backup_bytes/import_backup_bytes — единственный бесплатный
     (без стороннего сервиса) способ пережить redeploy на Render: дизайнер
     выгружает .zip себе в Telegram и загружает обратно после деплоя.
@@ -2371,8 +2394,8 @@ class BackupExportImportTests(unittest.TestCase):
         shutil.rmtree(self.tmpdir, ignore_errors=True)
         shutil.rmtree(self.img_tmpdir, ignore_errors=True)
 
-    def test_export_zip_contains_data_files_and_images(self):
-        zip_bytes = content_store.export_backup_bytes()
+    async def test_export_zip_contains_data_files_and_images(self):
+        zip_bytes = await content_store.export_backup_bytes()
         with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
             names = zf.namelist()
         self.assertIn("data/portfolio.json", names)
@@ -2380,49 +2403,49 @@ class BackupExportImportTests(unittest.TestCase):
         self.assertIn("img/portfolio/case_1.jpg", names)
         self.assertIn("img/about/avatar.jpg", names)
 
-    def test_import_restores_json_field_that_changed_after_export(self):
-        zip_bytes = content_store.export_backup_bytes()
-        content_store.update_portfolio_type_related_service(self.actor, "landing", "SITE")  # мутируем после бэкапа
-        self.assertEqual(content_store.default_related_service_for_type("landing"), "SITE")
+    async def test_import_restores_json_field_that_changed_after_export(self):
+        zip_bytes = await content_store.export_backup_bytes()
+        await content_store.update_portfolio_type_related_service(self.actor, "landing", "SITE")  # мутируем после бэкапа
+        self.assertEqual(await content_store.default_related_service_for_type("landing"), "SITE")
 
-        content_store.import_backup_bytes(self.actor, zip_bytes)
+        await content_store.import_backup_bytes(self.actor, zip_bytes)
 
-        self.assertEqual(content_store.default_related_service_for_type("landing"), "LEND")  # вернулось из бэкапа
+        self.assertEqual(await content_store.default_related_service_for_type("landing"), "LEND")  # вернулось из бэкапа
 
-    def test_import_restores_deleted_image_file(self):
-        zip_bytes = content_store.export_backup_bytes()
+    async def test_import_restores_deleted_image_file(self):
+        zip_bytes = await content_store.export_backup_bytes()
         (content_store.IMG_PORTFOLIO_DIR / "case_1.jpg").unlink()
         self.assertFalse((content_store.IMG_PORTFOLIO_DIR / "case_1.jpg").exists())
 
-        content_store.import_backup_bytes(self.actor, zip_bytes)
+        await content_store.import_backup_bytes(self.actor, zip_bytes)
 
         self.assertTrue((content_store.IMG_PORTFOLIO_DIR / "case_1.jpg").exists())
         self.assertEqual((content_store.IMG_PORTFOLIO_DIR / "case_1.jpg").read_bytes(), b"fake-jpeg-bytes")
 
-    def test_import_requires_designer(self):
-        zip_bytes = content_store.export_backup_bytes()
+    async def test_import_requires_designer(self):
+        zip_bytes = await content_store.export_backup_bytes()
         with self.assertRaises(content_store.NotDesignerError):
-            content_store.import_backup_bytes("not-the-designer", zip_bytes)
+            await content_store.import_backup_bytes("not-the-designer", zip_bytes)
 
-    def test_import_rejects_non_zip_bytes(self):
+    async def test_import_rejects_non_zip_bytes(self):
         with self.assertRaises(zipfile.BadZipFile):
-            content_store.import_backup_bytes(self.actor, b"not a zip file at all")
+            await content_store.import_backup_bytes(self.actor, b"not a zip file at all")
 
     # ---- P1-1 (production-hardening аудит): all-or-nothing restore + snapshot/rollback ----
 
-    def test_full_valid_backup_restores_all_json_and_reports_no_missing(self):
-        zip_bytes = content_store.export_backup_bytes()
-        content_store.update_portfolio_type_related_service(self.actor, "landing", "SITE")  # мутируем после бэкапа
+    async def test_full_valid_backup_restores_all_json_and_reports_no_missing(self):
+        zip_bytes = await content_store.export_backup_bytes()
+        await content_store.update_portfolio_type_related_service(self.actor, "landing", "SITE")  # мутируем после бэкапа
 
-        result = content_store.import_backup_bytes(self.actor, zip_bytes)
+        result = await content_store.import_backup_bytes(self.actor, zip_bytes)
 
         self.assertEqual(sorted(result.restored_json), sorted(content_store.DATA_FILENAMES))
         self.assertEqual(result.missing_json, [])
         self.assertEqual(result.failed_images, [])
         self.assertIn("img/portfolio/case_1.jpg", result.restored_images)
-        self.assertEqual(content_store.default_related_service_for_type("landing"), "LEND")  # вернулось из бэкапа
+        self.assertEqual(await content_store.default_related_service_for_type("landing"), "LEND")  # вернулось из бэкапа
 
-    def test_import_corrupted_json_writes_nothing(self):
+    async def test_import_corrupted_json_writes_nothing(self):
         original_faq = (Path(self.tmpdir) / "faq.json").read_bytes()
         original_leads = (Path(self.tmpdir) / "leads.json").read_bytes()
         zip_bytes = _make_zip({
@@ -2431,7 +2454,7 @@ class BackupExportImportTests(unittest.TestCase):
         })
 
         with self.assertRaises(content_store.BackupValidationError) as ctx:
-            content_store.import_backup_bytes(self.actor, zip_bytes)
+            await content_store.import_backup_bytes(self.actor, zip_bytes)
 
         self.assertEqual(ctx.exception.filename, "leads.json")
         self.assertIn("leads.json", ctx.exception.found_filenames)
@@ -2441,54 +2464,54 @@ class BackupExportImportTests(unittest.TestCase):
         self.assertEqual((Path(self.tmpdir) / "faq.json").read_bytes(), original_faq)
         self.assertEqual((Path(self.tmpdir) / "leads.json").read_bytes(), original_leads)
 
-    def test_import_invalid_shape_writes_nothing(self):
+    async def test_import_invalid_shape_writes_nothing(self):
         original_leads = (Path(self.tmpdir) / "leads.json").read_bytes()
         bad_leads = json.dumps({"leads": "not-a-list"}).encode("utf-8")  # валидный JSON, неверная форма
         zip_bytes = _make_zip({"data/leads.json": bad_leads})
 
         with self.assertRaises(content_store.BackupValidationError) as ctx:
-            content_store.import_backup_bytes(self.actor, zip_bytes)
+            await content_store.import_backup_bytes(self.actor, zip_bytes)
 
         self.assertEqual(ctx.exception.filename, "leads.json")
         self.assertIn("list", ctx.exception.reason)
         self.assertEqual((Path(self.tmpdir) / "leads.json").read_bytes(), original_leads)
 
-    def test_import_missing_backup_file_does_not_break_others(self):
-        zip_bytes = content_store.export_backup_bytes()
+    async def test_import_missing_backup_file_does_not_break_others(self):
+        zip_bytes = await content_store.export_backup_bytes()
         with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
             entries = {n: zf.read(n) for n in zf.namelist() if n != "data/about.json"}
         trimmed_zip = _make_zip(entries)
-        content_store.update_portfolio_type_related_service(self.actor, "landing", "SITE")  # мутируем после бэкапа
+        await content_store.update_portfolio_type_related_service(self.actor, "landing", "SITE")  # мутируем после бэкапа
         original_about = (Path(self.tmpdir) / "about.json").read_bytes()
 
-        result = content_store.import_backup_bytes(self.actor, trimmed_zip)
+        result = await content_store.import_backup_bytes(self.actor, trimmed_zip)
 
         self.assertIn("about.json", result.missing_json)
         self.assertNotIn("about.json", result.restored_json)
         self.assertEqual((Path(self.tmpdir) / "about.json").read_bytes(), original_about)  # не тронут
-        self.assertEqual(content_store.default_related_service_for_type("landing"), "LEND")  # остальное восстановлено
+        self.assertEqual(await content_store.default_related_service_for_type("landing"), "LEND")  # остальное восстановлено
 
-    def test_import_ignores_unrelated_archive_file(self):
-        zip_bytes = content_store.export_backup_bytes()
+    async def test_import_ignores_unrelated_archive_file(self):
+        zip_bytes = await content_store.export_backup_bytes()
         with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
             entries = {n: zf.read(n) for n in zf.namelist()}
         entries["readme.txt"] = b"not a data file"
         entries["data/unknown.json"] = b'{"whatever": true}'
         combined_zip = _make_zip(entries)
 
-        result = content_store.import_backup_bytes(self.actor, combined_zip)
+        result = await content_store.import_backup_bytes(self.actor, combined_zip)
 
         self.assertEqual(sorted(result.restored_json), sorted(content_store.DATA_FILENAMES))
         self.assertEqual(result.missing_json, [])
 
-    def test_write_failure_on_first_json_leaves_no_state_change(self):
-        zip_bytes = content_store.export_backup_bytes()
-        content_store.update_portfolio_type_related_service(self.actor, "landing", "SITE")  # мутируем после бэкапа
+    async def test_write_failure_on_first_json_leaves_no_state_change(self):
+        zip_bytes = await content_store.export_backup_bytes()
+        await content_store.update_portfolio_type_related_service(self.actor, "landing", "SITE")  # мутируем после бэкапа
         pre_restore = {name: (Path(self.tmpdir) / name).read_bytes() for name in content_store.DATA_FILENAMES}
 
         with patch("bot.content_store._write", side_effect=RuntimeError("simulated write failure")):
             with self.assertRaises(content_store.BackupRestoreFailedError) as ctx:
-                content_store.import_backup_bytes(self.actor, zip_bytes)
+                await content_store.import_backup_bytes(self.actor, zip_bytes)
 
         self.assertEqual(ctx.exception.failed_filename, content_store.DATA_FILENAMES[0])  # portfolio.json — первый
         self.assertEqual(ctx.exception.rolled_back, [])  # нечего было откатывать — ничего не успело записаться
@@ -2496,9 +2519,9 @@ class BackupExportImportTests(unittest.TestCase):
         for name in content_store.DATA_FILENAMES:
             self.assertEqual((Path(self.tmpdir) / name).read_bytes(), pre_restore[name])  # 0 изменений
 
-    def test_write_failure_on_nth_json_rolls_back_previous_byte_for_byte(self):
-        zip_bytes = content_store.export_backup_bytes()
-        content_store.update_portfolio_type_related_service(self.actor, "landing", "SITE")  # мутируем после бэкапа
+    async def test_write_failure_on_nth_json_rolls_back_previous_byte_for_byte(self):
+        zip_bytes = await content_store.export_backup_bytes()
+        await content_store.update_portfolio_type_related_service(self.actor, "landing", "SITE")  # мутируем после бэкапа
         # Сравниваем по распарсенному значению, а не сырым байтам: rollback
         # идёт через _write() -> json.dump(indent=2), который канонически
         # переформатирует JSON (переносы строк, отступы) независимо от
@@ -2511,14 +2534,14 @@ class BackupExportImportTests(unittest.TestCase):
         fail_on = "about.json"  # 4-й файл в DATA_FILENAMES — падение НЕ на первом
         original_write = content_store._write
 
-        def fake_write(filename, data):
+        async def fake_write(filename, data):
             if filename == fail_on:
                 raise RuntimeError("simulated write failure")
-            return original_write(filename, data)
+            return await original_write(filename, data)
 
         with patch("bot.content_store._write", side_effect=fake_write):
             with self.assertRaises(content_store.BackupRestoreFailedError) as ctx:
-                content_store.import_backup_bytes(self.actor, zip_bytes)
+                await content_store.import_backup_bytes(self.actor, zip_bytes)
 
         self.assertEqual(ctx.exception.failed_filename, fail_on)
         self.assertEqual(sorted(ctx.exception.rolled_back), ["faq.json", "portfolio.json", "pricing.json"])
@@ -2529,35 +2552,35 @@ class BackupExportImportTests(unittest.TestCase):
         for name in content_store.DATA_FILENAMES:
             self.assertEqual(json.loads((Path(self.tmpdir) / name).read_bytes()), pre_restore[name])
 
-    def test_rollback_failure_is_loud(self):
-        zip_bytes = content_store.export_backup_bytes()
-        content_store.update_portfolio_type_related_service(self.actor, "landing", "SITE")  # мутируем после бэкапа
+    async def test_rollback_failure_is_loud(self):
+        zip_bytes = await content_store.export_backup_bytes()
+        await content_store.update_portfolio_type_related_service(self.actor, "landing", "SITE")  # мутируем после бэкапа
 
         fail_forward_on = "about.json"     # 4-й — здесь падает сама запись
         fail_rollback_on = "pricing.json"  # 2-й — при откате его запись тоже падает
         original_write = content_store._write
         calls: dict[str, int] = {}
 
-        def fake_write(filename, data):
+        async def fake_write(filename, data):
             calls[filename] = calls.get(filename, 0) + 1
             if filename == fail_forward_on:
                 raise RuntimeError("simulated forward write failure")
             if filename == fail_rollback_on and calls[filename] == 2:
                 raise RuntimeError("simulated rollback write failure")
-            return original_write(filename, data)
+            return await original_write(filename, data)
 
         with patch("bot.content_store._write", side_effect=fake_write):
             with self.assertLogs("bot.content_store", level="ERROR") as log_ctx:
                 with self.assertRaises(content_store.BackupRestoreFailedError) as ctx:
-                    content_store.import_backup_bytes(self.actor, zip_bytes)
+                    await content_store.import_backup_bytes(self.actor, zip_bytes)
 
         self.assertEqual(ctx.exception.failed_filename, fail_forward_on)
         self.assertEqual(sorted(ctx.exception.rolled_back), ["faq.json", "portfolio.json"])
         self.assertEqual(ctx.exception.rollback_failed, [fail_rollback_on])
         self.assertTrue(any("ROLLBACK" in msg.upper() for msg in log_ctx.output))  # громкий лог о неудавшемся откате
 
-    def test_binary_write_happens_only_after_json_phase_succeeds(self):
-        zip_bytes = content_store.export_backup_bytes()
+    async def test_binary_write_happens_only_after_json_phase_succeeds(self):
+        zip_bytes = await content_store.export_backup_bytes()
         with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
             entries = {n: zf.read(n) for n in zf.namelist()}
         entries["img/portfolio/new_case.jpg"] = b"new-fake-image-bytes"
@@ -2565,19 +2588,19 @@ class BackupExportImportTests(unittest.TestCase):
 
         with patch("bot.content_store._write", side_effect=RuntimeError("simulated write failure")):
             with self.assertRaises(content_store.BackupRestoreFailedError):
-                content_store.import_backup_bytes(self.actor, combined_zip)
+                await content_store.import_backup_bytes(self.actor, combined_zip)
 
         self.assertFalse((content_store.IMG_PORTFOLIO_DIR / "new_case.jpg").exists())  # Phase 3 не запускался
 
 
-class BackupUpstashSafetyTests(unittest.TestCase):
+class BackupUpstashSafetyTests(unittest.IsolatedAsyncioTestCase):
     """P1-1 (production-hardening аудит), пересечение с P0-1: export должен
     полностью отказывать (не выдавать частичный ZIP), если хотя бы один
     DATA_FILENAMES-ключ пропал (UpstashKeyMissingError) — никогда не
     отдавать бэкап без leads.json под видом полноценного. Ни export, ни
     import никогда не должны трогать MARKER_KEY."""
 
-    def setUp(self):
+    async def asyncSetUp(self):
         self.fake = FakeUpstash()
         self._orig_url = content_store.config.UPSTASH_REDIS_REST_URL
         self._orig_token = content_store.config.UPSTASH_REDIS_REST_TOKEN
@@ -2588,7 +2611,7 @@ class BackupUpstashSafetyTests(unittest.TestCase):
         self.actor = "999"
         self._patch = patch("bot.content_store.urllib.request.urlopen", side_effect=self.fake.urlopen)
         self._patch.start()
-        content_store.ensure_storage_initialized()  # "продакшн" Upstash с реальными данными + marker
+        await content_store.ensure_storage_initialized()  # "продакшн" Upstash с реальными данными + marker
 
     def tearDown(self):
         self._patch.stop()
@@ -2596,34 +2619,315 @@ class BackupUpstashSafetyTests(unittest.TestCase):
         content_store.config.UPSTASH_REDIS_REST_TOKEN = self._orig_token
         content_store.config.DESIGNER_CHAT_ID = self._orig_designer
 
-    def test_export_with_all_keys_present_succeeds(self):
-        zip_bytes = content_store.export_backup_bytes()
+    async def test_export_with_all_keys_present_succeeds(self):
+        zip_bytes = await content_store.export_backup_bytes()
         with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
             names = zf.namelist()
         self.assertIn("data/leads.json", names)
 
-    def test_export_with_missing_key_fails_completely(self):
+    async def test_export_with_missing_key_fails_completely(self):
         del self.fake.store["leads.json"]  # ключ "пропал" уже ПОСЛЕ инициализации (P0-1 сценарий)
         with self.assertRaises(content_store.BackupExportError) as ctx:
-            content_store.export_backup_bytes()
+            await content_store.export_backup_bytes()
         self.assertEqual(ctx.exception.missing_filenames, ["leads.json"])
 
-    def test_export_with_multiple_missing_keys_lists_all(self):
+    async def test_export_with_multiple_missing_keys_lists_all(self):
         del self.fake.store["leads.json"]
         del self.fake.store["faq.json"]
         with self.assertRaises(content_store.BackupExportError) as ctx:
-            content_store.export_backup_bytes()
+            await content_store.export_backup_bytes()
         self.assertEqual(sorted(ctx.exception.missing_filenames), ["faq.json", "leads.json"])
 
-    def test_import_and_export_never_touch_marker(self):
+    async def test_import_and_export_never_touch_marker(self):
         calls_before = len(self.fake.calls)
-        zip_bytes = content_store.export_backup_bytes()
-        content_store.import_backup_bytes(self.actor, zip_bytes)
+        zip_bytes = await content_store.export_backup_bytes()
+        await content_store.import_backup_bytes(self.actor, zip_bytes)
         new_calls = self.fake.calls[calls_before:]
         self.assertFalse(any(c[1] == content_store.MARKER_KEY for c in new_calls))
 
 
-class ReferentialIntegrityTests(unittest.TestCase):
+class StorageConcurrencyTests(unittest.IsolatedAsyncioTestCase):
+    """P1-1/P2-6/P2-7 (production-hardening аудит, второй design review) —
+    per-key asyncio.Lock model: event loop не блокируется медленным Upstash
+    (asyncio.to_thread), single-key read-modify-write атомарен относительно
+    других writer'ов того же ключа, РАЗНЫЕ ключи не блокируют друг друга
+    (это то, что отличает per-key lock от отклонённого design'а с единым
+    global lock), multi-key операции (delete_service, backup) берут locks
+    строго в каноническом порядке DATA_FILENAMES и не создают deadlock,
+    backup restore атомарен относительно других content_store readers/
+    writers внутри процесса.
+
+    Задержки — искусственные (time.sleep внутри fake urlopen, исполняется в
+    worker-треде asyncio.to_thread) или asyncio.sleep — НЕ реальная сетевая
+    задержка (см. явное требование ТЗ)."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        real_data_dir = Path(__file__).resolve().parent.parent / "data"
+        for name in content_store.DATA_FILENAMES:
+            shutil.copy(real_data_dir / name, Path(self.tmpdir) / name)
+        self._orig_data_dir = content_store.DATA_DIR
+        self._orig_designer = content_store.config.DESIGNER_CHAT_ID
+        self._orig_url = content_store.config.UPSTASH_REDIS_REST_URL
+        self._orig_token = content_store.config.UPSTASH_REDIS_REST_TOKEN
+        content_store.DATA_DIR = Path(self.tmpdir)
+        content_store.config.DESIGNER_CHAT_ID = "999"
+        self.actor = "999"
+
+    def tearDown(self):
+        content_store.DATA_DIR = self._orig_data_dir
+        content_store.config.DESIGNER_CHAT_ID = self._orig_designer
+        content_store.config.UPSTASH_REDIS_REST_URL = self._orig_url
+        content_store.config.UPSTASH_REDIS_REST_TOKEN = self._orig_token
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    # ---- 1. Event loop responsiveness (P1-1) ----
+
+    async def test_slow_upstash_call_does_not_block_event_loop_heartbeat(self):
+        # Считать тики heartbeat НЕ подходит как метрика: heartbeat всё
+        # равно рано или поздно сделает все N итераций независимо от того,
+        # блокирован loop или нет (asyncio.gather просто отложит его старт)
+        # — единственный надёжный дискриминирующий сигнал: суммарное
+        # wall-clock время. Если _read блокирует loop — heartbeat стартует
+        # только ПОСЛЕ него (время суммируется: ~slow + ~heartbeat). Если не
+        # блокирует (to_thread) — оба идут параллельно (время ~= max(slow,
+        # heartbeat)). Проверено вручную против sync-эквивалента _read
+        # (прямой вызов _upstash_command без to_thread): ~0.8s vs ~0.47s
+        # для этих же длительностей — разница явная и устойчивая.
+        content_store.config.UPSTASH_REDIS_REST_URL = "https://fake-upstash.example/"
+        content_store.config.UPSTASH_REDIS_REST_TOKEN = "fake-token"
+
+        def slow_urlopen(req, timeout=10):
+            time.sleep(0.4)  # блокирует worker-тред to_thread, НЕ event loop и НЕ реальная сеть
+            body = json.dumps({"result": json.dumps({"menu": {"portfolio": True}})}).encode("utf-8")
+            return _FakeUpstashResponse(body)
+
+        async def heartbeat():
+            for _ in range(20):
+                await asyncio.sleep(0.02)  # ~0.4s суммарно
+
+        with patch("bot.content_store.urllib.request.urlopen", side_effect=slow_urlopen):
+            started = time.monotonic()
+            await asyncio.gather(content_store._read("ui_config.json"), heartbeat())
+            elapsed = time.monotonic() - started
+
+        # Последовательно (заблокированный loop) заняло бы ~0.4+0.4=0.8s+
+        # (эмпирически измерено ~1.05s против sync-эквивалента _read);
+        # параллельно (event loop свободен во время to_thread) — ~max(0.4,
+        # 0.4)=0.4s (эмпирически ~0.65-0.67s с накладными расходами
+        # планировщика). Порог 0.85s — с запасом ниже последовательного
+        # сценария (~1.05s) и с запасом выше параллельного (~0.67s),
+        # устойчиво к таймингам под нагрузкой CI.
+        self.assertLess(elapsed, 0.85)
+
+    # ---- 2. Lock ordering (P2-7) ----
+
+    def test_lock_acquires_in_canonical_order_regardless_of_call_site_order(self):
+        lock = content_store._lock("leads.json", "portfolio.json", "pricing.json")
+        self.assertEqual(lock._filenames, ("portfolio.json", "pricing.json", "leads.json"))
+
+    def test_no_code_bypasses_lock_helper_to_touch_locks_dict_directly(self):
+        # Структурная гарантия против "reverse-order acquisition where-либо":
+        # единственное место в модуле, где _locks[...] используется —
+        # определение самого _StorageLock (__aenter__/__aexit__). Любой
+        # будущий multi-key call site ОБЯЗАН идти через _lock(...), не может
+        # случайно взять локи в произвольном порядке напрямую.
+        import inspect
+        src = inspect.getsource(content_store)
+        lines_with_locks_dict = [
+            i for i, line in enumerate(src.splitlines(), 1)
+            if "_locks[" in line and not line.strip().startswith("#")
+        ]
+        class_start = next(i for i, line in enumerate(src.splitlines(), 1) if line.startswith("class _StorageLock"))
+        class_end = next(i for i, line in enumerate(src.splitlines(), 1) if line.startswith("def _lock("))
+        for lineno in lines_with_locks_dict:
+            self.assertTrue(
+                class_start <= lineno <= class_end,
+                f"_locks[...] используется вне _StorageLock на строке {lineno} — потенциальный обход канонического порядка",
+            )
+
+    # ---- 3. Same-key writes serialize; different-key writes don't (P1-1 review: reject global lock) ----
+
+    async def test_concurrent_operations_on_same_key_are_serialized(self):
+        active = {"n": 0, "max": 0}
+
+        async def locked_op():
+            async with content_store._lock("faq.json"):
+                active["n"] += 1
+                active["max"] = max(active["max"], active["n"])
+                await asyncio.sleep(0.03)
+                active["n"] -= 1
+
+        await asyncio.gather(*(locked_op() for _ in range(5)))
+        self.assertEqual(active["max"], 1)
+
+    async def test_concurrent_operations_on_different_keys_proceed_concurrently(self):
+        active = {"n": 0, "max": 0}
+
+        async def locked_op(filename):
+            async with content_store._lock(filename):
+                active["n"] += 1
+                active["max"] = max(active["max"], active["n"])
+                await asyncio.sleep(0.05)
+                active["n"] -= 1
+
+        await asyncio.gather(*(locked_op(name) for name in content_store.DATA_FILENAMES))
+        # Все 6 разных ключей — НЕ должны сериализоваться друг за другом
+        # (это ровно то отличие per-key lock от global lock, которое второй
+        # design review потребовал сохранить).
+        self.assertEqual(active["max"], len(content_store.DATA_FILENAMES))
+
+    # ---- 4. Lead concurrency: Tier 1, same key (leads.json) ----
+
+    async def test_concurrent_add_lead_calls_produce_two_distinct_leads_no_duplicate_or_lost_id(self):
+        content_store.config.UPSTASH_REDIS_REST_URL = "https://fake-upstash.example/"
+        content_store.config.UPSTASH_REDIS_REST_TOKEN = "fake-token"
+        fake = FakeUpstash()
+
+        def delayed_urlopen(req, timeout=10):
+            time.sleep(0.02)  # искусственное окно гонки внутри worker-треда
+            return fake.urlopen(req, timeout=timeout)
+
+        with patch("bot.content_store.urllib.request.urlopen", side_effect=delayed_urlopen):
+            lead_a, lead_b = await asyncio.gather(
+                content_store.add_lead({"service_name": "A"}, {"user_id": 111, "username": "a"}),
+                content_store.add_lead({"service_name": "B"}, {"user_id": 222, "username": "b"}),
+            )
+
+            self.assertNotEqual(lead_a["id"], lead_b["id"])  # ни дубликата, ни потери — оба id различны
+            leads = (await content_store._read("leads.json"))["leads"]
+        self.assertEqual(len(leads), 2)
+        self.assertEqual({lead_a["id"], lead_b["id"]}, {l["id"] for l in leads})
+
+    # ---- 5. Multi-key correctness: delete_service (Tier 2) ----
+
+    async def test_delete_service_holds_both_locks_and_cleans_up_referential_integrity(self):
+        await content_store.add_service(
+            self.actor, service_id="TMP_SVC", name="Temp", base_price=1000, term_min=1, term_max=2, includes="x",
+        )
+        await content_store.update_case(self.actor, "case_1", related_service="TMP_SVC")
+
+        self.assertTrue(await content_store.delete_service(self.actor, "TMP_SVC"))
+
+        services = await content_store.list_services()
+        self.assertNotIn("TMP_SVC", [s["id"] for s in services])
+        case = next(c for c in await content_store.list_cases() if c["id"] == "case_1")
+        self.assertIsNone(case["related_service"])  # portfolio.json тоже вычищен, а не оставлен висящей ссылкой
+
+    # ---- 6. Deadlock avoidance: concurrent multi-key operations complete ----
+
+    async def test_concurrent_multikey_operations_do_not_deadlock(self):
+        await content_store.add_service(
+            self.actor, service_id="TMP_SVC2", name="Temp2", base_price=500, term_min=1, term_max=2, includes="x",
+        )
+        # delete_service (portfolio+pricing) и export_backup_bytes (все 6) —
+        # оба берут locks в каноническом порядке; конкурентный запуск не
+        # должен зависнуть (asyncio.wait_for с коротким timeout доказывает
+        # завершение, а не просто "тест не упал").
+        results = await asyncio.wait_for(
+            asyncio.gather(
+                content_store.delete_service(self.actor, "TMP_SVC2"),
+                content_store.export_backup_bytes(),
+            ),
+            timeout=5,
+        )
+        self.assertTrue(results[0])
+        self.assertIsInstance(results[1], bytes)
+
+    # ---- 7-9. Backup restore atomicity relative to other readers (P2-7) ----
+
+    async def test_concurrent_reader_during_restore_never_sees_torn_cross_file_state(self):
+        content_store.config.UPSTASH_REDIS_REST_URL = "https://fake-upstash.example/"
+        content_store.config.UPSTASH_REDIS_REST_TOKEN = "fake-token"
+        fake = FakeUpstash()
+
+        def delayed_urlopen(req, timeout=10):
+            time.sleep(0.01)
+            return fake.urlopen(req, timeout=timeout)
+
+        with patch("bot.content_store.urllib.request.urlopen", side_effect=delayed_urlopen):
+            await content_store.ensure_storage_initialized()  # засевает fake Upstash реальными "old"-данными
+
+            # "old" summary — известный baseline из реальных data/*.json.
+            old_summary = await content_store.content_readiness_summary()
+
+            # Готовим backup с ЗАВЕДОМО другой, легко отличимой сводкой —
+            # 1 placeholder-кейс, 1 незаполненное поле about, 1 неотвеченный FAQ.
+            portfolio = json.loads(fake.store["portfolio.json"])
+            portfolio["cases"][0]["cover"] = "img/portfolio/placeholder.svg"
+            about = json.loads(fake.store["about.json"])
+            about["needs_review_fields"] = ["tagline"]
+            faq = json.loads(fake.store["faq.json"])
+            faq["faq"][0]["needs_review"] = True
+            new_pricing = json.loads(fake.store["pricing.json"])
+            new_ui_config = json.loads(fake.store["ui_config.json"])
+            new_leads = json.loads(fake.store["leads.json"])
+            zip_bytes = _make_zip({
+                "data/portfolio.json": json.dumps(portfolio).encode("utf-8"),
+                "data/pricing.json": json.dumps(new_pricing).encode("utf-8"),
+                "data/faq.json": json.dumps(faq).encode("utf-8"),
+                "data/about.json": json.dumps(about).encode("utf-8"),
+                "data/ui_config.json": json.dumps(new_ui_config).encode("utf-8"),
+                "data/leads.json": json.dumps(new_leads).encode("utf-8"),
+            })
+            new_summary_expected = {"placeholder_cases": 1, "about_pending_fields": 1, "faq_pending": 1}
+
+            readers_results = []
+
+            async def reader():
+                for _ in range(8):
+                    readers_results.append(await content_store.content_readiness_summary())
+                    await asyncio.sleep(0.005)
+
+            await asyncio.gather(
+                content_store.import_backup_bytes(self.actor, zip_bytes),
+                reader(),
+            )
+            # Финальное состояние после restore — гарантированно новое
+            # (проверяем ещё внутри patch — Upstash "выключается" за
+            # пределами этого блока).
+            final_summary = await content_store.content_readiness_summary()
+
+        # Каждое прочитанное значение — либо ЦЕЛИКОМ старое, либо ЦЕЛИКОМ
+        # новое; ничего среднего (частично применённого restore) увидено не было.
+        for result in readers_results:
+            self.assertIn(result, (old_summary, new_summary_expected), f"torn cross-file read: {result}")
+        self.assertEqual(final_summary, new_summary_expected)
+
+    # ---- 10. Backup snapshot failure performs zero writes (P2-6) ----
+
+    async def test_snapshot_failure_raises_before_any_write_and_leaves_data_untouched(self):
+        zip_bytes = await content_store.export_backup_bytes()
+        original = {name: (Path(self.tmpdir) / name).read_bytes() for name in content_store.DATA_FILENAMES}
+
+        with patch("bot.content_store._read", side_effect=RuntimeError("simulated snapshot failure")):
+            with self.assertRaises(content_store.BackupSnapshotError) as ctx:
+                await content_store.import_backup_bytes(self.actor, zip_bytes)
+
+        self.assertEqual(ctx.exception.filename, content_store.DATA_FILENAMES[0])
+        for name in content_store.DATA_FILENAMES:
+            self.assertEqual((Path(self.tmpdir) / name).read_bytes(), original[name])
+
+    # ---- 11. Missing key during snapshot preserves existing _MISSING semantics (P2-6, unchanged) ----
+
+    async def test_missing_key_during_snapshot_is_not_a_backup_snapshot_error(self):
+        content_store.config.UPSTASH_REDIS_REST_URL = "https://fake-upstash.example/"
+        content_store.config.UPSTASH_REDIS_REST_TOKEN = "fake-token"
+        fake = FakeUpstash()
+        with patch("bot.content_store.urllib.request.urlopen", side_effect=fake.urlopen):
+            await content_store.ensure_storage_initialized()
+            zip_bytes = await content_store.export_backup_bytes()
+            del fake.store["leads.json"]  # ключ "пропал" уже после экспорта (P0-1 сценарий)
+
+            # UpstashKeyMissingError на снапшоте — НЕ BackupSnapshotError,
+            # обрабатывается как _MISSING (нечего откатывать), restore
+            # остальных файлов продолжается нормально.
+            result = await content_store.import_backup_bytes(self.actor, zip_bytes)
+
+        self.assertIn("leads.json", result.restored_json)  # leads.json всё равно восстановлен (SET, не откат)
+
+
+class ReferentialIntegrityTests(unittest.IsolatedAsyncioTestCase):
     """Category -> Service: и находка 09 (кастомные категории должны уметь
     получить related_service), и её следствие, о котором предупредили в
     разборе — удаление услуги не должно оставлять related_service,
@@ -2645,55 +2949,55 @@ class ReferentialIntegrityTests(unittest.TestCase):
         content_store.config.DESIGNER_CHAT_ID = self._orig_designer
         shutil.rmtree(self.tmpdir, ignore_errors=True)
 
-    def test_custom_category_can_get_a_related_service(self):
-        new_type = content_store.add_portfolio_type(self.actor, type_id="cat_custom", label="Тестовая категория")
+    async def test_custom_category_can_get_a_related_service(self):
+        new_type = await content_store.add_portfolio_type(self.actor, type_id="cat_custom", label="Тестовая категория")
         self.assertIsNone(new_type["related_service"])  # раньше здесь навсегда осталось бы "нет связи"
 
-        content_store.update_portfolio_type_related_service(self.actor, "cat_custom", "SMM")
-        self.assertEqual(content_store.default_related_service_for_type("cat_custom"), "SMM")
+        await content_store.update_portfolio_type_related_service(self.actor, "cat_custom", "SMM")
+        self.assertEqual(await content_store.default_related_service_for_type("cat_custom"), "SMM")
 
-    def test_deleting_service_clears_it_from_categories_and_cases(self):
-        content_store.update_portfolio_type_related_service(self.actor, "landing", "LEND")
-        self.assertEqual(content_store.default_related_service_for_type("landing"), "LEND")
-        cases_before = [c["id"] for c in content_store.list_cases() if c.get("related_service") == "LEND"]
+    async def test_deleting_service_clears_it_from_categories_and_cases(self):
+        await content_store.update_portfolio_type_related_service(self.actor, "landing", "LEND")
+        self.assertEqual(await content_store.default_related_service_for_type("landing"), "LEND")
+        cases_before = [c["id"] for c in await content_store.list_cases() if c.get("related_service") == "LEND"]
         self.assertTrue(cases_before, "фикстура должна содержать хотя бы один кейс с related_service=LEND")
 
-        content_store.delete_service(self.actor, "LEND")
+        await content_store.delete_service(self.actor, "LEND")
 
-        self.assertIsNone(content_store.default_related_service_for_type("landing"))
-        dangling = [c["id"] for c in content_store.list_cases() if c.get("related_service") == "LEND"]
+        self.assertIsNone(await content_store.default_related_service_for_type("landing"))
+        dangling = [c["id"] for c in await content_store.list_cases() if c.get("related_service") == "LEND"]
         self.assertEqual(dangling, [], "не должно остаться related_service, указывающих на удалённую услугу")
 
-    def test_category_without_related_service_is_a_valid_steady_state(self):
+    async def test_category_without_related_service_is_a_valid_steady_state(self):
         # "graphics" в фикстуре осознанно без related_service — объединяет
         # 3 услуги, однозначно выбрать нельзя (см. data/pricing.json -> groups).
-        self.assertIsNone(content_store.default_related_service_for_type("graphics"))
-        case = content_store.add_case(
+        self.assertIsNone(await content_store.default_related_service_for_type("graphics"))
+        case = await content_store.add_case(
             self.actor, case_id="case_test_graphics", title="Тест", type_id="graphics",
             cover="img/portfolio/x.svg", task="t",
-            related_service=content_store.default_related_service_for_type("graphics"),
+            related_service=await content_store.default_related_service_for_type("graphics"),
         )
         self.assertIsNone(case["related_service"])
 
-    def test_category_without_cases_can_be_deleted_category_with_cases_cannot(self):
-        empty_type = content_store.add_portfolio_type(self.actor, type_id="cat_empty", label="Пустая категория")
-        self.assertEqual(content_store.count_cases_with_type(empty_type["id"]), 0)
-        self.assertTrue(content_store.delete_portfolio_type(self.actor, empty_type["id"]))
+    async def test_category_without_cases_can_be_deleted_category_with_cases_cannot(self):
+        empty_type = await content_store.add_portfolio_type(self.actor, type_id="cat_empty", label="Пустая категория")
+        self.assertEqual(await content_store.count_cases_with_type(empty_type["id"]), 0)
+        self.assertTrue(await content_store.delete_portfolio_type(self.actor, empty_type["id"]))
 
-        self.assertGreater(content_store.count_cases_with_type("landing"), 0)
-        self.assertFalse(content_store.delete_portfolio_type(self.actor, "landing"))
+        self.assertGreater(await content_store.count_cases_with_type("landing"), 0)
+        self.assertFalse(await content_store.delete_portfolio_type(self.actor, "landing"))
 
-    def test_deleting_a_service_with_no_cases_referencing_it_is_a_clean_noop_on_portfolio(self):
-        service_id = content_store.next_service_id()
-        content_store.add_service(
+    async def test_deleting_a_service_with_no_cases_referencing_it_is_a_clean_noop_on_portfolio(self):
+        service_id = await content_store.next_service_id()
+        await content_store.add_service(
             self.actor, service_id=service_id, name="Тестовая услуга",
             base_price=1000, term_min=1, term_max=2, includes="—",
         )
-        portfolio_before = content_store._read("portfolio.json")
+        portfolio_before = await content_store._read("portfolio.json")
 
-        self.assertTrue(content_store.delete_service(self.actor, service_id))
+        self.assertTrue(await content_store.delete_service(self.actor, service_id))
 
-        portfolio_after = content_store._read("portfolio.json")
+        portfolio_after = await content_store._read("portfolio.json")
         self.assertEqual(portfolio_before, portfolio_after, "услуга без единой ссылки не должна менять portfolio.json вовсе")
 
 
@@ -2728,7 +3032,7 @@ class ClientFacingFaqFilterTests(unittest.IsolatedAsyncioTestCase):
         callback.message.edit_text.assert_not_awaited()
 
 
-class ContentReadinessSummaryTests(unittest.TestCase):
+class ContentReadinessSummaryTests(unittest.IsolatedAsyncioTestCase):
     """UX-аудит, находки F01-F03: сводка в /admin должна отражать реальное
     число незавершённых пунктов контента, а не быть статичным нулём."""
 
@@ -2748,34 +3052,34 @@ class ContentReadinessSummaryTests(unittest.TestCase):
         content_store.config.DESIGNER_CHAT_ID = self._orig_designer
         shutil.rmtree(self.tmpdir, ignore_errors=True)
 
-    def test_summary_reflects_current_fixture_state(self):
+    async def test_summary_reflects_current_fixture_state(self):
         # demo-контент заполнен (см. content fill pass): реальные обложки,
         # все FAQ отвечены; About.education/links намеренно оставлены
         # пустыми — банер всё ещё должен предупреждать именно про них.
-        summary = content_store.content_readiness_summary()
+        summary = await content_store.content_readiness_summary()
         self.assertEqual(summary["placeholder_cases"], 0)
         self.assertEqual(summary["faq_pending"], 0)
         self.assertGreater(summary["about_pending_fields"], 0)
-        text = admin._admin_root_text()
+        text = await admin._admin_root_text()
         self.assertIn("⚠️", text)
         self.assertIn("Обо мне", text)
 
-    def test_summary_drops_to_zero_once_content_is_filled_in(self):
-        for c in content_store.list_cases():
-            content_store.update_case(self.actor, c["id"], cover="img/portfolio/real_photo.jpg")
-        about = content_store.get_about()
+    async def test_summary_drops_to_zero_once_content_is_filled_in(self):
+        for c in await content_store.list_cases():
+            await content_store.update_case(self.actor, c["id"], cover="img/portfolio/real_photo.jpg")
+        about = await content_store.get_about()
         for field in list(about.get("needs_review_fields", [])):
-            content_store.update_about_field(self.actor, field, "заполнено")
-        for item in content_store.list_faq():
+            await content_store.update_about_field(self.actor, field, "заполнено")
+        for item in await content_store.list_faq():
             if item.get("needs_review"):
-                content_store.update_faq(self.actor, item["id"], answer="Готовый ответ")
+                await content_store.update_faq(self.actor, item["id"], answer="Готовый ответ")
 
-        summary = content_store.content_readiness_summary()
+        summary = await content_store.content_readiness_summary()
         self.assertEqual(summary, {"placeholder_cases": 0, "about_pending_fields": 0, "faq_pending": 0})
-        self.assertNotIn("⚠️", admin._admin_root_text())
+        self.assertNotIn("⚠️", await admin._admin_root_text())
 
 
-class CaseCategoryChangeTests(unittest.TestCase):
+class CaseCategoryChangeTests(unittest.IsolatedAsyncioTestCase):
     """Part 1 ТЗ: категория кейса стала editable (раньше — только при
     создании). related_service должен предлагать новый дефолт только если
     раньше НЕ был осознанно выбран вручную — см. update_case_category."""
@@ -2796,42 +3100,42 @@ class CaseCategoryChangeTests(unittest.TestCase):
         content_store.config.DESIGNER_CHAT_ID = self._orig_designer
         shutil.rmtree(self.tmpdir, ignore_errors=True)
 
-    def test_related_service_follows_new_category_default_when_not_customized(self):
-        case = content_store.add_case(
+    async def test_related_service_follows_new_category_default_when_not_customized(self):
+        case = await content_store.add_case(
             self.actor, case_id="case_cat_test1", title="Т", type_id="landing",
             cover="img/portfolio/x.svg", task="t", related_service="LEND",
         )
         self.assertEqual(case["related_service"], "LEND")  # совпадает с дефолтом старой категории
 
-        content_store.update_case_category(self.actor, "case_cat_test1", "site")
+        await content_store.update_case_category(self.actor, "case_cat_test1", "site")
 
-        updated = next(c for c in content_store.list_cases() if c["id"] == "case_cat_test1")
+        updated = next(c for c in await content_store.list_cases() if c["id"] == "case_cat_test1")
         self.assertEqual(updated["type"], "site")
         self.assertEqual(updated["related_service"], "SITE", "не тронут вручную -> подставляем новый дефолт")
 
-    def test_manually_customized_related_service_survives_category_change(self):
-        case = content_store.add_case(
+    async def test_manually_customized_related_service_survives_category_change(self):
+        case = await content_store.add_case(
             self.actor, case_id="case_cat_test2", title="Т", type_id="landing",
             cover="img/portfolio/x.svg", task="t", related_service="UXUI",
         )
         self.assertEqual(case["related_service"], "UXUI")  # отличается от дефолта "landing" (LEND) -> выбран вручную
 
-        content_store.update_case_category(self.actor, "case_cat_test2", "site")
+        await content_store.update_case_category(self.actor, "case_cat_test2", "site")
 
-        updated = next(c for c in content_store.list_cases() if c["id"] == "case_cat_test2")
+        updated = next(c for c in await content_store.list_cases() if c["id"] == "case_cat_test2")
         self.assertEqual(updated["type"], "site")
         self.assertEqual(updated["related_service"], "UXUI", "осознанный выбор не должен стираться сменой категории")
 
-    def test_update_case_category_returns_false_for_unknown_case(self):
-        self.assertFalse(content_store.update_case_category(self.actor, "case_does_not_exist", "site"))
+    async def test_update_case_category_returns_false_for_unknown_case(self):
+        self.assertFalse(await content_store.update_case_category(self.actor, "case_does_not_exist", "site"))
 
 
-class CaseImageManagementTests(unittest.TestCase):
+class CaseImageManagementTests(unittest.IsolatedAsyncioTestCase):
     """Part 1 ТЗ: независимое управление галереей — добавить/удалить/
     переставить/назначить обложку, без пустых состояний и без потери
     обложки при удалении текущей."""
 
-    def setUp(self):
+    async def asyncSetUp(self):
         self.tmpdir = tempfile.mkdtemp()
         real_data_dir = Path(__file__).resolve().parent.parent / "data"
         for name in ("pricing.json", "portfolio.json", "faq.json", "about.json", "ui_config.json"):
@@ -2841,7 +3145,7 @@ class CaseImageManagementTests(unittest.TestCase):
         content_store.DATA_DIR = Path(self.tmpdir)
         content_store.config.DESIGNER_CHAT_ID = "999"
         self.actor = "999"
-        content_store.add_case(
+        await content_store.add_case(
             self.actor, case_id="case_img_test", title="Т", type_id="landing",
             cover="img/portfolio/a.svg", task="t", related_service=None,
         )
@@ -2851,49 +3155,49 @@ class CaseImageManagementTests(unittest.TestCase):
         content_store.config.DESIGNER_CHAT_ID = self._orig_designer
         shutil.rmtree(self.tmpdir, ignore_errors=True)
 
-    def _case(self):
-        return next(c for c in content_store.list_cases() if c["id"] == "case_img_test")
+    async def _case(self):
+        return next(c for c in await content_store.list_cases() if c["id"] == "case_img_test")
 
-    def test_add_image_does_not_override_existing_cover_unless_forced(self):
-        content_store.add_case_image(self.actor, "case_img_test", "img/portfolio/b.svg")
-        case = self._case()
+    async def test_add_image_does_not_override_existing_cover_unless_forced(self):
+        await content_store.add_case_image(self.actor, "case_img_test", "img/portfolio/b.svg")
+        case = await self._case()
         self.assertEqual(case["images"], ["img/portfolio/a.svg", "img/portfolio/b.svg"])
         self.assertEqual(case["cover"], "img/portfolio/a.svg")
 
-        content_store.add_case_image(self.actor, "case_img_test", "img/portfolio/c.svg", set_as_cover=True)
-        self.assertEqual(self._case()["cover"], "img/portfolio/c.svg")
+        await content_store.add_case_image(self.actor, "case_img_test", "img/portfolio/c.svg", set_as_cover=True)
+        self.assertEqual((await self._case())["cover"], "img/portfolio/c.svg")
 
-    def test_remove_cover_image_reassigns_to_first_remaining(self):
-        content_store.add_case_image(self.actor, "case_img_test", "img/portfolio/b.svg")
-        content_store.remove_case_image(self.actor, "case_img_test", "img/portfolio/a.svg")
-        case = self._case()
+    async def test_remove_cover_image_reassigns_to_first_remaining(self):
+        await content_store.add_case_image(self.actor, "case_img_test", "img/portfolio/b.svg")
+        await content_store.remove_case_image(self.actor, "case_img_test", "img/portfolio/a.svg")
+        case = await self._case()
         self.assertEqual(case["images"], ["img/portfolio/b.svg"])
         self.assertEqual(case["cover"], "img/portfolio/b.svg")
 
-    def test_remove_last_image_leaves_cover_none_not_broken(self):
-        content_store.remove_case_image(self.actor, "case_img_test", "img/portfolio/a.svg")
-        case = self._case()
+    async def test_remove_last_image_leaves_cover_none_not_broken(self):
+        await content_store.remove_case_image(self.actor, "case_img_test", "img/portfolio/a.svg")
+        case = await self._case()
         self.assertEqual(case["images"], [])
         self.assertIsNone(case["cover"])
 
-    def test_reorder_image_swaps_and_rejects_out_of_bounds(self):
-        content_store.add_case_image(self.actor, "case_img_test", "img/portfolio/b.svg")
-        self.assertTrue(content_store.reorder_case_image(self.actor, "case_img_test", "img/portfolio/b.svg", "up"))
-        self.assertEqual(self._case()["images"], ["img/portfolio/b.svg", "img/portfolio/a.svg"])
-        self.assertFalse(content_store.reorder_case_image(self.actor, "case_img_test", "img/portfolio/b.svg", "up"))
+    async def test_reorder_image_swaps_and_rejects_out_of_bounds(self):
+        await content_store.add_case_image(self.actor, "case_img_test", "img/portfolio/b.svg")
+        self.assertTrue(await content_store.reorder_case_image(self.actor, "case_img_test", "img/portfolio/b.svg", "up"))
+        self.assertEqual((await self._case())["images"], ["img/portfolio/b.svg", "img/portfolio/a.svg"])
+        self.assertFalse(await content_store.reorder_case_image(self.actor, "case_img_test", "img/portfolio/b.svg", "up"))
 
-    def test_set_cover_requires_image_to_already_be_in_gallery(self):
-        self.assertFalse(content_store.set_case_cover(self.actor, "case_img_test", "img/portfolio/not-there.svg"))
-        self.assertEqual(self._case()["cover"], "img/portfolio/a.svg")
-        content_store.add_case_image(self.actor, "case_img_test", "img/portfolio/b.svg")
-        self.assertTrue(content_store.set_case_cover(self.actor, "case_img_test", "img/portfolio/b.svg"))
-        self.assertEqual(self._case()["cover"], "img/portfolio/b.svg")
+    async def test_set_cover_requires_image_to_already_be_in_gallery(self):
+        self.assertFalse(await content_store.set_case_cover(self.actor, "case_img_test", "img/portfolio/not-there.svg"))
+        self.assertEqual((await self._case())["cover"], "img/portfolio/a.svg")
+        await content_store.add_case_image(self.actor, "case_img_test", "img/portfolio/b.svg")
+        self.assertTrue(await content_store.set_case_cover(self.actor, "case_img_test", "img/portfolio/b.svg"))
+        self.assertEqual((await self._case())["cover"], "img/portfolio/b.svg")
 
 
-class CaseSectionManagementTests(unittest.TestCase):
+class CaseSectionManagementTests(unittest.IsolatedAsyncioTestCase):
     """Part 1 ТЗ: гибкие sections вместо жёстких task/solution/result."""
 
-    def setUp(self):
+    async def asyncSetUp(self):
         self.tmpdir = tempfile.mkdtemp()
         real_data_dir = Path(__file__).resolve().parent.parent / "data"
         for name in ("pricing.json", "portfolio.json", "faq.json", "about.json", "ui_config.json"):
@@ -2903,7 +3207,7 @@ class CaseSectionManagementTests(unittest.TestCase):
         content_store.DATA_DIR = Path(self.tmpdir)
         content_store.config.DESIGNER_CHAT_ID = "999"
         self.actor = "999"
-        content_store.add_case(
+        await content_store.add_case(
             self.actor, case_id="case_sec_test", title="Т", type_id="landing",
             cover="img/portfolio/a.svg", task="t", related_service=None,
         )
@@ -2913,40 +3217,40 @@ class CaseSectionManagementTests(unittest.TestCase):
         content_store.config.DESIGNER_CHAT_ID = self._orig_designer
         shutil.rmtree(self.tmpdir, ignore_errors=True)
 
-    def _case(self):
-        return next(c for c in content_store.list_cases() if c["id"] == "case_sec_test")
+    async def _case(self):
+        return next(c for c in await content_store.list_cases() if c["id"] == "case_sec_test")
 
-    def test_add_gallery_section_stores_images_not_content(self):
-        content_store.add_case_section(
+    async def test_add_gallery_section_stores_images_not_content(self):
+        await content_store.add_case_section(
             self.actor, "case_sec_test", section_type="gallery", title="Скриншоты",
             images=["img/portfolio/x.svg"],
         )
-        section = self._case()["sections"][0]
+        section = (await self._case())["sections"][0]
         self.assertEqual(section["images"], ["img/portfolio/x.svg"])
         self.assertNotIn("content", section)
 
-    def test_add_text_section_stores_content(self):
-        content_store.add_case_section(self.actor, "case_sec_test", section_type="text", title="Задача", content="Описание")
-        section = self._case()["sections"][0]
+    async def test_add_text_section_stores_content(self):
+        await content_store.add_case_section(self.actor, "case_sec_test", section_type="text", title="Задача", content="Описание")
+        section = (await self._case())["sections"][0]
         self.assertEqual(section["content"], "Описание")
 
-    def test_update_delete_reorder_sections(self):
-        content_store.add_case_section(self.actor, "case_sec_test", section_type="text", title="Первая", content="A")
-        content_store.add_case_section(self.actor, "case_sec_test", section_type="text", title="Вторая", content="B")
+    async def test_update_delete_reorder_sections(self):
+        await content_store.add_case_section(self.actor, "case_sec_test", section_type="text", title="Первая", content="A")
+        await content_store.add_case_section(self.actor, "case_sec_test", section_type="text", title="Вторая", content="B")
 
-        content_store.update_case_section(self.actor, "case_sec_test", 0, title="Первая (изменено)")
-        self.assertEqual(self._case()["sections"][0]["title"], "Первая (изменено)")
+        await content_store.update_case_section(self.actor, "case_sec_test", 0, title="Первая (изменено)")
+        self.assertEqual((await self._case())["sections"][0]["title"], "Первая (изменено)")
 
-        self.assertTrue(content_store.reorder_case_section(self.actor, "case_sec_test", 0, "down"))
-        self.assertEqual([s["title"] for s in self._case()["sections"]], ["Вторая", "Первая (изменено)"])
-        self.assertFalse(content_store.reorder_case_section(self.actor, "case_sec_test", 0, "up"))
+        self.assertTrue(await content_store.reorder_case_section(self.actor, "case_sec_test", 0, "down"))
+        self.assertEqual([s["title"] for s in (await self._case())["sections"]], ["Вторая", "Первая (изменено)"])
+        self.assertFalse(await content_store.reorder_case_section(self.actor, "case_sec_test", 0, "up"))
 
-        self.assertTrue(content_store.delete_case_section(self.actor, "case_sec_test", 0))
-        self.assertEqual(len(self._case()["sections"]), 1)
-        self.assertFalse(content_store.delete_case_section(self.actor, "case_sec_test", 5))
+        self.assertTrue(await content_store.delete_case_section(self.actor, "case_sec_test", 0))
+        self.assertEqual(len((await self._case())["sections"]), 1)
+        self.assertFalse(await content_store.delete_case_section(self.actor, "case_sec_test", 5))
 
 
-class LeadStoreTests(unittest.TestCase):
+class LeadStoreTests(unittest.IsolatedAsyncioTestCase):
     """Part 6-7 ТЗ: заявки — upsert по draft_id (без дублей при "Дополнить
     информацию"), фильтрация по статусу, требование прав на смену статуса."""
 
@@ -2967,84 +3271,84 @@ class LeadStoreTests(unittest.TestCase):
         content_store.config.DESIGNER_CHAT_ID = self._orig_designer
         shutil.rmtree(self.tmpdir, ignore_errors=True)
 
-    def test_add_lead_without_draft_id_always_creates_a_new_lead(self):
-        lead1 = content_store.add_lead({"service_name": "Лендинг"}, self.telegram)
-        lead2 = content_store.add_lead({"service_name": "Лендинг"}, self.telegram)
+    async def test_add_lead_without_draft_id_always_creates_a_new_lead(self):
+        lead1 = await content_store.add_lead({"service_name": "Лендинг"}, self.telegram)
+        lead2 = await content_store.add_lead({"service_name": "Лендинг"}, self.telegram)
         self.assertNotEqual(lead1["id"], lead2["id"])
-        self.assertEqual(len(content_store.list_leads()), 2)
+        self.assertEqual(len(await content_store.list_leads()), 2)
 
-    def test_add_lead_with_matching_draft_id_updates_instead_of_duplicating(self):
-        first = content_store.add_lead({"service_name": "Лендинг"}, self.telegram, draft_id="draft-abc")
+    async def test_add_lead_with_matching_draft_id_updates_instead_of_duplicating(self):
+        first = await content_store.add_lead({"service_name": "Лендинг"}, self.telegram, draft_id="draft-abc")
         self.assertIsNone(first["updated_at"])
 
-        second = content_store.add_lead(
+        second = await content_store.add_lead(
             {"service_name": "Лендинг", "task_description": "доп. инфо"}, self.telegram, draft_id="draft-abc",
         )
 
         self.assertEqual(second["id"], first["id"], "\"Дополнить информацию\" не должно создавать вторую заявку")
         self.assertIsNotNone(second["updated_at"])
-        self.assertEqual(len(content_store.list_leads()), 1)
+        self.assertEqual(len(await content_store.list_leads()), 1)
         self.assertEqual(second["payload"]["task_description"], "доп. инфо")
 
-    def test_add_lead_with_different_draft_id_creates_separate_lead(self):
-        content_store.add_lead({"service_name": "Лендинг"}, self.telegram, draft_id="draft-1")
-        content_store.add_lead({"service_name": "Сайт"}, self.telegram, draft_id="draft-2")
-        self.assertEqual(len(content_store.list_leads()), 2)
+    async def test_add_lead_with_different_draft_id_creates_separate_lead(self):
+        await content_store.add_lead({"service_name": "Лендинг"}, self.telegram, draft_id="draft-1")
+        await content_store.add_lead({"service_name": "Сайт"}, self.telegram, draft_id="draft-2")
+        self.assertEqual(len(await content_store.list_leads()), 2)
 
-    def test_list_leads_filters_by_status_and_sorts_newest_first(self):
-        lead1 = content_store.add_lead({"service_name": "A"}, self.telegram)
-        lead2 = content_store.add_lead({"service_name": "B"}, self.telegram)
-        content_store.update_lead_status(self.actor, lead2["id"], "IN_PROGRESS")
+    async def test_list_leads_filters_by_status_and_sorts_newest_first(self):
+        lead1 = await content_store.add_lead({"service_name": "A"}, self.telegram)
+        lead2 = await content_store.add_lead({"service_name": "B"}, self.telegram)
+        await content_store.update_lead_status(self.actor, lead2["id"], "IN_PROGRESS")
 
-        all_leads = content_store.list_leads()
+        all_leads = await content_store.list_leads()
         self.assertEqual([l["id"] for l in all_leads], [lead2["id"], lead1["id"]])
 
-        new_only = content_store.list_leads("NEW")
+        new_only = await content_store.list_leads("NEW")
         self.assertEqual([l["id"] for l in new_only], [lead1["id"]])
 
-    def test_list_leads_updated_lead_rises_above_newer_untouched_lead(self):
+    async def test_list_leads_updated_lead_rises_above_newer_untouched_lead(self):
         # UX-аудит "Заявки как рабочая очередь": заявка, которую только что
         # обновили, должна подниматься наверх, даже если у неё меньший id,
         # чем у другой, нетронутой после создания заявки.
-        old_lead = content_store.add_lead({"service_name": "A"}, self.telegram)
-        new_lead = content_store.add_lead({"service_name": "B"}, self.telegram)
-        content_store.update_lead_status(self.actor, old_lead["id"], "IN_PROGRESS")
+        old_lead = await content_store.add_lead({"service_name": "A"}, self.telegram)
+        new_lead = await content_store.add_lead({"service_name": "B"}, self.telegram)
+        await content_store.update_lead_status(self.actor, old_lead["id"], "IN_PROGRESS")
 
         # Форсируем заведомо более позднюю метку — как и в аналогичном
         # тесте для list_leads_by_user() (MyLeadsFilteringTests), два
         # datetime.now(timezone.utc) подряд иногда совпадают по разрешению
         # системных часов, тест иначе был бы flaky.
-        leads = content_store._read_leads()
+        leads = await content_store._read_leads()
         for l in leads:
             if l["id"] == old_lead["id"]:
                 l["updated_at"] = "2030-01-01T00:00:00+00:00"
-        content_store._write_leads(leads)
+        await content_store._write_leads(leads)
 
-        result = content_store.list_leads()
+        result = await content_store.list_leads()
         self.assertEqual([l["id"] for l in result], [old_lead["id"], new_lead["id"]])
 
-    def test_list_leads_same_updated_at_tiebreaks_on_higher_id(self):
-        first = content_store.add_lead({"service_name": "A"}, self.telegram)
-        second = content_store.add_lead({"service_name": "B"}, self.telegram)
-        leads = content_store._read_leads()
+    async def test_list_leads_same_updated_at_tiebreaks_on_higher_id(self):
+        first = await content_store.add_lead({"service_name": "A"}, self.telegram)
+        second = await content_store.add_lead({"service_name": "B"}, self.telegram)
+        leads = await content_store._read_leads()
         same_ts = "2026-01-01T00:00:00+00:00"
         for l in leads:
             if l["id"] in (first["id"], second["id"]):
                 l["updated_at"] = same_ts
-        content_store._write_leads(leads)
+        await content_store._write_leads(leads)
 
-        result = content_store.list_leads()
+        result = await content_store.list_leads()
         self.assertEqual([l["id"] for l in result], [second["id"], first["id"]])
 
-    def test_list_leads_active_filter_excludes_done_and_cancelled(self):
+    async def test_list_leads_active_filter_excludes_done_and_cancelled(self):
         leads_by_status = {}
         for status in content_store.LEAD_STATUSES:
-            lead = content_store.add_lead({"service_name": status}, self.telegram)
+            lead = await content_store.add_lead({"service_name": status}, self.telegram)
             if status != "NEW":
-                content_store.update_lead_status(self.actor, lead["id"], status)
+                await content_store.update_lead_status(self.actor, lead["id"], status)
             leads_by_status[status] = lead["id"]
 
-        active_ids = {l["id"] for l in content_store.list_leads("ACTIVE")}
+        active_ids = {l["id"] for l in await content_store.list_leads("ACTIVE")}
         self.assertEqual(
             active_ids,
             {leads_by_status[s] for s in ("NEW", "VIEWED", "IN_PROGRESS", "WAITING_CLIENT")},
@@ -3052,30 +3356,30 @@ class LeadStoreTests(unittest.TestCase):
         self.assertNotIn(leads_by_status["DONE"], active_ids)
         self.assertNotIn(leads_by_status["CANCELLED"], active_ids)
 
-    def test_list_leads_explicit_status_filters_still_work(self):
-        lead = content_store.add_lead({"service_name": "A"}, self.telegram)
-        content_store.update_lead_status(self.actor, lead["id"], "DONE")
+    async def test_list_leads_explicit_status_filters_still_work(self):
+        lead = await content_store.add_lead({"service_name": "A"}, self.telegram)
+        await content_store.update_lead_status(self.actor, lead["id"], "DONE")
 
-        self.assertEqual([l["id"] for l in content_store.list_leads("DONE")], [lead["id"]])
-        self.assertEqual(content_store.list_leads("CANCELLED"), [])
-        self.assertEqual([l["id"] for l in content_store.list_leads("ALL")], [lead["id"]])
+        self.assertEqual([l["id"] for l in await content_store.list_leads("DONE")], [lead["id"]])
+        self.assertEqual(await content_store.list_leads("CANCELLED"), [])
+        self.assertEqual([l["id"] for l in await content_store.list_leads("ALL")], [lead["id"]])
 
-    def test_active_is_not_a_real_lead_status(self):
+    async def test_active_is_not_a_real_lead_status(self):
         # "ACTIVE" — техническое значение только для list_leads(), не
         # персистентный business-статус (см. content_store.ACTIVE_LEAD_STATUSES).
         self.assertNotIn("ACTIVE", content_store.LEAD_STATUSES)
-        lead = content_store.add_lead({"service_name": "A"}, self.telegram)
-        self.assertFalse(content_store.update_lead_status(self.actor, lead["id"], "ACTIVE"))
-        self.assertEqual(content_store.get_lead(lead["id"])["status"], "NEW")  # не изменился
+        lead = await content_store.add_lead({"service_name": "A"}, self.telegram)
+        self.assertFalse(await content_store.update_lead_status(self.actor, lead["id"], "ACTIVE"))
+        self.assertEqual((await content_store.get_lead(lead["id"]))["status"], "NEW")  # не изменился
 
-    def test_update_lead_status_rejects_unknown_status_and_requires_designer(self):
-        lead = content_store.add_lead({"service_name": "A"}, self.telegram)
-        self.assertFalse(content_store.update_lead_status(self.actor, lead["id"], "BOGUS"))
+    async def test_update_lead_status_rejects_unknown_status_and_requires_designer(self):
+        lead = await content_store.add_lead({"service_name": "A"}, self.telegram)
+        self.assertFalse(await content_store.update_lead_status(self.actor, lead["id"], "BOGUS"))
         with self.assertRaises(content_store.NotDesignerError):
-            content_store.update_lead_status("not-the-designer", lead["id"], "DONE")
+            await content_store.update_lead_status("not-the-designer", lead["id"], "DONE")
 
-    def test_get_lead_returns_none_for_unknown_id(self):
-        self.assertIsNone(content_store.get_lead(999999))
+    async def test_get_lead_returns_none_for_unknown_id(self):
+        self.assertIsNone(await content_store.get_lead(999999))
 
 
 class ParseNumberBoundsTests(unittest.TestCase):
@@ -3358,7 +3662,7 @@ class RealisticInitDataCrossCheckTests(unittest.TestCase):
         self.assertEqual(our_result["id"], 42)
 
 
-class MyLeadsFilteringTests(unittest.TestCase):
+class MyLeadsFilteringTests(unittest.IsolatedAsyncioTestCase):
     """list_leads_by_user — User A никогда не должен получить заявки User B."""
 
     def setUp(self):
@@ -3377,36 +3681,36 @@ class MyLeadsFilteringTests(unittest.TestCase):
         content_store.config.DESIGNER_CHAT_ID = self._orig_designer
         shutil.rmtree(self.tmpdir, ignore_errors=True)
 
-    def test_user_a_does_not_see_user_b_leads(self):
-        lead_a = content_store.add_lead({"service_name": "Лендинг"}, {"user_id": 111, "username": "a"})
-        lead_b = content_store.add_lead({"service_name": "Сайт"}, {"user_id": 222, "username": "b"})
+    async def test_user_a_does_not_see_user_b_leads(self):
+        lead_a = await content_store.add_lead({"service_name": "Лендинг"}, {"user_id": 111, "username": "a"})
+        lead_b = await content_store.add_lead({"service_name": "Сайт"}, {"user_id": 222, "username": "b"})
 
-        leads_for_a = content_store.list_leads_by_user(111)
-        leads_for_b = content_store.list_leads_by_user(222)
+        leads_for_a = await content_store.list_leads_by_user(111)
+        leads_for_b = await content_store.list_leads_by_user(222)
 
         self.assertEqual([l["id"] for l in leads_for_a], [lead_a["id"]])
         self.assertEqual([l["id"] for l in leads_for_b], [lead_b["id"]])
         self.assertNotIn(lead_b["id"], [l["id"] for l in leads_for_a])
 
-    def test_unknown_user_gets_empty_list_not_error(self):
-        content_store.add_lead({"service_name": "Лендинг"}, {"user_id": 111, "username": "a"})
-        self.assertEqual(content_store.list_leads_by_user(999999), [])
+    async def test_unknown_user_gets_empty_list_not_error(self):
+        await content_store.add_lead({"service_name": "Лендинг"}, {"user_id": 111, "username": "a"})
+        self.assertEqual(await content_store.list_leads_by_user(999999), [])
 
-    def test_leads_sorted_newest_first(self):
+    async def test_leads_sorted_newest_first(self):
         # Обе заявки ни разу не обновлялись (updated_at=None у обеих) —
         # сортировка падает на created_at, порядок по факту создания.
-        first = content_store.add_lead({"service_name": "A"}, {"user_id": 111})
-        second = content_store.add_lead({"service_name": "B"}, {"user_id": 111})
-        leads = content_store.list_leads_by_user(111)
+        first = await content_store.add_lead({"service_name": "A"}, {"user_id": 111})
+        second = await content_store.add_lead({"service_name": "B"}, {"user_id": 111})
+        leads = await content_store.list_leads_by_user(111)
         self.assertEqual([l["id"] for l in leads], [second["id"], first["id"]])
 
-    def test_updated_old_lead_rises_above_newer_untouched_lead(self):
+    async def test_updated_old_lead_rises_above_newer_untouched_lead(self):
         # См. UX-аудит "Мои заявки" — недавняя активность (статус/supplement/
         # owner_message/материал) должна поднимать заявку наверх, даже если
         # она создана раньше другой, нетронутой заявки.
-        old_lead = content_store.add_lead({"service_name": "A"}, {"user_id": 111})
-        new_lead = content_store.add_lead({"service_name": "B"}, {"user_id": 111})
-        content_store.update_lead_status(self.actor, old_lead["id"], "IN_PROGRESS")
+        old_lead = await content_store.add_lead({"service_name": "A"}, {"user_id": 111})
+        new_lead = await content_store.add_lead({"service_name": "B"}, {"user_id": 111})
+        await content_store.update_lead_status(self.actor, old_lead["id"], "IN_PROGRESS")
 
         # update_lead_status() уже реально отработал (сам факт простановки
         # updated_at проверяется отдельно, в других тестах) — но два
@@ -3416,51 +3720,51 @@ class MyLeadsFilteringTests(unittest.TestCase):
         # тогда тай-брейк по id (осознанно реализованный) отдаёт победу
         # новой заявке, и тест стал бы flaky. Форсируем заведомо более
         # позднюю метку, чтобы порядок проверялся детерминированно.
-        leads = content_store._read_leads()
+        leads = await content_store._read_leads()
         for l in leads:
             if l["id"] == old_lead["id"]:
                 l["updated_at"] = "2030-01-01T00:00:00+00:00"
-        content_store._write_leads(leads)
+        await content_store._write_leads(leads)
 
-        leads = content_store.list_leads_by_user(111)
+        leads = await content_store.list_leads_by_user(111)
         self.assertEqual([l["id"] for l in leads], [old_lead["id"], new_lead["id"]])
 
-    def test_same_updated_at_tiebreaks_on_higher_id(self):
-        first = content_store.add_lead({"service_name": "A"}, {"user_id": 111})
-        second = content_store.add_lead({"service_name": "B"}, {"user_id": 111})
+    async def test_same_updated_at_tiebreaks_on_higher_id(self):
+        first = await content_store.add_lead({"service_name": "A"}, {"user_id": 111})
+        second = await content_store.add_lead({"service_name": "B"}, {"user_id": 111})
         # Форсируем одинаковый updated_at у обеих — на быстром хранилище
         # (Upstash) реальное совпадение до секунды вполне возможно, это не
         # искусственный случай.
-        leads = content_store._read_leads()
+        leads = await content_store._read_leads()
         same_ts = "2026-01-01T00:00:00+00:00"
         for l in leads:
             if l["id"] in (first["id"], second["id"]):
                 l["updated_at"] = same_ts
-        content_store._write_leads(leads)
+        await content_store._write_leads(leads)
 
-        result = content_store.list_leads_by_user(111)
+        result = await content_store.list_leads_by_user(111)
         self.assertEqual([l["id"] for l in result], [second["id"], first["id"]])
 
-    def test_sorting_does_not_change_lead_fields(self):
-        lead = content_store.add_lead({"service_name": "Лендинг", "task_description": "Тест"}, {"user_id": 111})
-        content_store.update_lead_status(self.actor, lead["id"], "DONE")
+    async def test_sorting_does_not_change_lead_fields(self):
+        lead = await content_store.add_lead({"service_name": "Лендинг", "task_description": "Тест"}, {"user_id": 111})
+        await content_store.update_lead_status(self.actor, lead["id"], "DONE")
 
-        result = content_store.list_leads_by_user(111)
+        result = await content_store.list_leads_by_user(111)
         self.assertEqual(result[0]["payload"]["service_name"], "Лендинг")
         self.assertEqual(result[0]["payload"]["task_description"], "Тест")
         self.assertEqual(result[0]["status"], "DONE")
 
-    def test_admin_list_leads_now_also_sorts_by_updated_at(self):
+    async def test_admin_list_leads_now_also_sorts_by_updated_at(self):
         # Ранее list_leads() (для /admin) был отсортирован строго по id —
         # с UX-аудита "Заявки как рабочая очередь" (P2 продуктовый блок)
         # он использует тот же принцип, что и list_leads_by_user() ниже:
         # недавняя активность поднимает заявку наверх, даже если она
         # создана раньше другой, нетронутой заявки.
-        old_lead = content_store.add_lead({"service_name": "A"}, {"user_id": 111})
-        new_lead = content_store.add_lead({"service_name": "B"}, {"user_id": 111})
-        content_store.update_lead_status(self.actor, old_lead["id"], "IN_PROGRESS")
+        old_lead = await content_store.add_lead({"service_name": "A"}, {"user_id": 111})
+        new_lead = await content_store.add_lead({"service_name": "B"}, {"user_id": 111})
+        await content_store.update_lead_status(self.actor, old_lead["id"], "IN_PROGRESS")
 
-        admin_leads = content_store.list_leads()
+        admin_leads = await content_store.list_leads()
         self.assertEqual([l["id"] for l in admin_leads], [old_lead["id"], new_lead["id"]])
 
 
@@ -3486,8 +3790,8 @@ class MyLeadsHttpEndpointTests(unittest.IsolatedAsyncioTestCase):
     async def test_endpoint_returns_only_authenticated_users_leads(self):
         from aiohttp.test_utils import TestClient, TestServer
 
-        content_store.add_lead({"service_name": "Лендинг"}, {"user_id": 555, "username": "me"})
-        content_store.add_lead({"service_name": "Сайт"}, {"user_id": 666, "username": "other"})
+        await content_store.add_lead({"service_name": "Лендинг"}, {"user_id": 555, "username": "me"})
+        await content_store.add_lead({"service_name": "Сайт"}, {"user_id": 666, "username": "other"})
 
         init_data = _sign_init_data(
             {"auth_date": str(int(time.time())), "user": json.dumps({"id": 555, "first_name": "Я"})},
@@ -3568,7 +3872,7 @@ class MyLeadsHttpEndpointTests(unittest.IsolatedAsyncioTestCase):
         только читается для логов, никогда не участвует в решении."""
         from aiohttp.test_utils import TestClient, TestServer
 
-        content_store.add_lead({"service_name": "Лендинг"}, {"user_id": 42, "username": "me"})
+        await content_store.add_lead({"service_name": "Лендинг"}, {"user_id": 42, "username": "me"})
         init_data = _sign_init_data(
             {"auth_date": str(int(time.time())), "user": json.dumps({"id": 42, "first_name": "Я"})},
             webserver.config.BOT_TOKEN,
@@ -3591,7 +3895,7 @@ class MyLeadsHttpEndpointTests(unittest.IsolatedAsyncioTestCase):
         каких-либо побочных эффектов от добавленной диагностики."""
         from aiohttp.test_utils import TestClient, TestServer
 
-        content_store.add_lead({"service_name": "Лендинг"}, {"user_id": 42, "username": "me"})
+        await content_store.add_lead({"service_name": "Лендинг"}, {"user_id": 42, "username": "me"})
         init_data = _sign_init_data(
             {"auth_date": str(int(time.time())), "user": json.dumps({"id": 42, "first_name": "Я"})},
             webserver.config.BOT_TOKEN,
@@ -3648,7 +3952,7 @@ class CreateLeadHttpEndpointTests(unittest.IsolatedAsyncioTestCase):
             body = await resp.json()
             self.assertIn("lead_id", body)
 
-        leads = content_store.list_leads_by_user(42)
+        leads = await content_store.list_leads_by_user(42)
         self.assertEqual(len(leads), 1)
 
     async def test_missing_init_data_is_401_and_creates_no_lead(self):
@@ -3662,7 +3966,7 @@ class CreateLeadHttpEndpointTests(unittest.IsolatedAsyncioTestCase):
                 json={"service_name": "Лендинг"},
             )
             self.assertEqual(resp.status, 401)
-        self.assertEqual(content_store.list_leads(), [])
+        self.assertEqual(await content_store.list_leads(), [])
 
     async def test_invalid_init_data_is_401_and_creates_no_lead(self):
         from aiohttp.test_utils import TestClient, TestServer
@@ -3675,7 +3979,7 @@ class CreateLeadHttpEndpointTests(unittest.IsolatedAsyncioTestCase):
                 json={"service_name": "Лендинг"},
             )
             self.assertEqual(resp.status, 401)
-        self.assertEqual(content_store.list_leads(), [])
+        self.assertEqual(await content_store.list_leads(), [])
 
     async def test_user_id_spoofed_in_body_is_ignored(self):
         # Ключевое требование безопасности: body может содержать что угодно
@@ -3692,8 +3996,8 @@ class CreateLeadHttpEndpointTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertEqual(resp.status, 200)
 
-        self.assertEqual(content_store.list_leads_by_user(999999), [])
-        leads_for_real_user = content_store.list_leads_by_user(42)
+        self.assertEqual(await content_store.list_leads_by_user(999999), [])
+        leads_for_real_user = await content_store.list_leads_by_user(42)
         self.assertEqual(len(leads_for_real_user), 1)
 
     async def test_draft_id_upsert_updates_existing_lead_not_duplicate(self):
@@ -3715,7 +4019,7 @@ class CreateLeadHttpEndpointTests(unittest.IsolatedAsyncioTestCase):
             second_body = await second.json()
 
         self.assertEqual(first_body["lead_id"], second_body["lead_id"])  # тот же lead, не новый
-        leads = content_store.list_leads_by_user(42)
+        leads = await content_store.list_leads_by_user(42)
         self.assertEqual(len(leads), 1)
         self.assertEqual(leads[0]["payload"]["service_name"], "Лендинг, доп. правки")
 
@@ -3739,7 +4043,7 @@ class CreateLeadHttpEndpointTests(unittest.IsolatedAsyncioTestCase):
             body = await resp.json()
             self.assertIsNotNone(body["price_range"])  # calc_summary реально посчитан
 
-        lead = content_store.list_leads_by_user(42)[0]
+        lead = (await content_store.list_leads_by_user(42))[0]
         self.assertEqual(lead["payload"]["source_case_id"], "case_3")
         self.assertEqual(lead["payload"]["source_case_title"], "Лендинг кофейни")
         self.assertIsNotNone(lead["calc_summary"])
@@ -3757,7 +4061,7 @@ class CreateLeadHttpEndpointTests(unittest.IsolatedAsyncioTestCase):
             body = await resp.json()
             self.assertTrue(body["attach_tz"])
 
-        lead = content_store.find_lead_awaiting_file(42)
+        lead = await content_store.find_lead_awaiting_file(42)
         self.assertIsNotNone(lead)
 
     async def test_designer_is_notified_via_bot_instance(self):
@@ -3866,7 +4170,7 @@ class SubmitIdempotencyTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(last_body["created"])
 
         # Один lead (upsert), но ОДНО уведомление — не пять.
-        self.assertEqual(len(content_store.list_leads_by_user(42)), 1)
+        self.assertEqual(len(await content_store.list_leads_by_user(42)), 1)
         fake_bot.send_message.assert_awaited_once()
 
     async def test_different_user_same_draft_id_is_rejected(self):
@@ -3895,13 +4199,13 @@ class SubmitIdempotencyTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(await second.json(), {"error": "forbidden"})
 
         # Исходная заявка не изменилась ни в payload, ни в identity.
-        lead = content_store.get_lead(lead_id)
+        lead = await content_store.get_lead(lead_id)
         self.assertEqual(lead["payload"]["task_description"], "заявка user 42")
         self.assertEqual(lead["telegram"]["user_id"], 42)
         # user 999 не получил чужую заявку в своём списке, и новой заявки
         # под тем же draft_id не появилось.
-        self.assertEqual(content_store.list_leads_by_user(999), [])
-        self.assertEqual(len(content_store.list_leads_by_user(42)), 1)
+        self.assertEqual(await content_store.list_leads_by_user(999), [])
+        self.assertEqual(len(await content_store.list_leads_by_user(42)), 1)
         # Уведомление владельцу ушло РОВНО один раз (за первую, настоящую
         # заявку) — отклонённая коллизия не притворилась новой заявкой.
         fake_bot.send_message.assert_awaited_once()
@@ -3996,7 +4300,7 @@ class LeadSupplementTests(unittest.IsolatedAsyncioTestCase):
             body = await resp.json()
             self.assertEqual(body, {"error": "not_found"})
 
-        lead = content_store.get_lead(lead_id)
+        lead = await content_store.get_lead(lead_id)
         self.assertEqual(lead.get("supplements", []), [])  # чужая попытка ничего не добавила
 
     async def test_wrong_owner_and_nonexistent_lead_responses_are_identical(self):
@@ -4035,7 +4339,7 @@ class LeadSupplementTests(unittest.IsolatedAsyncioTestCase):
                 json={"mode": "supplement", "lead_id": lead_id, "fields": {"comment": "дополнительная деталь"}},
             )
 
-        lead = content_store.get_lead(lead_id)
+        lead = await content_store.get_lead(lead_id)
         self.assertEqual(lead["payload"]["task_description"], "исходное описание")  # не перезаписан
 
     async def test_two_supplements_are_both_kept_append_only(self):
@@ -4055,7 +4359,7 @@ class LeadSupplementTests(unittest.IsolatedAsyncioTestCase):
                 json={"mode": "supplement", "lead_id": lead_id, "fields": {"comment": "второе дополнение"}},
             )
 
-        lead = content_store.get_lead(lead_id)
+        lead = await content_store.get_lead(lead_id)
         self.assertEqual(len(lead["supplements"]), 2)
         self.assertEqual(lead["supplements"][0]["fields"]["comment"], "первое дополнение")
         self.assertEqual(lead["supplements"][1]["fields"]["comment"], "второе дополнение")
@@ -4271,12 +4575,12 @@ class LeadMaterialTests(unittest.IsolatedAsyncioTestCase):
     async def test_material_attaches_to_correct_lead_and_saves_file_id(self):
         message = make_message()
         await webapp._handle_brief_submission(message, {"service_name": "Лендинг", "attach_tz": True, "draft_id": "m1"})
-        lead_id = content_store.find_lead_awaiting_file(message.from_user.id)["id"]
+        lead_id = (await content_store.find_lead_awaiting_file(message.from_user.id))["id"]
 
         message.document = make_fake_document(file_id="doc-1", file_unique_id="uniq-1")
         await webapp.handle_tz_file(message)
 
-        lead = content_store.get_lead(lead_id)
+        lead = await content_store.get_lead(lead_id)
         self.assertEqual(len(lead["materials"]), 1)
         self.assertEqual(lead["materials"][0]["file_id"], "doc-1")
         self.assertEqual(lead["materials"][0]["file_unique_id"], "uniq-1")
@@ -4286,11 +4590,11 @@ class LeadMaterialTests(unittest.IsolatedAsyncioTestCase):
     async def test_awaiting_state_cleared_after_material_received(self):
         message = make_message()
         await webapp._handle_brief_submission(message, {"service_name": "Лендинг", "attach_tz": True, "draft_id": "m2"})
-        self.assertIsNotNone(content_store.find_lead_awaiting_file(message.from_user.id))
+        self.assertIsNotNone(await content_store.find_lead_awaiting_file(message.from_user.id))
 
         message.document = make_fake_document()
         await webapp.handle_tz_file(message)
-        self.assertIsNone(content_store.find_lead_awaiting_file(message.from_user.id))
+        self.assertIsNone(await content_store.find_lead_awaiting_file(message.from_user.id))
 
     async def test_multiple_leads_same_user_do_not_cause_misattribution(self):
         # Два лида одного клиента, оба помечены attach_tz=True — второй
@@ -4299,21 +4603,21 @@ class LeadMaterialTests(unittest.IsolatedAsyncioTestCase):
         # была бы неоднозначной и файл мог уйти не в ту заявку.
         message = make_message()
         await webapp._handle_brief_submission(message, {"service_name": "Лендинг", "attach_tz": True, "draft_id": "m3-a"})
-        first_lead_id = content_store.find_lead_awaiting_file(message.from_user.id)["id"]
+        first_lead_id = (await content_store.find_lead_awaiting_file(message.from_user.id))["id"]
 
         await webapp._handle_brief_submission(message, {"service_name": "Логотип", "attach_tz": True, "draft_id": "m3-b"})
-        second_lead_id = content_store.find_lead_awaiting_file(message.from_user.id)["id"]
+        second_lead_id = (await content_store.find_lead_awaiting_file(message.from_user.id))["id"]
 
         self.assertNotEqual(first_lead_id, second_lead_id)
-        first_lead = content_store.get_lead(first_lead_id)
+        first_lead = await content_store.get_lead(first_lead_id)
         self.assertFalse(first_lead["awaiting_tz_file"])  # снято вторым запросом
 
         message.document = make_fake_document()
         await webapp.handle_tz_file(message)
 
         # Файл должен уйти именно во вторую (единственно ожидающую) заявку.
-        self.assertEqual(len(content_store.get_lead(second_lead_id)["materials"]), 1)
-        self.assertEqual(content_store.get_lead(first_lead_id).get("materials", []), [])
+        self.assertEqual(len((await content_store.get_lead(second_lead_id))["materials"]), 1)
+        self.assertEqual((await content_store.get_lead(first_lead_id)).get("materials", []), [])
 
     async def test_supplement_wants_file_ties_awaiting_state_to_that_lead(self):
         from aiohttp.test_utils import TestClient, TestServer
@@ -4345,7 +4649,7 @@ class LeadMaterialTests(unittest.IsolatedAsyncioTestCase):
         finally:
             webserver.config.BOT_TOKEN = self._orig_token
 
-        lead = content_store.find_lead_awaiting_file(555)
+        lead = await content_store.find_lead_awaiting_file(555)
         self.assertIsNotNone(lead)
         self.assertEqual(lead["id"], lead_id)
         self.assertEqual(lead["awaiting_tz_file_source"], "supplement")
@@ -4368,7 +4672,7 @@ class OwnerMessageTests(unittest.IsolatedAsyncioTestCase):
     паттерн, что и supplements[]/materials[] (см. аудит): отдельный поток,
     не трогает payload, не теряется при неудачной Telegram-доставке."""
 
-    def setUp(self):
+    async def asyncSetUp(self):
         self.tmpdir = tempfile.mkdtemp()
         real_data_dir = Path(__file__).resolve().parent.parent / "data"
         for name in ("pricing.json", "portfolio.json", "faq.json", "about.json", "ui_config.json"):
@@ -4378,7 +4682,7 @@ class OwnerMessageTests(unittest.IsolatedAsyncioTestCase):
         content_store.DATA_DIR = Path(self.tmpdir)
         content_store.config.DESIGNER_CHAT_ID = "888"
         self.actor = 888
-        self.lead = content_store.add_lead(
+        self.lead = await content_store.add_lead(
             {"service_name": "Лендинг", "task_description": "Исходная задача"},
             {"user_id": 55555, "username": "client", "first_name": "Клиент"},
         )
@@ -4390,37 +4694,37 @@ class OwnerMessageTests(unittest.IsolatedAsyncioTestCase):
 
     # ---- content_store.add_owner_message ----
 
-    def test_new_owner_message_is_saved(self):
-        lead = content_store.add_owner_message(self.actor, self.lead["id"], "Первый ответ", "sent")
+    async def test_new_owner_message_is_saved(self):
+        lead = await content_store.add_owner_message(self.actor, self.lead["id"], "Первый ответ", "sent")
         self.assertEqual(len(lead["owner_messages"]), 1)
         self.assertEqual(lead["owner_messages"][0]["text"], "Первый ответ")
         self.assertEqual(lead["owner_messages"][0]["delivery_status"], "sent")
         self.assertEqual(lead["owner_messages"][0]["id"], 1)
 
-    def test_two_messages_are_both_kept_append_only(self):
-        content_store.add_owner_message(self.actor, self.lead["id"], "Первый", "sent")
-        lead = content_store.add_owner_message(self.actor, self.lead["id"], "Второй", "sent")
+    async def test_two_messages_are_both_kept_append_only(self):
+        await content_store.add_owner_message(self.actor, self.lead["id"], "Первый", "sent")
+        lead = await content_store.add_owner_message(self.actor, self.lead["id"], "Второй", "sent")
         self.assertEqual(len(lead["owner_messages"]), 2)
         self.assertEqual(lead["owner_messages"][0]["text"], "Первый")
         self.assertEqual(lead["owner_messages"][1]["text"], "Второй")
         self.assertEqual(lead["owner_messages"][0]["id"], 1)
         self.assertEqual(lead["owner_messages"][1]["id"], 2)
 
-    def test_owner_message_does_not_change_payload(self):
-        lead = content_store.add_owner_message(self.actor, self.lead["id"], "Ответ", "sent")
+    async def test_owner_message_does_not_change_payload(self):
+        lead = await content_store.add_owner_message(self.actor, self.lead["id"], "Ответ", "sent")
         self.assertEqual(lead["payload"]["task_description"], "Исходная задача")
 
-    def test_owner_message_updates_updated_at(self):
+    async def test_owner_message_updates_updated_at(self):
         self.assertIsNone(self.lead["updated_at"])
-        lead = content_store.add_owner_message(self.actor, self.lead["id"], "Ответ", "sent")
+        lead = await content_store.add_owner_message(self.actor, self.lead["id"], "Ответ", "sent")
         self.assertIsNotNone(lead["updated_at"])
 
-    def test_owner_message_requires_designer(self):
+    async def test_owner_message_requires_designer(self):
         with self.assertRaises(content_store.NotDesignerError):
-            content_store.add_owner_message("not-the-designer", self.lead["id"], "Ответ", "sent")
+            await content_store.add_owner_message("not-the-designer", self.lead["id"], "Ответ", "sent")
 
-    def test_owner_message_for_unknown_lead_returns_none(self):
-        self.assertIsNone(content_store.add_owner_message(self.actor, 999999, "Ответ", "sent"))
+    async def test_owner_message_for_unknown_lead_returns_none(self):
+        self.assertIsNone(await content_store.add_owner_message(self.actor, 999999, "Ответ", "sent"))
 
     # ---- bot/handlers/admin.py::lead_reply_send (реальный хендлер) ----
 
@@ -4432,7 +4736,7 @@ class OwnerMessageTests(unittest.IsolatedAsyncioTestCase):
         message = make_reply_message(self.actor, "Всё уточнили, приступаем", AsyncMock())
         await admin.lead_reply_send(message, state)
 
-        lead = content_store.get_lead(self.lead["id"])
+        lead = await content_store.get_lead(self.lead["id"])
         self.assertEqual(len(lead["owner_messages"]), 1)
         self.assertEqual(lead["owner_messages"][0]["delivery_status"], "sent")
         self.assertEqual(lead["owner_messages"][0]["text"], "Всё уточнили, приступаем")
@@ -4450,7 +4754,7 @@ class OwnerMessageTests(unittest.IsolatedAsyncioTestCase):
         message = make_reply_message(self.actor, "Ответ, который не дойдёт", failing_send)
         await admin.lead_reply_send(message, state)
 
-        lead = content_store.get_lead(self.lead["id"])
+        lead = await content_store.get_lead(self.lead["id"])
         self.assertEqual(len(lead["owner_messages"]), 1)  # не потерялось
         self.assertEqual(lead["owner_messages"][0]["delivery_status"], "failed")
         self.assertEqual(lead["owner_messages"][0]["text"], "Ответ, который не дойдёт")
@@ -4459,9 +4763,9 @@ class OwnerMessageTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Не получилось отправить", admin_text)
 
     async def test_admin_detail_shows_owner_messages(self):
-        content_store.add_owner_message(self.actor, self.lead["id"], "Первый ответ", "sent")
-        content_store.add_owner_message(self.actor, self.lead["id"], "Второй, не дошёл", "failed")
-        lead = content_store.get_lead(self.lead["id"])
+        await content_store.add_owner_message(self.actor, self.lead["id"], "Первый ответ", "sent")
+        await content_store.add_owner_message(self.actor, self.lead["id"], "Второй, не дошёл", "failed")
+        lead = await content_store.get_lead(self.lead["id"])
 
         text = lead_format.format_lead_admin_detail(lead)
         self.assertIn("Ответы дизайнера", text)
@@ -4474,7 +4778,7 @@ class OwnerMessageTests(unittest.IsolatedAsyncioTestCase):
     async def test_my_leads_returns_owner_messages(self):
         from aiohttp.test_utils import TestClient, TestServer
 
-        content_store.add_owner_message(self.actor, self.lead["id"], "Виден клиенту", "sent")
+        await content_store.add_owner_message(self.actor, self.lead["id"], "Виден клиенту", "sent")
         self._orig_token = webserver.config.BOT_TOKEN
         webserver.config.BOT_TOKEN = "123456:test-token-not-real"
         try:
@@ -4522,14 +4826,14 @@ class StatusNotificationTests(unittest.IsolatedAsyncioTestCase):
         content_store.config.DESIGNER_CHAT_ID = self._orig_designer
         shutil.rmtree(self.tmpdir, ignore_errors=True)
 
-    def _make_lead(self, user_id=55555):
-        return content_store.add_lead(
+    async def _make_lead(self, user_id=55555):
+        return await content_store.add_lead(
             {"service_name": "Лендинг", "task_description": "Тест"},
             {"user_id": user_id, "username": "client", "first_name": "Клиент"},
         )
 
     async def test_status_change_sends_one_notification(self):
-        lead = self._make_lead()
+        lead = await self._make_lead()
         state = make_state(self.actor)
         await state.update_data(lead_id=lead["id"])
         callback = make_callback("adminleadstatus:IN_PROGRESS", chat_id=self.actor)
@@ -4538,13 +4842,13 @@ class StatusNotificationTests(unittest.IsolatedAsyncioTestCase):
 
         callback.bot.send_message.assert_awaited_once()
         self.assertEqual(callback.bot.send_message.await_args.kwargs["chat_id"], 55555)
-        self.assertEqual(content_store.get_lead(lead["id"])["status"], "IN_PROGRESS")
+        self.assertEqual((await content_store.get_lead(lead["id"]))["status"], "IN_PROGRESS")
 
     async def test_status_change_notification_has_service_name_and_label(self):
         # lead.id — глобальный сквозной счётчик по ВСЕМ заявкам от ВСЕХ
         # клиентов (см. content_store.add_lead), клиенту его не показываем
         # (см. UX-аудит) — вместо номера используется service_name.
-        lead = self._make_lead()
+        lead = await self._make_lead()
         state = make_state(self.actor)
         await state.update_data(lead_id=lead["id"])
         callback = make_callback("adminleadstatus:WAITING_CLIENT", chat_id=self.actor)
@@ -4557,7 +4861,7 @@ class StatusNotificationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Нужно ваше действие", text)
 
     async def test_status_change_notification_does_not_contain_lead_id(self):
-        lead = self._make_lead()
+        lead = await self._make_lead()
         state = make_state(self.actor)
         await state.update_data(lead_id=lead["id"])
         callback = make_callback("adminleadstatus:DONE", chat_id=self.actor)
@@ -4569,7 +4873,7 @@ class StatusNotificationTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(str(lead["id"]), text)
 
     async def test_status_change_notification_falls_back_when_service_name_missing(self):
-        lead = content_store.add_lead(
+        lead = await content_store.add_lead(
             {"task_description": "Без указания услуги"},  # service_name отсутствует в payload
             {"user_id": 55555, "username": "client", "first_name": "Клиент"},
         )
@@ -4587,7 +4891,7 @@ class StatusNotificationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("В работе", text)
 
     async def test_repeat_same_status_sends_zero_notifications(self):
-        lead = self._make_lead()  # уже "NEW" по умолчанию
+        lead = await self._make_lead()  # уже "NEW" по умолчанию
         state = make_state(self.actor)
         await state.update_data(lead_id=lead["id"])
         callback = make_callback("adminleadstatus:NEW", chat_id=self.actor)
@@ -4595,10 +4899,10 @@ class StatusNotificationTests(unittest.IsolatedAsyncioTestCase):
         await admin.lead_change_status(callback, state)
 
         callback.bot.send_message.assert_not_awaited()
-        self.assertEqual(content_store.get_lead(lead["id"])["status"], "NEW")
+        self.assertEqual((await content_store.get_lead(lead["id"]))["status"], "NEW")
 
     async def test_missing_user_id_changes_status_but_sends_zero_notifications(self):
-        lead = content_store.add_lead(
+        lead = await content_store.add_lead(
             {"service_name": "Лендинг"}, {"user_id": None, "username": None, "first_name": None},
         )
         state = make_state(self.actor)
@@ -4608,10 +4912,10 @@ class StatusNotificationTests(unittest.IsolatedAsyncioTestCase):
         await admin.lead_change_status(callback, state)
 
         callback.bot.send_message.assert_not_awaited()
-        self.assertEqual(content_store.get_lead(lead["id"])["status"], "IN_PROGRESS")
+        self.assertEqual((await content_store.get_lead(lead["id"]))["status"], "IN_PROGRESS")
 
     async def test_send_message_exception_leaves_status_changed(self):
-        lead = self._make_lead()
+        lead = await self._make_lead()
         state = make_state(self.actor)
         await state.update_data(lead_id=lead["id"])
         failing_bot = AsyncMock()
@@ -4620,18 +4924,18 @@ class StatusNotificationTests(unittest.IsolatedAsyncioTestCase):
 
         await admin.lead_change_status(callback, state)  # не должно бросить исключение наружу
 
-        self.assertEqual(content_store.get_lead(lead["id"])["status"], "DONE")
+        self.assertEqual((await content_store.get_lead(lead["id"]))["status"], "DONE")
 
     async def test_status_change_does_not_touch_owner_messages(self):
-        lead = self._make_lead()
-        content_store.add_owner_message(self.actor, lead["id"], "Ранее написанный ответ", "sent")
+        lead = await self._make_lead()
+        await content_store.add_owner_message(self.actor, lead["id"], "Ранее написанный ответ", "sent")
         state = make_state(self.actor)
         await state.update_data(lead_id=lead["id"])
         callback = make_callback("adminleadstatus:IN_PROGRESS", chat_id=self.actor)
 
         await admin.lead_change_status(callback, state)
 
-        lead_after = content_store.get_lead(lead["id"])
+        lead_after = await content_store.get_lead(lead["id"])
         self.assertEqual(len(lead_after["owner_messages"]), 1)
         self.assertEqual(lead_after["owner_messages"][0]["text"], "Ранее написанный ответ")
 

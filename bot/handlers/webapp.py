@@ -69,7 +69,7 @@ async def _handle_brief_submission(message: Message, payload: dict) -> None:
     # awaiting_tz_file из payload["attach_tz"] — см. bot/content_store.py,
     # тот же persistent-механизм, что и для основного HTTP-пути
     # (handle_tz_file ниже не различает, откуда взялась заявка).
-    lead = content_store.add_lead(payload, telegram_identity, calc_summary, draft_id=payload.get("draft_id"))
+    lead = await content_store.add_lead(payload, telegram_identity, calc_summary, draft_id=payload.get("draft_id"))
 
     # Уведомляем владельца только при реальном создании — та же логика
     # idempotency, что и в bot/webserver.py::_handle_lead_create (см. аудит).
@@ -108,7 +108,7 @@ async def handle_tz_file(message: Message) -> None:
     не наш случай (например, админ шлёт архив бэкапа — это отдельный,
     FSM-scoped хендлер в admin.py, который стоит раньше в порядке
     роутеров и перехватит его первым)."""
-    lead = content_store.find_lead_awaiting_file(message.from_user.id)
+    lead = await content_store.find_lead_awaiting_file(message.from_user.id)
     if lead is None:
         return
 
@@ -121,7 +121,7 @@ async def handle_tz_file(message: Message) -> None:
     # Материал сохраняем ДО пересылки — если пересылка упадёт (Telegram API
     # недоступен и т.п.), связь "файл ↔ заявка" всё равно не теряется, её
     # можно будет восстановить вручную через file_id из /admin.
-    content_store.record_lead_material(lead["id"], file_id, file_unique_id, kind, source)
+    await content_store.record_lead_material(lead["id"], file_id, file_unique_id, kind, source)
 
     if config.DESIGNER_CHAT_ID:
         try:

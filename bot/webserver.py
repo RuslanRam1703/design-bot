@@ -110,7 +110,7 @@ async def handle_my_leads(request: web.Request) -> web.Response:
             request.headers.get("User-Agent", "")[:120],
         )
         return web.json_response({"error": "unauthorized"}, status=401)
-    leads = content_store.list_leads_by_user(user["id"])
+    leads = await content_store.list_leads_by_user(user["id"])
     return web.json_response(leads, dumps=lambda d: json.dumps(d, ensure_ascii=False))
 
 
@@ -175,7 +175,7 @@ async def _handle_lead_create(payload: dict, telegram_identity: dict, bot: Bot) 
     calc_summary = dataclasses.asdict(calc_result) if calc_result and calc_result.valid else None
 
     try:
-        lead = content_store.add_lead(payload, telegram_identity, calc_summary, draft_id=payload.get("draft_id"))
+        lead = await content_store.add_lead(payload, telegram_identity, calc_summary, draft_id=payload.get("draft_id"))
     except content_store.NotLeadOwnerError:
         # draft_id совпал с чужой заявкой (см. content_store.add_lead,
         # production-аудит P1-2) — ничего не создано и не изменено.
@@ -234,7 +234,7 @@ async def _handle_lead_supplement(payload: dict, telegram_identity: dict, bot: B
         return web.json_response({"error": "empty_supplement"}, status=400)
 
     try:
-        lead, supplement_id = content_store.add_lead_supplement(lead_id, telegram_identity, fields, wants_file=wants_file)
+        lead, supplement_id = await content_store.add_lead_supplement(lead_id, telegram_identity, fields, wants_file=wants_file)
     except (content_store.LeadNotFoundError, content_store.NotLeadOwnerError):
         # Единый внешне наблюдаемый ответ для "такого lead_id нет" и "lead_id
         # чужой" (см. production-аудит, P2-11) — иначе разница 404 vs 403

@@ -112,7 +112,7 @@ async def main() -> None:
     # один апдейт от Telegram не мог попасть на ещё не проинициализированное
     # хранилище (см. production-hardening аудит, P0-1). При выключенном
     # Upstash — no-op (см. ensure_storage_initialized).
-    content_store.ensure_storage_initialized()
+    await content_store.ensure_storage_initialized()
 
     app = create_app(bot)
     runner = web.AppRunner(app)

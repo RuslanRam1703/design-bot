@@ -56,9 +56,9 @@ async def cmd_cancel(message: Message, state: FSMContext) -> None:
     # content_store.find_lead_awaiting_file/mark_tz_file_received,
     # bot/handlers/webapp.py::handle_tz_file), переживает рестарт бота.
     # /cancel здесь просто снимает флаг ожидания — заявка остаётся как есть.
-    awaiting_lead = content_store.find_lead_awaiting_file(message.from_user.id)
+    awaiting_lead = await content_store.find_lead_awaiting_file(message.from_user.id)
     if awaiting_lead is not None:
-        content_store.mark_tz_file_received(awaiting_lead["id"])
+        await content_store.mark_tz_file_received(awaiting_lead["id"])
         text = "Хорошо, отменил ожидание файла."
     else:
         text = "Отменять было нечего."

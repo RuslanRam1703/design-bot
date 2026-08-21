@@ -12,6 +12,40 @@ actor_chat_id и сверяет его с DESIGNER_CHAT_ID сама, незав�
 кто и как её вызвал — так что даже при ошибке в фильтре роутера или
 будущем добавлении нового пути вызова (например, другого хендлера,
 который забудут защитить) запись в данные без прав физически невозможна.
+
+ASYNC + LOCKING MODEL (P1-1/P2-6/P2-7, production-hardening аудит, второй
+design review — см. историю). Все публичные функции — async def:
+`_upstash_command()` остаётся ПОЛНОСТЬЮ синхронной (urllib, без изменений в
+request/timeout/logging/exception semantics) — единственная async-граница
+это `await asyncio.to_thread(_upstash_command, ...)` внутри `_read`/`_write`,
+не переписывание самого HTTP-вызова.
+
+Locking — per-key, НЕ единый global lock (отклонён во втором review: он бы
+без необходимости сериализовал операции на РАЗНЫХ файлах — например,
+четыре параллельных fetch() публичных JSON Mini App при каждом открытии
+страницы, см. Block 2A). Ровно один `asyncio.Lock` на каждый DATA_FILENAMES
+ключ, три уровня:
+
+  Tier 0 — single-key read-only: БЕЗ лока вообще. Upstash GET одного ключа
+    атомарен сам по себе (Redis SET — atomic replace, никогда нет
+    "частично записанного" значения) — без follow-up записи никакого
+    lost-update нет.
+  Tier 1 — single-key read-modify-write: один `async with _lock(filename):`
+    на ВСЮ функцию, от первого read до последнего write. Держать лок только
+    вокруг _write() недостаточно — гонка двух конкурентных `add_lead()` за
+    один и тот же `next_id` требует держать лок от read до write включительно.
+  Tier 2 — multi-key (delete_service, content_readiness_summary,
+    export_backup_bytes, import_backup_bytes): ВСЕ нужные локи приобретаются
+    ДО первого storage I/O, строго в каноническом порядке DATA_FILENAMES
+    (см. _LOCK_ORDER) — это стандартный lock-ordering приём против deadlock:
+    если каждая multi-key операция берёт локи в одном и том же порядке,
+    цикл в графе ожидания невозможен по построению. `_StorageLock` сам
+    сортирует переданные имена по этому порядку — порядок в вызове на
+    конкретном call site не важен, гарантия обеспечена централизованно.
+
+Backup (export/import) держит все 6 локов на всю операцию — это то же
+самое, что и global lock, но ТОЛЬКО на время backup, а не всегда: остальные
+~45 tier-0/tier-1 функций им не платят.
 """
 
 import asyncio
@@ -69,6 +103,45 @@ def _require_designer(actor_chat_id: int | str) -> None:
 
 MARKER_KEY = "design_assistant:storage_initialized"
 
+DATA_FILENAMES = ("portfolio.json", "pricing.json", "faq.json", "about.json", "ui_config.json", "leads.json")
+
+# Канонический порядок приобретения per-key locks — единственный источник
+# истины для lock ordering (см. докстринг модуля). ЛЮБАЯ multi-key операция
+# обязана брать локи через _lock(...) ниже, не напрямую через _locks[...] —
+# _lock() сам сортирует по этому порядку, так что порядок аргументов на
+# конкретном call site не может случайно нарушить инвариант.
+_LOCK_ORDER: tuple[str, ...] = DATA_FILENAMES
+_locks: dict[str, asyncio.Lock] = {name: asyncio.Lock() for name in _LOCK_ORDER}
+
+
+class _StorageLock:
+    """Context manager: приобретает per-key asyncio.Lock для одного или
+    нескольких DATA_FILENAMES-ключей строго в каноническом порядке
+    _LOCK_ORDER, независимо от порядка, в котором имена переданы вызывающим
+    кодом — единственная точка приобретения locks в этом модуле. Держится
+    ДО первого storage I/O операции и отпускается только после её полного
+    завершения (см. докстринг модуля, Tier 1/Tier 2)."""
+
+    __slots__ = ("_filenames",)
+
+    def __init__(self, *filenames: str):
+        self._filenames = tuple(sorted(set(filenames), key=_LOCK_ORDER.index))
+
+    async def __aenter__(self) -> "_StorageLock":
+        for name in self._filenames:
+            await _locks[name].acquire()
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb) -> None:
+        for name in reversed(self._filenames):
+            _locks[name].release()
+        return False
+
+
+def _lock(*filenames: str) -> _StorageLock:
+    return _StorageLock(*filenames)
+
+
 def _upstash_enabled() -> bool:
     return bool(config.UPSTASH_REDIS_REST_URL and config.UPSTASH_REDIS_REST_TOKEN)
 
@@ -83,6 +156,14 @@ def _upstash_command(*args: Any) -> Any:
     # содержимое файла: для leads.json — реальные контакты/payload
     # клиентов) и никогда сам токен (он есть только в headers запроса,
     # в лог не попадает).
+    #
+    # Остаётся ПОЛНОСТЬЮ синхронной (P1-1 design review, часть "ASYNC
+    # STORAGE LAYER"): единственный async boundary — await asyncio.to_thread
+    # вокруг ВЫЗОВА этой функции (см. _read/_write/ensure_storage_initialized
+    # ниже), не переписывание её внутренней urllib-реализации. Никакого
+    # module-level mutable state здесь нет (request собирается заново на
+    # каждый вызов, ничего не переиспользуется между вызовами) — вызывать её
+    # из worker-треда asyncio.to_thread безопасно без дополнительных мер.
     command = args[0]
     key = args[1] if len(args) > 1 else None
     req = urllib.request.Request(
@@ -124,12 +205,12 @@ def _write_local(filename: str, data: Any) -> None:
         raise
 
 
-def _read(filename: str) -> Any:
+async def _read(filename: str) -> Any:
     if not _upstash_enabled():
         return _read_local(filename)
-    raw = _upstash_command("GET", filename)
+    raw = await asyncio.to_thread(_upstash_command, "GET", filename)
     if raw is None:
-        if _upstash_command("GET", MARKER_KEY) is not None:
+        if await asyncio.to_thread(_upstash_command, "GET", MARKER_KEY) is not None:
             # MARKER_KEY есть — значит хранилище уже было полностью
             # инициализировано раньше (см. ensure_storage_initialized), а
             # значит "ключа нет" здесь означает не "ещё не создан", а
@@ -143,33 +224,29 @@ def _read(filename: str) -> Any:
         # инициализации, что и в ensure_storage_initialized, безопасно
         # досеять именно этот файл.
         data = _read_local(filename)
-        _upstash_command("SET", filename, json.dumps(data, ensure_ascii=False))
+        await asyncio.to_thread(_upstash_command, "SET", filename, json.dumps(data, ensure_ascii=False))
         return data
     return json.loads(raw)
 
 
-def _write(filename: str, data: Any) -> None:
+async def _write(filename: str, data: Any) -> None:
     if not _upstash_enabled():
         _write_local(filename, data)
         return
-    _upstash_command("SET", filename, json.dumps(data, ensure_ascii=False))
+    await asyncio.to_thread(_upstash_command, "SET", filename, json.dumps(data, ensure_ascii=False))
 
 
 async def read_async(filename: str) -> Any:
-    """Тонкая asyncio.to_thread-обёртка вокруг _read — НЕ часть общей async-
-    миграции content_store (P1-1, production-hardening аудит, отдельная,
-    ещё не реализованная задача). Единственная цель: дать
-    webserver.py::handle_public_data читать ИЗ ТОГО ЖЕ backend, что и /admin
-    (Upstash, если включён, иначе локальный файл — то есть ровно то же
-    ветвление, что уже внутри _read), не блокируя event loop этим одним
-    вызовом, и не переписывая остальные ~50 синхронных функций хранилища.
-    Когда P1-1 будет реализована для content_store целиком, эта обёртка
-    станет не нужна — вызывающий код сможет просто await content_store._read
+    """Публичная точка входа для webserver.py::handle_public_data (Block
+    2A) — теперь просто тонкий alias для _read, которая сама уже async и
+    сама уже не блокирует event loop (P1-1 миграция). Единственный
+    вызывающий код — handle_public_data; больше нигде использовать не
+    нужно, публичный async-доступ ко ВСЕМ функциям хранилища теперь есть
     напрямую."""
-    return await asyncio.to_thread(_read, filename)
+    return await _read(filename)
 
 
-def ensure_storage_initialized() -> None:
+async def ensure_storage_initialized() -> None:
     """Вызывается один раз при старте процесса (bot/main.py::main), ДО
     начала обработки апдейтов/HTTP-запросов. Eager batch-сид всех
     DATA_FILENAMES под единым persistent MARKER_KEY — решает гонку, которую
@@ -189,21 +266,25 @@ def ensure_storage_initialized() -> None:
     только если GET вернул None) — на уже работающей production-базе, где
     все 6 ключей реальны, это делает вызов идемпотентным no-op'ом,
     добавляющим только сам marker (безопасная миграция для уже
-    задеплоенных инстансов, см. production-hardening аудит, P0-1)."""
+    задеплоенных инстансов, см. production-hardening аудит, P0-1).
+
+    Без per-key locks: выполняется до site.start()/dp.start_polling(),
+    когда конкурентного трафика ещё физически нет — блокировать здесь
+    нечего от чего защищать (P1-1 design review)."""
     if not _upstash_enabled():
         return
     logger.info("Storage: startup initialization started")
     try:
-        if _upstash_command("GET", MARKER_KEY) is not None:
+        if await asyncio.to_thread(_upstash_command, "GET", MARKER_KEY) is not None:
             logger.info("Storage: marker already present, skipping seed")
             return
         seeded = []
         for filename in DATA_FILENAMES:
-            if _upstash_command("GET", filename) is None:
+            if await asyncio.to_thread(_upstash_command, "GET", filename) is None:
                 data = _read_local(filename)
-                _upstash_command("SET", filename, json.dumps(data, ensure_ascii=False))
+                await asyncio.to_thread(_upstash_command, "SET", filename, json.dumps(data, ensure_ascii=False))
                 seeded.append(filename)
-        _upstash_command("SET", MARKER_KEY, datetime.now(timezone.utc).isoformat())
+        await asyncio.to_thread(_upstash_command, "SET", MARKER_KEY, datetime.now(timezone.utc).isoformat())
     except Exception:
         logger.exception("Upstash initialization failed")
         raise
@@ -212,16 +293,16 @@ def ensure_storage_initialized() -> None:
 
 # ---- Кейсы портфолио (чтение — без ограничений, пишет только в Mini App/бота) ----
 
-def list_cases() -> list[dict]:
-    return _read("portfolio.json")["cases"]
+async def list_cases() -> list[dict]:
+    return (await _read("portfolio.json"))["cases"]
 
 
-def list_portfolio_types() -> list[dict]:
-    return _read("portfolio.json")["types"]
+async def list_portfolio_types() -> list[dict]:
+    return (await _read("portfolio.json"))["types"]
 
 
-def next_case_id() -> str:
-    cases = list_cases()
+async def next_case_id() -> str:
+    cases = await list_cases()
     nums = []
     for c in cases:
         if c["id"].startswith("case_"):
@@ -232,128 +313,135 @@ def next_case_id() -> str:
     return f"case_{max(nums, default=0) + 1}"
 
 
-def add_case(actor_chat_id: int | str, *, case_id: str, title: str, type_id: str, cover: str, task: str, related_service: str | None) -> dict:
+async def add_case(actor_chat_id: int | str, *, case_id: str, title: str, type_id: str, cover: str, task: str, related_service: str | None) -> dict:
     _require_designer(actor_chat_id)
-    data = _read("portfolio.json")
-    case = {
-        "id": case_id,
-        "title": title,
-        "type": type_id,
-        "cover": cover,
-        "images": [cover],
-        "task": task,
-        "solution": "",
-        "result": "",
-        "related_service": related_service,
-    }
-    data["cases"].append(case)
-    _write("portfolio.json", data)
-    return case
+    async with _lock("portfolio.json"):
+        data = await _read("portfolio.json")
+        case = {
+            "id": case_id,
+            "title": title,
+            "type": type_id,
+            "cover": cover,
+            "images": [cover],
+            "task": task,
+            "solution": "",
+            "result": "",
+            "related_service": related_service,
+        }
+        data["cases"].append(case)
+        await _write("portfolio.json", data)
+        return case
 
 
-def update_case(actor_chat_id: int | str, case_id: str, **fields: Any) -> bool:
+async def update_case(actor_chat_id: int | str, case_id: str, **fields: Any) -> bool:
     """"cover" через это поле — быстрый путь "загрузить новую обложку":
     новое фото ДОБАВЛЯЕТСЯ в галерею (images) и становится cover, но не
     стирает остальные изображения кейса — за полным управлением галереей
     (добавить/удалить/переставить/назначить обложку без загрузки) см.
     add_case_image / remove_case_image / reorder_case_image / set_case_cover."""
     _require_designer(actor_chat_id)
-    data = _read("portfolio.json")
-    for c in data["cases"]:
-        if c["id"] == case_id:
-            c.update(fields)
-            if "cover" in fields:
-                images = c.setdefault("images", [])
-                if fields["cover"] not in images:
-                    images.append(fields["cover"])
-            _write("portfolio.json", data)
-            return True
-    return False
+    async with _lock("portfolio.json"):
+        data = await _read("portfolio.json")
+        for c in data["cases"]:
+            if c["id"] == case_id:
+                c.update(fields)
+                if "cover" in fields:
+                    images = c.setdefault("images", [])
+                    if fields["cover"] not in images:
+                        images.append(fields["cover"])
+                await _write("portfolio.json", data)
+                return True
+        return False
 
 
 def _find_case(data: dict, case_id: str) -> dict | None:
     return next((c for c in data["cases"] if c["id"] == case_id), None)
 
 
-def add_case_image(actor_chat_id: int | str, case_id: str, image_path: str, *, set_as_cover: bool = False) -> bool:
+async def add_case_image(actor_chat_id: int | str, case_id: str, image_path: str, *, set_as_cover: bool = False) -> bool:
     _require_designer(actor_chat_id)
-    data = _read("portfolio.json")
-    case = _find_case(data, case_id)
-    if case is None:
-        return False
-    images = case.setdefault("images", [])
-    if image_path not in images:
-        images.append(image_path)
-    if set_as_cover or not case.get("cover"):
-        case["cover"] = image_path
-    _write("portfolio.json", data)
-    return True
+    async with _lock("portfolio.json"):
+        data = await _read("portfolio.json")
+        case = _find_case(data, case_id)
+        if case is None:
+            return False
+        images = case.setdefault("images", [])
+        if image_path not in images:
+            images.append(image_path)
+        if set_as_cover or not case.get("cover"):
+            case["cover"] = image_path
+        await _write("portfolio.json", data)
+        return True
 
 
-def remove_case_image(actor_chat_id: int | str, case_id: str, image_path: str) -> bool:
+async def remove_case_image(actor_chat_id: int | str, case_id: str, image_path: str) -> bool:
     """Если удаляемое изображение было обложкой — обложка автоматически
     переходит на первое оставшееся; если изображений не осталось вовсе —
     cover становится None (Mini App показывает пустое состояние, не
     сломанную картинку — см. renderCase())."""
     _require_designer(actor_chat_id)
-    data = _read("portfolio.json")
-    case = _find_case(data, case_id)
-    if case is None or image_path not in case.get("images", []):
-        return False
-    case["images"] = [i for i in case["images"] if i != image_path]
-    if case.get("cover") == image_path:
-        case["cover"] = case["images"][0] if case["images"] else None
-    _write("portfolio.json", data)
-    return True
+    async with _lock("portfolio.json"):
+        data = await _read("portfolio.json")
+        case = _find_case(data, case_id)
+        if case is None or image_path not in case.get("images", []):
+            return False
+        case["images"] = [i for i in case["images"] if i != image_path]
+        if case.get("cover") == image_path:
+            case["cover"] = case["images"][0] if case["images"] else None
+        await _write("portfolio.json", data)
+        return True
 
 
-def reorder_case_image(actor_chat_id: int | str, case_id: str, image_path: str, direction: str) -> bool:
+async def reorder_case_image(actor_chat_id: int | str, case_id: str, image_path: str, direction: str) -> bool:
     """direction: "up" (раньше в галерее) | "down" (позже)."""
     _require_designer(actor_chat_id)
-    data = _read("portfolio.json")
-    case = _find_case(data, case_id)
-    if case is None or image_path not in case.get("images", []):
-        return False
-    images = case["images"]
-    i = images.index(image_path)
-    j = i - 1 if direction == "up" else i + 1
-    if j < 0 or j >= len(images):
-        return False
-    images[i], images[j] = images[j], images[i]
-    _write("portfolio.json", data)
-    return True
+    async with _lock("portfolio.json"):
+        data = await _read("portfolio.json")
+        case = _find_case(data, case_id)
+        if case is None or image_path not in case.get("images", []):
+            return False
+        images = case["images"]
+        i = images.index(image_path)
+        j = i - 1 if direction == "up" else i + 1
+        if j < 0 or j >= len(images):
+            return False
+        images[i], images[j] = images[j], images[i]
+        await _write("portfolio.json", data)
+        return True
 
 
-def set_case_cover(actor_chat_id: int | str, case_id: str, image_path: str) -> bool:
+async def set_case_cover(actor_chat_id: int | str, case_id: str, image_path: str) -> bool:
     _require_designer(actor_chat_id)
-    data = _read("portfolio.json")
-    case = _find_case(data, case_id)
-    if case is None or image_path not in case.get("images", []):
-        return False
-    case["cover"] = image_path
-    _write("portfolio.json", data)
-    return True
+    async with _lock("portfolio.json"):
+        data = await _read("portfolio.json")
+        case = _find_case(data, case_id)
+        if case is None or image_path not in case.get("images", []):
+            return False
+        case["cover"] = image_path
+        await _write("portfolio.json", data)
+        return True
 
 
-def update_case_category(actor_chat_id: int | str, case_id: str, new_type_id: str) -> bool:
+async def update_case_category(actor_chat_id: int | str, case_id: str, new_type_id: str) -> bool:
     """Меняет категорию существующего кейса — раньше это было возможно
     только при создании. related_service подставляется из дефолта НОВОЙ
     категории только если у кейса он либо не задан, либо совпадал с
     дефолтом СТАРОЙ категории (то есть ранее не был выбран вручную) —
     осознанно выбранная связь с услугой при смене категории не стирается."""
     _require_designer(actor_chat_id)
-    data = _read("portfolio.json")
-    case = _find_case(data, case_id)
-    if case is None:
-        return False
-    old_type_id = case.get("type")
-    old_default = next((t.get("related_service") for t in data["types"] if t["id"] == old_type_id), None)
-    new_default = next((t.get("related_service") for t in data["types"] if t["id"] == new_type_id), None)
-    if not case.get("related_service") or case.get("related_service") == old_default:
-        case["related_service"] = new_default
-    case["type"] = new_type_id
-    _write("portfolio.json", data)
-    return True
+    async with _lock("portfolio.json"):
+        data = await _read("portfolio.json")
+        case = _find_case(data, case_id)
+        if case is None:
+            return False
+        old_type_id = case.get("type")
+        old_default = next((t.get("related_service") for t in data["types"] if t["id"] == old_type_id), None)
+        new_default = next((t.get("related_service") for t in data["types"] if t["id"] == new_type_id), None)
+        if not case.get("related_service") or case.get("related_service") == old_default:
+            case["related_service"] = new_default
+        case["type"] = new_type_id
+        await _write("portfolio.json", data)
+        return True
 
 
 # ---- Разделы содержимого кейса (sections) ----
@@ -362,74 +450,79 @@ def update_case_category(actor_chat_id: int | str, case_id: str, new_type_id: st
 # sections (пока не мигрированы) продолжают рендериться по task/solution/
 # result как раньше — см. backward-compatible рендер в webapp/js/app.js.
 
-def add_case_section(actor_chat_id: int | str, case_id: str, *, section_type: str, title: str, content: str = "", images: list[str] | None = None) -> bool:
+async def add_case_section(actor_chat_id: int | str, case_id: str, *, section_type: str, title: str, content: str = "", images: list[str] | None = None) -> bool:
     _require_designer(actor_chat_id)
-    data = _read("portfolio.json")
-    case = _find_case(data, case_id)
-    if case is None:
-        return False
-    section: dict[str, Any] = {"type": section_type, "title": title}
-    if section_type == "gallery":
-        section["images"] = images or []
-    else:
-        section["content"] = content
-    case.setdefault("sections", []).append(section)
-    _write("portfolio.json", data)
-    return True
+    async with _lock("portfolio.json"):
+        data = await _read("portfolio.json")
+        case = _find_case(data, case_id)
+        if case is None:
+            return False
+        section: dict[str, Any] = {"type": section_type, "title": title}
+        if section_type == "gallery":
+            section["images"] = images or []
+        else:
+            section["content"] = content
+        case.setdefault("sections", []).append(section)
+        await _write("portfolio.json", data)
+        return True
 
 
-def update_case_section(actor_chat_id: int | str, case_id: str, index: int, **fields: Any) -> bool:
+async def update_case_section(actor_chat_id: int | str, case_id: str, index: int, **fields: Any) -> bool:
     _require_designer(actor_chat_id)
-    data = _read("portfolio.json")
-    case = _find_case(data, case_id)
-    if case is None:
-        return False
-    sections = case.get("sections", [])
-    if not (0 <= index < len(sections)):
-        return False
-    sections[index].update(fields)
-    _write("portfolio.json", data)
-    return True
+    async with _lock("portfolio.json"):
+        data = await _read("portfolio.json")
+        case = _find_case(data, case_id)
+        if case is None:
+            return False
+        sections = case.get("sections", [])
+        if not (0 <= index < len(sections)):
+            return False
+        sections[index].update(fields)
+        await _write("portfolio.json", data)
+        return True
 
 
-def delete_case_section(actor_chat_id: int | str, case_id: str, index: int) -> bool:
+async def delete_case_section(actor_chat_id: int | str, case_id: str, index: int) -> bool:
     _require_designer(actor_chat_id)
-    data = _read("portfolio.json")
-    case = _find_case(data, case_id)
-    if case is None:
-        return False
-    sections = case.get("sections", [])
-    if not (0 <= index < len(sections)):
-        return False
-    del sections[index]
-    _write("portfolio.json", data)
-    return True
+    async with _lock("portfolio.json"):
+        data = await _read("portfolio.json")
+        case = _find_case(data, case_id)
+        if case is None:
+            return False
+        sections = case.get("sections", [])
+        if not (0 <= index < len(sections)):
+            return False
+        del sections[index]
+        await _write("portfolio.json", data)
+        return True
 
 
-def reorder_case_section(actor_chat_id: int | str, case_id: str, index: int, direction: str) -> bool:
+async def reorder_case_section(actor_chat_id: int | str, case_id: str, index: int, direction: str) -> bool:
     _require_designer(actor_chat_id)
-    data = _read("portfolio.json")
-    case = _find_case(data, case_id)
-    if case is None:
-        return False
-    sections = case.get("sections", [])
-    j = index - 1 if direction == "up" else index + 1
-    if not (0 <= index < len(sections)) or not (0 <= j < len(sections)):
-        return False
-    sections[index], sections[j] = sections[j], sections[index]
-    _write("portfolio.json", data)
-    return True
+    async with _lock("portfolio.json"):
+        data = await _read("portfolio.json")
+        case = _find_case(data, case_id)
+        if case is None:
+            return False
+        sections = case.get("sections", [])
+        j = index - 1 if direction == "up" else index + 1
+        if not (0 <= index < len(sections)) or not (0 <= j < len(sections)):
+            return False
+        sections[index], sections[j] = sections[j], sections[index]
+        await _write("portfolio.json", data)
+        return True
 
 
-def delete_case(actor_chat_id: int | str, case_id: str) -> bool:
+async def delete_case(actor_chat_id: int | str, case_id: str) -> bool:
     _require_designer(actor_chat_id)
-    data = _read("portfolio.json")
-    before = len(data["cases"])
-    data["cases"] = [c for c in data["cases"] if c["id"] != case_id]
-    if len(data["cases"]) == before:
-        return False
-    _write("portfolio.json", data)
-    return True
+    async with _lock("portfolio.json"):
+        data = await _read("portfolio.json")
+        before = len(data["cases"])
+        data["cases"] = [c for c in data["cases"] if c["id"] != case_id]
+        if len(data["cases"]) == before:
+            return False
+        await _write("portfolio.json", data)
+        return True
 
 
 async def save_case_photo(actor_chat_id: int | str, bot: Any, file_id: str, case_id: str) -> str:
@@ -444,88 +537,95 @@ async def save_case_photo(actor_chat_id: int | str, bot: Any, file_id: str, case
 
 # ---- FAQ ----
 
-def list_faq() -> list[dict]:
-    return _read("faq.json")["faq"]
+async def list_faq() -> list[dict]:
+    return (await _read("faq.json"))["faq"]
 
 
-def add_faq(actor_chat_id: int | str, question: str, answer: str) -> dict:
+async def add_faq(actor_chat_id: int | str, question: str, answer: str) -> dict:
     _require_designer(actor_chat_id)
-    data = _read("faq.json")
-    new_id = max((i["id"] for i in data["faq"]), default=0) + 1
-    item = {"id": new_id, "question": question, "type": "static", "answer": answer, "needs_review": False}
-    data["faq"].append(item)
-    _write("faq.json", data)
-    return item
+    async with _lock("faq.json"):
+        data = await _read("faq.json")
+        new_id = max((i["id"] for i in data["faq"]), default=0) + 1
+        item = {"id": new_id, "question": question, "type": "static", "answer": answer, "needs_review": False}
+        data["faq"].append(item)
+        await _write("faq.json", data)
+        return item
 
 
-def update_faq(actor_chat_id: int | str, faq_id: int, **fields: Any) -> bool:
+async def update_faq(actor_chat_id: int | str, faq_id: int, **fields: Any) -> bool:
     _require_designer(actor_chat_id)
-    data = _read("faq.json")
-    for item in data["faq"]:
-        if item["id"] == faq_id:
-            item.update(fields)
-            item["needs_review"] = False
-            _write("faq.json", data)
-            return True
-    return False
-
-
-def delete_faq(actor_chat_id: int | str, faq_id: int) -> bool:
-    _require_designer(actor_chat_id)
-    data = _read("faq.json")
-    before = len(data["faq"])
-    data["faq"] = [i for i in data["faq"] if i["id"] != faq_id]
-    if len(data["faq"]) == before:
+    async with _lock("faq.json"):
+        data = await _read("faq.json")
+        for item in data["faq"]:
+            if item["id"] == faq_id:
+                item.update(fields)
+                item["needs_review"] = False
+                await _write("faq.json", data)
+                return True
         return False
-    _write("faq.json", data)
-    return True
+
+
+async def delete_faq(actor_chat_id: int | str, faq_id: int) -> bool:
+    _require_designer(actor_chat_id)
+    async with _lock("faq.json"):
+        data = await _read("faq.json")
+        before = len(data["faq"])
+        data["faq"] = [i for i in data["faq"] if i["id"] != faq_id]
+        if len(data["faq"]) == before:
+            return False
+        await _write("faq.json", data)
+        return True
 
 
 # ---- Обо мне ----
 
-def get_about() -> dict:
-    return _read("about.json")
+async def get_about() -> dict:
+    return await _read("about.json")
 
 
-def update_about_field(actor_chat_id: int | str, field: str, value: Any) -> bool:
+async def update_about_field(actor_chat_id: int | str, field: str, value: Any) -> bool:
     _require_designer(actor_chat_id)
-    data = _read("about.json")
-    if field not in data:
-        return False
-    data[field] = value
-    data["needs_review_fields"] = [f for f in data.get("needs_review_fields", []) if f != field]
-    _write("about.json", data)
-    return True
+    async with _lock("about.json"):
+        data = await _read("about.json")
+        if field not in data:
+            return False
+        data[field] = value
+        data["needs_review_fields"] = [f for f in data.get("needs_review_fields", []) if f != field]
+        await _write("about.json", data)
+        return True
 
 
-def add_about_experience(actor_chat_id: int | str, *, role: str, company: str, period: str, description: str = "") -> bool:
+async def add_about_experience(actor_chat_id: int | str, *, role: str, company: str, period: str, description: str = "") -> bool:
     _require_designer(actor_chat_id)
-    data = _read("about.json")
-    data.setdefault("experience", []).append({"role": role, "company": company, "period": period, "description": description})
-    _write("about.json", data)
-    return True
+    async with _lock("about.json"):
+        data = await _read("about.json")
+        data.setdefault("experience", []).append({"role": role, "company": company, "period": period, "description": description})
+        await _write("about.json", data)
+        return True
 
 
-def update_about_experience(actor_chat_id: int | str, index: int, **fields: Any) -> bool:
+async def update_about_experience(actor_chat_id: int | str, index: int, **fields: Any) -> bool:
     _require_designer(actor_chat_id)
-    data = _read("about.json")
-    entries = data.get("experience", [])
-    if not (0 <= index < len(entries)):
-        return False
-    entries[index].update(fields)
-    _write("about.json", data)
-    return True
+    async with _lock("about.json"):
+        data = await _read("about.json")
+        entries = data.get("experience", [])
+        if not (0 <= index < len(entries)):
+            return False
+        entries[index].update(fields)
+        await _write("about.json", data)
+        return True
 
 
-def delete_about_experience(actor_chat_id: int | str, index: int) -> bool:
+async def delete_about_experience(actor_chat_id: int | str, index: int) -> bool:
     _require_designer(actor_chat_id)
-    data = _read("about.json")
-    entries = data.get("experience", [])
-    if not (0 <= index < len(entries)):
-        return False
-    del entries[index]
-    _write("about.json", data)
-    return True
+    async with _lock("about.json"):
+        data = await _read("about.json")
+        entries = data.get("experience", [])
+        if not (0 <= index < len(entries)):
+            return False
+        del entries[index]
+        await _write("about.json", data)
+        return True
 
 
 async def save_about_photo(actor_chat_id: int | str, bot: Any, file_id: str) -> str:
@@ -540,19 +640,19 @@ async def save_about_photo(actor_chat_id: int | str, bot: Any, file_id: str) -> 
 
 # ---- Услуги калькулятора ----
 
-def list_services() -> list[dict]:
-    return _read("pricing.json")["services"]
+async def list_services() -> list[dict]:
+    return (await _read("pricing.json"))["services"]
 
 
-def get_service(service_id: str) -> dict | None:
-    return next((s for s in list_services() if s["id"] == service_id), None)
+async def get_service(service_id: str) -> dict | None:
+    return next((s for s in await list_services() if s["id"] == service_id), None)
 
 
-def next_service_id() -> str:
+async def next_service_id() -> str:
     """Встроенные услуги (LEND, SITE...) имеют смысловые id — для новых,
     добавленных админом, генерируем нейтральный SVC_N, чтобы не гадать с
     транслитерацией названия."""
-    data = _read("pricing.json")
+    data = await _read("pricing.json")
     nums = []
     for s in data["services"]:
         if s["id"].startswith("SVC_"):
@@ -563,73 +663,85 @@ def next_service_id() -> str:
     return f"SVC_{max(nums, default=0) + 1}"
 
 
-def add_service(actor_chat_id: int | str, *, service_id: str, name: str, base_price: float, term_min: float, term_max: float, includes: str) -> dict:
+async def add_service(actor_chat_id: int | str, *, service_id: str, name: str, base_price: float, term_min: float, term_max: float, includes: str) -> dict:
     _require_designer(actor_chat_id)
-    data = _read("pricing.json")
-    service = {
-        "id": service_id,
-        "name": name,
-        "base_price": base_price,
-        "term_min": term_min,
-        "term_max": term_max,
-        "includes": includes,
-    }
-    data["services"].append(service)
-    _write("pricing.json", data)
-    return service
+    async with _lock("pricing.json"):
+        data = await _read("pricing.json")
+        service = {
+            "id": service_id,
+            "name": name,
+            "base_price": base_price,
+            "term_min": term_min,
+            "term_max": term_max,
+            "includes": includes,
+        }
+        data["services"].append(service)
+        await _write("pricing.json", data)
+        return service
 
 
-def update_service(actor_chat_id: int | str, service_id: str, **fields: Any) -> bool:
+async def update_service(actor_chat_id: int | str, service_id: str, **fields: Any) -> bool:
     _require_designer(actor_chat_id)
-    data = _read("pricing.json")
-    for s in data["services"]:
-        if s["id"] == service_id:
-            s.update(fields)
-            _write("pricing.json", data)
-            return True
-    return False
+    async with _lock("pricing.json"):
+        data = await _read("pricing.json")
+        for s in data["services"]:
+            if s["id"] == service_id:
+                s.update(fields)
+                await _write("pricing.json", data)
+                return True
+        return False
 
 
-def delete_service(actor_chat_id: int | str, service_id: str) -> bool:
+async def delete_service(actor_chat_id: int | str, service_id: str) -> bool:
     """Удаляет услугу вместе с её опциями. Кейсы портфолио и категории
     портфолио, ссылавшиеся на неё через related_service, не удаляются —
     просто теряют автоподстановку услуги (related_service -> None), и там,
     и там: иначе после удаления услуги в data остался бы related_service,
-    указывающий на несуществующую услугу — referential integrity."""
-    _require_designer(actor_chat_id)
-    data = _read("pricing.json")
-    before = len(data["services"])
-    data["services"] = [s for s in data["services"] if s["id"] != service_id]
-    if len(data["services"]) == before:
-        return False
-    data["options"] = [o for o in data["options"] if o["service_id"] != service_id]
-    for g in data.get("groups", []):
-        g["service_ids"] = [sid for sid in g["service_ids"] if sid != service_id]
-    _write("pricing.json", data)
+    указывающий на несуществующую услугу — referential integrity.
 
-    portfolio = _read("portfolio.json")
-    changed = False
-    for c in portfolio["cases"]:
-        if c.get("related_service") == service_id:
-            c["related_service"] = None
-            changed = True
-    for t in portfolio["types"]:
-        if t.get("related_service") == service_id:
-            t["related_service"] = None
-            changed = True
-    if changed:
-        _write("portfolio.json", portfolio)
-    return True
+    Multi-key (Tier 2, P1-1/P2-7 design review): pricing.json И
+    portfolio.json — оба лока приобретаются ДО первого чтения, в
+    каноническом порядке (portfolio раньше pricing в _LOCK_ORDER), хотя
+    сама бизнес-логика по-прежнему обрабатывает pricing.json первым —
+    порядок приобретения locks и порядок I/O намеренно разные (см. докстринг
+    модуля): конкурентный reader не может увидеть состояние "услуга уже
+    удалена из pricing.json, но related_service в portfolio.json ещё не
+    обнулён"."""
+    _require_designer(actor_chat_id)
+    async with _lock("portfolio.json", "pricing.json"):
+        data = await _read("pricing.json")
+        before = len(data["services"])
+        data["services"] = [s for s in data["services"] if s["id"] != service_id]
+        if len(data["services"]) == before:
+            return False
+        data["options"] = [o for o in data["options"] if o["service_id"] != service_id]
+        for g in data.get("groups", []):
+            g["service_ids"] = [sid for sid in g["service_ids"] if sid != service_id]
+        await _write("pricing.json", data)
+
+        portfolio = await _read("portfolio.json")
+        changed = False
+        for c in portfolio["cases"]:
+            if c.get("related_service") == service_id:
+                c["related_service"] = None
+                changed = True
+        for t in portfolio["types"]:
+            if t.get("related_service") == service_id:
+                t["related_service"] = None
+                changed = True
+        if changed:
+            await _write("portfolio.json", portfolio)
+        return True
 
 
 # ---- Опции услуг ----
 
-def list_options(service_id: str) -> list[dict]:
-    return [o for o in _read("pricing.json")["options"] if o["service_id"] == service_id]
+async def list_options(service_id: str) -> list[dict]:
+    return [o for o in (await _read("pricing.json"))["options"] if o["service_id"] == service_id]
 
 
-def next_option_id(service_id: str) -> str:
-    data = _read("pricing.json")
+async def next_option_id(service_id: str) -> str:
+    data = await _read("pricing.json")
     nums = []
     prefix = f"{service_id}_"
     for o in data["options"]:
@@ -641,99 +753,105 @@ def next_option_id(service_id: str) -> str:
     return f"{prefix}{max(nums, default=0) + 1}"
 
 
-def add_option(actor_chat_id: int | str, *, option_id: str, service_id: str, name: str, price: float, days: float, multipliable: bool) -> dict:
+async def add_option(actor_chat_id: int | str, *, option_id: str, service_id: str, name: str, price: float, days: float, multipliable: bool) -> dict:
     _require_designer(actor_chat_id)
-    data = _read("pricing.json")
-    option = {
-        "service_id": service_id,
-        "id": option_id,
-        "name": name,
-        "price": price,
-        "days": days,
-        "multipliable": multipliable,
-    }
-    data["options"].append(option)
-    _write("pricing.json", data)
-    return option
+    async with _lock("pricing.json"):
+        data = await _read("pricing.json")
+        option = {
+            "service_id": service_id,
+            "id": option_id,
+            "name": name,
+            "price": price,
+            "days": days,
+            "multipliable": multipliable,
+        }
+        data["options"].append(option)
+        await _write("pricing.json", data)
+        return option
 
 
-def update_option(actor_chat_id: int | str, option_id: str, **fields: Any) -> bool:
+async def update_option(actor_chat_id: int | str, option_id: str, **fields: Any) -> bool:
     _require_designer(actor_chat_id)
-    data = _read("pricing.json")
-    for o in data["options"]:
-        if o["id"] == option_id:
-            o.update(fields)
-            _write("pricing.json", data)
-            return True
-    return False
-
-
-def delete_option(actor_chat_id: int | str, option_id: str) -> bool:
-    _require_designer(actor_chat_id)
-    data = _read("pricing.json")
-    before = len(data["options"])
-    data["options"] = [o for o in data["options"] if o["id"] != option_id]
-    if len(data["options"]) == before:
+    async with _lock("pricing.json"):
+        data = await _read("pricing.json")
+        for o in data["options"]:
+            if o["id"] == option_id:
+                o.update(fields)
+                await _write("pricing.json", data)
+                return True
         return False
-    _write("pricing.json", data)
-    return True
+
+
+async def delete_option(actor_chat_id: int | str, option_id: str) -> bool:
+    _require_designer(actor_chat_id)
+    async with _lock("pricing.json"):
+        data = await _read("pricing.json")
+        before = len(data["options"])
+        data["options"] = [o for o in data["options"] if o["id"] != option_id]
+        if len(data["options"]) == before:
+            return False
+        await _write("pricing.json", data)
+        return True
 
 
 # ---- Коэффициенты и округление вилки ----
 
-def get_pricing_rules() -> dict:
-    data = _read("pricing.json")
+async def get_pricing_rules() -> dict:
+    data = await _read("pricing.json")
     return {"coefficients": data["coefficients"], "rounding": data["rounding"]}
 
 
-def update_coefficient(actor_chat_id: int | str, key: str, multiplier: float) -> bool:
+async def update_coefficient(actor_chat_id: int | str, key: str, multiplier: float) -> bool:
     _require_designer(actor_chat_id)
-    data = _read("pricing.json")
-    if key not in data["coefficients"]:
-        return False
-    data["coefficients"][key]["multiplier"] = multiplier
-    _write("pricing.json", data)
-    return True
+    async with _lock("pricing.json"):
+        data = await _read("pricing.json")
+        if key not in data["coefficients"]:
+            return False
+        data["coefficients"][key]["multiplier"] = multiplier
+        await _write("pricing.json", data)
+        return True
 
 
-def update_rounding(actor_chat_id: int | str, field: str, value: float) -> bool:
+async def update_rounding(actor_chat_id: int | str, field: str, value: float) -> bool:
     _require_designer(actor_chat_id)
-    data = _read("pricing.json")
-    if field not in data["rounding"]:
-        return False
-    data["rounding"][field] = value
-    _write("pricing.json", data)
-    return True
+    async with _lock("pricing.json"):
+        data = await _read("pricing.json")
+        if field not in data["rounding"]:
+            return False
+        data["rounding"][field] = value
+        await _write("pricing.json", data)
+        return True
 
 
 # ---- Категории портфолио ----
 
-def default_related_service_for_type(type_id: str) -> str | None:
+async def default_related_service_for_type(type_id: str) -> str | None:
     """Дефолтная услуга для новых кейсов в категории — читается из
     data/portfolio.json -> types[].related_service (задаётся в /admin ->
     Категории портфолио -> Похожая услуга). Раньше бралась из захардкоженного
     словаря TYPE_TO_SERVICE и не работала для категорий, добавленных через
     /admin -> Категории портфолио -> Добавить, у которых просто не было
     записи в этом словаре."""
-    for t in list_portfolio_types():
+    for t in await list_portfolio_types():
         if t["id"] == type_id:
             return t.get("related_service")
     return None
 
 
-def update_portfolio_type_related_service(actor_chat_id: int | str, type_id: str, related_service: str | None) -> bool:
+async def update_portfolio_type_related_service(actor_chat_id: int | str, type_id: str, related_service: str | None) -> bool:
     _require_designer(actor_chat_id)
-    data = _read("portfolio.json")
-    for t in data["types"]:
-        if t["id"] == type_id:
-            t["related_service"] = related_service
-            _write("portfolio.json", data)
-            return True
-    return False
+    async with _lock("portfolio.json"):
+        data = await _read("portfolio.json")
+        for t in data["types"]:
+            if t["id"] == type_id:
+                t["related_service"] = related_service
+                await _write("portfolio.json", data)
+                return True
+        return False
 
 
-def next_portfolio_type_id() -> str:
-    data = _read("portfolio.json")
+async def next_portfolio_type_id() -> str:
+    data = await _read("portfolio.json")
     nums = []
     for t in data["types"]:
         if t["id"].startswith("cat_"):
@@ -744,81 +862,99 @@ def next_portfolio_type_id() -> str:
     return f"cat_{max(nums, default=0) + 1}"
 
 
-def add_portfolio_type(actor_chat_id: int | str, *, type_id: str, label: str) -> dict:
+async def add_portfolio_type(actor_chat_id: int | str, *, type_id: str, label: str) -> dict:
     _require_designer(actor_chat_id)
-    data = _read("portfolio.json")
-    type_entry = {"id": type_id, "label": label, "related_service": None}
-    data["types"].append(type_entry)
-    _write("portfolio.json", data)
-    return type_entry
+    async with _lock("portfolio.json"):
+        data = await _read("portfolio.json")
+        type_entry = {"id": type_id, "label": label, "related_service": None}
+        data["types"].append(type_entry)
+        await _write("portfolio.json", data)
+        return type_entry
 
 
-def rename_portfolio_type(actor_chat_id: int | str, type_id: str, new_label: str) -> bool:
+async def rename_portfolio_type(actor_chat_id: int | str, type_id: str, new_label: str) -> bool:
     """Меняем только подпись, не id — иначе "type" во всех кейсах, которые
     уже используют эту категорию, перестанет на неё указывать."""
     _require_designer(actor_chat_id)
-    data = _read("portfolio.json")
-    for t in data["types"]:
-        if t["id"] == type_id:
-            t["label"] = new_label
-            _write("portfolio.json", data)
-            return True
-    return False
+    async with _lock("portfolio.json"):
+        data = await _read("portfolio.json")
+        for t in data["types"]:
+            if t["id"] == type_id:
+                t["label"] = new_label
+                await _write("portfolio.json", data)
+                return True
+        return False
 
 
-def count_cases_with_type(type_id: str) -> int:
-    return sum(1 for c in list_cases() if c["type"] == type_id)
+async def count_cases_with_type(type_id: str) -> int:
+    return sum(1 for c in await list_cases() if c["type"] == type_id)
 
 
-def delete_portfolio_type(actor_chat_id: int | str, type_id: str) -> bool:
+async def delete_portfolio_type(actor_chat_id: int | str, type_id: str) -> bool:
     """Отказывает, если категория ещё используется хоть одним кейсом —
     вызывающий код (admin.py) должен сначала проверить count_cases_with_type
-    и показать дизайнеру понятное сообщение, а не просто получить False."""
+    и показать дизайнеру понятное сообщение, а не просто получить False.
+
+    count_cases_with_type — tier-0 read, вызывается ДО приобретения
+    portfolio.json lock; сама запись ниже повторно проверяет актуальность
+    (before/after длины списка) на СВЕЖЕ прочитанных внутри лока данных —
+    тот же defensive-паттерн, что был и до этого рефакторинга (admin-действия
+    и так сериализованы SimpleEventIsolation per-chat, см. P1-1 design
+    review — второй параллельный delete/add одной и той же категории с
+    одного и того же DESIGNER_CHAT_ID физически невозможен)."""
     _require_designer(actor_chat_id)
-    if count_cases_with_type(type_id) > 0:
+    if await count_cases_with_type(type_id) > 0:
         return False
-    data = _read("portfolio.json")
-    before = len(data["types"])
-    data["types"] = [t for t in data["types"] if t["id"] != type_id]
-    if len(data["types"]) == before:
-        return False
-    _write("portfolio.json", data)
-    return True
+    async with _lock("portfolio.json"):
+        data = await _read("portfolio.json")
+        before = len(data["types"])
+        data["types"] = [t for t in data["types"] if t["id"] != type_id]
+        if len(data["types"]) == before:
+            return False
+        await _write("portfolio.json", data)
+        return True
 
 
 # ---- Видимость экранов (меню бота / таб-бар Mini App) ----
 
-def get_ui_config() -> dict:
-    return _read("ui_config.json")
+async def get_ui_config() -> dict:
+    return await _read("ui_config.json")
 
 
-def set_menu_item_enabled(actor_chat_id: int | str, key: str, enabled: bool) -> bool:
+async def set_menu_item_enabled(actor_chat_id: int | str, key: str, enabled: bool) -> bool:
     _require_designer(actor_chat_id)
-    data = _read("ui_config.json")
-    if key not in data["menu"]:
-        return False
-    data["menu"][key] = enabled
-    _write("ui_config.json", data)
-    return True
+    async with _lock("ui_config.json"):
+        data = await _read("ui_config.json")
+        if key not in data["menu"]:
+            return False
+        data["menu"][key] = enabled
+        await _write("ui_config.json", data)
+        return True
 
 
 # ---- Готовность контента к показу реальным клиентам ----
 
-def content_readiness_summary() -> dict:
+async def content_readiness_summary() -> dict:
     """Сводка незавершённого клиент-facing контента — кейсы с обложкой-
     заглушкой, незаполненные поля "Обо мне", вопросы FAQ без финального
     ответа. Используется в /admin (см. handlers/admin.py), чтобы дизайнер
     не пропустил, что часть контента ещё не готова к показу клиентам —
     сами данные (needs_review / needs_review_fields / путь заглушки) уже
-    существовали, но нигде не были собраны в одну сводку."""
-    placeholder_cases = sum(1 for c in list_cases() if "placeholder" in (c.get("cover") or ""))
-    about_pending = len(get_about().get("needs_review_fields", []))
-    faq_pending = sum(1 for i in list_faq() if i.get("needs_review"))
-    return {
-        "placeholder_cases": placeholder_cases,
-        "about_pending_fields": about_pending,
-        "faq_pending": faq_pending,
-    }
+    существовали, но нигде не были собраны в одну сводку.
+
+    Multi-key read-only (Tier 2, P1-1/P2-7 design review): portfolio.json +
+    about.json + faq.json — держим все три лока на время чтения, чтобы не
+    получить сводку, посчитанную по смеси до- и после-restore состояния
+    разных файлов, если backup restore случится ровно между тремя read."""
+    async with _lock("portfolio.json", "about.json", "faq.json"):
+        placeholder_cases = sum(1 for c in await list_cases() if "placeholder" in (c.get("cover") or ""))
+        about_pending = len((await get_about()).get("needs_review_fields", []))
+        faq_pending = sum(1 for i in await list_faq() if i.get("needs_review"))
+        return {
+            "placeholder_cases": placeholder_cases,
+            "about_pending_fields": about_pending,
+            "faq_pending": faq_pending,
+        }
 
 
 # ---- Заявки (leads) ----
@@ -847,15 +983,15 @@ class NotLeadOwnerError(Exception):
     совпадает с telegram.user_id заявки — попытка дополнить чужую заявку."""
 
 
-def _read_leads() -> list[dict]:
+async def _read_leads() -> list[dict]:
     try:
-        return _read("leads.json")["leads"]
+        return (await _read("leads.json"))["leads"]
     except FileNotFoundError:
         return []
 
 
-def _write_leads(leads: list[dict]) -> None:
-    _write("leads.json", {"leads": leads})
+async def _write_leads(leads: list[dict]) -> None:
+    await _write("leads.json", {"leads": leads})
 
 
 def _clear_other_awaiting(leads: list[dict], user_id: int, keep_lead_id: int) -> None:
@@ -866,14 +1002,19 @@ def _clear_other_awaiting(leads: list[dict], user_id: int, keep_lead_id: int) ->
     уйти не туда (см. аудит). Вместо угадывания в момент получения файла —
     не допускаем самого состояния неоднозначности: постановка новой заявки
     в ожидание файла всегда снимает ожидание со всех остальных заявок
-    этого же клиента."""
+    этого же клиента.
+
+    Синхронная (P1-1 design review): чистая мутация уже прочитанного в
+    памяти списка leads, никакого I/O — вызывается изнутри уже
+    приобретённого leads.json lock в add_lead/add_lead_supplement, не берёт
+    лок сама (не re-entrant-проблема, т.к. вообще не лочит)."""
     for l in leads:
         if l["id"] != keep_lead_id and l.get("telegram", {}).get("user_id") == user_id and l.get("awaiting_tz_file"):
             l["awaiting_tz_file"] = False
             l["awaiting_tz_file_source"] = None
 
 
-def add_lead(payload: dict, telegram: dict, calc_summary: dict | None = None, draft_id: str | None = None) -> dict:
+async def add_lead(payload: dict, telegram: dict, calc_summary: dict | None = None, draft_id: str | None = None) -> dict:
     """Вызывается и из bot/webserver.py::handle_create_lead (основной путь,
     authenticated HTTP), и из bot/handlers/webapp.py::handle_webapp_data
     (legacy sendData() — оставлен как fallback) — не требует
@@ -902,56 +1043,63 @@ def add_lead(payload: dict, telegram: dict, calc_summary: dict | None = None, dr
     см. find_lead_awaiting_file/mark_tz_file_received/record_lead_material
     ниже. awaiting_tz_file_source запоминает, каким действием клиент начал
     ждать файл ("new" — при создании заявки, "supplement" — из дополнения),
-    чтобы materials[].source был точным, а не предположением."""
-    leads = _read_leads()
-    awaiting_tz_file = bool(payload.get("attach_tz"))
-    if draft_id:
-        existing = next((l for l in leads if l.get("draft_id") == draft_id), None)
-        if existing is not None:
-            # draft_id — обычная строка из localStorage клиента, ничем не
-            # подписана. Без этой проверки чужой (совпавший или подобранный)
-            # draft_id тихо перезаписал бы payload/identity уже существующей
-            # заявки (см. production-аудит, P1-2) — тот же класс ошибки, что
-            # add_lead_supplement ниже уже ловит по lead_id; здесь то же самое
-            # для draft_id-апсерта. Ничего не меняем и не пишем при коллизии.
-            if existing.get("telegram", {}).get("user_id") != telegram.get("user_id"):
-                raise NotLeadOwnerError(existing["id"])
-            existing.update(
-                payload=payload,
-                telegram=telegram,
-                calc_summary=calc_summary,
-                awaiting_tz_file=awaiting_tz_file,
-                awaiting_tz_file_source=("new" if awaiting_tz_file else None),
-                updated_at=datetime.now(timezone.utc).isoformat(),
-            )
-            if awaiting_tz_file:
-                _clear_other_awaiting(leads, telegram["user_id"], existing["id"])
-            _write_leads(leads)
-            return {**existing, "created": False}
+    чтобы materials[].source был точным, а не предположением.
 
-    next_id = max((l["id"] for l in leads), default=0) + 1
-    lead = {
-        "id": next_id,
-        "draft_id": draft_id,
-        "status": "NEW",
-        "created_at": datetime.now(timezone.utc).isoformat(),
-        "updated_at": None,
-        "telegram": telegram,
-        "payload": payload,
-        "calc_summary": calc_summary,
-        "awaiting_tz_file": awaiting_tz_file,
-        "awaiting_tz_file_source": "new" if awaiting_tz_file else None,
-        "supplements": [],
-        "materials": [],
-    }
-    leads.append(lead)
-    if awaiting_tz_file:
-        _clear_other_awaiting(leads, telegram["user_id"], lead["id"])
-    _write_leads(leads)
-    return {**lead, "created": True}
+    Tier 1 (P1-1 design review): весь read-modify-write под ОДНИМ
+    приобретением leads.json lock, от _read_leads() до _write_leads()
+    включительно — без этого два конкурентных add_lead() с РАЗНЫМИ
+    draft_id могли бы оба вычислить один и тот же next_id из одного и того
+    же устаревшего списка и потерять одну из двух заявок (lost update)."""
+    async with _lock("leads.json"):
+        leads = await _read_leads()
+        awaiting_tz_file = bool(payload.get("attach_tz"))
+        if draft_id:
+            existing = next((l for l in leads if l.get("draft_id") == draft_id), None)
+            if existing is not None:
+                # draft_id — обычная строка из localStorage клиента, ничем не
+                # подписана. Без этой проверки чужой (совпавший или подобранный)
+                # draft_id тихо перезаписал бы payload/identity уже существующей
+                # заявки (см. production-аудит, P1-2) — тот же класс ошибки, что
+                # add_lead_supplement ниже уже ловит по lead_id; здесь то же самое
+                # для draft_id-апсерта. Ничего не меняем и не пишем при коллизии.
+                if existing.get("telegram", {}).get("user_id") != telegram.get("user_id"):
+                    raise NotLeadOwnerError(existing["id"])
+                existing.update(
+                    payload=payload,
+                    telegram=telegram,
+                    calc_summary=calc_summary,
+                    awaiting_tz_file=awaiting_tz_file,
+                    awaiting_tz_file_source=("new" if awaiting_tz_file else None),
+                    updated_at=datetime.now(timezone.utc).isoformat(),
+                )
+                if awaiting_tz_file:
+                    _clear_other_awaiting(leads, telegram["user_id"], existing["id"])
+                await _write_leads(leads)
+                return {**existing, "created": False}
+
+        next_id = max((l["id"] for l in leads), default=0) + 1
+        lead = {
+            "id": next_id,
+            "draft_id": draft_id,
+            "status": "NEW",
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "updated_at": None,
+            "telegram": telegram,
+            "payload": payload,
+            "calc_summary": calc_summary,
+            "awaiting_tz_file": awaiting_tz_file,
+            "awaiting_tz_file_source": "new" if awaiting_tz_file else None,
+            "supplements": [],
+            "materials": [],
+        }
+        leads.append(lead)
+        if awaiting_tz_file:
+            _clear_other_awaiting(leads, telegram["user_id"], lead["id"])
+        await _write_leads(leads)
+        return {**lead, "created": True}
 
 
-def add_lead_supplement(lead_id: int, telegram: dict, fields: dict, wants_file: bool = False) -> tuple[dict, int]:
+async def add_lead_supplement(lead_id: int, telegram: dict, fields: dict, wants_file: bool = False) -> tuple[dict, int]:
     """Дополнение к уже существующей заявке — НЕ трогает lead["payload"]
     (исходные ответы Order Builder остаются как есть), только добавляет
     append-only запись в lead["supplements"]. lead_id — единственный и
@@ -964,31 +1112,35 @@ def add_lead_supplement(lead_id: int, telegram: dict, fields: dict, wants_file: 
     же telegram.user_id, что уже сохранён на заявке (сам он туда попал из
     validate_init_data при создании), должен совпадать с текущим
     провалидированным user_id. LeadNotFoundError/NotLeadOwnerError — на
-    хендлере превращаются в 404/403, тело чужой заявки клиенту не видно."""
-    leads = _read_leads()
-    lead = next((l for l in leads if l["id"] == lead_id), None)
-    if lead is None:
-        raise LeadNotFoundError(lead_id)
-    if lead.get("telegram", {}).get("user_id") != telegram.get("user_id"):
-        raise NotLeadOwnerError(lead_id)
+    хендлере превращаются в 404 (унифицированный ответ, см. production-
+    аудит P2-11), тело чужой заявки клиенту не видно.
 
-    supplements = lead.setdefault("supplements", [])
-    next_supplement_id = max((s["id"] for s in supplements), default=0) + 1
-    supplements.append({
-        "id": next_supplement_id,
-        "created_at": datetime.now(timezone.utc).isoformat(),
-        "fields": fields,
-    })
-    lead["updated_at"] = datetime.now(timezone.utc).isoformat()
-    if wants_file:
-        lead["awaiting_tz_file"] = True
-        lead["awaiting_tz_file_source"] = "supplement"
-        _clear_other_awaiting(leads, telegram["user_id"], lead_id)
-    _write_leads(leads)
-    return lead, next_supplement_id
+    Tier 1: весь read-modify-write под одним leads.json lock."""
+    async with _lock("leads.json"):
+        leads = await _read_leads()
+        lead = next((l for l in leads if l["id"] == lead_id), None)
+        if lead is None:
+            raise LeadNotFoundError(lead_id)
+        if lead.get("telegram", {}).get("user_id") != telegram.get("user_id"):
+            raise NotLeadOwnerError(lead_id)
+
+        supplements = lead.setdefault("supplements", [])
+        next_supplement_id = max((s["id"] for s in supplements), default=0) + 1
+        supplements.append({
+            "id": next_supplement_id,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "fields": fields,
+        })
+        lead["updated_at"] = datetime.now(timezone.utc).isoformat()
+        if wants_file:
+            lead["awaiting_tz_file"] = True
+            lead["awaiting_tz_file_source"] = "supplement"
+            _clear_other_awaiting(leads, telegram["user_id"], lead_id)
+        await _write_leads(leads)
+        return lead, next_supplement_id
 
 
-def record_lead_material(lead_id: int, file_id: str, file_unique_id: str, kind: str, source: str) -> bool:
+async def record_lead_material(lead_id: int, file_id: str, file_unique_id: str, kind: str, source: str) -> bool:
     """Сохраняет метаданные присланного клиентом файла (document/photo) НА
     заявке — раньше файл только пересылался владельцу через message.forward()
     и нигде не сохранялся, связь "файл ↔ заявка" существовала лишь на
@@ -996,26 +1148,27 @@ def record_lead_material(lead_id: int, file_id: str, file_unique_id: str, kind: 
     файл по-прежнему не скачивается и не хранится нами — только Telegram
     file_id/file_unique_id, этого достаточно, чтобы позже получить файл
     заново через Bot API (getFile), без Google Drive/S3 на этом этапе."""
-    leads = _read_leads()
-    lead = next((l for l in leads if l["id"] == lead_id), None)
-    if lead is None:
-        return False
-    materials = lead.setdefault("materials", [])
-    materials.append({
-        "file_id": file_id,
-        "file_unique_id": file_unique_id,
-        "kind": kind,
-        "source": source,
-        "received_at": datetime.now(timezone.utc).isoformat(),
-    })
-    lead["awaiting_tz_file"] = False
-    lead["awaiting_tz_file_source"] = None
-    lead["updated_at"] = datetime.now(timezone.utc).isoformat()
-    _write_leads(leads)
-    return True
+    async with _lock("leads.json"):
+        leads = await _read_leads()
+        lead = next((l for l in leads if l["id"] == lead_id), None)
+        if lead is None:
+            return False
+        materials = lead.setdefault("materials", [])
+        materials.append({
+            "file_id": file_id,
+            "file_unique_id": file_unique_id,
+            "kind": kind,
+            "source": source,
+            "received_at": datetime.now(timezone.utc).isoformat(),
+        })
+        lead["awaiting_tz_file"] = False
+        lead["awaiting_tz_file_source"] = None
+        lead["updated_at"] = datetime.now(timezone.utc).isoformat()
+        await _write_leads(leads)
+        return True
 
 
-def find_lead_awaiting_file(user_id: int) -> dict | None:
+async def find_lead_awaiting_file(user_id: int) -> dict | None:
     """Для handle_tz_file (bot/handlers/webapp.py) — связывает присланный в
     чат документ/фото с правильной заявкой ТОЛЬКО по проверенному
     Telegram user_id (см. message.from_user.id — всегда надёжен, не
@@ -1025,31 +1178,34 @@ def find_lead_awaiting_file(user_id: int) -> dict | None:
     здесь больше НЕТ угадывания "самой свежей" среди нескольких кандидатов
     (см. аудит): при соблюдённом инварианте кандидат всего один, max()
     остаётся только защитой на случай уже существующих в хранилище данных,
-    сохранённых до этого исправления."""
+    сохранённых до этого исправления.
+
+    Tier 0 — pure read, без lock (см. докстринг модуля)."""
     leads = [
-        l for l in _read_leads()
+        l for l in await _read_leads()
         if l.get("telegram", {}).get("user_id") == user_id and l.get("awaiting_tz_file")
     ]
     return max(leads, key=lambda l: l["id"], default=None)
 
 
-def mark_tz_file_received(lead_id: int) -> bool:
+async def mark_tz_file_received(lead_id: int) -> bool:
     """Снять ожидание файла БЕЗ записи материала — используется только для
     "Отменить" (bot/handlers/start.py::cmd_cancel). Получение реального
     файла идёт через record_lead_material (выше), которая сама снимает
     awaiting_tz_file — эта функция для него не нужна."""
-    leads = _read_leads()
-    lead = next((l for l in leads if l["id"] == lead_id), None)
-    if lead is None:
-        return False
-    lead["awaiting_tz_file"] = False
-    lead["awaiting_tz_file_source"] = None
-    lead["updated_at"] = datetime.now(timezone.utc).isoformat()
-    _write_leads(leads)
-    return True
+    async with _lock("leads.json"):
+        leads = await _read_leads()
+        lead = next((l for l in leads if l["id"] == lead_id), None)
+        if lead is None:
+            return False
+        lead["awaiting_tz_file"] = False
+        lead["awaiting_tz_file_source"] = None
+        lead["updated_at"] = datetime.now(timezone.utc).isoformat()
+        await _write_leads(leads)
+        return True
 
 
-def list_leads(status: str | None = None) -> list[dict]:
+async def list_leads(status: str | None = None) -> list[dict]:
     """Для /admin -> Заявки. status="ACTIVE" — см. ACTIVE_LEAD_STATUSES
     выше (не персистентный статус, чисто фильтр по НЕ-завершённым).
 
@@ -1059,8 +1215,10 @@ def list_leads(status: str | None = None) -> list[dict]:
     supplement, материал, ответ дизайнера, теперь и просто открытие
     карточки владельцем) должна поднимать заявку наверх рабочей очереди,
     а не оставлять её на месте по порядку создания (см. UX-аудит "Заявки
-    как рабочая очередь")."""
-    leads = _read_leads()
+    как рабочая очередь").
+
+    Tier 0 — pure read, без lock."""
+    leads = await _read_leads()
     if status == "ACTIVE":
         leads = [l for l in leads if l.get("status") in ACTIVE_LEAD_STATUSES]
     elif status and status != "ALL":
@@ -1068,7 +1226,7 @@ def list_leads(status: str | None = None) -> list[dict]:
     return sorted(leads, key=lambda l: (l.get("updated_at") or l["created_at"], l["id"]), reverse=True)
 
 
-def list_leads_by_user(user_id: int) -> list[dict]:
+async def list_leads_by_user(user_id: int) -> list[dict]:
     """Для клиентского "Мои заявки" — user_id должен быть уже проверен через
     bot.telegram_auth.validate_init_data ДО вызова этой функции, здесь
     доверие к нему не проверяется повторно (это ответственность вызывающего
@@ -1083,30 +1241,33 @@ def list_leads_by_user(user_id: int) -> list[dict]:
     created_at как фолбэк. ISO 8601-строки (везде datetime.now(timezone.utc)
     .isoformat(), один и тот же формат) сравниваются лексикографически
     корректно — парсинг в datetime не нужен. list_leads() (для /admin)
-    сортировку не меняет — это отдельная функция, здесь не затронута."""
-    leads = [l for l in _read_leads() if l.get("telegram", {}).get("user_id") == user_id]
+    сортировку не меняет — это отдельная функция, здесь не затронута.
+
+    Tier 0 — pure read, без lock."""
+    leads = [l for l in await _read_leads() if l.get("telegram", {}).get("user_id") == user_id]
     return sorted(leads, key=lambda l: (l.get("updated_at") or l["created_at"], l["id"]), reverse=True)
 
 
-def get_lead(lead_id: int) -> dict | None:
-    return next((l for l in _read_leads() if l["id"] == lead_id), None)
+async def get_lead(lead_id: int) -> dict | None:
+    return next((l for l in await _read_leads() if l["id"] == lead_id), None)
 
 
-def update_lead_status(actor_chat_id: int | str, lead_id: int, status: str) -> bool:
+async def update_lead_status(actor_chat_id: int | str, lead_id: int, status: str) -> bool:
     _require_designer(actor_chat_id)
     if status not in LEAD_STATUSES:
         return False
-    leads = _read_leads()
-    lead = next((l for l in leads if l["id"] == lead_id), None)
-    if lead is None:
-        return False
-    lead["status"] = status
-    lead["updated_at"] = datetime.now(timezone.utc).isoformat()
-    _write_leads(leads)
-    return True
+    async with _lock("leads.json"):
+        leads = await _read_leads()
+        lead = next((l for l in leads if l["id"] == lead_id), None)
+        if lead is None:
+            return False
+        lead["status"] = status
+        lead["updated_at"] = datetime.now(timezone.utc).isoformat()
+        await _write_leads(leads)
+        return True
 
 
-def add_owner_message(actor_chat_id: int | str, lead_id: int, text: str, delivery_status: str) -> dict | None:
+async def add_owner_message(actor_chat_id: int | str, lead_id: int, text: str, delivery_status: str) -> dict | None:
     """Ответ дизайнера клиенту (bot/handlers/admin.py::lead_reply_send) —
     append-only, тот же паттерн, что и add_lead_supplement/record_lead_material
     выше: не трогает payload/supplements/materials, отдельный независимый
@@ -1116,32 +1277,34 @@ def add_owner_message(actor_chat_id: int | str, lead_id: int, text: str, deliver
     ответ не терялся из истории заявки даже если Telegram-доставка не удалась
     (клиент заблокировал бота и т.п.)."""
     _require_designer(actor_chat_id)
-    leads = _read_leads()
-    lead = next((l for l in leads if l["id"] == lead_id), None)
-    if lead is None:
-        return None
-    messages = lead.setdefault("owner_messages", [])
-    next_id = max((m["id"] for m in messages), default=0) + 1
-    messages.append({
-        "id": next_id,
-        "text": text,
-        "sent_at": datetime.now(timezone.utc).isoformat(),
-        "delivery_status": delivery_status,
-    })
-    lead["updated_at"] = datetime.now(timezone.utc).isoformat()
-    _write_leads(leads)
-    return lead
+    async with _lock("leads.json"):
+        leads = await _read_leads()
+        lead = next((l for l in leads if l["id"] == lead_id), None)
+        if lead is None:
+            return None
+        messages = lead.setdefault("owner_messages", [])
+        next_id = max((m["id"] for m in messages), default=0) + 1
+        messages.append({
+            "id": next_id,
+            "text": text,
+            "sent_at": datetime.now(timezone.utc).isoformat(),
+            "delivery_status": delivery_status,
+        })
+        lead["updated_at"] = datetime.now(timezone.utc).isoformat()
+        await _write_leads(leads)
+        return lead
 
 
-def delete_lead(actor_chat_id: int | str, lead_id: int) -> bool:
+async def delete_lead(actor_chat_id: int | str, lead_id: int) -> bool:
     _require_designer(actor_chat_id)
-    leads = _read_leads()
-    before = len(leads)
-    leads = [l for l in leads if l["id"] != lead_id]
-    if len(leads) == before:
-        return False
-    _write_leads(leads)
-    return True
+    async with _lock("leads.json"):
+        leads = await _read_leads()
+        before = len(leads)
+        leads = [l for l in leads if l["id"] != lead_id]
+        if len(leads) == before:
+            return False
+        await _write_leads(leads)
+        return True
 
 
 # ---- Бэкап (экспорт/восстановление через .zip в Telegram) ----
@@ -1151,8 +1314,6 @@ def delete_lead(actor_chat_id: int | str, lead_id: int) -> bool:
 # присланный документ у получателя) и загружает его обратно после деплоя.
 # Покрывает и data/*.json, и загруженные фото — то, что Upstash-режим
 # выше не покрывает вовсе.
-
-DATA_FILENAMES = ("portfolio.json", "pricing.json", "faq.json", "about.json", "ui_config.json", "leads.json")
 
 # Минимальная structural-валидация бэкапа (P1-1, production-hardening
 # аудит) — только то, что остальной код content_store уже безусловно
@@ -1197,6 +1358,19 @@ class BackupValidationError(ValueError):
         self.filename = filename
         self.reason = reason
         self.found_filenames = found_filenames
+
+
+class BackupSnapshotError(RuntimeError):
+    """Phase 1 (снапшот текущих значений перед записью) во время restore
+    упал НЕ из-за UpstashKeyMissingError (та сохраняет свою существующую
+    _MISSING-семантику ниже) — а из-за какой-то другой ошибки чтения (сеть,
+    Upstash-side error-ответ, повреждённый JSON уже хранящегося значения).
+    Restore отменяется целиком ДО первой записи — Phase 2 не начинается
+    вовсе (P2-6, production-hardening аудит, второй design review)."""
+
+    def __init__(self, filename: str):
+        self.filename = filename
+        super().__init__(f"Резервная копия не восстановлена: не удалось прочитать текущее значение {filename!r} перед записью (снапшот) — изменения не применены")
 
 
 class BackupRestoreFailedError(RuntimeError):
@@ -1244,7 +1418,10 @@ def _write_image_atomic(dest: Path, content: bytes) -> None:
     """Тот же паттерн, что и _write_local для JSON (temp-файл + os.replace)
     — обрыв записи не оставляет старое фото заменённым наполовину
     испорченными байтами: старый файл не трогается, пока новый полностью
-    не готов (P1-1, production-hardening аудит)."""
+    не готов (P1-1, production-hardening аудит). Локальный диск, не сеть —
+    остаётся синхронной (P1-1 design review, "internal helpers... могут
+    остаться sync, если они не делают network I/O напрямую"), вызывается
+    вне locks (см. import_backup_bytes Phase 3)."""
     dest.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_path = tempfile.mkstemp(dir=dest.parent, prefix=f".{dest.name}.", suffix=".tmp")
     try:
@@ -1257,14 +1434,21 @@ def _write_image_atomic(dest: Path, content: bytes) -> None:
         raise
 
 
-def export_backup_bytes() -> bytes:
+async def export_backup_bytes() -> bytes:
+    """Multi-key (Tier 2): держит все 6 locks ТОЛЬКО на время чтения всех
+    DATA_FILENAMES в память (см. P2-7 design review) — сборка самого .zip
+    (CPU/диск, не Upstash) намеренно происходит уже ПОСЛЕ освобождения
+    locks: данные уже полностью и консистентно собраны в `collected`,
+    удерживать locks дольше не даёт никакой дополнительной гарантии, только
+    без нужды продлевает окно блокировки для остальных операций."""
     missing: list[str] = []
     collected: dict[str, Any] = {}
-    for name in DATA_FILENAMES:
-        try:
-            collected[name] = _read(name)
-        except (FileNotFoundError, UpstashKeyMissingError):
-            missing.append(name)
+    async with _lock(*DATA_FILENAMES):
+        for name in DATA_FILENAMES:
+            try:
+                collected[name] = await _read(name)
+            except (FileNotFoundError, UpstashKeyMissingError):
+                missing.append(name)
     if missing:
         raise BackupExportError(missing)
 
@@ -1281,21 +1465,29 @@ def export_backup_bytes() -> bytes:
     return buf.getvalue()
 
 
-def import_backup_bytes(actor_chat_id: int | str, zip_bytes: bytes) -> BackupImportResult:
+async def import_backup_bytes(actor_chat_id: int | str, zip_bytes: bytes) -> BackupImportResult:
     """Восстанавливает data/*.json и фото из .zip, созданного export_backup_bytes.
 
-    P1-1 (production-hardening аудит) — all-or-nothing restore:
     Phase 0 — архив читается и полностью валидируется (parse + minimal
-    shape) ДО единой записи; любая ошибка отменяет ВЕСЬ restore.
+    shape) ДО единой записи; любая ошибка отменяет ВЕСЬ restore. Никакого
+    storage I/O, никаких locks.
     Phase 1 — снапшот текущих значений файлов, которые будут перезаписаны
-    (тоже только чтение).
+    (тоже только чтение). UpstashKeyMissingError -> _MISSING (нечего
+    откатывать, как и раньше). Любая ДРУГАЯ ошибка чтения -> BackupSnapshotError,
+    restore отменяется целиком, Phase 2 не начинается (P2-6).
     Phase 2 — сама запись JSON; при ошибке уже записанные файлы
     откатываются к снапшоту (best-effort, без тяжёлой transaction-
     инфраструктуры — Upstash REST не поддерживает multi-key транзакции).
-    Phase 3 — изображения, только после успешного завершения Phase 2
-    целиком; между собой не транзакционны (по решению аудита — не
-    изображать транзакционность там, где её нет), ошибка одного файла не
-    трогает остальные и не откатывает уже восстановленный JSON.
+    Phase 1 и Phase 2 выполняются ПОД ОДНИМ приобретением ВСЕХ 6 locks
+    (Tier 2, P2-7 design review) — единственный способ гарантировать, что
+    ни один content_store reader/writer внутри процесса не увидит restore
+    "наполовину": другой вызов либо выполняется целиком до этого restore,
+    либо целиком после.
+    Phase 3 — изображения, ПОСЛЕ освобождения locks: локальные файлы, не
+    часть content_store/Upstash-консистентности, между собой не
+    транзакционны (по решению аудита — не изображать транзакционность там,
+    где её нет), ошибка одного файла не трогает остальные и не откатывает
+    уже восстановленный JSON.
 
     Имена файлов в архиве берутся только по basename (без пути) и данные —
     только по белому списку DATA_FILENAMES, чтобы вредоносный/повреждённый
@@ -1339,47 +1531,53 @@ def import_backup_bytes(actor_chat_id: int | str, zip_bytes: bytes) -> BackupImp
 
     missing_json = [f for f in DATA_FILENAMES if f not in json_plan]
 
-    # ---- Phase 1: снапшот текущих значений файлов, которые будут
-    # перезаписаны — тоже только чтение, ни одной записи.
-    snapshot: dict[str, Any] = {}
-    for filename in json_plan:
-        try:
-            snapshot[filename] = _read(filename)
-        except UpstashKeyMissingError:
-            snapshot[filename] = _MISSING
-
-    # ---- Phase 2: запись JSON. Ошибка -> откат уже записанных к снапшоту.
-    written: list[str] = []
-    failed_filename: str | None = None
-    write_error: Exception | None = None
-    for filename, data in json_plan.items():
-        try:
-            _write(filename, data)
-            written.append(filename)
-        except Exception as e:
-            failed_filename = filename
-            write_error = e
-            break
-
-    if write_error is not None:
-        rolled_back: list[str] = []
-        rollback_failed: list[str] = []
-        for filename in written:
-            if snapshot.get(filename) is _MISSING:
-                continue
+    # ---- Phase 1 + Phase 2 (+ rollback) — под всеми 6 locks, приобретёнными
+    # ДО первого storage I/O (см. докстринг функции выше).
+    async with _lock(*DATA_FILENAMES):
+        # ---- Phase 1: снапшот
+        snapshot: dict[str, Any] = {}
+        for filename in json_plan:
             try:
-                _write(filename, snapshot[filename])
-                rolled_back.append(filename)
-            except Exception:
-                logger.exception("Storage: backup rollback FAILED for %s — требуется ручная проверка данных", filename)
-                rollback_failed.append(filename)
-        if rollback_failed:
-            logger.error("Storage: backup restore aborted on %s, ROLLBACK INCOMPLETE for: %s", failed_filename, rollback_failed)
-        else:
-            logger.error("Storage: backup restore aborted on %s, rollback succeeded for: %s", failed_filename, rolled_back)
-        raise BackupRestoreFailedError(failed_filename, rolled_back, rollback_failed) from write_error
+                snapshot[filename] = await _read(filename)
+            except UpstashKeyMissingError:
+                snapshot[filename] = _MISSING
+            except Exception as e:
+                logger.exception("Storage: backup snapshot failed for %s — restore aborted before any write", filename)
+                raise BackupSnapshotError(filename) from e
 
-    # ---- Phase 3: изображения — только после успешного JSON restore целиком.
+        # ---- Phase 2: запись JSON. Ошибка -> откат уже записанных к снапшоту.
+        written: list[str] = []
+        failed_filename: str | None = None
+        write_error: Exception | None = None
+        for filename, data in json_plan.items():
+            try:
+                await _write(filename, data)
+                written.append(filename)
+            except Exception as e:
+                failed_filename = filename
+                write_error = e
+                break
+
+        if write_error is not None:
+            rolled_back: list[str] = []
+            rollback_failed: list[str] = []
+            for filename in written:
+                if snapshot.get(filename) is _MISSING:
+                    continue
+                try:
+                    await _write(filename, snapshot[filename])
+                    rolled_back.append(filename)
+                except Exception:
+                    logger.exception("Storage: backup rollback FAILED for %s — требуется ручная проверка данных", filename)
+                    rollback_failed.append(filename)
+            if rollback_failed:
+                logger.error("Storage: backup restore aborted on %s, ROLLBACK INCOMPLETE for: %s", failed_filename, rollback_failed)
+            else:
+                logger.error("Storage: backup restore aborted on %s, rollback succeeded for: %s", failed_filename, rolled_back)
+            raise BackupRestoreFailedError(failed_filename, rolled_back, rollback_failed) from write_error
+
+    # ---- Phase 3: изображения — ПОСЛЕ освобождения locks, только после
+    # успешного завершения Phase 2 целиком.
     restored_images: list[str] = []
     failed_images: list[str] = []
     for name, dest, content in image_entries:
