@@ -2083,17 +2083,36 @@ class AdminNavAnchorResetTests(unittest.IsolatedAsyncioTestCase):
         await admin.cases_add_category(make_callback("admincat:landing", chat_id=self.actor), state)
         await admin.cases_add_title(make_msg(text="Новый лендинг"), state)
         await admin.cases_add_photo(make_photo_message(self.actor), state)
-        await admin.cases_add_description(make_msg(text="Короткое описание задачи"), state)  # один из 24 сайтов
+        final_msg = make_msg(text="Короткое описание задачи")
+        await admin.cases_add_description(final_msg, state)  # один из 24 сайтов
 
         self.assertIsNone(await state.get_state())
         data = await state.get_data()
         self.assertEqual(data.get(flow._NAV_ANCHOR_MSG_KEY), 111)
-        self.assertNotIn("case_id", data)
-        self.assertNotIn("title", data)
-        self.assertNotIn("type_id", data)
+        # P1-3, Batch 4: cases_add_description теперь использует
+        # flow.finish_flow (не reset_state_keep_nav) после step_from_text
+        # — оставшиеся admin-local ключи (case_id/title/type_id/cover)
+        # больше НЕ стираются намеренно: их сохранность — не баг, а именно
+        # то, что позволяет _flow_msg_id/_flow_chat_id (тоже в data)
+        # пережить этот шаг, чтобы "⌂ Главное меню" сразу после завершения
+        # мастера могло найти и удалить актуальный финальный экран, а не
+        # оставить его orphan (см. AdminRemainingAnchorGapsTests). Раньше
+        # этот тест ошибочно требовал их отсутствия — assertNotIn ниже
+        # заменены на assertIn ровно для _flow_msg_id, единственного ключа,
+        # чья сохранность здесь действительно important.
+        self.assertIn(flow._ANCHOR_MSG_KEY, data)
+        self.assertEqual(data.get(flow._ANCHOR_MSG_KEY), final_msg.bot.edit_message_text.await_args.kwargs["message_id"])
         # сама бизнес-операция не пострадала — кейс реально создан
         cases = await content_store.list_cases()
         self.assertTrue(any(c["title"] == "Новый лендинг" for c in cases))
+
+        # И главное — Главное меню сразу после завершения мастера
+        # действительно удаляет актуальный финальный экран, а не оставляет
+        # его orphan (то, что было физически невозможно проверить до
+        # исправления: anchor был бы уже стёрт).
+        trigger = make_flow_message_factory(chat_id=self.actor, start_id=2100)(text=texts.MAIN_MENU_BUTTON)
+        await admin.admin_main_menu_button(trigger, state)
+        trigger.bot.delete_message.assert_awaited_once_with(chat_id=self.actor, message_id=data.get(flow._ANCHOR_MSG_KEY))
 
     # ---- 3 (сценарий, близкий к B): отмена внутри confirm-диалога ("Нет") ----
     async def test_cancelling_delete_confirmation_preserves_nav_anchor(self):
@@ -2955,6 +2974,236 @@ class AdminPricingServiceAnchorTests(unittest.IsolatedAsyncioTestCase):
         probe.answer.assert_not_awaited()
         data = await state.get_data()
         self.assertEqual(data.get(flow._NAV_ANCHOR_MSG_KEY), 111)
+
+
+class AdminRemainingAnchorGapsTests(unittest.IsolatedAsyncioTestCase):
+    """P1-3, Batch 4: last 9 of the 24 reset_state_keep_nav() call sites in
+    admin.py, spanning Cases (edit-done, delete), About (edit-done),
+    Categories (add, rename, related-service, delete x2), Leads
+    (reply-to-missing-lead) — same bug Batch 1-3 fixed elsewhere: reset
+    wipes _flow_msg_id/_flow_chat_id, a raw edit_text()/answer() right
+    after never restored it.
+
+    Correction to the Batch 2 audit: these sites all leave state=None, so
+    /cancel (which requires an active AdminStates value) is never
+    reachable from them — but start.py::main_menu_or_confirm fires
+    flow.main_menu_cleanup() *immediately* whenever state is None, no
+    confirmation gate. So "Главное меню" — not /cancel — is the actually
+    reachable path that exposed the orphan here, and every test below
+    proves the fix through that path.
+
+    With this batch, all 24 reset_state_keep_nav() call sites in admin.py
+    are paired with a lifecycle primitive that restores the anchor —
+    confirmed by a repo-wide sweep (see PART A of the delivery report),
+    not just by this test list."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        real_data_dir = Path(__file__).resolve().parent.parent / "data"
+        for name in ("pricing.json", "portfolio.json", "faq.json", "about.json", "ui_config.json"):
+            shutil.copy(real_data_dir / name, Path(self.tmpdir) / name)
+        self._orig_data_dir = content_store.DATA_DIR
+        self._orig_designer = content_store.config.DESIGNER_CHAT_ID
+        content_store.DATA_DIR = Path(self.tmpdir)
+        content_store.config.DESIGNER_CHAT_ID = "777"
+        self.actor = 777
+
+    def tearDown(self):
+        content_store.DATA_DIR = self._orig_data_dir
+        content_store.config.DESIGNER_CHAT_ID = self._orig_designer
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    async def _state_with_nav(self, nav_msg_id: int = 111) -> FSMContext:
+        state = make_state(self.actor)
+        await state.update_data(**{
+            flow._NAV_ANCHOR_MSG_KEY: nav_msg_id,
+            flow._NAV_ANCHOR_CHAT_KEY: self.actor,
+        })
+        return state
+
+    async def _assert_main_menu_cleans_current_screen(self, state: FSMContext, msg_id: int, start_id: int) -> None:
+        self.assertIsNone(await state.get_state())  # все 9 сайтов оставляют state=None
+        trigger = make_flow_message_factory(chat_id=self.actor, start_id=start_id)(text=texts.MAIN_MENU_BUTTON)
+        await admin.admin_main_menu_button(trigger, state)
+        trigger.bot.delete_message.assert_awaited_once_with(chat_id=self.actor, message_id=msg_id)
+        trigger.answer.assert_not_awaited()  # ни одного нового WELCOME
+        data = await state.get_data()
+        self.assertEqual(data.get(flow._NAV_ANCHOR_MSG_KEY), 111)
+
+    # ---- Cases: edit "done" ----
+    async def test_cases_edit_done_then_main_menu_cleans_current_screen(self):
+        state = await self._state_with_nav()
+        msg_id = 12000
+        await state.update_data(case_id="whatever")
+        await state.set_state(AdminStates.edit_case_field_pick)
+        cb = make_callback("admineditfield:done", chat_id=self.actor, message_id=msg_id)
+        await admin.cases_edit_field(cb, state)
+        cb.message.edit_text.assert_awaited_once_with("Кейсы портфолио:", reply_markup=kb.admin_cases_menu_keyboard())
+        await self._assert_main_menu_cleans_current_screen(state, msg_id, 12100)
+
+    # ---- Cases: delete confirm/cancel ----
+    async def test_cases_delete_do_then_main_menu_cleans_current_screen(self):
+        case = await content_store.add_case(
+            str(self.actor), case_id="case_del", title="Тест", type_id="landing",
+            cover="img/portfolio/seed.svg", task="t", related_service=None,
+        )
+        state = await self._state_with_nav()
+        msg_id = 12200
+        await state.update_data(case_id=case["id"])
+        await state.set_state(AdminStates.delete_case_confirm)
+        cb = make_callback("admindelcaseconfirm:yes", chat_id=self.actor, message_id=msg_id)
+        await admin.cases_delete_do(cb, state)
+        cb.message.edit_text.assert_awaited_once_with("Кейс удалён ✅", reply_markup=kb.admin_cases_menu_keyboard())
+        remaining = await content_store.list_cases()
+        self.assertFalse(any(c["id"] == case["id"] for c in remaining))
+        await self._assert_main_menu_cleans_current_screen(state, msg_id, 12300)
+
+    # ---- About: edit "done" ----
+    async def test_about_edit_done_then_main_menu_cleans_current_screen(self):
+        state = await self._state_with_nav()
+        msg_id = 12400
+        await state.set_state(AdminStates.edit_about_field_pick)
+        cb = make_callback("admineditabout:done", chat_id=self.actor, message_id=msg_id)
+        await admin.about_edit_field(cb, state)
+        cb.message.edit_text.assert_awaited_once_with("Админ-меню:", reply_markup=kb.admin_root_keyboard())
+        await self._assert_main_menu_cleans_current_screen(state, msg_id, 12500)
+
+    # ---- Categories: add ----
+    async def test_cat_add_label_then_main_menu_cleans_current_screen(self):
+        state = await self._state_with_nav()
+        msg_id = 12600
+        await state.set_state(AdminStates.add_category_label)
+        msg = make_flow_message_factory(chat_id=self.actor, start_id=msg_id * 10)(text="Новая категория")
+        # anchor уже отслеживается (пришли через cat_add_start, self-healing).
+        await state.update_data(**{flow._ANCHOR_MSG_KEY: msg_id, flow._ANCHOR_CHAT_KEY: self.actor})
+        await admin.cat_add_label(msg, state)
+        msg.bot.edit_message_text.assert_awaited_once_with(
+            "Категория «Новая категория» добавлена ✅", chat_id=self.actor, message_id=msg_id, reply_markup=kb.categories_menu_keyboard()
+        )
+        await self._assert_main_menu_cleans_current_screen(state, msg_id, 12700)
+
+    # ---- Categories: rename ----
+    async def test_cat_rename_value_then_main_menu_cleans_current_screen(self):
+        cat = await content_store.add_portfolio_type(str(self.actor), type_id="cat_ren", label="Старое имя")
+        state = await self._state_with_nav()
+        msg_id = 12800
+        await state.update_data(type_id=cat["id"], **{flow._ANCHOR_MSG_KEY: msg_id, flow._ANCHOR_CHAT_KEY: self.actor})
+        await state.set_state(AdminStates.rename_category_value)
+        msg = make_flow_message_factory(chat_id=self.actor, start_id=12900)(text="Новое имя")
+        await admin.cat_rename_value(msg, state)
+        msg.bot.edit_message_text.assert_awaited_once_with(
+            "Переименовано ✅", chat_id=self.actor, message_id=msg_id, reply_markup=kb.categories_menu_keyboard()
+        )
+        await self._assert_main_menu_cleans_current_screen(state, msg_id, 13000)
+
+    # ---- Categories: related-service set ----
+    async def test_cat_relservice_set_then_main_menu_cleans_current_screen(self):
+        cat = await content_store.add_portfolio_type(str(self.actor), type_id="cat_rel", label="Категория")
+        state = await self._state_with_nav()
+        msg_id = 13100
+        await state.update_data(type_id=cat["id"])
+        await state.set_state(AdminStates.category_related_service_pick)
+        cb = make_callback("admincatrelservice:none", chat_id=self.actor, message_id=msg_id)
+        await admin.cat_relservice_set(cb, state)
+        cb.message.edit_text.assert_awaited_once_with("Обновлено ✅", reply_markup=kb.categories_menu_keyboard())
+        await self._assert_main_menu_cleans_current_screen(state, msg_id, 13200)
+
+    # ---- Categories: delete blocked (in use) ----
+    async def test_cat_delete_confirm_in_use_then_main_menu_cleans_current_screen(self):
+        case = await content_store.add_case(
+            str(self.actor), case_id="case_using_cat", title="Тест", type_id="landing",
+            cover="img/portfolio/seed.svg", task="t", related_service=None,
+        )
+        state = await self._state_with_nav()
+        msg_id = 13300
+        await state.set_state(AdminStates.delete_category_pick)
+        cb = make_callback("admindelcat:landing", chat_id=self.actor, message_id=msg_id)
+        await admin.cat_delete_confirm(cb, state)
+        cb.message.edit_text.assert_awaited_once()
+        self.assertIn("используется", cb.message.edit_text.await_args.args[0])
+        await self._assert_main_menu_cleans_current_screen(state, msg_id, 13400)
+        await content_store.delete_case(str(self.actor), case["id"])  # cleanup, не влияет на тест
+
+    # ---- Categories: delete confirm/cancel ----
+    async def test_cat_delete_do_then_main_menu_cleans_current_screen(self):
+        cat = await content_store.add_portfolio_type(str(self.actor), type_id="cat_del", label="Удалить меня")
+        state = await self._state_with_nav()
+        msg_id = 13500
+        await state.update_data(type_id=cat["id"])
+        await state.set_state(AdminStates.delete_category_confirm)
+        cb = make_callback("admindelcatconfirm:yes", chat_id=self.actor, message_id=msg_id)
+        await admin.cat_delete_do(cb, state)
+        cb.message.edit_text.assert_awaited_once_with("Категория удалена ✅", reply_markup=kb.categories_menu_keyboard())
+        remaining = await content_store.list_portfolio_types()
+        self.assertFalse(any(t["id"] == cat["id"] for t in remaining))
+        await self._assert_main_menu_cleans_current_screen(state, msg_id, 13600)
+
+    # ---- Leads: reply to a lead that no longer exists ----
+    async def test_lead_reply_send_missing_lead_then_main_menu_cleans_current_screen(self):
+        state = await self._state_with_nav()
+        msg_id = 13700
+        await state.update_data(lead_id=999999, **{flow._ANCHOR_MSG_KEY: msg_id, flow._ANCHOR_CHAT_KEY: self.actor})
+        await state.set_state(AdminStates.lead_reply_text)
+        msg = make_flow_message_factory(chat_id=self.actor, start_id=13800)(text="Ответ")
+        await admin.lead_reply_send(msg, state)
+        msg.bot.edit_message_text.assert_awaited_once_with(
+            "Заявка не найдена.", chat_id=self.actor, message_id=msg_id, reply_markup=kb.admin_root_keyboard()
+        )
+        await self._assert_main_menu_cleans_current_screen(state, msg_id, 13900)
+
+    # ---- ensure_nav_anchor: представительная выборка (callback- и text-триггерные) ----
+    async def test_ensure_nav_anchor_after_cases_edit_done_does_not_recreate(self):
+        state = await self._state_with_nav()
+        await state.update_data(case_id="whatever")
+        await state.set_state(AdminStates.edit_case_field_pick)
+        await admin.cases_edit_field(make_callback("admineditfield:done", chat_id=self.actor, message_id=14000), state)
+
+        probe = make_flow_message_factory(chat_id=self.actor, start_id=14100)()
+        created = await flow.ensure_nav_anchor(probe, state)
+        self.assertFalse(created)
+        probe.answer.assert_not_awaited()
+        data = await state.get_data()
+        self.assertEqual(data.get(flow._NAV_ANCHOR_MSG_KEY), 111)
+
+    async def test_ensure_nav_anchor_after_cat_add_label_does_not_recreate(self):
+        state = await self._state_with_nav()
+        await state.update_data(**{flow._ANCHOR_MSG_KEY: 14200, flow._ANCHOR_CHAT_KEY: self.actor})
+        await state.set_state(AdminStates.add_category_label)
+        await admin.cat_add_label(make_flow_message_factory(chat_id=self.actor, start_id=14300)(text="Категория"), state)
+
+        probe = make_flow_message_factory(chat_id=self.actor, start_id=14400)()
+        created = await flow.ensure_nav_anchor(probe, state)
+        self.assertFalse(created)
+        probe.answer.assert_not_awaited()
+        data = await state.get_data()
+        self.assertEqual(data.get(flow._NAV_ANCHOR_MSG_KEY), 111)
+
+    # ---- Additional finding discovered while implementing this batch: ----
+    # step_from_text's successful-edit path doesn't touch state.data (the
+    # anchor is already correct and unchanged), so a reset_state_keep_nav()
+    # immediately after it still wiped _flow_msg_id anyway — a real,
+    # already-shipped gap in cases_add_description (Batch 1) and
+    # price_add_includes (Batch 3), empirically confirmed and fixed in
+    # this batch by swapping reset_state_keep_nav for flow.finish_flow
+    # (same primitive faq_add_answer already used). cases_add_description
+    # is covered by the updated
+    # AdminNavAnchorResetTests.test_completing_add_case_wizard_preserves_nav_anchor;
+    # price_add_includes did not have an equivalent pre-existing test, so
+    # it is covered fresh here.
+    async def test_price_add_includes_then_main_menu_cleans_current_screen(self):
+        state = await self._state_with_nav()
+        msg_id = 14500
+        await state.update_data(**{flow._ANCHOR_MSG_KEY: msg_id, flow._ANCHOR_CHAT_KEY: self.actor})
+        await state.update_data(name="Услуга", base_price=10000, term_min=1, term_max=5)
+        await state.set_state(AdminStates.add_service_includes)
+        msg = make_flow_message_factory(chat_id=self.actor, start_id=14600)(text="Дизайн под ключ")
+        await admin.price_add_includes(msg, state)
+        msg.bot.edit_message_text.assert_awaited_once_with(
+            "Услуга «Услуга» добавлена ✅", chat_id=self.actor, message_id=msg_id, reply_markup=kb.pricing_menu_keyboard()
+        )
+        services = await content_store.list_services()
+        self.assertTrue(any(s["name"] == "Услуга" for s in services))
+        await self._assert_main_menu_cleans_current_screen(state, msg_id, 14700)
 
 
 class AdminLeadsFullSequenceTests(unittest.IsolatedAsyncioTestCase):

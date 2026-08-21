@@ -324,18 +324,24 @@ async def cases_add_description(message: Message, state: FSMContext) -> None:
         task=message.text.strip(),
         related_service=related_service,
     )
-    # step_from_text ДО reset_state_keep_nav — иначе последний перестаёт
-    # видеть tracked _flow_msg_id (reset уже стёр бы его) и просто шлёт
-    # новое сообщение, теряя смысл миграции. reset_state_keep_nav ниже
-    # по-прежнему стирает то же самое, что и раньше — порядок не меняет
-    # итоговые state/data, только то, каким сообщением показан результат.
+    # step_from_text, затем finish_flow, НЕ reset_state_keep_nav (P1-3,
+    # Batch 4 — исправляет собственную находку Batch 1): когда edit
+    # внутри step_from_text успевает отредактировать существующий anchor
+    # (частый случай), он НЕ трогает state.data вообще — значение уже
+    # верное. Если следом шёл reset_state_keep_nav (полная замена
+    # state.data), он стирал _flow_msg_id заново, хотя физический экран
+    # остаётся тем же самым, корректным финальным сообщением — и
+    # "⌂ Главное меню" сразу после завершения мастера не находило, что
+    # удалять (эмпирически подтверждено). finish_flow — тот же primitive,
+    # что уже используется в faq_add_answer — только гасит FSM-состояние,
+    # не трогая data, поэтому anchor переживает этот шаг.
     await flow.step_from_text(
         message, state,
         f"Кейс «{case['title']}» добавлен и уже виден в Mini App ✅\n\n"
         "Поля «Решение» и «Результат» пока пустые — заполнить можно через «✏️ Редактировать».",
         kb.admin_cases_menu_keyboard(),
     )
-    await flow.reset_state_keep_nav(state)
+    await flow.finish_flow(state)
 
 
 @router.callback_query(F.data == "admincasesaction:edit")
@@ -364,8 +370,12 @@ async def cases_edit_picked(callback: CallbackQuery, state: FSMContext) -> None:
 async def cases_edit_field(callback: CallbackQuery, state: FSMContext) -> None:
     field = callback.data.split(":", 1)[1]
     if field == "done":
+        # flow.step_from_callback (P1-3, Batch 4) — тот же паттерн, что
+        # Batch 1-3 исправили для menu_*/faq_*/price_*: reset_state_keep_nav
+        # стирает anchor, step_from_callback заново фиксирует его на
+        # актуальном экране "Кейсы портфолио:".
         await flow.reset_state_keep_nav(state)
-        await callback.message.edit_text("Кейсы портфолио:", reply_markup=kb.admin_cases_menu_keyboard())
+        await flow.step_from_callback(callback, state, "Кейсы портфолио:", kb.admin_cases_menu_keyboard())
         await callback.answer()
         return
     await state.update_data(field=field)
@@ -746,8 +756,10 @@ async def cases_delete_do(callback: CallbackQuery, state: FSMContext) -> None:
         text = "Кейс удалён ✅"
     else:
         text = "Отменено."
+    # flow.step_from_callback (P1-3, Batch 4) — тот же паттерн, что
+    # cases_delete_do's аналоги в faq/price уже исправили.
     await flow.reset_state_keep_nav(state)
-    await callback.message.edit_text(text, reply_markup=kb.admin_cases_menu_keyboard())
+    await flow.step_from_callback(callback, state, text, kb.admin_cases_menu_keyboard())
     await callback.answer()
 
 
@@ -869,8 +881,9 @@ async def faq_delete_do(callback: CallbackQuery, state: FSMContext) -> None:
 async def about_edit_field(callback: CallbackQuery, state: FSMContext) -> None:
     field = callback.data.split(":", 1)[1]
     if field == "done":
+        # flow.step_from_callback (P1-3, Batch 4).
         await flow.reset_state_keep_nav(state)
-        await callback.message.edit_text("Админ-меню:", reply_markup=kb.admin_root_keyboard())
+        await flow.step_from_callback(callback, state, "Админ-меню:", kb.admin_root_keyboard())
         await callback.answer()
         return
     if field == "experience":
@@ -1077,10 +1090,10 @@ async def price_add_includes(message: Message, state: FSMContext) -> None:
         term_max=data["term_max"],
         includes=message.text.strip(),
     )
-    # step_from_text ДО reset_state_keep_nav — см. то же обоснование в
-    # cases_add_description выше.
+    # step_from_text, затем finish_flow, НЕ reset_state_keep_nav (P1-3,
+    # Batch 4) — см. то же обоснование в cases_add_description выше.
     await flow.step_from_text(message, state, f"Услуга «{service['name']}» добавлена ✅", kb.pricing_menu_keyboard())
-    await flow.reset_state_keep_nav(state)
+    await flow.finish_flow(state)
 
 
 # ---- Редактировать услугу (+ опции внутри) ----
@@ -1429,8 +1442,16 @@ async def cat_add_start(callback: CallbackQuery, state: FSMContext) -> None:
 async def cat_add_label(message: Message, state: FSMContext) -> None:
     type_id = await content_store.next_portfolio_type_id()
     cat = await content_store.add_portfolio_type(message.chat.id, type_id=type_id, label=message.text.strip())
-    await flow.reset_state_keep_nav(state)
-    await message.answer(f"Категория «{cat['label']}» добавлена ✅", reply_markup=kb.categories_menu_keyboard())
+    # step_from_text, затем finish_flow, НЕ reset_state_keep_nav (P1-3,
+    # Batch 4): reset_state_keep_nav делает полную замену state.data и
+    # стирает _flow_msg_id заново, даже когда step_from_text только что
+    # успешно отредактировал существующий anchor на месте (он не трогает
+    # state.data в этом случае — значение уже верное) — итог: физический
+    # экран корректен, но "⌂ Главное меню" сразу после не находит, что
+    # удалять (эмпирически подтверждено). finish_flow (как в
+    # faq_add_answer) гасит FSM-состояние, не трогая data.
+    await flow.step_from_text(message, state, f"Категория «{cat['label']}» добавлена ✅", kb.categories_menu_keyboard())
+    await flow.finish_flow(state)
 
 
 @router.callback_query(F.data == "admincataction:rename")
@@ -1455,8 +1476,10 @@ async def cat_rename_picked(callback: CallbackQuery, state: FSMContext) -> None:
 async def cat_rename_value(message: Message, state: FSMContext) -> None:
     data = await state.get_data()
     await content_store.rename_portfolio_type(message.chat.id, data["type_id"], message.text.strip())
-    await flow.reset_state_keep_nav(state)
-    await message.answer("Переименовано ✅", reply_markup=kb.categories_menu_keyboard())
+    # step_from_text, затем finish_flow, НЕ reset_state_keep_nav (P1-3,
+    # Batch 4) — см. обоснование в cat_add_label.
+    await flow.step_from_text(message, state, "Переименовано ✅", kb.categories_menu_keyboard())
+    await flow.finish_flow(state)
 
 
 @router.callback_query(F.data == "admincataction:relservice")
@@ -1488,8 +1511,9 @@ async def cat_relservice_set(callback: CallbackQuery, state: FSMContext) -> None
     value = callback.data.split(":", 1)[1]
     data = await state.get_data()
     await content_store.update_portfolio_type_related_service(callback.message.chat.id, data["type_id"], None if value == "none" else value)
+    # flow.step_from_callback (P1-3, Batch 4).
     await flow.reset_state_keep_nav(state)
-    await callback.message.edit_text("Обновлено ✅", reply_markup=kb.categories_menu_keyboard())
+    await flow.step_from_callback(callback, state, "Обновлено ✅", kb.categories_menu_keyboard())
     await callback.answer()
 
 
@@ -1507,12 +1531,18 @@ async def cat_delete_confirm(callback: CallbackQuery, state: FSMContext) -> None
     type_id = callback.data.split(":", 1)[1]
     in_use = await content_store.count_cases_with_type(type_id)
     if in_use > 0:
-        await callback.message.edit_text(
+        # reset_state_keep_nav ДО step_from_callback (P1-3, Batch 4) —
+        # порядок важен: step_from_callback пишет anchor через
+        # state.update_data (merge), а reset_state_keep_nav делает
+        # state.set_data (полная замена) — если бы reset шёл после, он
+        # стёр бы только что записанный anchor обратно.
+        await flow.reset_state_keep_nav(state)
+        await flow.step_from_callback(
+            callback, state,
             f"Нельзя удалить — категория используется в {in_use} кейс(ах). "
             "Сначала перенесите эти кейсы в другую категорию (редактирование кейса) или удалите их.",
-            reply_markup=kb.categories_menu_keyboard(),
+            kb.categories_menu_keyboard(),
         )
-        await flow.reset_state_keep_nav(state)
         await callback.answer()
         return
     await state.update_data(type_id=type_id)
@@ -1530,8 +1560,9 @@ async def cat_delete_do(callback: CallbackQuery, state: FSMContext) -> None:
         text = "Категория удалена ✅"
     else:
         text = "Отменено."
+    # flow.step_from_callback (P1-3, Batch 4).
     await flow.reset_state_keep_nav(state)
-    await callback.message.edit_text(text, reply_markup=kb.categories_menu_keyboard())
+    await flow.step_from_callback(callback, state, text, kb.categories_menu_keyboard())
     await callback.answer()
 
 
@@ -1650,8 +1681,10 @@ async def lead_reply_send(message: Message, state: FSMContext) -> None:
     data = await state.get_data()
     lead = await content_store.get_lead(data["lead_id"])
     if lead is None:
-        await message.answer("Заявка не найдена.", reply_markup=kb.admin_root_keyboard())
-        await flow.reset_state_keep_nav(state)
+        # step_from_text, затем finish_flow, НЕ reset_state_keep_nav
+        # (P1-3, Batch 4) — см. обоснование в cat_add_label.
+        await flow.step_from_text(message, state, "Заявка не найдена.", kb.admin_root_keyboard())
+        await flow.finish_flow(state)
         return
     text = message.text.strip()
     try:
