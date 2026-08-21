@@ -1107,8 +1107,14 @@ async def price_edit_picked(callback: CallbackQuery, state: FSMContext) -> None:
 async def price_edit_field(callback: CallbackQuery, state: FSMContext) -> None:
     field = callback.data.split(":", 1)[1]
     if field == "done":
+        # flow.step_from_callback (P1-3, Batch 3) — reset_state_keep_nav
+        # выше стирает _flow_msg_id/_flow_chat_id (сохраняет только NAV),
+        # и raw edit_text ничего не ставило взамен: экран физически
+        # корректен (тот же message_id), но TRANSIENT anchor больше на
+        # него не указывает — тот же паттерн, что Batch 1/2 исправили для
+        # menu_* section navigation и faq_edit_field's "done" ветки.
         await flow.reset_state_keep_nav(state)
-        await callback.message.edit_text("Услуги и цены:", reply_markup=kb.pricing_menu_keyboard())
+        await flow.step_from_callback(callback, state, "Услуги и цены:", kb.pricing_menu_keyboard())
         await callback.answer()
         return
     if field == "options":
@@ -1173,8 +1179,11 @@ async def price_delete_do(callback: CallbackQuery, state: FSMContext) -> None:
         text = "Услуга удалена ✅"
     else:
         text = "Отменено."
+    # flow.step_from_callback (P1-3, Batch 3) — тот же паттерн, что и
+    # price_edit_field's "done" ветка: reset_state_keep_nav стирает anchor,
+    # step_from_callback заново фиксирует его на актуальном pricing-root экране.
     await flow.reset_state_keep_nav(state)
-    await callback.message.edit_text(text, reply_markup=kb.pricing_menu_keyboard())
+    await flow.step_from_callback(callback, state, text, kb.pricing_menu_keyboard())
     await callback.answer()
 
 

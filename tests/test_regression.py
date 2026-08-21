@@ -2564,6 +2564,399 @@ class AdminFaqEditDeleteAnchorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(data.get(flow._NAV_ANCHOR_MSG_KEY), 111)
 
 
+class AdminPricingServiceAnchorTests(unittest.IsolatedAsyncioTestCase):
+    """P1-3, Batch 3: pricing/service/coefficient/option lifecycle. Every
+    reset_state_keep_nav() call site in this block (price_add_includes,
+    price_edit_field's "done", price_delete_do) was audited; only the
+    latter two paired raw callback.message.edit_text() with it — same bug
+    Batch 1/2 fixed elsewhere, now fixed via flow.step_from_callback. All
+    other price_*/option_* callback handlers edit the SAME physical
+    message menu_pricing (Batch 1) already tracks and never call
+    reset_state_keep_nav/state.set_data — confirmed self-healing, left
+    unchanged (verified below, not just assumed)."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        real_data_dir = Path(__file__).resolve().parent.parent / "data"
+        for name in ("pricing.json", "portfolio.json", "faq.json", "about.json", "ui_config.json"):
+            shutil.copy(real_data_dir / name, Path(self.tmpdir) / name)
+        self._orig_data_dir = content_store.DATA_DIR
+        self._orig_designer = content_store.config.DESIGNER_CHAT_ID
+        content_store.DATA_DIR = Path(self.tmpdir)
+        content_store.config.DESIGNER_CHAT_ID = "666"
+        self.actor = 666
+
+    def tearDown(self):
+        content_store.DATA_DIR = self._orig_data_dir
+        content_store.config.DESIGNER_CHAT_ID = self._orig_designer
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    async def _state_with_nav(self, nav_msg_id: int = 111) -> FSMContext:
+        state = make_state(self.actor)
+        await state.update_data(**{
+            flow._NAV_ANCHOR_MSG_KEY: nav_msg_id,
+            flow._NAV_ANCHOR_CHAT_KEY: self.actor,
+        })
+        return state
+
+    # ---- 2/3: service add wizard — вся цепочка на одном message_id ----
+    async def test_service_add_wizard_chain_tracks_one_transient_through_all_steps(self):
+        state = await self._state_with_nav()
+        msg_id = 8000
+        await admin.menu_pricing(make_callback("adminmenu:pricing", chat_id=self.actor, message_id=msg_id), state)
+        await admin.price_add_start(make_callback("adminpriceaction:add", chat_id=self.actor, message_id=msg_id), state)
+
+        name_msg = make_flow_message_factory(chat_id=self.actor, start_id=8100)(text="Тестовая услуга")
+        await admin.price_add_name(name_msg, state)
+        name_msg.bot.edit_message_text.assert_awaited_once_with(
+            "Базовая цена, ₽ (число):", chat_id=self.actor, message_id=msg_id, reply_markup=kb.cancel_keyboard()
+        )
+
+        price_msg = make_flow_message_factory(chat_id=self.actor, start_id=8200)(text="15000")
+        await admin.price_add_price(price_msg, state)
+        price_msg.bot.edit_message_text.assert_awaited_once_with(
+            "Минимальный срок, дней (число):", chat_id=self.actor, message_id=msg_id, reply_markup=kb.cancel_keyboard()
+        )
+
+        data = await state.get_data()
+        self.assertEqual(data.get(flow._ANCHOR_MSG_KEY), msg_id)  # anchor не уехал за 2 шага
+        self.assertEqual(data.get(flow._NAV_ANCHOR_MSG_KEY), 111)
+
+    # ---- 4: invalid input на шаге цены — retry редактирует тот же экран ----
+    async def test_service_add_invalid_price_retry_keeps_correct_transient(self):
+        state = await self._state_with_nav()
+        msg_id = 8300
+        await admin.menu_pricing(make_callback("adminmenu:pricing", chat_id=self.actor, message_id=msg_id), state)
+        await admin.price_add_start(make_callback("adminpriceaction:add", chat_id=self.actor, message_id=msg_id), state)
+        await admin.price_add_name(make_flow_message_factory(chat_id=self.actor, start_id=8400)(text="Услуга"), state)
+
+        bad_msg = make_flow_message_factory(chat_id=self.actor, start_id=8500)(text="не число")
+        await admin.price_add_price(bad_msg, state)
+        bad_msg.bot.edit_message_text.assert_awaited_once_with(
+            "Нужно число, например 25000. Попробуйте ещё раз:", chat_id=self.actor, message_id=msg_id, reply_markup=kb.cancel_keyboard()
+        )
+        data = await state.get_data()
+        self.assertEqual(data.get(flow._ANCHOR_MSG_KEY), msg_id)  # ни одного orphan retry-сообщения
+
+    # ---- 5: успешное завершение мастера -> корректный экран Услуги и цены ----
+    async def test_service_add_success_returns_to_pricing_root(self):
+        state = await self._state_with_nav()
+        msg_id = 8600
+        await admin.menu_pricing(make_callback("adminmenu:pricing", chat_id=self.actor, message_id=msg_id), state)
+        await admin.price_add_start(make_callback("adminpriceaction:add", chat_id=self.actor, message_id=msg_id), state)
+        make_msg = make_flow_message_factory(chat_id=self.actor, start_id=8700)
+        await admin.price_add_name(make_msg(text="Полный тест"), state)
+        await admin.price_add_price(make_msg(text="20000"), state)
+        await admin.price_add_term_min(make_msg(text="3"), state)
+        await admin.price_add_term_max(make_msg(text="10"), state)
+        final_msg = make_msg(text="Дизайн под ключ")
+        await admin.price_add_includes(final_msg, state)
+
+        final_msg.bot.edit_message_text.assert_awaited_once_with(
+            "Услуга «Полный тест» добавлена ✅", chat_id=self.actor, message_id=msg_id, reply_markup=kb.pricing_menu_keyboard()
+        )
+        self.assertIsNone(await state.get_state())
+        services = await content_store.list_services()
+        self.assertTrue(any(s["name"] == "Полный тест" for s in services))
+        data = await state.get_data()
+        self.assertEqual(data.get(flow._NAV_ANCHOR_MSG_KEY), 111)
+
+    # ---- 6/7: мастер добавления услуги -> Главное меню и /cancel ----
+    async def test_service_add_then_main_menu_shows_confirm_without_touching_transient(self):
+        state = await self._state_with_nav()
+        msg_id = 8800
+        await admin.menu_pricing(make_callback("adminmenu:pricing", chat_id=self.actor, message_id=msg_id), state)
+        await admin.price_add_start(make_callback("adminpriceaction:add", chat_id=self.actor, message_id=msg_id), state)
+        await admin.price_add_name(make_flow_message_factory(chat_id=self.actor, start_id=8900)(text="Услуга"), state)
+        self.assertEqual(await state.get_state(), AdminStates.add_service_price.state)  # активный мастер, не None
+
+        trigger = make_flow_message_factory(chat_id=self.actor, start_id=9000)(text=texts.MAIN_MENU_BUTTON)
+        await admin.admin_main_menu_button(trigger, state)
+        # add_service_price — активный AdminStates, значит "Главное меню"
+        # сначала спрашивает подтверждение (main_menu_confirm_keyboard), а
+        # не удаляет сразу — тот же путь, что и у любого другого активного
+        # мастера (см. bot/handlers/start.py::main_menu_or_confirm). Anchor
+        # и transient-экран мастера при этом не тронуты — подтверждение
+        # ещё не получено.
+        trigger.answer.assert_awaited_once()
+        trigger.bot.delete_message.assert_not_awaited()
+        data = await state.get_data()
+        self.assertEqual(data.get(flow._ANCHOR_MSG_KEY), msg_id)  # anchor не пострадал
+        self.assertEqual(data.get(flow._NAV_ANCHOR_MSG_KEY), 111)
+
+    async def test_service_add_then_cancel_removes_current_prompt(self):
+        state = await self._state_with_nav()
+        msg_id = 9100
+        await admin.menu_pricing(make_callback("adminmenu:pricing", chat_id=self.actor, message_id=msg_id), state)
+        await admin.price_add_start(make_callback("adminpriceaction:add", chat_id=self.actor, message_id=msg_id), state)
+        await admin.price_add_name(make_flow_message_factory(chat_id=self.actor, start_id=9200)(text="Услуга"), state)
+
+        cancel_msg = make_flow_message_factory(chat_id=self.actor, start_id=9300)(text="/cancel")
+        await admin.admin_cancel_command(cancel_msg, state)
+        cancel_msg.bot.delete_message.assert_awaited_once_with(chat_id=self.actor, message_id=msg_id)
+        data = await state.get_data()
+        self.assertEqual(data.get(flow._NAV_ANCHOR_MSG_KEY), 111)
+
+    # ---- 8/11: service edit — pick/field-select self-healing, /cancel удаляет актуальный экран ----
+    async def test_service_edit_chain_tracks_transient_and_cancel_removes_it(self):
+        service = await content_store.add_service(
+            str(self.actor), service_id="SVC_T1", name="Тест", base_price=10000, term_min=1, term_max=5, includes="—",
+        )
+        state = await self._state_with_nav()
+        msg_id = 9400
+        await admin.menu_pricing(make_callback("adminmenu:pricing", chat_id=self.actor, message_id=msg_id), state)
+        await admin.price_edit_start(make_callback("adminpriceaction:edit", chat_id=self.actor, message_id=msg_id), state)
+        await admin.price_edit_picked(make_callback(f"admineditservice:{service['id']}", chat_id=self.actor, message_id=msg_id), state)
+        await admin.price_edit_field(make_callback("admineditservicefield:name", chat_id=self.actor, message_id=msg_id), state)
+        self.assertEqual(await state.get_state(), AdminStates.edit_service_value.state)
+
+        cancel_msg = make_flow_message_factory(chat_id=self.actor, start_id=9500)(text="/cancel")
+        await admin.admin_cancel_command(cancel_msg, state)
+        cancel_msg.bot.delete_message.assert_awaited_once_with(chat_id=self.actor, message_id=msg_id)
+        data = await state.get_data()
+        self.assertEqual(data.get(flow._NAV_ANCHOR_MSG_KEY), 111)
+
+    # ---- 9/10: service edit success -> "done" -> Главное меню удаляет актуальный pricing-root экран ----
+    async def test_service_edit_value_success_then_done_and_main_menu_cleans_it(self):
+        service = await content_store.add_service(
+            str(self.actor), service_id="SVC_T2", name="Тест2", base_price=10000, term_min=1, term_max=5, includes="—",
+        )
+        state = await self._state_with_nav()
+        msg_id = 9600
+        await admin.menu_pricing(make_callback("adminmenu:pricing", chat_id=self.actor, message_id=msg_id), state)
+        await admin.price_edit_start(make_callback("adminpriceaction:edit", chat_id=self.actor, message_id=msg_id), state)
+        await admin.price_edit_picked(make_callback(f"admineditservice:{service['id']}", chat_id=self.actor, message_id=msg_id), state)
+        await admin.price_edit_field(make_callback("admineditservicefield:name", chat_id=self.actor, message_id=msg_id), state)
+
+        value_msg = make_flow_message_factory(chat_id=self.actor, start_id=9700)(text="Новое имя")
+        await admin.price_edit_value(value_msg, state)
+        value_msg.bot.edit_message_text.assert_awaited_once_with(
+            "Обновлено ✅\n\nЧто изменить?", chat_id=self.actor, message_id=msg_id, reply_markup=kb.service_field_keyboard()
+        )
+
+        # До фикса reset_state_keep_nav в этой "done"-ветке стирал anchor,
+        # и Главное меню не находило бы, что удалять.
+        done_cb = make_callback("admineditservicefield:done", chat_id=self.actor, message_id=msg_id)
+        await admin.price_edit_field(done_cb, state)
+        self.assertIsNone(await state.get_state())
+        data = await state.get_data()
+        self.assertEqual(data.get(flow._ANCHOR_MSG_KEY), msg_id)
+
+        trigger = make_flow_message_factory(chat_id=self.actor, start_id=9800)(text=texts.MAIN_MENU_BUTTON)
+        await admin.admin_main_menu_button(trigger, state)
+        trigger.bot.delete_message.assert_awaited_once_with(chat_id=self.actor, message_id=msg_id)
+        trigger.answer.assert_not_awaited()  # ни одного нового WELCOME
+        data_after = await state.get_data()
+        self.assertEqual(data_after.get(flow._NAV_ANCHOR_MSG_KEY), 111)
+
+    # ---- 15: service delete confirmation отслеживает актуальный transient ----
+    async def test_service_delete_confirmation_tracks_transient(self):
+        service = await content_store.add_service(
+            str(self.actor), service_id="SVC_T3", name="Тест3", base_price=5000, term_min=1, term_max=3, includes="—",
+        )
+        state = await self._state_with_nav()
+        msg_id = 9900
+        await admin.menu_pricing(make_callback("adminmenu:pricing", chat_id=self.actor, message_id=msg_id), state)
+        await admin.price_delete_start(make_callback("adminpriceaction:delete", chat_id=self.actor, message_id=msg_id), state)
+        cb = make_callback(f"admindelservice:{service['id']}", chat_id=self.actor, message_id=msg_id)
+        await admin.price_delete_confirm(cb, state)
+        cb.message.edit_text.assert_awaited_once()
+        self.assertEqual(await state.get_state(), AdminStates.delete_service_confirm.state)
+
+        cancel_msg = make_flow_message_factory(chat_id=self.actor, start_id=10000)(text="/cancel")
+        await admin.admin_cancel_command(cancel_msg, state)
+        cancel_msg.bot.delete_message.assert_awaited_once_with(chat_id=self.actor, message_id=msg_id)
+
+    # ---- 17: delete cancellation ("Нет") сохраняет NAV и фиксирует pricing-root anchor ----
+    async def test_service_delete_cancellation_preserves_nav_and_tracks_pricing_root(self):
+        state = await self._state_with_nav()
+        msg_id = 10100
+        await state.update_data(service_id="whatever", cancel_to="pricing")
+        await state.set_state(AdminStates.delete_service_confirm)
+
+        cb = make_callback("admindelserviceconfirm:no", chat_id=self.actor, message_id=msg_id)
+        await admin.price_delete_do(cb, state)
+
+        cb.message.edit_text.assert_awaited_once_with("Отменено.", reply_markup=kb.pricing_menu_keyboard())
+        data = await state.get_data()
+        self.assertEqual(data.get(flow._ANCHOR_MSG_KEY), msg_id)
+        self.assertEqual(data.get(flow._NAV_ANCHOR_MSG_KEY), 111)
+        self.assertIsNone(await state.get_state())
+
+    # ---- 16: delete success -> Главное меню не оставляет confirmation orphan ----
+    async def test_service_delete_success_returns_to_pricing_root_without_orphaning_confirmation(self):
+        service = await content_store.add_service(
+            str(self.actor), service_id="SVC_T4", name="Тест4", base_price=8000, term_min=1, term_max=4, includes="—",
+        )
+        state = await self._state_with_nav()
+        msg_id = 10200
+        await state.update_data(service_id=service["id"], cancel_to="pricing")
+        await state.set_state(AdminStates.delete_service_confirm)
+
+        cb = make_callback("admindelserviceconfirm:yes", chat_id=self.actor, message_id=msg_id)
+        await admin.price_delete_do(cb, state)
+
+        cb.message.edit_text.assert_awaited_once_with("Услуга удалена ✅", reply_markup=kb.pricing_menu_keyboard())
+        remaining = await content_store.list_services()
+        self.assertFalse(any(s["id"] == service["id"] for s in remaining))
+
+        trigger = make_flow_message_factory(chat_id=self.actor, start_id=10300)(text=texts.MAIN_MENU_BUTTON)
+        await admin.admin_main_menu_button(trigger, state)
+        trigger.bot.delete_message.assert_awaited_once_with(chat_id=self.actor, message_id=msg_id)
+        data_after = await state.get_data()
+        self.assertEqual(data_after.get(flow._NAV_ANCHOR_MSG_KEY), 111)
+
+    # ---- 18: отсутствующая услуга не ломает навигацию (delete_service -> False, без исключения) ----
+    async def test_service_delete_missing_service_does_not_corrupt_navigation(self):
+        state = await self._state_with_nav()
+        msg_id = 10400
+        await state.update_data(service_id="NOPE_NOT_REAL", cancel_to="pricing")
+        await state.set_state(AdminStates.delete_service_confirm)
+
+        cb = make_callback("admindelserviceconfirm:yes", chat_id=self.actor, message_id=msg_id)
+        await admin.price_delete_do(cb, state)  # не должно бросить исключение
+
+        cb.message.edit_text.assert_awaited_once_with("Услуга удалена ✅", reply_markup=kb.pricing_menu_keyboard())
+        data = await state.get_data()
+        self.assertEqual(data.get(flow._ANCHOR_MSG_KEY), msg_id)
+        self.assertEqual(data.get(flow._NAV_ANCHOR_MSG_KEY), 111)
+        self.assertIsNone(await state.get_state())
+
+    # ---- 12: coefficient edit — вся цепочка self-healing, /cancel удаляет актуальный экран ----
+    async def test_coefficient_edit_chain_tracks_transient_and_cancel_removes_it(self):
+        state = await self._state_with_nav()
+        msg_id = 10500
+        await admin.menu_pricing(make_callback("adminmenu:pricing", chat_id=self.actor, message_id=msg_id), state)
+        await admin.price_coef_start(make_callback("adminpriceaction:coef", chat_id=self.actor, message_id=msg_id), state)
+        await admin.price_coef_pick(make_callback("admineditcoef:urgent", chat_id=self.actor, message_id=msg_id), state)
+        self.assertEqual(await state.get_state(), AdminStates.edit_coefficients_value.state)
+
+        value_msg = make_flow_message_factory(chat_id=self.actor, start_id=10600)(text="1.3")
+        await admin.price_coef_value(value_msg, state)
+        value_msg.bot.edit_message_text.assert_awaited_once_with(
+            "Обновлено ✅\n\nЧто ещё изменить?", chat_id=self.actor, message_id=msg_id, reply_markup=kb.coefficients_menu_keyboard()
+        )
+        self.assertEqual(await state.get_state(), AdminStates.edit_coefficients_pick.state)
+
+        cancel_msg = make_flow_message_factory(chat_id=self.actor, start_id=10700)(text="/cancel")
+        await admin.admin_cancel_command(cancel_msg, state)
+        cancel_msg.bot.delete_message.assert_awaited_once_with(chat_id=self.actor, message_id=msg_id)
+        data = await state.get_data()
+        self.assertEqual(data.get(flow._NAV_ANCHOR_MSG_KEY), 111)
+
+    # ---- 13: option add — вся цепочка на одном message_id ----
+    async def test_option_add_wizard_chain_tracks_one_transient_through_all_steps(self):
+        service = await content_store.add_service(
+            str(self.actor), service_id="SVC_T5", name="Тест5", base_price=6000, term_min=1, term_max=3, includes="—",
+        )
+        state = await self._state_with_nav()
+        msg_id = 10800
+        # anchor уже отслеживается (пришли сюда через price_edit_field's
+        # "options" ветку, которая, как и option_action, self-healing —
+        # см. аудит) — здесь сокращаем цепочку до сути, не отрицая её.
+        await state.update_data(**{flow._ANCHOR_MSG_KEY: msg_id, flow._ANCHOR_CHAT_KEY: self.actor})
+        await state.update_data(service_id=service["id"])
+        await state.set_state(AdminStates.edit_service_field_pick)
+        await admin.option_action(make_callback("adminoptaction:add", chat_id=self.actor, message_id=msg_id), state)
+
+        make_msg = make_flow_message_factory(chat_id=self.actor, start_id=10900)
+        await admin.option_add_name(make_msg(text="Доп. страница"), state)
+        await admin.option_add_price(make_msg(text="3000"), state)
+        await admin.option_add_days(make_msg(text="2"), state)
+        data = await state.get_data()
+        self.assertEqual(data.get(flow._ANCHOR_MSG_KEY), msg_id)  # anchor не уехал за 3 шага
+
+        done_cb = make_callback("adminoptmultipliable:yes", chat_id=self.actor, message_id=msg_id)
+        await admin.option_add_multipliable(done_cb, state)
+        options = await content_store.list_options(service["id"])
+        self.assertTrue(any(o["name"] == "Доп. страница" for o in options))
+        self.assertEqual(await state.get_state(), AdminStates.edit_service_field_pick.state)
+
+    # ---- 13 (продолжение): option edit — self-healing, /cancel удаляет актуальный экран ----
+    async def test_option_edit_chain_tracks_transient_and_cancel_removes_it(self):
+        service = await content_store.add_service(
+            str(self.actor), service_id="SVC_T6", name="Тест6", base_price=6000, term_min=1, term_max=3, includes="—",
+        )
+        option_id = await content_store.next_option_id(service["id"])
+        await content_store.add_option(str(self.actor), option_id=option_id, service_id=service["id"], name="Опция", price=1000, days=1, multipliable=False)
+        state = await self._state_with_nav()
+        msg_id = 11000
+        await state.update_data(**{flow._ANCHOR_MSG_KEY: msg_id, flow._ANCHOR_CHAT_KEY: self.actor})
+        await state.update_data(service_id=service["id"])
+        await state.set_state(AdminStates.edit_service_field_pick)
+        await admin.option_action(make_callback("adminoptaction:edit", chat_id=self.actor, message_id=msg_id), state)
+        await admin.option_edit_picked(make_callback(f"admineditoption:{option_id}", chat_id=self.actor, message_id=msg_id), state)
+        await admin.option_edit_field(make_callback("admineditoptionfield:price", chat_id=self.actor, message_id=msg_id), state)
+        self.assertEqual(await state.get_state(), AdminStates.option_edit_value.state)
+
+        value_msg = make_flow_message_factory(chat_id=self.actor, start_id=11100)(text="4000")
+        await admin.option_edit_value_text(value_msg, state)
+        value_msg.bot.edit_message_text.assert_awaited_once_with(
+            "Обновлено ✅\n\nЧто изменить?", chat_id=self.actor, message_id=msg_id, reply_markup=kb.option_field_keyboard()
+        )
+
+        cancel_msg = make_flow_message_factory(chat_id=self.actor, start_id=11200)(text="/cancel")
+        await admin.admin_cancel_command(cancel_msg, state)
+        cancel_msg.bot.delete_message.assert_awaited_once_with(chat_id=self.actor, message_id=msg_id)
+
+    # ---- 14: option delete — self-healing (option_delete_do не сбрасывает state.data) ----
+    async def test_option_delete_chain_tracks_transient_and_cancel_removes_it(self):
+        service = await content_store.add_service(
+            str(self.actor), service_id="SVC_T7", name="Тест7", base_price=6000, term_min=1, term_max=3, includes="—",
+        )
+        option_id = await content_store.next_option_id(service["id"])
+        await content_store.add_option(str(self.actor), option_id=option_id, service_id=service["id"], name="Опция", price=1000, days=1, multipliable=False)
+        state = await self._state_with_nav()
+        msg_id = 11300
+        await state.update_data(**{flow._ANCHOR_MSG_KEY: msg_id, flow._ANCHOR_CHAT_KEY: self.actor})
+        await state.update_data(service_id=service["id"], cancel_to="options")
+        await state.set_state(AdminStates.edit_service_field_pick)
+        await admin.option_action(make_callback("adminoptaction:delete", chat_id=self.actor, message_id=msg_id), state)
+        cb = make_callback(f"admindeloption:{option_id}", chat_id=self.actor, message_id=msg_id)
+        await admin.option_delete_confirm(cb, state)
+        self.assertEqual(await state.get_state(), AdminStates.option_delete_confirm.state)
+
+        do_cb = make_callback("admindeloptionconfirm:yes", chat_id=self.actor, message_id=msg_id)
+        await admin.option_delete_do(do_cb, state)
+        do_cb.message.edit_text.assert_awaited_once_with("Опция удалена ✅\n\nОпции этой услуги:", reply_markup=kb.options_menu_keyboard())
+        self.assertEqual(await state.get_state(), AdminStates.edit_service_field_pick.state)
+        remaining = await content_store.list_options(service["id"])
+        self.assertFalse(any(o["id"] == option_id for o in remaining))
+
+        # option_delete_do не вызывает reset_state_keep_nav — anchor всё
+        # ещё корректно указывает на то же физическое сообщение.
+        cancel_msg = make_flow_message_factory(chat_id=self.actor, start_id=11400)(text="/cancel")
+        await admin.admin_cancel_command(cancel_msg, state)
+        cancel_msg.bot.delete_message.assert_awaited_once_with(chat_id=self.actor, message_id=msg_id)
+
+    # ---- 20: ensure_nav_anchor после price_edit_field "done" и price_delete_do не дублирует WELCOME ----
+    async def test_ensure_nav_anchor_after_price_edit_done_does_not_recreate(self):
+        state = await self._state_with_nav()
+        await state.update_data(field="name", service_id="whatever", cancel_to="pricing")
+        await state.set_state(AdminStates.edit_service_field_pick)
+        await admin.price_edit_field(make_callback("admineditservicefield:done", chat_id=self.actor, message_id=11500), state)
+
+        probe = make_flow_message_factory(chat_id=self.actor, start_id=11600)()
+        created = await flow.ensure_nav_anchor(probe, state)
+        self.assertFalse(created)
+        probe.answer.assert_not_awaited()
+        data = await state.get_data()
+        self.assertEqual(data.get(flow._NAV_ANCHOR_MSG_KEY), 111)
+
+    async def test_ensure_nav_anchor_after_price_delete_do_does_not_recreate(self):
+        state = await self._state_with_nav()
+        await state.update_data(service_id="whatever", cancel_to="pricing")
+        await state.set_state(AdminStates.delete_service_confirm)
+        await admin.price_delete_do(make_callback("admindelserviceconfirm:yes", chat_id=self.actor, message_id=11700), state)
+
+        probe = make_flow_message_factory(chat_id=self.actor, start_id=11800)()
+        created = await flow.ensure_nav_anchor(probe, state)
+        self.assertFalse(created)
+        probe.answer.assert_not_awaited()
+        data = await state.get_data()
+        self.assertEqual(data.get(flow._NAV_ANCHOR_MSG_KEY), 111)
+
+
 class AdminLeadsFullSequenceTests(unittest.IsolatedAsyncioTestCase):
     """TEST D из ТЗ: /admin -> Заявки -> открыть -> изменить статус ->
     вернуться, одной непрерывной последовательностью реальных хендлеров
