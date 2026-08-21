@@ -802,8 +802,14 @@ async def faq_edit_picked(callback: CallbackQuery, state: FSMContext) -> None:
 async def faq_edit_field(callback: CallbackQuery, state: FSMContext) -> None:
     field = callback.data.split(":", 1)[1]
     if field == "done":
+        # flow.step_from_callback (P1-3, Batch 2) — reset_state_keep_nav
+        # выше стирает _flow_msg_id/_flow_chat_id (сохраняет только NAV),
+        # и raw edit_text ничего не ставило взамен: экран физически
+        # корректен (тот же message_id), но TRANSIENT anchor больше на
+        # него не указывает — тот же паттерн, что Batch 1 исправил для
+        # menu_* section navigation.
         await flow.reset_state_keep_nav(state)
-        await callback.message.edit_text("FAQ:", reply_markup=kb.admin_faq_menu_keyboard())
+        await flow.step_from_callback(callback, state, "FAQ:", kb.admin_faq_menu_keyboard())
         await callback.answer()
         return
     await state.update_data(field=field)
@@ -849,8 +855,11 @@ async def faq_delete_do(callback: CallbackQuery, state: FSMContext) -> None:
         text = "Вопрос удалён ✅"
     else:
         text = "Отменено."
+    # flow.step_from_callback (P1-3, Batch 2) — тот же паттерн, что и
+    # faq_edit_field's "done" ветка: reset_state_keep_nav стирает anchor,
+    # step_from_callback заново фиксирует его на актуальном FAQ-root экране.
     await flow.reset_state_keep_nav(state)
-    await callback.message.edit_text(text, reply_markup=kb.admin_faq_menu_keyboard())
+    await flow.step_from_callback(callback, state, text, kb.admin_faq_menu_keyboard())
     await callback.answer()
 
 

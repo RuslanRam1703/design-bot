@@ -2335,6 +2335,235 @@ class AdminSectionNavigationAnchorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(data.get(flow._NAV_ANCHOR_CHAT_KEY), self.actor)
 
 
+class AdminFaqEditDeleteAnchorTests(unittest.IsolatedAsyncioTestCase):
+    """P1-3, Batch 2: FAQ edit/delete lifecycle. faq_edit_start/
+    faq_edit_picked/faq_edit_field (non-"done") и faq_delete_start/
+    faq_delete_confirm all edit the SAME physical message that menu_faq
+    (Batch 1) already tracks — since editing never changes message_id and
+    none of them touch state.data, the anchor stays accurate through the
+    whole pick/field-select chain without any code change (verified below,
+    not just assumed). The two REAL bugs, matching Batch 1's exact
+    mechanism, were faq_edit_field's "done" branch and faq_delete_do:
+    both called flow.reset_state_keep_nav() (wipes the anchor, keeps only
+    NAV) followed by a raw edit_text that never restored it — fixed here
+    via flow.step_from_callback, same primitive Batch 1 used.
+
+    faq_edit_value has no retry/invalid-input branch at all (update_faq is
+    called unconditionally on any text) — confirmed in the read-only audit,
+    so there is no "invalid input" scenario to test for FAQ edit."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        real_data_dir = Path(__file__).resolve().parent.parent / "data"
+        for name in ("pricing.json", "portfolio.json", "faq.json", "about.json", "ui_config.json"):
+            shutil.copy(real_data_dir / name, Path(self.tmpdir) / name)
+        self._orig_data_dir = content_store.DATA_DIR
+        self._orig_designer = content_store.config.DESIGNER_CHAT_ID
+        content_store.DATA_DIR = Path(self.tmpdir)
+        content_store.config.DESIGNER_CHAT_ID = "555"
+        self.actor = 555
+
+    def tearDown(self):
+        content_store.DATA_DIR = self._orig_data_dir
+        content_store.config.DESIGNER_CHAT_ID = self._orig_designer
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    async def _state_with_nav(self, nav_msg_id: int = 111) -> FSMContext:
+        state = make_state(self.actor)
+        await state.update_data(**{
+            flow._NAV_ANCHOR_MSG_KEY: nav_msg_id,
+            flow._NAV_ANCHOR_CHAT_KEY: self.actor,
+        })
+        return state
+
+    # ---- 1/2/6/11: edit entry -> pick -> field select -> /cancel, все на одном message_id ----
+    async def test_faq_edit_navigation_chain_tracks_transient_and_cancel_removes_it(self):
+        item = await content_store.add_faq(str(self.actor), "Старый вопрос?", "Старый ответ")
+        state = await self._state_with_nav()
+        msg_id = 6000
+
+        # Реалистичный вход — сначала menu_faq (Batch 1), которая реально
+        # закладывает anchor; без него faq_edit_start и не должен был бы
+        # ничего найти (self-healing работает только при уже корректном
+        # anchor на входе, см. аудит).
+        await admin.menu_faq(make_callback("adminmenu:faq", chat_id=self.actor, message_id=msg_id), state)
+        await admin.faq_edit_start(make_callback("adminfaqaction:edit", chat_id=self.actor, message_id=msg_id), state)
+        data = await state.get_data()
+        self.assertEqual(await state.get_state(), AdminStates.edit_faq_pick.state)
+
+        await admin.faq_edit_picked(make_callback(f"admineditfaq:{item['id']}", chat_id=self.actor, message_id=msg_id), state)
+        self.assertEqual(await state.get_state(), AdminStates.edit_faq_field_pick.state)
+
+        await admin.faq_edit_field(make_callback("admineditfaqfield:answer", chat_id=self.actor, message_id=msg_id), state)
+        self.assertEqual(await state.get_state(), AdminStates.edit_faq_value.state)
+
+        # anchor всё это время указывает на то же физическое сообщение —
+        # ни один из этих трёх raw edit_text-хендлеров не должен был его
+        # менять, ему это и не нужно (тот же message_id, RULE 3).
+        cancel_msg = make_flow_message_factory(chat_id=self.actor, start_id=6100)(text="/cancel")
+        await admin.admin_cancel_command(cancel_msg, state)
+        cancel_msg.bot.delete_message.assert_awaited_once_with(chat_id=self.actor, message_id=msg_id)
+        data_after = await state.get_data()
+        self.assertEqual(data_after.get(flow._NAV_ANCHOR_MSG_KEY), 111)
+
+    # ---- 4: успешное завершение поля -> корректный финальный экран (уже Batch 3, здесь сквозная проверка) ----
+    async def test_faq_edit_value_success_then_done_reaches_faq_root_correctly(self):
+        item = await content_store.add_faq(str(self.actor), "Вопрос", "Ответ")
+        state = await self._state_with_nav()
+        msg_id = 6200
+        await admin.menu_faq(make_callback("adminmenu:faq", chat_id=self.actor, message_id=msg_id), state)
+        await admin.faq_edit_start(make_callback("adminfaqaction:edit", chat_id=self.actor, message_id=msg_id), state)
+        await admin.faq_edit_picked(make_callback(f"admineditfaq:{item['id']}", chat_id=self.actor, message_id=msg_id), state)
+        await admin.faq_edit_field(make_callback("admineditfaqfield:answer", chat_id=self.actor, message_id=msg_id), state)
+
+        value_msg = make_flow_message_factory(chat_id=self.actor, start_id=6300)(text="Новый ответ")
+        await admin.faq_edit_value(value_msg, state)
+        value_msg.bot.edit_message_text.assert_awaited_once_with(
+            "Обновлено ✅\n\nЧто ещё изменить?", chat_id=self.actor, message_id=msg_id, reply_markup=kb.faq_field_keyboard()
+        )
+        updated_items = await content_store.list_faq()
+        self.assertEqual(next(i for i in updated_items if i["id"] == item["id"])["answer"], "Новый ответ")
+
+        # 5/D/G/H: "done" -> Main Menu должно удалить именно этот, актуальный экран
+        done_cb = make_callback("admineditfaqfield:done", chat_id=self.actor, message_id=msg_id)
+        await admin.faq_edit_field(done_cb, state)
+        self.assertIsNone(await state.get_state())
+        data = await state.get_data()
+        self.assertEqual(data.get(flow._ANCHOR_MSG_KEY), msg_id)  # anchor теперь на "FAQ:" root
+
+        trigger = make_flow_message_factory(chat_id=self.actor, start_id=6400)(text=texts.MAIN_MENU_BUTTON)
+        await admin.admin_main_menu_button(trigger, state)
+        trigger.bot.delete_message.assert_awaited_once_with(chat_id=self.actor, message_id=msg_id)
+        trigger.answer.assert_not_awaited()  # ни одного нового WELCOME
+        data_after = await state.get_data()
+        self.assertEqual(data_after.get(flow._NAV_ANCHOR_MSG_KEY), 111)
+
+    # ---- 5: faq_edit_field "done" сам по себе корректно фиксирует FAQ root anchor ----
+    async def test_faq_edit_done_tracks_faq_root_as_current_transient(self):
+        state = await self._state_with_nav()
+        msg_id = 6500
+        await state.update_data(field="answer", faq_id=1, cancel_to="faq")
+        await state.set_state(AdminStates.edit_faq_field_pick)
+        cb = make_callback("admineditfaqfield:done", chat_id=self.actor, message_id=msg_id)
+        await admin.faq_edit_field(cb, state)
+
+        cb.message.edit_text.assert_awaited_once_with("FAQ:", reply_markup=kb.admin_faq_menu_keyboard())
+        data = await state.get_data()
+        self.assertEqual(data.get(flow._ANCHOR_MSG_KEY), msg_id)
+        self.assertEqual(data.get(flow._ANCHOR_CHAT_KEY), self.actor)
+        self.assertEqual(data.get(flow._NAV_ANCHOR_MSG_KEY), 111)
+        self.assertIsNone(await state.get_state())
+
+    # ---- 7: delete confirmation отслеживает актуальный transient ----
+    async def test_faq_delete_confirmation_tracks_transient(self):
+        item = await content_store.add_faq(str(self.actor), "Удалить меня?", "Ответ")
+        state = await self._state_with_nav()
+        msg_id = 6600
+
+        await admin.menu_faq(make_callback("adminmenu:faq", chat_id=self.actor, message_id=msg_id), state)
+        await admin.faq_delete_start(make_callback("adminfaqaction:delete", chat_id=self.actor, message_id=msg_id), state)
+        self.assertEqual(await state.get_state(), AdminStates.delete_faq_pick.state)
+
+        cb = make_callback(f"admindelfaq:{item['id']}", chat_id=self.actor, message_id=msg_id)
+        await admin.faq_delete_confirm(cb, state)
+        cb.message.edit_text.assert_awaited_once()
+        self.assertEqual(await state.get_state(), AdminStates.delete_faq_confirm.state)
+
+        cancel_msg = make_flow_message_factory(chat_id=self.actor, start_id=6700)(text="/cancel")
+        await admin.admin_cancel_command(cancel_msg, state)
+        cancel_msg.bot.delete_message.assert_awaited_once_with(chat_id=self.actor, message_id=msg_id)
+
+    # ---- 8: delete cancellation ("Нет") сохраняет NAV и корректно фиксирует FAQ root anchor ----
+    async def test_faq_delete_cancellation_preserves_nav_and_tracks_faq_root(self):
+        item = await content_store.add_faq(str(self.actor), "Вопрос", "Ответ")
+        state = await self._state_with_nav()
+        msg_id = 6800
+        await state.update_data(faq_id=item["id"], cancel_to="faq")
+        await state.set_state(AdminStates.delete_faq_confirm)
+
+        cb = make_callback("admindelfaqconfirm:no", chat_id=self.actor, message_id=msg_id)
+        await admin.faq_delete_do(cb, state)
+
+        cb.message.edit_text.assert_awaited_once_with("Отменено.", reply_markup=kb.admin_faq_menu_keyboard())
+        data = await state.get_data()
+        self.assertEqual(data.get(flow._ANCHOR_MSG_KEY), msg_id)  # FAQ root теперь корректно отслеживается
+        self.assertEqual(data.get(flow._NAV_ANCHOR_MSG_KEY), 111)
+        self.assertEqual(data.get(flow._NAV_ANCHOR_CHAT_KEY), self.actor)
+        self.assertIsNone(await state.get_state())
+        # вопрос не был удалён — "Нет" действительно отменяет, а не подтверждает
+        remaining = await content_store.list_faq()
+        self.assertTrue(any(i["id"] == item["id"] for i in remaining))
+
+    # ---- 9: delete success возвращает на FAQ root, не оставляя confirmation orphan ----
+    async def test_faq_delete_success_returns_to_faq_root_without_orphaning_confirmation(self):
+        item = await content_store.add_faq(str(self.actor), "Вопрос", "Ответ")
+        state = await self._state_with_nav()
+        msg_id = 6900
+        await state.update_data(faq_id=item["id"], cancel_to="faq")
+        await state.set_state(AdminStates.delete_faq_confirm)
+
+        cb = make_callback("admindelfaqconfirm:yes", chat_id=self.actor, message_id=msg_id)
+        await admin.faq_delete_do(cb, state)
+
+        cb.message.edit_text.assert_awaited_once_with("Вопрос удалён ✅", reply_markup=kb.admin_faq_menu_keyboard())
+        data = await state.get_data()
+        self.assertEqual(data.get(flow._ANCHOR_MSG_KEY), msg_id)  # тот же экран (confirmation), теперь "удалён ✅"
+        remaining = await content_store.list_faq()
+        self.assertFalse(any(i["id"] == item["id"] for i in remaining))
+
+        # Main Menu после этого должно удалить именно этот, актуальный экран —
+        # до фикса confirmation-сообщение осталось бы orphan навсегда.
+        trigger = make_flow_message_factory(chat_id=self.actor, start_id=7000)(text=texts.MAIN_MENU_BUTTON)
+        await admin.admin_main_menu_button(trigger, state)
+        trigger.bot.delete_message.assert_awaited_once_with(chat_id=self.actor, message_id=msg_id)
+        data_after = await state.get_data()
+        self.assertEqual(data_after.get(flow._NAV_ANCHOR_MSG_KEY), 111)
+
+    # ---- 10/14: отсутствующий FAQ item не ломает навигацию (content_store.delete_faq -> False, без исключения) ----
+    async def test_faq_delete_missing_item_does_not_corrupt_navigation(self):
+        state = await self._state_with_nav()
+        msg_id = 7100
+        await state.update_data(faq_id=999999, cancel_to="faq")  # id, которого нет
+        await state.set_state(AdminStates.delete_faq_confirm)
+
+        cb = make_callback("admindelfaqconfirm:yes", chat_id=self.actor, message_id=msg_id)
+        await admin.faq_delete_do(cb, state)  # не должно бросить исключение
+
+        cb.message.edit_text.assert_awaited_once_with("Вопрос удалён ✅", reply_markup=kb.admin_faq_menu_keyboard())
+        data = await state.get_data()
+        self.assertEqual(data.get(flow._ANCHOR_MSG_KEY), msg_id)
+        self.assertEqual(data.get(flow._NAV_ANCHOR_MSG_KEY), 111)
+        self.assertIsNone(await state.get_state())  # FSM корректно сброшен, не завис
+
+    # ---- 13: ensure_nav_anchor после edit-done и delete-do не дублирует WELCOME ----
+    async def test_ensure_nav_anchor_after_faq_edit_done_does_not_recreate(self):
+        state = await self._state_with_nav()
+        await state.update_data(field="answer", faq_id=1, cancel_to="faq")
+        await state.set_state(AdminStates.edit_faq_field_pick)
+        await admin.faq_edit_field(make_callback("admineditfaqfield:done", chat_id=self.actor, message_id=7200), state)
+
+        probe = make_flow_message_factory(chat_id=self.actor, start_id=7300)()
+        created = await flow.ensure_nav_anchor(probe, state)
+        self.assertFalse(created)
+        probe.answer.assert_not_awaited()
+        data = await state.get_data()
+        self.assertEqual(data.get(flow._NAV_ANCHOR_MSG_KEY), 111)
+
+    async def test_ensure_nav_anchor_after_faq_delete_do_does_not_recreate(self):
+        item = await content_store.add_faq(str(self.actor), "Вопрос", "Ответ")
+        state = await self._state_with_nav()
+        await state.update_data(faq_id=item["id"], cancel_to="faq")
+        await state.set_state(AdminStates.delete_faq_confirm)
+        await admin.faq_delete_do(make_callback("admindelfaqconfirm:yes", chat_id=self.actor, message_id=7400), state)
+
+        probe = make_flow_message_factory(chat_id=self.actor, start_id=7500)()
+        created = await flow.ensure_nav_anchor(probe, state)
+        self.assertFalse(created)
+        probe.answer.assert_not_awaited()
+        data = await state.get_data()
+        self.assertEqual(data.get(flow._NAV_ANCHOR_MSG_KEY), 111)
+
+
 class AdminLeadsFullSequenceTests(unittest.IsolatedAsyncioTestCase):
     """TEST D из ТЗ: /admin -> Заявки -> открыть -> изменить статус ->
     вернуться, одной непрерывной последовательностью реальных хендлеров
