@@ -448,8 +448,11 @@ async def case_image_add_receive(message: Message, state: FSMContext) -> None:
 
 
 @router.message(AdminStates.case_image_add)
-async def case_image_add_wrong(message: Message) -> None:
-    await message.answer("Нужно фото 📎.", reply_markup=kb.cancel_keyboard())
+async def case_image_add_wrong(message: Message, state: FSMContext) -> None:
+    # flow.step_from_text (P1-3, Batch 2) — та же прогулка через RULE 3,
+    # что и Batch 1: без неё эта reprompt-ветка оставляла бы неотслеживаемое
+    # сообщение, и /cancel на повторной попытке удалял бы не его.
+    await flow.step_from_text(message, state, "Нужно фото 📎.", kb.cancel_keyboard())
 
 
 @router.callback_query(AdminStates.case_images_menu, F.data.startswith("admincaseimgpick:"))
@@ -641,9 +644,13 @@ async def case_section_edit_value(message: Message, state: FSMContext) -> None:
     field = data.get("section_field")
     case_id, index = data["case_id"], data["section_index"]
 
+    # Обе reprompt-ветки ниже — flow.step_from_text (P1-3, Batch 2): без
+    # него invalid-попытка оставляла бы неотслеживаемое сообщение, и
+    # /cancel на следующей попытке удалял бы не его (тот же механизм,
+    # что Batch 1 исправил для guaranteed-stale valid-path шагов).
     if field == "addimg":
         if not (message.photo or message.document):
-            await message.answer("Нужно фото 📎.", reply_markup=kb.cancel_keyboard())
+            await flow.step_from_text(message, state, "Нужно фото 📎.", kb.cancel_keyboard())
             return
         file_id = message.photo[-1].file_id if message.photo else message.document.file_id
         path = await content_store.save_case_photo(message.chat.id, message.bot, file_id, f"{case_id}_{uuid.uuid4().hex[:8]}")
@@ -652,7 +659,7 @@ async def case_section_edit_value(message: Message, state: FSMContext) -> None:
         await content_store.update_case_section(message.chat.id, case_id, index, images=images + [path])
     else:
         if not message.text:
-            await message.answer("Нужен текст.", reply_markup=kb.cancel_keyboard())
+            await flow.step_from_text(message, state, "Нужен текст.", kb.cancel_keyboard())
             return
         await content_store.update_case_section(message.chat.id, case_id, index, **{field: message.text.strip()})
 
@@ -674,14 +681,14 @@ async def cases_edit_value(message: Message, state: FSMContext) -> None:
     field = data["field"]
     if field == "cover":
         if not (message.photo or message.document):
-            await message.answer("Нужно фото 📎.", reply_markup=kb.cancel_keyboard())
+            await flow.step_from_text(message, state, "Нужно фото 📎.", kb.cancel_keyboard())
             return
         file_id = message.photo[-1].file_id if message.photo else message.document.file_id
         value = await content_store.save_case_photo(message.chat.id, message.bot, file_id, data["case_id"])
         await content_store.update_case(message.chat.id, data["case_id"], cover=value)
     else:
         if not message.text:
-            await message.answer("Нужен текст.", reply_markup=kb.cancel_keyboard())
+            await flow.step_from_text(message, state, "Нужен текст.", kb.cancel_keyboard())
             return
         await content_store.update_case(message.chat.id, data["case_id"], **{field: message.text.strip()})
     await message.answer("Обновлено ✅\n\nЧто ещё изменить?", reply_markup=kb.case_field_keyboard())
@@ -947,8 +954,8 @@ async def about_edit_photo(message: Message, state: FSMContext) -> None:
 
 
 @router.message(AdminStates.edit_about_photo)
-async def about_edit_photo_wrong(message: Message) -> None:
-    await message.answer("Нужно фото 📎.", reply_markup=kb.cancel_keyboard())
+async def about_edit_photo_wrong(message: Message, state: FSMContext) -> None:
+    await flow.step_from_text(message, state, "Нужно фото 📎.", kb.cancel_keyboard())
 
 
 @router.message(AdminStates.edit_about_value, F.text)
@@ -1086,7 +1093,7 @@ async def price_edit_value(message: Message, state: FSMContext) -> None:
     if field in ("base_price", "term_min", "term_max"):
         value = _parse_number(message.text)
         if value is None:
-            await message.answer("Нужно число. Попробуйте ещё раз:", reply_markup=kb.cancel_keyboard())
+            await flow.step_from_text(message, state, "Нужно число. Попробуйте ещё раз:", kb.cancel_keyboard())
             return
         await content_store.update_service(message.chat.id, data["service_id"], **{field: value})
     else:
@@ -1170,7 +1177,7 @@ async def price_coef_value(message: Message, state: FSMContext) -> None:
     min_value = 0.01 if data.get("key") == "round_to" else 0
     value = _parse_number(message.text, min_value=min_value)
     if value is None:
-        await message.answer("Нужно число. Попробуйте ещё раз:", reply_markup=kb.cancel_keyboard())
+        await flow.step_from_text(message, state, "Нужно число. Попробуйте ещё раз:", kb.cancel_keyboard())
         return
     if data["kind"] == "coef":
         await content_store.update_coefficient(message.chat.id, data["key"], value)
@@ -1323,7 +1330,7 @@ async def option_edit_value_text(message: Message, state: FSMContext) -> None:
     if field in ("price", "days"):
         value = _parse_number(message.text)
         if value is None:
-            await message.answer("Нужно число. Попробуйте ещё раз:", reply_markup=kb.cancel_keyboard())
+            await flow.step_from_text(message, state, "Нужно число. Попробуйте ещё раз:", kb.cancel_keyboard())
             return
         await content_store.update_option(message.chat.id, data["option_id"], **{field: value})
     else:
@@ -1706,7 +1713,12 @@ async def backup_import_receive(message: Message, state: FSMContext) -> None:
     try:
         result = await content_store.import_backup_bytes(message.chat.id, file_bytes_io.read())
     except zipfile.BadZipFile:
-        await message.answer("Файл повреждён или не .zip — пришлите другой файл.", reply_markup=kb.cancel_keyboard())
+        # flow.step_from_text (P1-3, Batch 2) — единственная ветка этого
+        # handler'а, что реально остаётся в том же AdminStates.
+        # backup_restore_wait_file (ждёт другой файл): остальные ветки
+        # ниже переводят в AdminStates.backup_menu — это terminal-результат
+        # (RULE 3 к ним не относится), не retry, и мигрировать их не нужно.
+        await flow.step_from_text(message, state, "Файл повреждён или не .zip — пришлите другой файл.", kb.cancel_keyboard())
         return
     except content_store.BackupValidationError as e:
         found = ", ".join(e.found_filenames) if e.found_filenames else "—"
@@ -1765,7 +1777,7 @@ async def backup_import_receive(message: Message, state: FSMContext) -> None:
 
 @router.message(AdminStates.backup_restore_wait_file)
 async def backup_import_wrong(message: Message, state: FSMContext) -> None:
-    await message.answer("Нужен .zip файл 📎.", reply_markup=kb.cancel_keyboard())
+    await flow.step_from_text(message, state, "Нужен .zip файл 📎.", kb.cancel_keyboard())
 
 
 # ---- Фолбэк: сообщение не того типа/формата на любом шаге админки ----
