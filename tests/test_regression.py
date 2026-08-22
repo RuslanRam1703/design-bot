@@ -3379,6 +3379,255 @@ class AdminLeadsQueueUxTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(updated.get("owner_messages", []), [])
 
 
+class AdminLeadWorkflowTests(unittest.IsolatedAsyncioTestCase):
+    """P1-3, Batch 7: Admin -> Leads / Client Interaction Workflow.
+
+    Full audit found the anchor-lifecycle class (Batch 4) already closed
+    here -- menu_leads is the only reset_state_keep_nav() site in this
+    block and was already migrated to flow.step_from_callback; every
+    other handler is a self-healing raw edit_text with no intervening
+    reset. content_store's lead functions (get_lead/update_lead_status/
+    delete_lead/add_owner_message) already follow the established bool-
+    return/no-raise pattern. The admin detail card (bot/lead.py::
+    format_lead_admin_detail) already surfaces everything the owner needs
+    to understand a request (Telegram identity, service, source, brief,
+    calc summary, supplements, materials, owner replies, timestamps) --
+    no data gaps found.
+
+    Two real, reproduced bugs were found and fixed:
+
+    1. lead_change_status read the freshly-updated lead unconditionally --
+       if the lead was deleted between opening its card and clicking a
+       status button (concurrent session, stale/replayed callback),
+       format_lead_admin_detail(None)/lead_detail_keyboard(None) crashed
+       with TypeError. Reproduced directly before fixing. Fixed with a
+       single "if lead is None" guard, falling back to the leads list --
+       the same graceful-missing-entity pattern used everywhere else in
+       admin.py.
+    2. lead_reply_start set cancel_to="root" -- unlike every other free-
+       text step in admin.py (which preserves its specific context via
+       _resolve_cancel's "options"/"sections"/"images" branches), cancelling
+       out of "Текст сообщения клиенту:" lost the lead entirely and sent
+       the owner to the bare admin root menu instead of back to the lead
+       card they were replying to. Fixed by adding a "leads" branch to
+       _resolve_cancel, mirroring the existing sections/images pattern.
+
+    Lead deletion (start/confirm/cancel/missing) had zero prior handler-
+    level test coverage -- covered here; found no bug (content_store.
+    delete_lead is already bool-safe, and lead_delete_do re-renders the
+    list rather than a specific lead, so it was never at crash risk)."""
+
+    async def asyncSetUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        real_data_dir = Path(__file__).resolve().parent.parent / "data"
+        for name in ("pricing.json", "portfolio.json", "faq.json", "about.json", "ui_config.json"):
+            shutil.copy(real_data_dir / name, Path(self.tmpdir) / name)
+        self._orig_data_dir = content_store.DATA_DIR
+        self._orig_designer = content_store.config.DESIGNER_CHAT_ID
+        content_store.DATA_DIR = Path(self.tmpdir)
+        content_store.config.DESIGNER_CHAT_ID = "333"
+        self.actor = 333
+        self.lead = await content_store.add_lead(
+            {"service_name": "Лендинг", "task_description": "Тест"},
+            {"user_id": 66666, "username": "client", "first_name": "Клиент"},
+        )
+
+    def tearDown(self):
+        content_store.DATA_DIR = self._orig_data_dir
+        content_store.config.DESIGNER_CHAT_ID = self._orig_designer
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    async def _state_in_lead_detail(self, lead_id: int, msg_id: int = 500) -> FSMContext:
+        state = make_state(self.actor)
+        await state.update_data(**{
+            flow._NAV_ANCHOR_MSG_KEY: 111, flow._NAV_ANCHOR_CHAT_KEY: self.actor,
+            flow._ANCHOR_MSG_KEY: msg_id, flow._ANCHOR_CHAT_KEY: self.actor,
+            "lead_id": lead_id,
+        })
+        await state.set_state(AdminStates.lead_detail)
+        return state
+
+    # ---- 8/9: missing/stale lead does not crash ----
+    async def test_lead_open_detail_missing_lead_shows_alert_without_crash(self):
+        state = make_state(self.actor)
+        cb = make_callback("adminleadpick:999999", chat_id=self.actor)
+        await admin.lead_open_detail(cb, state)  # не должно бросить исключение
+        cb.answer.assert_awaited_once_with("Заявка не найдена", show_alert=True)
+        self.assertIsNone(await state.get_state())  # ничего не открыто
+
+    async def test_lead_change_status_missing_lead_does_not_crash(self):
+        state = await self._state_in_lead_detail(999999, msg_id=600)  # такой заявки нет
+        cb = make_callback("adminleadstatus:IN_PROGRESS", chat_id=self.actor, message_id=600)
+
+        await admin.lead_change_status(cb, state)  # не должно бросить исключение
+
+        cb.message.edit_text.assert_awaited_once()
+        self.assertIn("не найдена", cb.message.edit_text.await_args.args[0])
+        self.assertEqual(await state.get_state(), AdminStates.leads_list.state)
+
+    # ---- 10/13: reply start guards a missing/incomplete recipient ----
+    async def test_lead_reply_start_missing_telegram_id_shows_alert_without_crash(self):
+        lead = await content_store.add_lead({"service_name": "Без Telegram ID"}, {})
+        state = await self._state_in_lead_detail(lead["id"], msg_id=610)
+        cb = make_callback("adminleadaction:reply", chat_id=self.actor, message_id=610)
+
+        await admin.lead_reply_start(cb, state)  # не должно бросить исключение
+
+        cb.answer.assert_awaited_once_with("Нет Telegram ID клиента — ответить через бота нельзя", show_alert=True)
+        self.assertEqual(await state.get_state(), AdminStates.lead_detail.state)  # остались на месте
+
+    async def test_lead_reply_start_missing_lead_shows_alert_without_crash(self):
+        state = await self._state_in_lead_detail(999999, msg_id=615)
+        cb = make_callback("adminleadaction:reply", chat_id=self.actor, message_id=615)
+
+        await admin.lead_reply_start(cb, state)  # не должно бросить исключение
+
+        cb.answer.assert_awaited_once_with("Нет Telegram ID клиента — ответить через бота нельзя", show_alert=True)
+
+    # ---- 7/11: reply cancellation returns to the lead card, not admin root ----
+    async def test_lead_reply_start_sets_cancel_to_leads(self):
+        state = await self._state_in_lead_detail(self.lead["id"], msg_id=620)
+        await admin.lead_reply_start(make_callback("adminleadaction:reply", chat_id=self.actor, message_id=620), state)
+        self.assertEqual((await state.get_data()).get("cancel_to"), "leads")
+        self.assertEqual(await state.get_state(), AdminStates.lead_reply_text.state)
+
+    async def test_lead_reply_inline_cancel_returns_to_lead_detail_not_root(self):
+        state = await self._state_in_lead_detail(self.lead["id"], msg_id=630)
+        await admin.lead_reply_start(make_callback("adminleadaction:reply", chat_id=self.actor, message_id=630), state)
+
+        cb = make_callback("admincancel", chat_id=self.actor, message_id=630)
+        await admin.admin_cancel(cb, state)
+
+        cb.message.edit_text.assert_awaited_once()
+        shown_text = cb.message.edit_text.await_args.args[0]
+        self.assertIn(f"Заявка #{self.lead['id']}", shown_text)  # карточка заявки, не общий Админ-меню
+        self.assertEqual(await state.get_state(), AdminStates.lead_detail.state)
+        self.assertEqual((await state.get_data()).get("lead_id"), self.lead["id"])
+
+    async def test_lead_reply_cancel_command_returns_to_lead_detail_not_root(self):
+        state = await self._state_in_lead_detail(self.lead["id"], msg_id=640)
+        await admin.lead_reply_start(make_callback("adminleadaction:reply", chat_id=self.actor, message_id=640), state)
+
+        cancel_msg = make_reply_message(self.actor, "/cancel", AsyncMock())
+        await admin.admin_cancel_command(cancel_msg, state)
+
+        self.assertEqual(await state.get_state(), AdminStates.lead_detail.state)
+        self.assertEqual((await state.get_data()).get("lead_id"), self.lead["id"])
+        cancel_msg.bot.delete_message.assert_awaited_once_with(chat_id=self.actor, message_id=640)  # старый prompt убран
+        sent_text = cancel_msg.answer.await_args.args[0]
+        self.assertIn(f"Заявка #{self.lead['id']}", sent_text)
+
+    async def test_lead_reply_cancel_missing_lead_falls_back_to_leads_list(self):
+        state = await self._state_in_lead_detail(999999, msg_id=650)
+        await state.update_data(cancel_to="leads")
+        await state.set_state(AdminStates.lead_reply_text)
+
+        cb = make_callback("admincancel", chat_id=self.actor, message_id=650)
+        await admin.admin_cancel(cb, state)  # не должно бросить исключение
+
+        cb.message.edit_text.assert_awaited_once()
+        self.assertIn("не найдена", cb.message.edit_text.await_args.args[0])
+        self.assertEqual(await state.get_state(), AdminStates.leads_list.state)
+
+    # ---- 6: Main Menu from lead detail cleans up correctly ----
+    async def test_lead_detail_then_main_menu_cleans_current_screen(self):
+        state = await self._state_in_lead_detail(self.lead["id"], msg_id=660)
+
+        trigger = make_reply_message(self.actor, texts.MAIN_MENU_BUTTON, AsyncMock())
+        await admin.admin_main_menu_button(trigger, state)
+        self.assertEqual(await state.get_state(), AdminStates.lead_detail.state)  # активное состояние -> сперва подтверждение
+
+        confirm_cb = SimpleNamespace(data="mainmenu:confirm", message=make_flow_message(chat_id=self.actor), answer=AsyncMock())
+        await start.main_menu_confirm(confirm_cb, state)
+        confirm_cb.message.bot.delete_message.assert_awaited_once_with(chat_id=self.actor, message_id=660)
+        confirm_cb.message.answer.assert_not_awaited()
+        self.assertIsNone(await state.get_state())
+
+    # ---- 15: delete/archive -- destructive, must be confirmed ----
+    async def test_lead_delete_shows_confirm_and_does_not_remove_until_confirmed(self):
+        state = await self._state_in_lead_detail(self.lead["id"], msg_id=670)
+        cb = make_callback("adminleadaction:delete", chat_id=self.actor, message_id=670)
+        await admin.lead_delete_start(cb, state)
+
+        cb.message.edit_text.assert_awaited_once_with(
+            f"Удалить заявку #{self.lead['id']}? Это необратимо.", reply_markup=kb.confirm_keyboard("admindelleadconfirm")
+        )
+        self.assertEqual(await state.get_state(), AdminStates.lead_delete_confirm.state)
+        self.assertIsNotNone(await content_store.get_lead(self.lead["id"]))  # ещё не удалена
+
+    async def test_lead_delete_cancel_preserves_lead(self):
+        state = await self._state_in_lead_detail(self.lead["id"], msg_id=680)
+        await state.set_state(AdminStates.lead_delete_confirm)
+        cb = make_callback("admindelleadconfirm:no", chat_id=self.actor, message_id=680)
+        await admin.lead_delete_do(cb, state)
+
+        self.assertIsNotNone(await content_store.get_lead(self.lead["id"]))
+        self.assertEqual(await state.get_state(), AdminStates.leads_list.state)
+        self.assertIn("Отменено", cb.message.edit_text.await_args.args[0])
+
+    async def test_lead_delete_confirm_yes_removes_lead(self):
+        state = await self._state_in_lead_detail(self.lead["id"], msg_id=690)
+        await state.set_state(AdminStates.lead_delete_confirm)
+        cb = make_callback("admindelleadconfirm:yes", chat_id=self.actor, message_id=690)
+        await admin.lead_delete_do(cb, state)
+
+        self.assertIsNone(await content_store.get_lead(self.lead["id"]))
+        self.assertEqual(await state.get_state(), AdminStates.leads_list.state)
+        self.assertIn("удалена", cb.message.edit_text.await_args.args[0])
+
+    async def test_lead_delete_missing_lead_does_not_crash(self):
+        state = await self._state_in_lead_detail(999999, msg_id=700)
+        await state.set_state(AdminStates.lead_delete_confirm)
+        cb = make_callback("admindelleadconfirm:yes", chat_id=self.actor, message_id=700)
+
+        await admin.lead_delete_do(cb, state)  # не должно бросить исключение
+
+        self.assertEqual(await state.get_state(), AdminStates.leads_list.state)
+        self.assertIsNotNone(await content_store.get_lead(self.lead["id"]))  # реальная заявка не задета
+
+    # ---- 14: repeated open does not orphan messages (same message_id reused) ----
+    async def test_repeated_lead_reopen_does_not_orphan_messages(self):
+        state = make_state(self.actor)
+        msg_id = 710
+        await state.update_data(**{flow._NAV_ANCHOR_MSG_KEY: 111, flow._NAV_ANCHOR_CHAT_KEY: self.actor})
+        await admin.menu_leads(make_callback("adminmenu:leads", chat_id=self.actor, message_id=msg_id), state)
+
+        cb1 = make_callback(f"adminleadpick:{self.lead['id']}", chat_id=self.actor, message_id=msg_id)
+        await admin.lead_open_detail(cb1, state)
+        cb2 = make_callback("adminleadaction:back", chat_id=self.actor, message_id=msg_id)
+        await admin.lead_back_to_list(cb2, state)
+        cb3 = make_callback(f"adminleadpick:{self.lead['id']}", chat_id=self.actor, message_id=msg_id)
+        await admin.lead_open_detail(cb3, state)
+
+        data = await state.get_data()
+        self.assertEqual(data.get(flow._ANCHOR_MSG_KEY), msg_id)  # всё ещё то же сообщение, ничего нового не создано
+        self.assertEqual(data.get(flow._NAV_ANCHOR_MSG_KEY), 111)
+
+    # ---- 16: ensure_nav_anchor after lead operations does not duplicate NAV ----
+    async def test_ensure_nav_anchor_after_lead_change_status_does_not_recreate(self):
+        state = await self._state_in_lead_detail(self.lead["id"], msg_id=720)
+        await admin.lead_change_status(make_callback("adminleadstatus:IN_PROGRESS", chat_id=self.actor, message_id=720), state)
+
+        probe = make_flow_message_factory(chat_id=self.actor, start_id=20600)()
+        created = await flow.ensure_nav_anchor(probe, state)
+        self.assertFalse(created)
+        probe.answer.assert_not_awaited()
+        data = await state.get_data()
+        self.assertEqual(data.get(flow._NAV_ANCHOR_MSG_KEY), 111)
+
+    async def test_ensure_nav_anchor_after_lead_delete_do_does_not_recreate(self):
+        state = await self._state_in_lead_detail(self.lead["id"], msg_id=730)
+        await state.set_state(AdminStates.lead_delete_confirm)
+        await admin.lead_delete_do(make_callback("admindelleadconfirm:yes", chat_id=self.actor, message_id=730), state)
+
+        probe = make_flow_message_factory(chat_id=self.actor, start_id=20700)()
+        created = await flow.ensure_nav_anchor(probe, state)
+        self.assertFalse(created)
+        probe.answer.assert_not_awaited()
+        data = await state.get_data()
+        self.assertEqual(data.get(flow._NAV_ANCHOR_MSG_KEY), 111)
+
+
 class MainMenuConfirmationTests(unittest.IsolatedAsyncioTestCase):
     """"⌂ Главное меню" (см. production-аудит про дублирование NAV anchor):
     нет активного bot/FSM-состояния -> только cleanup (flow.main_menu_cleanup

@@ -73,6 +73,20 @@ async def _resolve_cancel(data: dict) -> tuple[str, InlineKeyboardMarkup, State 
             AdminStates.case_images_menu,
             {"case_id": data["case_id"]},
         )
+    if target == "leads" and data.get("lead_id"):
+        # P1-3, Batch 7: сохраняет карточку заявки, к которой была открыта
+        # отмена (см. lead_reply_start) — та же логика, что sections/images
+        # выше, а не общий CANCEL_TARGETS["root"], который её терял.
+        lead = await content_store.get_lead(data["lead_id"])
+        if lead is None:
+            leads = await content_store.list_leads("ALL")
+            return "Отменено. Заявка не найдена.\n\nЗаявки:", kb.leads_list_keyboard(leads, "ALL"), AdminStates.leads_list, {}
+        return (
+            "Отменено.\n\n" + lead_format.format_lead_admin_detail(lead),
+            kb.lead_detail_keyboard(lead),
+            AdminStates.lead_detail,
+            {"lead_id": data["lead_id"]},
+        )
     text, kb_builder = CANCEL_TARGETS.get(target, CANCEL_TARGETS["root"])
     return text, kb_builder(), None, {}
 
@@ -1742,6 +1756,17 @@ async def lead_change_status(callback: CallbackQuery, state: FSMContext) -> None
     await content_store.update_lead_status(callback.message.chat.id, data["lead_id"], status)
     lead = await content_store.get_lead(data["lead_id"])
 
+    # P1-3, Batch 7: заявка могла быть удалена между открытием карточки и
+    # кликом по статусу (другая сессия, устаревший callback) — раньше
+    # format_lead_admin_detail(None)/lead_detail_keyboard(None) падали с
+    # TypeError вместо graceful "не найдена" (воспроизведено до фикса).
+    if lead is None:
+        leads = await content_store.list_leads("ALL")
+        await callback.message.edit_text(f"Заявка не найдена.\n\nЗаявки ({len(leads)}):", reply_markup=kb.leads_list_keyboard(leads, "ALL"))
+        await state.set_state(AdminStates.leads_list)
+        await callback.answer()
+        return
+
     # Уведомление клиенту — только если статус реально поменялся (не
     # повторная установка того же значения) и есть куда слать. owner_messages[]
     # здесь не трогается вообще — это отдельный, независимый поток (только
@@ -1749,7 +1774,7 @@ async def lead_change_status(callback: CallbackQuery, state: FSMContext) -> None
     # персистентный лог статус-уведомлений — сам lead["status"] уже
     # источник правды, Mini App покажет его корректно независимо от того,
     # дошло ли сейчас сообщение в Telegram.
-    if lead and old_status != status and lead.get("telegram", {}).get("user_id"):
+    if old_status != status and lead.get("telegram", {}).get("user_id"):
         try:
             await callback.bot.send_message(
                 chat_id=lead["telegram"]["user_id"],
@@ -1770,7 +1795,10 @@ async def lead_reply_start(callback: CallbackQuery, state: FSMContext) -> None:
         await callback.answer("Нет Telegram ID клиента — ответить через бота нельзя", show_alert=True)
         return
     await callback.message.edit_text("Текст сообщения клиенту:", reply_markup=kb.cancel_keyboard())
-    await state.update_data(cancel_to="root")
+    # cancel_to="leads", не "root" (P1-3, Batch 7) — раньше "❌ Отмена"/
+    # /cancel отсюда уводили на весь Админ-меню, теряя карточку заявки,
+    # к которой уже был открыт диалог ответа (см. _resolve_cancel).
+    await state.update_data(cancel_to="leads")
     await state.set_state(AdminStates.lead_reply_text)
     await callback.answer()
 
