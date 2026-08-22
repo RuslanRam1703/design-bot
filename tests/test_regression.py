@@ -1703,7 +1703,12 @@ class AdminRetryFragileFlowAnchorTests(unittest.IsolatedAsyncioTestCase):
         data = await state.get_data()
         self.assertEqual(data.get(flow._ANCHOR_MSG_KEY), 800)
 
-    # ---- backup/import validation: backup_import_receive (BadZipFile only), backup_import_wrong ----
+    # ---- backup/import validation: backup_import_receive + backup_restore_do
+    # (BadZipFile), backup_import_wrong ----
+    # P1-3, Batch 10: restore теперь требует подтверждения (см.
+    # backup_restore_do) — receive только сохраняет байты и показывает
+    # confirm; BadZipFile обнаруживается уже на "Да", тем же self-healing
+    # raw edit_text (RULE 3, тот же message_id, без reset между шагами).
     async def test_backup_import_bad_zip_retry_deletes_current_prompt_on_cancel(self):
         state = await self._state_with_anchor(anchor_id=1200, cancel_to="backup")
         bad = make_flow_message_factory(chat_id=self.actor, start_id=8500)()
@@ -1712,11 +1717,16 @@ class AdminRetryFragileFlowAnchorTests(unittest.IsolatedAsyncioTestCase):
         bad.bot.download_file = AsyncMock(return_value=io.BytesIO(b"not a zip"))
 
         await admin.backup_import_receive(bad, state)
-        bad.bot.edit_message_text.assert_awaited_once_with(
-            "Файл повреждён или не .zip — пришлите другой файл.", chat_id=self.actor, message_id=1200, reply_markup=kb.cancel_keyboard()
-        )
+        self.assertEqual(await state.get_state(), AdminStates.backup_restore_confirm.state)
         data = await state.get_data()
         self.assertEqual(data.get(flow._ANCHOR_MSG_KEY), 1200)
+
+        confirm_cb = make_callback("adminbackuprestoreconfirm:yes", chat_id=self.actor, message_id=1200)
+        await admin.backup_restore_do(confirm_cb, state)
+        confirm_cb.message.edit_text.assert_awaited_once_with(
+            "Файл повреждён или не .zip — пришлите другой файл.", reply_markup=kb.cancel_keyboard()
+        )
+        self.assertEqual(await state.get_state(), AdminStates.backup_restore_wait_file.state)
 
         cancel_msg = make_flow_message_factory(chat_id=self.actor, start_id=8600)(text="/cancel")
         await admin.admin_cancel_command(cancel_msg, state)
@@ -1943,59 +1953,84 @@ class AdminSuccessorStalenessAnchorTests(unittest.IsolatedAsyncioTestCase):
         msg.bot.download_file = AsyncMock(return_value=io.BytesIO(b"irrelevant, import_backup_bytes is mocked"))
         return msg
 
+    # P1-3, Batch 10: backup_import_receive больше не вызывает
+    # import_backup_bytes напрямую — теперь только сохраняет байты и
+    # показывает confirm-экран (см. backup_restore_do). Каждый тест ниже
+    # сначала проходит через backup_import_receive (проверяя anchor на
+    # confirm-шаге), затем эмулирует "Да" через backup_restore_do — тот же
+    # message_id, тот же self-healing raw edit_text (RULE 3, без
+    # промежуточного reset), что и у остальных confirm_do в этом файле.
+    async def _confirm_backup_restore(self, anchor_id: int, state: FSMContext) -> SimpleNamespace:
+        cb = make_callback("adminbackuprestoreconfirm:yes", chat_id=self.actor, message_id=anchor_id)
+        await admin.backup_restore_do(cb, state)
+        return cb
+
     async def test_backup_import_validation_error_keeps_anchor_synced(self):
         state = await self._state_with_anchor(anchor_id=680, cancel_to="backup")
         msg = self._backup_message(680)
+        await admin.backup_import_receive(msg, state)
+        self.assertEqual(await state.get_state(), AdminStates.backup_restore_confirm.state)
+        data = await state.get_data()
+        self.assertEqual(data.get(flow._ANCHOR_MSG_KEY), 680)
+
         with patch(
             "bot.content_store.import_backup_bytes",
             new=AsyncMock(side_effect=content_store.BackupValidationError("pricing.json", "not valid JSON", ["pricing.json"])),
         ):
-            await admin.backup_import_receive(msg, state)
-        msg.bot.edit_message_text.assert_awaited_once()
-        self.assertEqual(msg.bot.edit_message_text.await_args.kwargs["message_id"], 680)
+            cb = await self._confirm_backup_restore(680, state)
+        cb.message.edit_text.assert_awaited_once()
         self.assertEqual(await state.get_state(), AdminStates.backup_menu.state)
 
     async def test_backup_import_snapshot_error_keeps_anchor_synced(self):
         state = await self._state_with_anchor(anchor_id=690, cancel_to="backup")
         msg = self._backup_message(690)
+        await admin.backup_import_receive(msg, state)
+
         with patch(
             "bot.content_store.import_backup_bytes",
             new=AsyncMock(side_effect=content_store.BackupSnapshotError("pricing.json")),
         ):
-            await admin.backup_import_receive(msg, state)
-        msg.bot.edit_message_text.assert_awaited_once()
-        self.assertEqual(msg.bot.edit_message_text.await_args.kwargs["message_id"], 690)
+            cb = await self._confirm_backup_restore(690, state)
+        cb.message.edit_text.assert_awaited_once()
+        self.assertEqual(await state.get_state(), AdminStates.backup_menu.state)
 
     async def test_backup_import_restore_failed_rollback_failed_keeps_anchor_synced(self):
         state = await self._state_with_anchor(anchor_id=700, cancel_to="backup")
         msg = self._backup_message(700)
+        await admin.backup_import_receive(msg, state)
+
         with patch(
             "bot.content_store.import_backup_bytes",
             new=AsyncMock(side_effect=content_store.BackupRestoreFailedError("pricing.json", ["faq.json"], ["pricing.json"])),
         ):
-            await admin.backup_import_receive(msg, state)
-        msg.bot.edit_message_text.assert_awaited_once()
-        self.assertEqual(msg.bot.edit_message_text.await_args.kwargs["message_id"], 700)
+            cb = await self._confirm_backup_restore(700, state)
+        cb.message.edit_text.assert_awaited_once()
+        self.assertIn("КРИТИЧНО", cb.message.edit_text.await_args.args[0])
+        self.assertEqual(await state.get_state(), AdminStates.backup_menu.state)
 
     async def test_backup_import_restore_failed_rollback_ok_keeps_anchor_synced(self):
         state = await self._state_with_anchor(anchor_id=710, cancel_to="backup")
         msg = self._backup_message(710)
+        await admin.backup_import_receive(msg, state)
+
         with patch(
             "bot.content_store.import_backup_bytes",
             new=AsyncMock(side_effect=content_store.BackupRestoreFailedError("pricing.json", ["faq.json"], [])),
         ):
-            await admin.backup_import_receive(msg, state)
-        msg.bot.edit_message_text.assert_awaited_once()
-        self.assertEqual(msg.bot.edit_message_text.await_args.kwargs["message_id"], 710)
+            cb = await self._confirm_backup_restore(710, state)
+        cb.message.edit_text.assert_awaited_once()
+        self.assertIn("Исходное состояние данных восстановлено", cb.message.edit_text.await_args.args[0])
+        self.assertEqual(await state.get_state(), AdminStates.backup_menu.state)
 
     async def test_backup_import_success_deletes_current_prompt_on_cancel(self):
         state = await self._state_with_anchor(anchor_id=720, cancel_to="backup")
         msg = self._backup_message(720)
+        await admin.backup_import_receive(msg, state)
+
         fake_result = SimpleNamespace(restored_json=["pricing.json"], missing_json=[], restored_images=[], failed_images=[])
         with patch("bot.content_store.import_backup_bytes", new=AsyncMock(return_value=fake_result)):
-            await admin.backup_import_receive(msg, state)
-        msg.bot.edit_message_text.assert_awaited_once()
-        self.assertEqual(msg.bot.edit_message_text.await_args.kwargs["message_id"], 720)
+            cb = await self._confirm_backup_restore(720, state)
+        cb.message.edit_text.assert_awaited_once()
         self.assertEqual(await state.get_state(), AdminStates.backup_menu.state)
 
         cancel_msg = make_flow_message_factory(chat_id=self.actor, start_id=10300)(text="/cancel")
@@ -5007,6 +5042,23 @@ class AdminBackupHandlersTests(unittest.IsolatedAsyncioTestCase):
         with zipfile.ZipFile(io.BytesIO(sent_file.data)) as zf:
             self.assertIn("data/portfolio.json", zf.namelist())
 
+    # P1-3, Batch 10: restore теперь требует явного подтверждения (см.
+    # backup_restore_do) — единственное destructive-действие в admin.py,
+    # которое раньше срабатывало немедленно по факту загрузки файла, без
+    # confirm-шага (аудит нашёл это единственным подобным пробелом во всём
+    # файле). backup_import_receive теперь только скачивает и сохраняет
+    # байты; сам import_backup_bytes вызывается только из backup_restore_do
+    # после "Да" — три теста ниже обновлены на двухшаговый проход через
+    # реальные хендлеры (не мок) той же реальной цепочкой, что и раньше.
+    async def _confirm_real_restore(self, state: FSMContext) -> SimpleNamespace:
+        cb = SimpleNamespace(
+            data="adminbackuprestoreconfirm:yes",
+            message=SimpleNamespace(chat=SimpleNamespace(id=self.actor), edit_text=AsyncMock()),
+            answer=AsyncMock(),
+        )
+        await admin.backup_restore_do(cb, state)
+        return cb
+
     async def test_import_via_real_handler_restores_changed_data(self):
         zip_bytes = await content_store.export_backup_bytes()
         await content_store.update_portfolio_type_related_service(str(self.actor), "landing", "SITE")
@@ -5017,16 +5069,43 @@ class AdminBackupHandlersTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await state.get_state(), AdminStates.backup_restore_wait_file.state)
 
         await admin.backup_import_receive(self._make_zip_document_message(zip_bytes), state)
+        self.assertEqual(await state.get_state(), AdminStates.backup_restore_confirm.state)
+        # подтверждение ещё не нажато -- данные ещё НЕ восстановлены
+        self.assertEqual(await content_store.default_related_service_for_type("landing"), "SITE")
+
+        await self._confirm_real_restore(state)
 
         self.assertEqual(await content_store.default_related_service_for_type("landing"), "LEND")
         self.assertEqual(await state.get_state(), AdminStates.backup_menu.state)
+
+    async def test_import_restore_cancel_leaves_data_unchanged(self):
+        zip_bytes = await content_store.export_backup_bytes()
+        await content_store.update_portfolio_type_related_service(str(self.actor), "landing", "SITE")
+
+        state = make_state(self.actor)
+        await admin.backup_import_receive(self._make_zip_document_message(zip_bytes), state)
+        cb = SimpleNamespace(
+            data="adminbackuprestoreconfirm:no",
+            message=SimpleNamespace(chat=SimpleNamespace(id=self.actor), edit_text=AsyncMock()),
+            answer=AsyncMock(),
+        )
+        await admin.backup_restore_do(cb, state)
+
+        # "Нет" -- ничего не восстановлено, текущие (изменённые) данные целы
+        self.assertEqual(await content_store.default_related_service_for_type("landing"), "SITE")
+        self.assertEqual(await state.get_state(), AdminStates.backup_menu.state)
+        cb.message.edit_text.assert_awaited_once_with("Отменено. Бэкап:", reply_markup=kb.backup_menu_keyboard())
 
     async def test_import_bad_zip_via_real_handler_does_not_crash(self):
         state = make_state(self.actor)
         msg = self._make_zip_document_message(b"not a zip")
         await admin.backup_import_receive(msg, state)
-        msg.answer.assert_awaited_once()
-        self.assertIn("повреждён", msg.answer.await_args.args[0])
+        self.assertEqual(await state.get_state(), AdminStates.backup_restore_confirm.state)
+
+        cb = await self._confirm_real_restore(state)
+        cb.message.edit_text.assert_awaited_once()
+        self.assertIn("повреждён", cb.message.edit_text.await_args.args[0])
+        self.assertEqual(await state.get_state(), AdminStates.backup_restore_wait_file.state)
 
     async def test_import_snapshot_failure_via_real_handler_gives_clear_message_and_resets_state(self):
         # P2-6, второй design review: Phase 1 (снапшот) падает НЕ из-за
@@ -5039,16 +5118,74 @@ class AdminBackupHandlersTests(unittest.IsolatedAsyncioTestCase):
         original_before = (Path(self.tmpdir) / "leads.json").read_bytes()
         state = make_state(self.actor)
         msg = self._make_zip_document_message(zip_bytes)
+        await admin.backup_import_receive(msg, state)
 
         with patch("bot.content_store._read", side_effect=RuntimeError("simulated snapshot read failure")):
-            await admin.backup_import_receive(msg, state)
+            cb = await self._confirm_real_restore(state)
 
-        msg.answer.assert_awaited_once()
-        reply_text = msg.answer.await_args.args[0]
+        cb.message.edit_text.assert_awaited_once()
+        reply_text = cb.message.edit_text.await_args.args[0]
         self.assertIn("отменено", reply_text.lower())
         self.assertNotIn("simulated snapshot read failure", reply_text)  # деталь исходного исключения не утекает
         self.assertEqual(await state.get_state(), AdminStates.backup_menu.state)
         self.assertEqual((Path(self.tmpdir) / "leads.json").read_bytes(), original_before)  # ничего не записано
+
+    # ---- 6/8: stale/missing upload, repeated import, Main Menu from confirm ----
+    async def test_backup_restore_stale_missing_upload_does_not_crash(self):
+        # Устаревший/повторный callback без предварительного
+        # backup_import_receive в ЭТОЙ сессии (state.data никогда не
+        # содержал pending_backup_bytes) — см. аудит "stale/concurrent
+        # operations". Не должно случиться при нормальной навигации, но
+        # graceful fallback вместо KeyError/AttributeError.
+        state = make_state(self.actor)
+        cb = await self._confirm_real_restore(state)
+        cb.message.edit_text.assert_awaited_once_with("Файл не найден — пришлите его заново.\n\nБэкап:", reply_markup=kb.backup_menu_keyboard())
+        self.assertEqual(await state.get_state(), AdminStates.backup_menu.state)
+
+    async def test_backup_restore_repeated_upload_uses_latest_not_stale_bytes(self):
+        # Загрузили файл A, передумали и загрузили B ДО подтверждения —
+        # "Да" должен восстановить B, а не осевшие в state.data байты A.
+        zip_a = await content_store.export_backup_bytes()
+        await content_store.update_portfolio_type_related_service(str(self.actor), "landing", "SITE")
+        zip_b = await content_store.export_backup_bytes()  # содержит SITE
+        await content_store.update_portfolio_type_related_service(str(self.actor), "landing", "LEND")  # текущее -> LEND (не в A, не в B)
+
+        state = make_state(self.actor)
+        await admin.backup_import_receive(self._make_zip_document_message(zip_a), state)
+        await admin.backup_import_receive(self._make_zip_document_message(zip_b), state)
+        await self._confirm_real_restore(state)
+
+        self.assertEqual(await content_store.default_related_service_for_type("landing"), "SITE")  # из B, не из A
+
+    async def test_backup_menu_main_menu_cleans_up_from_confirm_screen(self):
+        zip_bytes = await content_store.export_backup_bytes()  # содержит текущее (LEND)
+        await content_store.update_portfolio_type_related_service(str(self.actor), "landing", "SITE")
+        state = make_state(self.actor)
+        # anchor задан заранее (как реально бывает — экран уже отслеживался
+        # ДО загрузки файла): без этого flow.step_from_text ушёл бы в
+        # answer()-fallback, а _make_zip_document_message даёт для него
+        # неконфигурированный AsyncMock без реальных chat/message_id.
+        await state.update_data(**{
+            flow._NAV_ANCHOR_MSG_KEY: 111, flow._NAV_ANCHOR_CHAT_KEY: self.actor,
+            flow._ANCHOR_MSG_KEY: 900, flow._ANCHOR_CHAT_KEY: self.actor,
+        })
+        msg = self._make_zip_document_message(zip_bytes)
+        await admin.backup_import_receive(msg, state)
+        self.assertEqual(await state.get_state(), AdminStates.backup_restore_confirm.state)
+        anchor_id = (await state.get_data()).get(flow._ANCHOR_MSG_KEY)
+        self.assertEqual(anchor_id, 900)
+
+        trigger = make_reply_message(self.actor, texts.MAIN_MENU_BUTTON, AsyncMock())
+        await admin.admin_main_menu_button(trigger, state)
+        self.assertEqual(await state.get_state(), AdminStates.backup_restore_confirm.state)  # сперва confirmation
+
+        confirm_cb = SimpleNamespace(data="mainmenu:confirm", message=make_flow_message(chat_id=self.actor), answer=AsyncMock())
+        await start.main_menu_confirm(confirm_cb, state)
+        confirm_cb.message.bot.delete_message.assert_awaited_once_with(chat_id=self.actor, message_id=anchor_id)
+        self.assertIsNone(await state.get_state())
+        # ушли через Главное меню, НЕ подтвердив -- restore не произошёл,
+        # текущее (изменённое уже после экспорта) значение осталось как есть
+        self.assertEqual(await content_store.default_related_service_for_type("landing"), "SITE")
 
 
 class AdminAboutResumeFieldsTests(unittest.IsolatedAsyncioTestCase):

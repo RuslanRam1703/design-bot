@@ -109,3 +109,4 @@ class AdminStates(StatesGroup):
     # ручной способ пережить redeploy без стороннего сервиса.
     backup_menu = State()
     backup_restore_wait_file = State()
+    backup_restore_confirm = State()

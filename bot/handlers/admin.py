@@ -1967,30 +1967,68 @@ async def backup_import_start(callback: CallbackQuery, state: FSMContext) -> Non
 
 @router.message(AdminStates.backup_restore_wait_file, F.document)
 async def backup_import_receive(message: Message, state: FSMContext) -> None:
+    # P1-3, Batch 10: раньше загрузка файла НЕМЕДЛЕННО запускала restore —
+    # единственное destructive-действие во всём admin.py без confirm-шага
+    # (перезаписывает разом все 6 файлов данных бота содержимым архива, без
+    # проверки "тот ли это файл"). Теперь только скачивает и сохраняет байты
+    # в state.data (MemoryStorage — обычный dict в памяти процесса, без
+    # сериализации, см. bot/main.py) — сам import_backup_bytes (со всей его
+    # Phase 0-3 валидацией/rollback, не изменёнными) вызывается только из
+    # backup_restore_do после явного "Да".
     file = await message.bot.get_file(message.document.file_id)
     file_bytes_io = await message.bot.download_file(file.file_path)
+    await state.update_data(pending_backup_bytes=file_bytes_io.read())
+    # flow.step_from_text (P1-3, Batch 2/3, тот же RULE 3 на этом шаге) —
+    # без него /cancel с confirm-экрана удалял бы не тот message.
+    await flow.step_from_text(
+        message, state,
+        "⚠️ Восстановление ЗАМЕНИТ текущие данные (заявки, кейсы, услуги, FAQ, «Обо мне», меню) "
+        "содержимым этого файла. Если файл повреждён или не подходит — ничего не изменится. Продолжить?",
+        kb.confirm_keyboard("adminbackuprestoreconfirm"),
+    )
+    await state.set_state(AdminStates.backup_restore_confirm)
+
+
+@router.callback_query(AdminStates.backup_restore_confirm, F.data.startswith("adminbackuprestoreconfirm:"))
+async def backup_restore_do(callback: CallbackQuery, state: FSMContext) -> None:
+    answer = callback.data.split(":", 1)[1]
+    if answer == "no":
+        await callback.message.edit_text("Отменено. Бэкап:", reply_markup=kb.backup_menu_keyboard())
+        await state.set_state(AdminStates.backup_menu)
+        await callback.answer()
+        return
+
+    data = await state.get_data()
+    zip_bytes = data.get("pending_backup_bytes")
+    if zip_bytes is None:
+        # Устаревший/повторный callback без реально сохранённого файла
+        # (см. аудит "stale/concurrent operations") — не должно случиться
+        # при нормальной навигации (backup_import_receive всегда пишет
+        # ключ перед этим состоянием), но graceful fallback вместо KeyError.
+        await callback.message.edit_text("Файл не найден — пришлите его заново.\n\nБэкап:", reply_markup=kb.backup_menu_keyboard())
+        await state.set_state(AdminStates.backup_menu)
+        await callback.answer()
+        return
+
     try:
-        result = await content_store.import_backup_bytes(message.chat.id, file_bytes_io.read())
+        result = await content_store.import_backup_bytes(callback.message.chat.id, zip_bytes)
     except zipfile.BadZipFile:
-        # flow.step_from_text (P1-3, Batch 2) — единственная ветка этого
-        # handler'а, что остаётся в том же AdminStates.backup_restore_wait_file
-        # (ждёт другой файл, настоящий retry). Остальные ветки ниже переводят
-        # в AdminStates.backup_menu — не retry, но AdminStates-активное
-        # состояние с сохранённым cancel_to="backup", поэтому тоже мигрированы
-        # (P1-3, Batch 3) — без этого /cancel из backup_menu удалял бы
-        # устаревший "Пришлите .zip файл..." prompt, оставляя этот
-        # результат-экран (с backup_menu_keyboard) осиротевшим.
-        await flow.step_from_text(message, state, "Файл повреждён или не .zip — пришлите другой файл.", kb.cancel_keyboard())
+        # Единственная ветка, что возвращает в AdminStates.backup_restore_wait_file
+        # (ждёт другой файл, настоящий retry) — остальные ниже ведут в
+        # AdminStates.backup_menu, не retry.
+        await callback.message.edit_text("Файл повреждён или не .zip — пришлите другой файл.", reply_markup=kb.cancel_keyboard())
+        await state.set_state(AdminStates.backup_restore_wait_file)
+        await callback.answer()
         return
     except content_store.BackupValidationError as e:
         found = ", ".join(e.found_filenames) if e.found_filenames else "—"
-        await flow.step_from_text(
-            message, state,
+        await callback.message.edit_text(
             "❌ Восстановление ПОЛНОСТЬЮ отменено, ничего не изменено.\n\n"
             f"Файл: {e.filename}\nОшибка: {e.reason}\nНайдено в архиве: {found}",
-            kb.backup_menu_keyboard(),
+            reply_markup=kb.backup_menu_keyboard(),
         )
         await state.set_state(AdminStates.backup_menu)
+        await callback.answer()
         return
     except content_store.BackupSnapshotError as e:
         # P2-6: не удалось прочитать текущее значение файла перед записью
@@ -1999,31 +2037,30 @@ async def backup_import_receive(message: Message, state: FSMContext) -> None:
         # исключения клиенту — только имя файла и факт отмены (полная
         # причина уже залогирована через logger.exception внутри
         # content_store.import_backup_bytes).
-        await flow.step_from_text(
-            message, state,
+        await callback.message.edit_text(
             "❌ Восстановление отменено: не удалось прочитать текущее значение "
             f"{e.filename!r} перед записью. Ничего не изменено — попробуйте ещё раз.",
-            kb.backup_menu_keyboard(),
+            reply_markup=kb.backup_menu_keyboard(),
         )
         await state.set_state(AdminStates.backup_menu)
+        await callback.answer()
         return
     except content_store.BackupRestoreFailedError as e:
         if e.rollback_failed:
-            await flow.step_from_text(
-                message, state,
+            await callback.message.edit_text(
                 f"🔴 КРИТИЧНО: восстановление прервано на файле {e.failed_filename}, "
                 f"откат НЕ полностью удался для: {', '.join(e.rollback_failed)}.\n\n"
                 "Требуется ручная проверка данных через /admin!",
-                kb.backup_menu_keyboard(),
+                reply_markup=kb.backup_menu_keyboard(),
             )
         else:
-            await flow.step_from_text(
-                message, state,
+            await callback.message.edit_text(
                 f"⚠️ Восстановление отменено из-за ошибки записи ({e.failed_filename}). "
                 "Исходное состояние данных восстановлено.",
-                kb.backup_menu_keyboard(),
+                reply_markup=kb.backup_menu_keyboard(),
             )
         await state.set_state(AdminStates.backup_menu)
+        await callback.answer()
         return
 
     lines: list[str] = []
@@ -2037,8 +2074,9 @@ async def backup_import_receive(message: Message, state: FSMContext) -> None:
         lines.append(f"⚠️ Не удалось восстановить {len(result.failed_images)} изображений (данные уже восстановлены): {', '.join(result.failed_images)}")
     if not result.restored_json and not result.restored_images:
         lines.append("В архиве не нашлось знакомых файлов данных/фото — ничего не восстановлено.")
-    await flow.step_from_text(message, state, "\n".join(lines) + "\n\nБэкап:", kb.backup_menu_keyboard())
+    await callback.message.edit_text("\n".join(lines) + "\n\nБэкап:", reply_markup=kb.backup_menu_keyboard())
     await state.set_state(AdminStates.backup_menu)
+    await callback.answer()
 
 
 @router.message(AdminStates.backup_restore_wait_file)
