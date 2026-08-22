@@ -1270,6 +1270,10 @@ class AdminMultiStepWizardAnchorTests(unittest.IsolatedAsyncioTestCase):
         cancel_msg.bot.delete_message.assert_awaited_once_with(chat_id=self.actor, message_id=500)
         data_after = await state.get_data()
         self.assertEqual(data_after.get(flow._NAV_ANCHOR_MSG_KEY), 111)  # NAV не задет
+        # content_store.add_case вызывается только на последнем шаге
+        # (cases_add_description) — отмена ДО него структурно не может
+        # создать частично записанный кейс (P1-3, Batch 5, item 15).
+        self.assertFalse(any(c["title"] == "Новый лендинг" for c in await content_store.list_cases()))
 
     # ---- 2. Service add: 2+ последовательных text step (+ retry) -> /cancel ----
     async def test_service_add_retry_and_multistep_cancel_deletes_current_prompt(self):
@@ -4175,6 +4179,106 @@ class AdminCaseConstructorTests(unittest.IsolatedAsyncioTestCase):
         # success-ветке, не только на retry.
         await admin.cases_edit_value(make_flow_message_factory(chat_id=self.actor, start_id=5200)(text="https://behance.net/gallery/x"), state)
         self.assertEqual((await self._case())["external_url"], "https://behance.net/gallery/x")
+
+
+class AdminCaseManagementCompletenessTests(unittest.IsolatedAsyncioTestCase):
+    """P1-3, Batch 5: полный re-audit управления кейсами (add/edit/delete/
+    images/sections) не нашёл ни одного нового anchor-lifecycle бага — все
+    3 сайта reset_state_keep_nav()/finish_flow() в этом блоке
+    (cases_add_description, cases_edit_field "done", cases_delete_do) уже
+    были исправлены в Batch 4; все raw edit_text() — self-healing (тот же
+    физический message_id, без промежуточного reset/set_data). Реальный
+    пробел был в regression-покрытии, а не в коде: редактирование/удаление
+    несуществующего кейса (content_store.update_case/delete_case тихо
+    возвращают False, никогда не бросают — тот же принятый
+    пред-существующий паттерн, что и у FAQ/pricing, см.
+    test_faq_delete_missing_item_does_not_corrupt_navigation; не
+    исправляется в рамках этого batch) и delete-половина инварианта
+    ensure_nav_anchor (edit-done половина уже покрыта
+    AdminRemainingAnchorGapsTests)."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        real_data_dir = Path(__file__).resolve().parent.parent / "data"
+        for name in ("pricing.json", "portfolio.json", "faq.json", "about.json", "ui_config.json"):
+            shutil.copy(real_data_dir / name, Path(self.tmpdir) / name)
+        self._orig_data_dir = content_store.DATA_DIR
+        self._orig_designer = content_store.config.DESIGNER_CHAT_ID
+        content_store.DATA_DIR = Path(self.tmpdir)
+        content_store.config.DESIGNER_CHAT_ID = "888"
+        self.actor = 888
+
+    def tearDown(self):
+        content_store.DATA_DIR = self._orig_data_dir
+        content_store.config.DESIGNER_CHAT_ID = self._orig_designer
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    async def _state_with_nav(self, nav_msg_id: int = 111) -> FSMContext:
+        state = make_state(self.actor)
+        await state.update_data(**{
+            flow._NAV_ANCHOR_MSG_KEY: nav_msg_id,
+            flow._NAV_ANCHOR_CHAT_KEY: self.actor,
+        })
+        return state
+
+    # ---- 9/15: редактирование метаданных несуществующего кейса не роняет
+    # хендлер и не портит навигацию/данные ----
+    async def test_cases_edit_value_missing_case_does_not_corrupt_navigation(self):
+        state = await self._state_with_nav()
+        msg_id = 13000
+        await state.update_data(**{flow._ANCHOR_MSG_KEY: msg_id, flow._ANCHOR_CHAT_KEY: self.actor},
+                                 case_id="case_does_not_exist", field="title", cancel_to="cases")
+        await state.set_state(AdminStates.edit_case_value)
+        msg = make_flow_message_factory(chat_id=self.actor, start_id=13100)(text="Новое название")
+
+        await admin.cases_edit_value(msg, state)  # не должно бросить исключение
+
+        msg.bot.edit_message_text.assert_awaited_once_with(
+            "Обновлено ✅\n\nЧто ещё изменить?", chat_id=self.actor, message_id=msg_id, reply_markup=kb.case_field_keyboard()
+        )
+        self.assertEqual(await state.get_state(), AdminStates.edit_case_field_pick.state)
+        data = await state.get_data()
+        self.assertEqual(data.get(flow._ANCHOR_MSG_KEY), msg_id)
+        self.assertEqual(data.get(flow._NAV_ANCHOR_MSG_KEY), 111)
+        # никакой кейс не появился и не испортился
+        self.assertFalse(any(c["id"] == "case_does_not_exist" for c in await content_store.list_cases()))
+
+    # ---- 8/15: удаление несуществующего кейса — тот же принятый паттерн,
+    # что и у test_faq_delete_missing_item_does_not_corrupt_navigation ----
+    async def test_cases_delete_missing_case_does_not_corrupt_navigation(self):
+        state = await self._state_with_nav()
+        msg_id = 13200
+        await state.update_data(case_id="case_does_not_exist", cancel_to="cases")
+        await state.set_state(AdminStates.delete_case_confirm)
+        cb = make_callback("admindelcaseconfirm:yes", chat_id=self.actor, message_id=msg_id)
+
+        await admin.cases_delete_do(cb, state)  # не должно бросить исключение
+
+        cb.message.edit_text.assert_awaited_once_with("Кейс удалён ✅", reply_markup=kb.admin_cases_menu_keyboard())
+        data = await state.get_data()
+        self.assertEqual(data.get(flow._ANCHOR_MSG_KEY), msg_id)
+        self.assertEqual(data.get(flow._NAV_ANCHOR_MSG_KEY), 111)
+        self.assertIsNone(await state.get_state())
+
+    # ---- 13: ensure_nav_anchor после cases_delete_do не дублирует WELCOME
+    # (edit-done половина этого инварианта уже покрыта
+    # AdminRemainingAnchorGapsTests.test_ensure_nav_anchor_after_cases_edit_done_does_not_recreate) ----
+    async def test_ensure_nav_anchor_after_cases_delete_do_does_not_recreate(self):
+        case = await content_store.add_case(
+            str(self.actor), case_id="case_ensure_del", title="Тест", type_id="landing",
+            cover="img/portfolio/seed.svg", task="t", related_service=None,
+        )
+        state = await self._state_with_nav()
+        await state.update_data(case_id=case["id"], cancel_to="cases")
+        await state.set_state(AdminStates.delete_case_confirm)
+        await admin.cases_delete_do(make_callback("admindelcaseconfirm:yes", chat_id=self.actor, message_id=13300), state)
+
+        probe = make_flow_message_factory(chat_id=self.actor, start_id=13400)()
+        created = await flow.ensure_nav_anchor(probe, state)
+        self.assertFalse(created)
+        probe.answer.assert_not_awaited()
+        data = await state.get_data()
+        self.assertEqual(data.get(flow._NAV_ANCHOR_MSG_KEY), 111)
 
 
 class AdminBackupHandlersTests(unittest.IsolatedAsyncioTestCase):
