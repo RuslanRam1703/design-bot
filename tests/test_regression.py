@@ -3621,6 +3621,23 @@ class AdminLeadWorkflowTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("не найдена", cb.message.edit_text.await_args.args[0])
         self.assertEqual(await state.get_state(), AdminStates.leads_list.state)
 
+    async def test_lead_change_status_same_status_is_a_no_op_not_a_crash(self):
+        # E2E MVP audit, Batch 4: re-tapping the ALREADY-active status used
+        # to call update_lead_status (unconditionally bumping updated_at)
+        # and then edit_text() with byte-identical text+keyboard — Telegram
+        # rejects that with an unhandled TelegramBadRequest("message is not
+        # modified"). Now short-circuits before either happens.
+        state = await self._state_in_lead_detail(self.lead["id"], msg_id=605)
+        cb = make_callback("adminleadstatus:NEW", chat_id=self.actor, message_id=605)  # NEW — уже текущий статус
+
+        await admin.lead_change_status(cb, state)  # не должно бросить исключение
+
+        cb.message.edit_text.assert_not_awaited()  # ничего не перерисовано — нечего перерисовывать
+        cb.answer.assert_awaited_once_with("Статус уже установлен")
+        lead = await content_store.get_lead(self.lead["id"])
+        self.assertEqual(lead["status"], "NEW")
+        self.assertIsNone(lead["updated_at"])  # update_lead_status не вызывался — updated_at не тронут
+
     # ---- 10/13: reply start guards a missing/incomplete recipient ----
     async def test_lead_reply_start_missing_telegram_id_shows_alert_without_crash(self):
         lead = await content_store.add_lead({"service_name": "Без Telegram ID"}, {})
@@ -8808,6 +8825,43 @@ class OwnerMessageTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Первый ответ", text)
         self.assertIn("Второй, не дошёл", text)
         self.assertIn("не доставлено", text)
+
+    # ---- Telegram 4096-char defensive limit (E2E MVP audit, Batch 4) ----
+
+    async def test_admin_detail_stays_under_telegram_limit_with_heavy_accumulation(self):
+        for _ in range(40):
+            await content_store.add_lead_supplement(
+                self.lead["id"], {"user_id": 55555, "username": "client"},
+                {"comment": "x" * 150, "additional_requirements": "y" * 150},
+            )
+        for i in range(40):
+            await content_store.record_lead_material(self.lead["id"], f"file-{i}", f"uniq-{i}", "document", "new")
+        for _ in range(40):
+            await content_store.add_owner_message(self.actor, self.lead["id"], "z" * 150, "sent")
+
+        lead = await content_store.get_lead(self.lead["id"])
+        text = lead_format.format_lead_admin_detail(lead)
+
+        self.assertLessEqual(len(text), 4096)  # реальный Telegram-лимит на длину сообщения
+        self.assertIn("часть истории скрыта", text)  # обрезка сработала явно, не тихо потеряла данные
+
+    async def test_admin_detail_short_lead_is_not_truncated(self):
+        # Обычная короткая заявка — формат карточки не меняется вообще.
+        await content_store.add_owner_message(self.actor, self.lead["id"], "Короткий ответ", "sent")
+        lead = await content_store.get_lead(self.lead["id"])
+        text = lead_format.format_lead_admin_detail(lead)
+
+        self.assertNotIn("часть истории скрыта", text)
+        self.assertIn("Короткий ответ", text)
+
+    async def test_admin_detail_truncation_does_not_touch_storage(self):
+        # Presentation-only — сам lead в storage не усечён, тронута только
+        # возвращаемая строка format_lead_admin_detail.
+        for _ in range(40):
+            await content_store.add_owner_message(self.actor, self.lead["id"], "z" * 150, "sent")
+
+        lead = await content_store.get_lead(self.lead["id"])
+        self.assertEqual(len(lead["owner_messages"]), 40)  # ничего не удалено из данных
 
     # ---- /api/my-leads (HTTP) ----
 

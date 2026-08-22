@@ -286,4 +286,29 @@ def format_lead_admin_detail(lead: dict) -> str:
     if lead.get("updated_at"):
         lines.append(f"<i>Обновлена: {lead['updated_at'][:16].replace('T', ' ')}</i>")
 
-    return "\n".join(lines)
+    return _clamp_to_telegram_limit(lines)
+
+
+# Presentation-only defensive лимит (E2E MVP audit, Batch 4) — при большом
+# накоплении supplements/materials/owner_messages итоговая карточка могла
+# превысить Telegram-лимит на длину сообщения (4096 символов), и
+# callback.message.edit_text() падал необработанным TelegramBadRequest.
+# Ничего не удаляется из lead в storage — только из возвращаемой строки.
+_MAX_DETAIL_LENGTH = 4000  # запас под саму пометку об обрезке ниже
+
+
+def _clamp_to_telegram_limit(lines: list[str]) -> str:
+    text = "\n".join(lines)
+    if len(text) <= _MAX_DETAIL_LENGTH:
+        return text
+    # Обрезаем ЦЕЛЫМИ строками с конца, а не посередине строки — каждая
+    # строка выше самодостаточна (открывающий и закрывающий HTML-тег всегда
+    # в одной строке), поэтому такая обрезка не может разорвать тег и
+    # сломать parse_mode="HTML". owner_messages уже добавлены в порядке
+    # "новые сверху" — обрезка с конца в первую очередь убирает более
+    # старые записи, т.е. по возможности сохраняет самую свежую информацию.
+    notice = "\n\n<i>… часть истории скрыта, показаны не все записи (лимит длины сообщения)</i>"
+    truncated = list(lines)
+    while truncated and len("\n".join(truncated)) + len(notice) > _MAX_DETAIL_LENGTH:
+        truncated.pop()
+    return "\n".join(truncated) + notice

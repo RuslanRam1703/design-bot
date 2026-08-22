@@ -430,11 +430,19 @@ function render() {
       break;
     case "calculator":
       content = renderCalculator();
-      TG.backButton.show(goBack);
+      // Тот же принцип, что и у "about" выше — калькулятор достижим только
+      // deep-link'ом (history пуст), см. renderCalculator()'s "←" ниже.
+      if (state.history.length > 0) TG.backButton.show(goBack);
+      else TG.backButton.hide();
       break;
     case "brief":
       content = renderBrief();
-      TG.backButton.show(goBack);
+      // В отличие от about/calculator, brief достижим и с историей (CTA из
+      // кейса/калькулятора/about, таб), и без (myleads/supplement "начать
+      // новую" — pushHistory:false) — тот же принцип, что и у "about", но
+      // здесь условие реально бывает в обе стороны, не только теоретически.
+      if (state.history.length > 0) TG.backButton.show(goBack);
+      else TG.backButton.hide();
       break;
     case "myleads":
       content = renderMyLeads();
@@ -923,6 +931,10 @@ function serviceItemHTML(s, label) {
 
 function renderCalculator() {
   const { pricing } = state;
+  // Калькулятор достижим только deep-link'ом — history пуст (тот же
+  // принцип, что и in-app "←" в renderAbout()). Один общий флаг для всех
+  // трёх return-точек ниже, а не дублировать условие в каждой.
+  const backBtnHTML = state.history.length > 0 ? '<button class="back-btn" id="back">←</button>' : "";
 
   if (!state.calc.serviceId && state.calc.openGroupId) {
     const group = pricing.groups.find((g) => g.id === state.calc.openGroupId);
@@ -932,7 +944,7 @@ function renderCalculator() {
       .join("");
     return `
       <div class="topbar">
-        <button class="back-btn" id="back">←</button>
+        ${backBtnHTML}
         <h1>💰 Калькулятор</h1>
       </div>
       <p class="section-lead"><a href="#" id="back-to-categories">← Все категории</a></p>
@@ -959,7 +971,7 @@ function renderCalculator() {
       .join("");
     return `
       <div class="topbar">
-        <button class="back-btn" id="back">←</button>
+        ${backBtnHTML}
         <h1>💰 Калькулятор</h1>
       </div>
       <p class="section-lead">Выберите услугу:</p>
@@ -998,7 +1010,7 @@ function renderCalculator() {
 
   return `
     <div class="topbar">
-      <button class="back-btn" id="back">←</button>
+      ${backBtnHTML}
       <h1>💰 Калькулятор</h1>
     </div>
     <div class="summary-box">
@@ -1605,9 +1617,12 @@ function wrapBrief(body, step) {
   const nav = step > 1 && step !== 2 && step !== 3 && step !== 6 && step !== 7
     ? `<div class="btn-row"><button class="btn btn-secondary" id="brief-prev">Назад</button></div>`
     : "";
+  // Тот же принцип, что и у about/calculator — brief не всегда достижим с
+  // историей (см. render()'s "brief" case).
+  const backBtnHTML = state.history.length > 0 ? '<button class="back-btn" id="back">←</button>' : "";
   return `
     <div class="topbar">
-      <button class="back-btn" id="back">←</button>
+      ${backBtnHTML}
       <h1>✍️ Заказать</h1>
     </div>
     ${renderProgress(step)}
@@ -1899,6 +1914,16 @@ function attachMyLeadsEvents() {
 // lead["supplements"] (bot/content_store.py::add_lead_supplement),
 // адресуемый строго по lead_id, а не по draft_id.
 function openSupplementFor(lead) {
+  // Сохраняем незавершённый draft при повторном открытии ДЛЯ ТОЙ ЖЕ заявки
+  // (E2E MVP audit, Batch 4) — раньше эта функция безусловно обнуляла
+  // state.supplement на каждый вызов, из-за чего уход на другой таб и
+  // возврат сюда стирали уже введённый текст. Для ДРУГОЙ заявки (leadId не
+  // совпадает) или уже отправленного draft (sent) поведение не меняется —
+  // ниже по-прежнему инициализируется с чистого листа.
+  if (state.supplement && state.supplement.leadId === lead.id && !state.supplement.sent) {
+    navigate("supplement");
+    return;
+  }
   const p = (lead && lead.payload) || {};
   state.supplement = {
     leadId: lead.id,

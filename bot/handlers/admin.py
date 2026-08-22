@@ -1797,6 +1797,17 @@ async def lead_change_status(callback: CallbackQuery, state: FSMContext) -> None
     lead_before = await content_store.get_lead(data["lead_id"])
     old_status = lead_before["status"] if lead_before else None
 
+    if old_status == status:
+        # Повторный тап уже активного статуса (двойной клик/медленная сеть) —
+        # карточка не изменится (тот же status, те же supplements/materials/
+        # owner_messages), но update_lead_status всё равно обновил бы
+        # updated_at, из-за чего edit_text() получил бы байт-в-байт то же
+        # сообщение и ту же клавиатуру — Telegram отвечает необработанным
+        # TelegramBadRequest("message is not modified") (E2E MVP audit,
+        # Batch 4). Ничего не меняем и не перерисовываем.
+        await callback.answer("Статус уже установлен")
+        return
+
     await content_store.update_lead_status(callback.message.chat.id, data["lead_id"], status)
     lead = await content_store.get_lead(data["lead_id"])
 
