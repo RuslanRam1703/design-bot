@@ -73,6 +73,13 @@ async def _resolve_cancel(data: dict) -> tuple[str, InlineKeyboardMarkup, State 
             AdminStates.case_images_menu,
             {"case_id": data["case_id"]},
         )
+    if target == "experience":
+        # P1-3, Batch 8: раньше add-мастер записи опыта и вход в сам список
+        # использовали cancel_to="root" — отмена теряла список "Опыт
+        # работы" целиком и уводила прямо в Админ-меню (та же категория
+        # находки, что Batch 7 исправил для заявок).
+        entries = (await content_store.get_about()).get("experience", [])
+        return "Отменено. Опыт работы:", kb.about_experience_menu_keyboard(entries), AdminStates.about_experience_menu, {}
     if target == "leads" and data.get("lead_id"):
         # P1-3, Batch 7: сохраняет карточку заявки, к которой была открыта
         # отмена (см. lead_reply_start) — та же логика, что sections/images
@@ -1002,7 +1009,8 @@ async def about_edit_field(callback: CallbackQuery, state: FSMContext) -> None:
     if field == "experience":
         entries = (await content_store.get_about()).get("experience", [])
         await callback.message.edit_text("Опыт работы:", reply_markup=kb.about_experience_menu_keyboard(entries))
-        await state.update_data(cancel_to="root")
+        # cancel_to="experience", не "root" (P1-3, Batch 8) — см. _resolve_cancel.
+        await state.update_data(cancel_to="experience")
         await state.set_state(AdminStates.about_experience_menu)
         await callback.answer()
         return
@@ -1022,7 +1030,8 @@ async def about_edit_field(callback: CallbackQuery, state: FSMContext) -> None:
 @router.callback_query(AdminStates.about_experience_menu, F.data == "adminaboutexpaction:add")
 async def about_experience_add_start(callback: CallbackQuery, state: FSMContext) -> None:
     await callback.message.edit_text("Должность / роль:", reply_markup=kb.cancel_keyboard())
-    await state.update_data(cancel_to="root")
+    # cancel_to="experience", не "root" (P1-3, Batch 8) — см. _resolve_cancel.
+    await state.update_data(cancel_to="experience")
     await state.set_state(AdminStates.about_experience_add_role)
     await callback.answer()
 
@@ -1088,10 +1097,45 @@ async def about_experience_picked(callback: CallbackQuery, state: FSMContext) ->
 async def about_experience_entry_action(callback: CallbackQuery, state: FSMContext) -> None:
     action = callback.data.split(":", 1)[1]
     if action == "delete":
+        # P1-3, Batch 8: удаление записи опыта необратимо (как и удаление
+        # раздела/изображения кейса, у которых уже есть confirm-шаг —
+        # Batch 6) — раньше срабатывало одним кликом без подтверждения.
+        # AdminStates.about_experience_pick_delete уже был объявлен в
+        # bot/states.py, но ни разу не подключён ни к одному handler'у —
+        # тот же паттерн, что Batch 6 нашёл для case_section_pick_delete.
         data = await state.get_data()
-        await content_store.delete_about_experience(callback.message.chat.id, data["exp_index"])
+        index = data.get("exp_index")
+        entries = (await content_store.get_about()).get("experience", [])
+        if index is None or not (0 <= index < len(entries)):
+            await callback.message.edit_text("Запись не найдена.\n\nОпыт работы:", reply_markup=kb.about_experience_menu_keyboard(entries))
+            await state.set_state(AdminStates.about_experience_menu)
+            await callback.answer()
+            return
+        entry = entries[index]
+        await callback.message.edit_text(
+            f"Удалить запись «{entry['role']} — {entry['company']}»? Это необратимо.",
+            reply_markup=kb.confirm_keyboard("admindelexpconfirm"),
+        )
+        await state.set_state(AdminStates.about_experience_pick_delete)
+        await callback.answer()
+        return
     entries = (await content_store.get_about()).get("experience", [])
     await callback.message.edit_text("Опыт работы:", reply_markup=kb.about_experience_menu_keyboard(entries))
+    await callback.answer()
+
+
+@router.callback_query(AdminStates.about_experience_pick_delete, F.data.startswith("admindelexpconfirm:"))
+async def about_experience_delete_do(callback: CallbackQuery, state: FSMContext) -> None:
+    answer = callback.data.split(":", 1)[1]
+    data = await state.get_data()
+    if answer == "yes":
+        await content_store.delete_about_experience(callback.message.chat.id, data["exp_index"])
+        text = "Запись удалена ✅\n\nОпыт работы:"
+    else:
+        text = "Опыт работы:"
+    entries = (await content_store.get_about()).get("experience", [])
+    await callback.message.edit_text(text, reply_markup=kb.about_experience_menu_keyboard(entries))
+    await state.set_state(AdminStates.about_experience_menu)
     await callback.answer()
 
 

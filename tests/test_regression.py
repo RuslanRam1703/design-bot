@@ -5045,6 +5045,137 @@ class _FakeUpstashResponse:
         return False
 
 
+class AdminAboutExperienceWorkflowTests(unittest.IsolatedAsyncioTestCase):
+    """P1-3, Batch 8: audit of the remaining admin content domains not yet
+    deep-audited beyond the mechanical anchor-lifecycle sweep (Pricing/
+    Services/Options, FAQ, Categories) found them already clean --
+    destructive actions already confirmed, cancel_to targets already
+    correct, no crash risk on missing entities. About -> Experience was
+    the one remaining gap, mirroring exactly what Batch 6 found for Case
+    sections/images and Batch 7 found for Leads:
+
+    1. Deleting an experience entry was a single click with no
+       confirmation, unlike every other destructive action in admin.py
+       (case/section/image/service/option/FAQ/category/lead delete all
+       already confirm). AdminStates.about_experience_pick_delete was
+       already declared in bot/states.py but never wired to a handler --
+       the same unused-state signature Batch 6 found for
+       case_section_pick_delete. Fixed by wiring it up, mirroring
+       option_delete_confirm/option_delete_do exactly.
+    2. Both entry points into the "Опыт работы" sub-flow (about_edit_field's
+       "experience" branch, and about_experience_add_start) set
+       cancel_to="root" -- cancelling out of adding an entry, or out of
+       the list itself, skipped past the experience list straight to the
+       bare admin root, the same class of bug Batch 7 fixed for
+       lead_reply_start. Fixed by adding an "experience" branch to
+       _resolve_cancel, mirroring the existing sections/images/leads
+       pattern."""
+
+    async def asyncSetUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        real_data_dir = Path(__file__).resolve().parent.parent / "data"
+        for name in ("pricing.json", "portfolio.json", "faq.json", "about.json", "ui_config.json"):
+            shutil.copy(real_data_dir / name, Path(self.tmpdir) / name)
+        self._orig_data_dir = content_store.DATA_DIR
+        self._orig_designer = content_store.config.DESIGNER_CHAT_ID
+        content_store.DATA_DIR = Path(self.tmpdir)
+        content_store.config.DESIGNER_CHAT_ID = "222"
+        self.actor = 222
+        # реальный about.json уже содержит seed-записи опыта — сбрасываем в
+        # пустой список для изолированного, детерминированного индекса.
+        await content_store.update_about_field(str(self.actor), "experience", [])
+        await content_store.add_about_experience(str(self.actor), role="Дизайнер", company="Acme", period="2020-2023", description="")
+
+    def tearDown(self):
+        content_store.DATA_DIR = self._orig_data_dir
+        content_store.config.DESIGNER_CHAT_ID = self._orig_designer
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    async def _entries(self):
+        return (await content_store.get_about()).get("experience", [])
+
+    async def _state_with_entry_open(self, index: int = 0, msg_id: int = 500) -> FSMContext:
+        state = make_state(self.actor)
+        await state.update_data(**{
+            flow._NAV_ANCHOR_MSG_KEY: 111, flow._NAV_ANCHOR_CHAT_KEY: self.actor,
+            flow._ANCHOR_MSG_KEY: msg_id, flow._ANCHOR_CHAT_KEY: self.actor,
+            "exp_index": index,
+        })
+        await state.set_state(AdminStates.about_experience_menu)
+        return state
+
+    # ---- delete now requires confirmation (was single-click) ----
+    async def test_experience_delete_shows_confirm_and_does_not_remove_until_confirmed(self):
+        state = await self._state_with_entry_open(0, msg_id=600)
+        cb = make_callback("adminaboutexpentry:delete", chat_id=self.actor, message_id=600)
+        await admin.about_experience_entry_action(cb, state)
+
+        cb.message.edit_text.assert_awaited_once_with(
+            "Удалить запись «Дизайнер — Acme»? Это необратимо.", reply_markup=kb.confirm_keyboard("admindelexpconfirm")
+        )
+        self.assertEqual(await state.get_state(), AdminStates.about_experience_pick_delete.state)
+        self.assertEqual(len(await self._entries()), 1)  # ещё не удалена
+
+    async def test_experience_delete_cancel_preserves_entry(self):
+        state = await self._state_with_entry_open(0, msg_id=610)
+        await state.set_state(AdminStates.about_experience_pick_delete)
+        cb = make_callback("admindelexpconfirm:no", chat_id=self.actor, message_id=610)
+        await admin.about_experience_delete_do(cb, state)
+
+        self.assertEqual(len(await self._entries()), 1)
+        self.assertEqual(await state.get_state(), AdminStates.about_experience_menu.state)
+        self.assertEqual(cb.message.edit_text.await_args.args[0], "Опыт работы:")
+
+    async def test_experience_delete_confirm_yes_removes_entry(self):
+        state = await self._state_with_entry_open(0, msg_id=620)
+        await state.set_state(AdminStates.about_experience_pick_delete)
+        cb = make_callback("admindelexpconfirm:yes", chat_id=self.actor, message_id=620)
+        await admin.about_experience_delete_do(cb, state)
+
+        self.assertEqual(len(await self._entries()), 0)
+        self.assertEqual(await state.get_state(), AdminStates.about_experience_menu.state)
+        self.assertEqual(cb.message.edit_text.await_args.args[0], "Запись удалена ✅\n\nОпыт работы:")
+
+    async def test_experience_delete_missing_entry_does_not_crash(self):
+        state = await self._state_with_entry_open(99, msg_id=630)  # такого индекса нет
+        cb = make_callback("adminaboutexpentry:delete", chat_id=self.actor, message_id=630)
+
+        await admin.about_experience_entry_action(cb, state)  # не должно бросить исключение
+
+        cb.message.edit_text.assert_awaited_once_with(
+            "Запись не найдена.\n\nОпыт работы:", reply_markup=kb.about_experience_menu_keyboard(await self._entries())
+        )
+        self.assertEqual(await state.get_state(), AdminStates.about_experience_menu.state)
+        self.assertEqual(len(await self._entries()), 1)  # реальная запись не задета
+
+    # ---- cancel_to="experience", not "root" (was losing the list context) ----
+    async def test_experience_menu_sets_cancel_to_experience(self):
+        state = make_state(self.actor)
+        await state.set_state(AdminStates.edit_about_field_pick)
+        await admin.about_edit_field(make_callback("admineditabout:experience", chat_id=self.actor), state)
+        self.assertEqual((await state.get_data()).get("cancel_to"), "experience")
+        self.assertEqual(await state.get_state(), AdminStates.about_experience_menu.state)
+
+    async def test_experience_add_start_sets_cancel_to_experience(self):
+        state = make_state(self.actor)
+        await state.set_state(AdminStates.about_experience_menu)
+        await admin.about_experience_add_start(make_callback("adminaboutexpaction:add", chat_id=self.actor), state)
+        self.assertEqual((await state.get_data()).get("cancel_to"), "experience")
+
+    async def test_experience_add_cancel_returns_to_experience_list_not_root(self):
+        state = await self._state_with_entry_open(0, msg_id=640)
+        await state.set_state(AdminStates.about_experience_menu)
+        await admin.about_experience_add_start(make_callback("adminaboutexpaction:add", chat_id=self.actor, message_id=640), state)
+
+        cancel_msg = make_reply_message(self.actor, "/cancel", AsyncMock())
+        await admin.admin_cancel_command(cancel_msg, state)
+
+        self.assertEqual(await state.get_state(), AdminStates.about_experience_menu.state)
+        sent_text = cancel_msg.answer.await_args.args[0]
+        self.assertEqual(sent_text, "Отменено. Опыт работы:")  # не "Отменено. Админ-меню:"
+        cancel_msg.bot.delete_message.assert_awaited_once_with(chat_id=self.actor, message_id=640)
+
+
 class UpstashPersistenceTests(unittest.IsolatedAsyncioTestCase):
     """content_store._read/_write должны переключаться на Upstash Redis
     (REST) вместо локальных файлов, когда заданы креды — конкретно чтобы
