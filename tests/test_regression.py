@@ -1104,6 +1104,15 @@ class EntryPointArchitectureTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsInstance(btn.web_app, WebAppInfo)
             self.assertTrue(btn.web_app.url.endswith(f"/{path}"))
 
+    async def test_cmd_id_reports_correct_chat_id(self):
+        # Batch 14: /faq/portfolio/about/brief уже покрыты выше (в т.ч.
+        # cmd_brief — через переменную handler в цикле, не буквальным
+        # вызовом cmd_brief(...), из-за чего был ошибочно посчитан
+        # непокрытым при аудите), но /id не был покрыт нигде.
+        msg = make_flow_message(chat_id=424242, text="/id")
+        await start.cmd_id(msg)
+        msg.answer.assert_awaited_once_with(texts.MY_ID_TEMPLATE.format(chat_id=424242), parse_mode="Markdown")
+
     async def test_faq_command_still_uses_inline_faq_keyboard(self):
         # /faq на свежем state тоже сначала создаёт NAV anchor (см.
         # bot/flow.py::open_flow -> ensure_nav_anchor) — answer() вызывается
@@ -7971,6 +7980,68 @@ class PublicDataRouteTests(unittest.IsolatedAsyncioTestCase):
             resp = await client.get("/data/pricing.json")
             self.assertEqual(resp.status, 200)
             self.assertEqual(resp.headers.get("Cache-Control"), "no-store, no-cache, must-revalidate")
+
+    async def test_cache_control_is_no_store_for_js_and_css(self):
+        # Тот же _no_cache middleware, что и /data/ выше, но для /js/ и /css/
+        # префиксов — раньше не проверялось ни для одного из них: WebView в
+        # Telegram-клиенте мог годами отдавать app.js/style.css из
+        # собственного диск-кэша без единого запроса к серверу (см.
+        # _no_cache докстринг в webserver.py).
+        from aiohttp.test_utils import TestClient, TestServer
+
+        app = webserver.create_app(AsyncMock())
+        async with TestClient(TestServer(app)) as client:
+            for path in ("/js/app.js", "/css/style.css"):
+                resp = await client.get(path)
+                self.assertEqual(resp.status, 200, f"{path} should be served")
+                self.assertEqual(resp.headers.get("Cache-Control"), "no-store, no-cache, must-revalidate", path)
+
+
+class WebServerCoreRoutesTests(unittest.IsolatedAsyncioTestCase):
+    """P1-3, Batch 14: /health и Mini App shell (handle_index) — раньше не
+    были покрыты НИ ОДНИМ автоматическим тестом; единственная проверка была
+    curl'ом ПОСЛЕ каждого деплоя (см. финальные отчёты предыдущих batch'ей),
+    то есть поломка обнаружилась бы только постфактум в production, а не в
+    CI. handle_index не читает content_store (отдаёт webapp/index.html
+    напрямую с диска), поэтому, в отличие от PublicDataRouteTests выше,
+    изолированный tmpdir/DATA_DIR здесь не нужен."""
+
+    async def test_health_returns_ok(self):
+        from aiohttp.test_utils import TestClient, TestServer
+
+        app = webserver.create_app(AsyncMock())
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.get("/health")
+            self.assertEqual(resp.status, 200)
+            body = await resp.text()
+            self.assertEqual(body, "ok")
+
+    async def test_index_serves_mini_app_shell(self):
+        from aiohttp.test_utils import TestClient, TestServer
+
+        app = webserver.create_app(AsyncMock())
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.get("/")
+            self.assertEqual(resp.status, 200)
+            self.assertIn("text/html", resp.headers.get("Content-Type", ""))
+            self.assertEqual(resp.headers.get("Cache-Control"), "no-store, no-cache, must-revalidate")
+            body = await resp.text()
+            self.assertIn('id="app"', body)  # реальный mount point Mini App (см. webapp/index.html), не абы какой HTML
+
+    async def test_all_mini_app_routes_serve_the_same_shell(self):
+        # Все 6 путей регистрируются на один и тот же handle_index (см.
+        # webserver.create_app) — какой конкретно экран открыть, решает
+        # ТОЛЬКО клиентский JS по window.location.pathname (см. app.js::
+        # init()), не сервер. Здесь достаточно подтвердить, что каждый путь
+        # реально смаршрутизирован (200) — тело/заголовки уже подробно
+        # проверены выше для "/", повторять это на каждом пути избыточно.
+        from aiohttp.test_utils import TestClient, TestServer
+
+        app = webserver.create_app(AsyncMock())
+        async with TestClient(TestServer(app)) as client:
+            for path in ("/", "/portfolio", "/about", "/calculator", "/brief", "/myleads"):
+                resp = await client.get(path)
+                self.assertEqual(resp.status, 200, f"{path} should route to the Mini App shell")
 
 
 class PublicDataRouteUpstashTests(unittest.IsolatedAsyncioTestCase):

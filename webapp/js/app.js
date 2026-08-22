@@ -428,7 +428,16 @@ function render() {
       break;
     case "supplement":
       content = renderSupplement();
-      TG.backButton.show(goBack);
+      // Форма (ещё не отправлено) — обычный уровень, topbar "←" и нативный
+      // BackButton оба ведут на goBack(). После отправки
+      // (state.supplement.sent) renderSupplement() намеренно убирает topbar —
+      // единственная видимая in-app навигация #supplement-back-to-lead;
+      // нативный BackButton должен делать то же самое (см.
+      // closeSupplementAfterSubmit), а не goBack(), который мог бы вернуть
+      // через устаревшую state.history без сброса/рефетча "Мои заявки" —
+      // тот же класс несоответствия, что уже исправлен для "myleads"
+      // (см. closeMyLeadDetail).
+      TG.backButton.show(state.supplement && state.supplement.sent ? closeSupplementAfterSubmit : goBack);
       break;
     case "submitted":
       content = renderSubmitted();
@@ -1936,20 +1945,28 @@ function renderSupplement() {
   `;
 }
 
+// Дополнение отправлено (state.supplement.sent) — единственная видимая
+// in-app навигация здесь #supplement-back-to-lead, НЕ topbar "←"/goBack()
+// (тот сознательно убран из этой ветки renderSupplement()). Вынесено в
+// отдельную функцию по тому же принципу, что и closeMyLeadDetail (Batch 13):
+// у in-app кнопки и нативного Telegram BackButton должно быть ровно одно,
+// общее определение "вернуться к заявке после отправки" — см. render().
+function closeSupplementAfterSubmit() {
+  // status: "idle" — перезапросить список, чтобы карточка заявки
+  // отражала только что отправленное дополнение.
+  state.myLeads.status = "idle";
+  state.myLeads.selected = null;
+  state.history = [];
+  navigate("myleads", { pushHistory: false });
+}
+
 function attachSupplementEvents() {
   const s = state.supplement;
   if (!s) return;
 
   if (s.sent) {
     const backToLeadBtn = document.getElementById("supplement-back-to-lead");
-    if (backToLeadBtn) backToLeadBtn.addEventListener("click", () => {
-      // status: "idle" — перезапросить список, чтобы карточка заявки
-      // отражала только что отправленное дополнение.
-      state.myLeads.status = "idle";
-      state.myLeads.selected = null;
-      state.history = [];
-      navigate("myleads", { pushHistory: false });
-    });
+    if (backToLeadBtn) backToLeadBtn.addEventListener("click", closeSupplementAfterSubmit);
     return;
   }
 
