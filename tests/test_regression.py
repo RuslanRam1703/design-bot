@@ -5912,6 +5912,38 @@ class BackupExportImportTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sorted(result.restored_json), sorted(content_store.DATA_FILENAMES))
         self.assertEqual(result.missing_json, [])
 
+    async def test_import_zip_slip_image_entry_is_confined_to_portfolio_dir(self):
+        # Security regression (Product Readiness audit, F2): import_backup_bytes
+        # extracts img/portfolio/* entries via IMG_PORTFOLIO_DIR / Path(name).name
+        # (basename only, see content_store.py) — the mechanism was already
+        # judged correct by code inspection, this proves it holds against an
+        # actual crafted traversal filename, not just by reading the code.
+        # Does NOT change import_backup_bytes — regression test only.
+        zip_bytes = await content_store.export_backup_bytes()
+        with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
+            entries = {n: zf.read(n) for n in zf.namelist()}
+        entries["img/portfolio/../../../evil_traversal.txt"] = b"malicious content"
+        combined_zip = _make_zip(entries)
+
+        # "../../../" от img/portfolio/ целились бы сюда — за пределы и
+        # IMG_PORTFOLIO_DIR, и всего self.img_tmpdir, будь basename-защита
+        # обойдена.
+        outside_target = Path(self.img_tmpdir).parent / "evil_traversal.txt"
+
+        result = await content_store.import_backup_bytes(self.actor, combined_zip)
+
+        self.assertFalse(outside_target.exists())  # traversal-путь не создан
+        # Не "отклонено", а "безопасно нейтрализовано" — так и задокументировано
+        # в import_backup_bytes: basename кладёт запись ВНУТРИ IMG_PORTFOLIO_DIR.
+        self.assertTrue((content_store.IMG_PORTFOLIO_DIR / "evil_traversal.txt").exists())
+        self.assertEqual((content_store.IMG_PORTFOLIO_DIR / "evil_traversal.txt").read_bytes(), b"malicious content")
+        self.assertIn("img/portfolio/../../../evil_traversal.txt", result.restored_images)
+
+        # Остальное состояние (легитимный case_1.jpg, все data/*.json) не
+        # пострадало — вредоносная запись не мешает нормальному restore.
+        self.assertEqual((content_store.IMG_PORTFOLIO_DIR / "case_1.jpg").read_bytes(), b"fake-jpeg-bytes")
+        self.assertEqual(sorted(result.restored_json), sorted(content_store.DATA_FILENAMES))
+
     async def test_write_failure_on_first_json_leaves_no_state_change(self):
         zip_bytes = await content_store.export_backup_bytes()
         await content_store.update_portfolio_type_related_service(self.actor, "landing", "SITE")  # мутируем после бэкапа
@@ -6757,6 +6789,96 @@ class ClientFacingFaqFilterTests(unittest.IsolatedAsyncioTestCase):
         shown = msg.answer.await_args_list[-1]
         shown_text = shown.args[0] if shown.args else shown.kwargs.get("text")
         self.assertEqual(shown_text, texts.FAQ_INTRO)
+
+
+class SaveCasePhotoPathSafetyTests(unittest.IsolatedAsyncioTestCase):
+    """Security hardening, Batch 3: save_case_photo()'s case_id приходит из
+    admin callback data (см. cases_edit_picked в handlers/admin.py) без
+    проверки, что такой кейс вообще существует. Path(case_id).name (см.
+    fix в content_store.py) гарантирует basename semantics — тот же паттерн,
+    что уже используется для zip-slip защиты в import_backup_bytes.
+
+    Доказываем именно filesystem boundary (куда РЕАЛЬНО легла запись через
+    fake bot.download_file), а не просто форму возвращаемой строки — фейковый
+    download_file ниже физически пишет байты по переданному destination,
+    как это делает настоящий aiogram Bot.download_file."""
+
+    def setUp(self):
+        self.img_tmpdir = tempfile.mkdtemp()
+        self._orig_img_portfolio = content_store.IMG_PORTFOLIO_DIR
+        content_store.IMG_PORTFOLIO_DIR = Path(self.img_tmpdir) / "portfolio"
+        content_store.IMG_PORTFOLIO_DIR.mkdir(parents=True)
+        self._orig_designer = content_store.config.DESIGNER_CHAT_ID
+        content_store.config.DESIGNER_CHAT_ID = "555"
+        self.actor = "555"
+
+    def tearDown(self):
+        content_store.IMG_PORTFOLIO_DIR = self._orig_img_portfolio
+        content_store.config.DESIGNER_CHAT_ID = self._orig_designer
+        shutil.rmtree(self.img_tmpdir, ignore_errors=True)
+
+    def _fake_bot(self, written: list) -> SimpleNamespace:
+        async def get_file(file_id):
+            return SimpleNamespace(file_path="photos/fake.jpg")
+
+        async def download_file(file_path, destination):
+            # Реальный aiogram Bot.download_file пишет байты напрямую по
+            # destination без какой-либо санитизации со своей стороны —
+            # вся защита должна быть внутри save_case_photo() ДО этого вызова.
+            written.append(Path(destination))
+            Path(destination).write_bytes(b"fake-image-bytes")
+
+        return SimpleNamespace(get_file=get_file, download_file=download_file)
+
+    async def test_absolute_path_case_id_stays_within_portfolio_dir(self):
+        written: list = []
+        bot = self._fake_bot(written)
+        # Абсолютный путь на СОСЕДНЮЮ директорию внутри того же tmpdir, НЕ
+        # внутри IMG_PORTFOLIO_DIR — Path(base) / "/absolute/path" в pathlib
+        # отбрасывает base целиком, если правый операнд абсолютный, поэтому
+        # без fix запись ушла бы именно туда.
+        outside_dir = Path(self.img_tmpdir) / "outside_marker"
+        malicious_case_id = str(outside_dir / "evil")
+
+        cover = await content_store.save_case_photo(self.actor, bot, "fid", malicious_case_id)
+
+        self.assertEqual(len(written), 1)
+        self.assertEqual(written[0].resolve().parent, content_store.IMG_PORTFOLIO_DIR.resolve())
+        self.assertFalse(outside_dir.exists())  # ничего не создано за пределами IMG_PORTFOLIO_DIR
+        self.assertTrue(cover.startswith("img/portfolio/"))
+
+    async def test_traversal_case_id_stays_within_portfolio_dir(self):
+        written: list = []
+        bot = self._fake_bot(written)
+
+        cover = await content_store.save_case_photo(self.actor, bot, "fid", "../../../evil")
+
+        self.assertEqual(len(written), 1)
+        self.assertEqual(written[0].resolve().parent, content_store.IMG_PORTFOLIO_DIR.resolve())
+        # ../../../ выше tmpdir ничего не создал — единственный написанный
+        # файл лежит ровно внутри IMG_PORTFOLIO_DIR (проверено строкой выше).
+        self.assertTrue(cover.startswith("img/portfolio/"))
+
+    async def test_normal_case_id_unchanged(self):
+        written: list = []
+        bot = self._fake_bot(written)
+
+        cover = await content_store.save_case_photo(self.actor, bot, "fid", "case_5")
+
+        self.assertEqual(cover, "img/portfolio/case_5.jpg")
+        self.assertEqual(written[0].resolve(), (content_store.IMG_PORTFOLIO_DIR / "case_5.jpg").resolve())
+        self.assertEqual(written[0].read_bytes(), b"fake-image-bytes")
+
+    async def test_gallery_add_case_id_with_uuid_suffix_unchanged(self):
+        # case_image_add_receive/case_section_edit_value передают
+        # f"{case_id}_{uuid4().hex[:8]}" (см. handlers/admin.py) — обычный
+        # безопасный компонент, .name не должен его менять.
+        written: list = []
+        bot = self._fake_bot(written)
+
+        cover = await content_store.save_case_photo(self.actor, bot, "fid", "case_5_a1b2c3d4")
+
+        self.assertEqual(cover, "img/portfolio/case_5_a1b2c3d4.jpg")
 
 
 class ContentReadinessSummaryTests(unittest.IsolatedAsyncioTestCase):
@@ -7738,6 +7860,38 @@ class CreateLeadHttpEndpointTests(unittest.IsolatedAsyncioTestCase):
         leads = await content_store.list_leads_by_user(42)
         self.assertEqual(len(leads), 1)
 
+    async def test_designer_chat_id_unset_lead_still_created_no_crash_no_notification(self):
+        # Coverage gap identified in the Product Readiness audit: the
+        # documented graceful-degrade branch in _handle_lead_create
+        # (bot/webserver.py) — "if config.DESIGNER_CHAT_ID: ... else:
+        # logger.warning(...)" — had no test proving it actually degrades
+        # gracefully instead of crashing or silently dropping the lead
+        # itself (only the notification should be skipped).
+        from aiohttp.test_utils import TestClient, TestServer
+
+        orig_designer = webserver.config.DESIGNER_CHAT_ID
+        webserver.config.DESIGNER_CHAT_ID = ""
+        try:
+            fake_bot = AsyncMock()
+            app = webserver.create_app(fake_bot)
+            async with TestClient(TestServer(app)) as client:
+                with self.assertLogs("bot.webserver", level="WARNING") as log_ctx:
+                    resp = await client.post(
+                        "/api/leads",
+                        headers={"X-Telegram-Init-Data": self._init_data(), "Content-Type": "application/json"},
+                        json={"service_name": "Лендинг", "attach_tz": False},
+                    )
+                self.assertEqual(resp.status, 200)  # сервер не падает
+                body = await resp.json()
+                self.assertIn("lead_id", body)
+        finally:
+            webserver.config.DESIGNER_CHAT_ID = orig_designer
+
+        leads = await content_store.list_leads_by_user(42)
+        self.assertEqual(len(leads), 1)  # заявка всё равно создана
+        fake_bot.send_message.assert_not_awaited()  # но уведомление не отправлено
+        self.assertTrue(any("DESIGNER_CHAT_ID" in msg for msg in log_ctx.output))  # предупреждение залогировано
+
     async def test_missing_init_data_is_401_and_creates_no_lead(self):
         from aiohttp.test_utils import TestClient, TestServer
 
@@ -8440,6 +8594,39 @@ class LeadMaterialTests(unittest.IsolatedAsyncioTestCase):
         message.document = make_fake_document()
         await webapp.handle_tz_file(message)
         self.assertIsNone(await content_store.find_lead_awaiting_file(message.from_user.id))
+
+    async def test_cancel_clears_awaiting_state_and_next_file_is_not_attributed(self):
+        # Coverage gap identified in the Product Readiness audit: /cancel's
+        # awaiting-file-clear path (start.cmd_cancel -> content_store.
+        # mark_tz_file_received) had zero direct test coverage — every
+        # existing cmd_cancel test used a chat with no awaiting lead at all.
+        message = make_message()  # from_user.id == 1
+        await webapp._handle_brief_submission(
+            message, {"service_name": "Лендинг", "attach_tz": True, "draft_id": "cancel1"},
+        )
+        lead_id = (await content_store.find_lead_awaiting_file(message.from_user.id))["id"]
+
+        # 1-2. клиент ждёт файл, шлёт /cancel (chat_id=1 == from_user.id
+        # выше — в приватном чате с ботом они всегда совпадают, см.
+        # make_flow_message).
+        state = make_state(1)
+        cancel_msg = make_flow_message(chat_id=1, text="/cancel")
+        await start.cmd_cancel(cancel_msg, state)
+
+        # 3. awaiting-file state очищено — и на уровне lookup, и на самой заявке.
+        self.assertIsNone(await content_store.find_lead_awaiting_file(message.from_user.id))
+        lead = await content_store.get_lead(lead_id)
+        self.assertFalse(lead["awaiting_tz_file"])
+        self.assertIsNone(lead["awaiting_tz_file_source"])
+        self.assertEqual(lead.get("materials", []), [])  # /cancel не пишет материал (см. mark_tz_file_received)
+
+        # 4. следующий присланный файл больше не привязывается к этой
+        # (уже отменённой) заявке — handle_tz_file ищет через
+        # find_lead_awaiting_file и, не найдя ожидающую заявку, ничего не делает.
+        message.document = make_fake_document(file_id="after-cancel", file_unique_id="after-cancel-u")
+        await webapp.handle_tz_file(message)
+        lead_after = await content_store.get_lead(lead_id)
+        self.assertEqual(lead_after.get("materials", []), [])
 
     async def test_multiple_leads_same_user_do_not_cause_misattribution(self):
         # Два лида одного клиента, оба помечены attach_tz=True — второй

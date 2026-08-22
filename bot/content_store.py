@@ -537,10 +537,18 @@ async def delete_case(actor_chat_id: int | str, case_id: str) -> bool:
 
 
 async def save_case_photo(actor_chat_id: int | str, bot: Any, file_id: str, case_id: str) -> str:
+    """case_id приходит из admin callback data (см. cases_edit_picked в
+    handlers/admin.py) без проверки, что такой кейс вообще существует —
+    Path(...).name берёт только последний компонент пути, тем же паттерном,
+    что уже используется для zip-slip защиты в import_backup_bytes: обычный
+    "case_N"/"case_N_<hex>" не меняется, а "../../x" или абсолютный путь не
+    может вывести запись за пределы IMG_PORTFOLIO_DIR (Product Readiness
+    audit, Batch 3)."""
     _require_designer(actor_chat_id)
     file = await bot.get_file(file_id)
     ext = Path(file.file_path).suffix or ".jpg"
-    filename = f"{case_id}{ext}"
+    safe_case_id = Path(case_id).name
+    filename = f"{safe_case_id}{ext}"
     dest = IMG_PORTFOLIO_DIR / filename
     await bot.download_file(file.file_path, destination=dest)
     return f"img/portfolio/{filename}"

@@ -381,6 +381,18 @@ function attachTabBarEvents() {
         navigate(screen);
         return;
       }
+      if (screen === "myleads") {
+        // Обычный вход через таб не должен повторно открывать деталь
+        // заявки, оставшуюся выбранной с прошлого визита (state.myLeads.selected
+        // переживает переключение на другой таб и обратно — сам этот
+        // обработчик его не трогал) — иначе renderMyLeads() снова открыл бы
+        // тот же detail вместо списка, да ещё и с устаревшим status
+        // (status оставался "loaded", рефетч не запускался). Тот же паттерн
+        // "вернуться в 'Мои заявки' с чистого листа", что уже используется
+        // в closeSupplementAfterSubmit() (Product Readiness audit, Batch 3).
+        state.myLeads.selected = null;
+        state.myLeads.status = "idle";
+      }
       state.history = [];
       state.screen = screen;
       render();
@@ -406,7 +418,15 @@ function render() {
       break;
     case "about":
       content = renderAbout();
-      TG.backButton.show(goBack);
+      // Как и "myleads" выше — About достижим ТОЛЬКО через таб (history
+      // всегда пуст в этот момент), кроме случая, когда что-то реально
+      // запушило экран перед ним (сейчас такого пути нет, но проверяем по
+      // факту, а не хардкодим "всегда hide", на случай будущего входа с
+      // историей). Раньше BackButton показывался безусловно — goBack() на
+      // пустом history падал в захардкоженный fallback "portfolio", даже
+      // если пользователь пришёл не оттуда (Product Readiness audit, Batch 3).
+      if (state.history.length > 0) TG.backButton.show(goBack);
+      else TG.backButton.hide();
       break;
     case "calculator":
       content = renderCalculator();
@@ -713,7 +733,7 @@ function renderAbout() {
 
   return `
     <div class="topbar">
-      <button class="back-btn" id="back">←</button>
+      ${state.history.length > 0 ? '<button class="back-btn" id="back">←</button>' : ""}
       <h1>👤 Обо мне</h1>
     </div>
 
