@@ -6426,6 +6426,89 @@ class ClientFacingFaqFilterTests(unittest.IsolatedAsyncioTestCase):
         callback.answer.assert_awaited_once_with("Услуга не найдена", show_alert=True)
         callback.message.edit_text.assert_not_awaited()
 
+    # ---- P1-3, Batch 13: /admin -> Меню и навигация -> "faq" теперь
+    # реально enforced на обеих точках входа (/faq, кнопка "❓ Частые
+    # вопросы") — раньше выключение флага не имело эффекта (см. аудит
+    # Batch 9/11). load_ui_config патчится явно (тот же синхронный
+    # локальный источник, что load_faq/load_pricing уже используют в этом
+    # файле, не зависит от реального data/ui_config.json). ----
+    UI_CONFIG_FAQ_ENABLED = {"menu": {"faq": True}}
+    UI_CONFIG_FAQ_DISABLED = {"menu": {"faq": False}}
+
+    async def test_faq_command_enabled_shows_faq_list(self):
+        state = make_state()
+        msg = make_flow_message(text="/faq")
+        with patch("bot.handlers.faq.load_ui_config", return_value=self.UI_CONFIG_FAQ_ENABLED), \
+             patch("bot.handlers.faq.load_faq", return_value=self.FAKE_FAQ):
+            await faq.cmd_faq(msg, state)
+        shown = msg.answer.await_args_list[-1]
+        shown_text = shown.args[0] if shown.args else shown.kwargs.get("text")
+        self.assertEqual(shown_text, texts.FAQ_INTRO)
+
+    async def test_faq_command_disabled_does_not_enter_faq_flow(self):
+        state = make_state()
+        msg = make_flow_message(text="/faq")
+        with patch("bot.handlers.faq.load_ui_config", return_value=self.UI_CONFIG_FAQ_DISABLED), \
+             patch("bot.handlers.faq.load_faq", return_value=self.FAKE_FAQ):
+            await faq.cmd_faq(msg, state)
+        shown = msg.answer.await_args_list[-1]
+        shown_text = shown.args[0] if shown.args else shown.kwargs.get("text")
+        self.assertEqual(shown_text, texts.FAQ_DISABLED)
+        shown_markup = shown.kwargs.get("reply_markup") if len(shown.args) < 2 else shown.args[1]
+        self.assertIsNone(shown_markup)  # никакого FAQ-списка/клавиатуры не показано
+
+    async def test_faq_reply_button_enabled_shows_faq_list(self):
+        state = make_state()
+        msg = make_flow_message(text=texts.MENU_FAQ)
+        with patch("bot.handlers.faq.load_ui_config", return_value=self.UI_CONFIG_FAQ_ENABLED), \
+             patch("bot.handlers.faq.load_faq", return_value=self.FAKE_FAQ):
+            await faq.show_faq_list(msg, state)
+        shown = msg.answer.await_args_list[-1]
+        shown_text = shown.args[0] if shown.args else shown.kwargs.get("text")
+        self.assertEqual(shown_text, texts.FAQ_INTRO)
+
+    async def test_faq_reply_button_disabled_does_not_enter_faq_flow(self):
+        state = make_state()
+        msg = make_flow_message(text=texts.MENU_FAQ)
+        with patch("bot.handlers.faq.load_ui_config", return_value=self.UI_CONFIG_FAQ_DISABLED), \
+             patch("bot.handlers.faq.load_faq", return_value=self.FAKE_FAQ):
+            await faq.show_faq_list(msg, state)
+        shown = msg.answer.await_args_list[-1]
+        shown_text = shown.args[0] if shown.args else shown.kwargs.get("text")
+        self.assertEqual(shown_text, texts.FAQ_DISABLED)
+
+    async def test_faq_reenabled_after_disabled_restores_normal_flow(self):
+        state = make_state()
+
+        with patch("bot.handlers.faq.load_ui_config", return_value=self.UI_CONFIG_FAQ_DISABLED), \
+             patch("bot.handlers.faq.load_faq", return_value=self.FAKE_FAQ):
+            disabled_msg = make_flow_message(text=texts.MENU_FAQ)
+            await faq.show_faq_list(disabled_msg, state)
+        disabled_shown = disabled_msg.answer.await_args_list[-1]
+        disabled_text = disabled_shown.args[0] if disabled_shown.args else disabled_shown.kwargs.get("text")
+        self.assertEqual(disabled_text, texts.FAQ_DISABLED)
+
+        with patch("bot.handlers.faq.load_ui_config", return_value=self.UI_CONFIG_FAQ_ENABLED), \
+             patch("bot.handlers.faq.load_faq", return_value=self.FAKE_FAQ):
+            reenabled_msg = make_flow_message(text=texts.MENU_FAQ)
+            await faq.show_faq_list(reenabled_msg, state)
+        reenabled_shown = reenabled_msg.answer.await_args_list[-1]
+        reenabled_text = reenabled_shown.args[0] if reenabled_shown.args else reenabled_shown.kwargs.get("text")
+        self.assertEqual(reenabled_text, texts.FAQ_INTRO)  # обычный FAQ-список снова доступен
+
+    async def test_faq_toggle_missing_key_defaults_to_enabled(self):
+        # ui_config.json без ключа "faq" вовсе (напр. очень старый бэкап) —
+        # тот же .get(key, True) default, что и в admin.py::nav_toggle
+        # (Batch 9) — по умолчанию доступно, а не тихо выключено.
+        state = make_state()
+        msg = make_flow_message(text="/faq")
+        with patch("bot.handlers.faq.load_ui_config", return_value={"menu": {}}), \
+             patch("bot.handlers.faq.load_faq", return_value=self.FAKE_FAQ):
+            await faq.cmd_faq(msg, state)
+        shown = msg.answer.await_args_list[-1]
+        shown_text = shown.args[0] if shown.args else shown.kwargs.get("text")
+        self.assertEqual(shown_text, texts.FAQ_INTRO)
+
 
 class ContentReadinessSummaryTests(unittest.IsolatedAsyncioTestCase):
     """UX-аудит, находки F01-F03: сводка в /admin должна отражать реальное
@@ -7158,6 +7241,22 @@ class MyLeadsFilteringTests(unittest.IsolatedAsyncioTestCase):
         old_lead = await content_store.add_lead({"service_name": "A"}, {"user_id": 111})
         new_lead = await content_store.add_lead({"service_name": "B"}, {"user_id": 111})
         await content_store.update_lead_status(self.actor, old_lead["id"], "IN_PROGRESS")
+
+        # P1-3, Batch 13: тот же принцип, что уже применён в
+        # test_updated_old_lead_rises_above_newer_untouched_lead выше (для
+        # list_leads_by_user) — два datetime.now(timezone.utc) вызова подряд
+        # иногда совпадают до используемого разрешения системных часов,
+        # из-за чего updated_at старой заявки может оказаться РАВЕН
+        # created_at новой, и тай-брейк по id отдаёт победу новой заявке —
+        # эта, admin-сторонняя версия того же теста была пропущена при том
+        # фиксе и оставалась flaky (наблюдалось прямо в full suite). Форсируем
+        # заведомо более позднюю метку — сама сортировка (list_leads) при
+        # этом по-прежнему реальная, не замокана.
+        leads = await content_store._read_leads()
+        for l in leads:
+            if l["id"] == old_lead["id"]:
+                l["updated_at"] = "2030-01-01T00:00:00+00:00"
+        await content_store._write_leads(leads)
 
         admin_leads = await content_store.list_leads()
         self.assertEqual([l["id"] for l in admin_leads], [old_lead["id"], new_lead["id"]])

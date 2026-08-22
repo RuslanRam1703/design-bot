@@ -6,7 +6,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, Message
 
 from bot import flow, texts
-from bot.data import get_service, load_faq, load_pricing
+from bot.data import get_service, load_faq, load_pricing, load_ui_config
 from bot.keyboards import (
     faq_back_keyboard,
     faq_list_keyboard,
@@ -27,6 +27,19 @@ def _client_faq_items() -> list[dict]:
 
 
 async def _send_faq_list(message: Message, state: FSMContext) -> None:
+    # P1-3, Batch 13: /admin -> Меню и навигация уже позволяет выключить
+    # пункт "faq" в ui_config.json, но ни одна из двух точек входа сюда
+    # (/faq, кнопка "❓ Частые вопросы") этот флаг не проверяла — выключение
+    # было полностью без эффекта (см. аудит Batch 9/11). load_ui_config,
+    # не content_store.get_ui_config — тот же синхронный локальный источник,
+    # что load_faq/load_pricing уже используют в этом файле; заново
+    # открытые faq:*/faqprice:* колбэки уже показанного клиенту сообщения
+    # сознательно не ретроактивны (то же принятое поведение, что и у
+    # needs_review-фильтра выше — устаревшее открытое сообщение продолжает
+    # работать, пока клиент не уйдёт с него).
+    if not load_ui_config()["menu"].get("faq", True):
+        await flow.open_root(message, state, texts.FAQ_DISABLED, None)
+        return
     # flow.open_root (не голый message.answer) — FAQ-список сам по себе
     # "корневой экран без FSM-состояния", в точности как /portfolio, /about,
     # /brief, /admin (см. open_root docstring). Раньше этот список никогда

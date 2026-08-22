@@ -418,7 +418,13 @@ function render() {
       break;
     case "myleads":
       content = renderMyLeads();
-      TG.backButton.hide();
+      // Список — свой собственный уровень (как portfolio), нативный
+      // BackButton скрыт. Деталь заявки (state.myLeads.selected) — это уже
+      // не самый верхний уровень внутри этого экрана: нативный BackButton
+      // показан и делает то же самое, что и in-app "← К списку заявок"
+      // (см. closeMyLeadDetail) — раньше был скрыт даже здесь.
+      if (state.myLeads.selected) TG.backButton.show(closeMyLeadDetail);
+      else TG.backButton.hide();
       break;
     case "supplement":
       content = renderSupplement();
@@ -1805,6 +1811,19 @@ function renderMyLeadDetail(lead) {
   `;
 }
 
+// Список <-> деталь внутри экрана "myleads" — отдельное под-состояние
+// (state.myLeads.selected), никогда не проходящее через navigate()/
+// state.history (тот же экран "myleads" всё это время) — поэтому
+// закрытие детали НЕ переиспользует goBack() (он бы вместо возврата к
+// списку заявок ушёл на screen, который был до входа в "Мои заявки"
+// вообще, минуя список). Вынесено в отдельную функцию, чтобы у кнопки
+// "← К списку заявок" и нативного Telegram BackButton было ровно одно,
+// общее определение "закрыть деталь" — см. render()/attachMyLeadsEvents().
+function closeMyLeadDetail() {
+  state.myLeads.selected = null;
+  render();
+}
+
 function attachMyLeadsEvents() {
   document.querySelectorAll("[data-lead-id]").forEach((el) =>
     el.addEventListener("click", () => {
@@ -1815,7 +1834,7 @@ function attachMyLeadsEvents() {
     })
   );
   const backBtn = document.getElementById("my-lead-back");
-  if (backBtn) backBtn.addEventListener("click", () => { state.myLeads.selected = null; render(); });
+  if (backBtn) backBtn.addEventListener("click", closeMyLeadDetail);
 
   const ownerHistoryToggle = document.getElementById("my-lead-owner-history-toggle");
   if (ownerHistoryToggle) ownerHistoryToggle.addEventListener("click", () => {

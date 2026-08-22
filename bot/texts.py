@@ -30,6 +30,7 @@ FAQ_INTRO = "Выберите вопрос:"
 FAQ_BACK = "◀️ Ко всем вопросам"
 FAQ_BACK_TO_SERVICES = "◀️ К выбору услуги"
 FAQ_PICK_SERVICE = "По какой услуге подсказать цену?"
+FAQ_DISABLED = "Раздел FAQ сейчас недоступен."
 
 MY_ID_TEMPLATE = (
     "Ваш chat_id: `{chat_id}`\n\n"
