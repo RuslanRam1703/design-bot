@@ -87,7 +87,14 @@ async def faq_price_answer(callback: CallbackQuery) -> None:
         return
 
     faq_items = load_faq()["faq"]
-    template_item = next(i for i in faq_items if i["type"] == "service_price")
+    # next(..., None) — тот же graceful-паттерн, что и в faq_answer выше
+    # (P1-3, Batch 12): шаблонный вопрос service_price мог быть удалён из
+    # /admin -> FAQ между показом пикера услуг и нажатием клиента (TOCTOU) —
+    # раньше next(...) без default падал с StopIteration.
+    template_item = next((i for i in faq_items if i["type"] == "service_price"), None)
+    if template_item is None:
+        await callback.answer("Вопрос не найден", show_alert=True)
+        return
     text = template_item["answer_template"].format(**service)
     await callback.message.edit_text(text, reply_markup=faq_price_answer_keyboard(template_item["id"]))
     await callback.answer()

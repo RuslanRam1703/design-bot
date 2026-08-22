@@ -6388,6 +6388,44 @@ class ClientFacingFaqFilterTests(unittest.IsolatedAsyncioTestCase):
         callback.answer.assert_awaited_once_with("Вопрос не найден", show_alert=True)
         callback.message.edit_text.assert_not_awaited()
 
+    # ---- P1-3, Batch 12: faq_price_answer — тот же TOCTOU-класс, что уже
+    # закрыт в admin.py (Batch 6/7/8/10): пикер услуг мог быть показан,
+    # пока в faq.json ещё был пункт type=="service_price", а к моменту
+    # клика по конкретной услуге этот пункт уже удалён из /admin -> FAQ. ----
+    FAKE_PRICING = {"services": [{"id": "LEND", "name": "Лендинг", "base_price": 25000, "term_min": 7, "term_max": 10}]}
+    FAKE_FAQ_WITH_TEMPLATE = {
+        "faq": [{"id": 1, "type": "service_price", "answer_template": "Цена {name}: от {base_price} ₽, срок {term_min}-{term_max} дн."}]
+    }
+    FAKE_FAQ_WITHOUT_TEMPLATE = {"faq": [{"id": 2, "type": "static", "answer": "не относится к делу"}]}
+
+    async def test_faq_price_answer_happy_path_with_existing_template(self):
+        callback = make_callback("faqprice:LEND")
+        with patch("bot.handlers.faq.load_faq", return_value=self.FAKE_FAQ_WITH_TEMPLATE), \
+             patch("bot.handlers.faq.load_pricing", return_value=self.FAKE_PRICING):
+            await faq.faq_price_answer(callback)
+        callback.message.edit_text.assert_awaited_once_with(
+            "Цена Лендинг: от 25000 ₽, срок 7-10 дн.", reply_markup=keyboards.faq_price_answer_keyboard(1)
+        )
+        callback.answer.assert_awaited_once()
+
+    async def test_faq_price_answer_missing_template_does_not_crash(self):
+        callback = make_callback("faqprice:LEND")
+        with patch("bot.handlers.faq.load_faq", return_value=self.FAKE_FAQ_WITHOUT_TEMPLATE), \
+             patch("bot.handlers.faq.load_pricing", return_value=self.FAKE_PRICING):
+            await faq.faq_price_answer(callback)  # не должно бросить исключение (было StopIteration)
+        callback.answer.assert_awaited_once_with("Вопрос не найден", show_alert=True)
+        callback.message.edit_text.assert_not_awaited()  # ничего не отредактировано, данные не тронуты
+
+    async def test_faq_price_answer_missing_service_still_graceful(self):
+        # Существующий, не связанный с этим фиксом путь — убеждаемся, что
+        # фикс не задел его: неизвестная услуга уже была graceful ДО Batch 12.
+        callback = make_callback("faqprice:UNKNOWN")
+        with patch("bot.handlers.faq.load_faq", return_value=self.FAKE_FAQ_WITH_TEMPLATE), \
+             patch("bot.handlers.faq.load_pricing", return_value=self.FAKE_PRICING):
+            await faq.faq_price_answer(callback)
+        callback.answer.assert_awaited_once_with("Услуга не найдена", show_alert=True)
+        callback.message.edit_text.assert_not_awaited()
+
 
 class ContentReadinessSummaryTests(unittest.IsolatedAsyncioTestCase):
     """UX-аудит, находки F01-F03: сводка в /admin должна отражать реальное
