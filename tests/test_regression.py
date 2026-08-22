@@ -6001,6 +6001,199 @@ class BackupExportImportTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse((content_store.IMG_PORTFOLIO_DIR / "new_case.jpg").exists())  # Phase 3 не запускался
 
 
+class BackupRestoreEndToEndTests(unittest.IsolatedAsyncioTestCase):
+    """Backup/Restore E2E audit, 2026-08-22: единый сквозной прогон
+    export -> ZIP -> mutate -> restore через РЕАЛЬНЫЙ production-путь
+    (content_store.export_backup_bytes/import_backup_bytes — те же функции,
+    что вызывает bot/handlers/admin.py, внутренняя логика не копируется).
+
+    Отличие от BackupExportImportTests выше: та проверяет отдельные аспекты
+    (по одному изменённому полю за тест), здесь — один представительный
+    датасет, покрывающий ВСЕ категории (leads/cases/services/about/faq/
+    ui_config/image) сразу, с заведомо уникальными "ORIGINAL_"-маркерами,
+    которые нельзя спутать со случайным совпадением, плюс cross-file
+    referential integrity (case.type/related_service -> реальные portfolio
+    types/pricing services) после restore.
+
+    Полностью изолировано от сети и Upstash: UPSTASH_REDIS_REST_URL/TOKEN
+    не заданы (дефолт тестового окружения) => content_store._upstash_enabled()
+    ложь => _read/_write идут через _read_local/_write_local в tmpdir (см.
+    content_store.py) — тот же изоляционный механизм, что и во всех
+    остальных Backup*Tests выше, ничего нового не введено.
+
+    FSM/confirm-шаг (upload -> "Да" -> backup_restore_do) сюда намеренно не
+    входит — он уже покрыт отдельно и полно в AdminBackupHandlersTests
+    (test_import_via_real_handler_restores_changed_data и соседние), которые
+    гоняют реальные bot/handlers/admin.py хендлеры. Здесь фокус на глубине
+    датасета и cross-file integrity, не на переигрывании FSM-переходов —
+    см. Limitations в итоговом отчёте."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.img_tmpdir = tempfile.mkdtemp()
+        self._orig_data_dir = content_store.DATA_DIR
+        self._orig_designer = content_store.config.DESIGNER_CHAT_ID
+        self._orig_img_portfolio = content_store.IMG_PORTFOLIO_DIR
+        self._orig_img_about = content_store.IMG_ABOUT_DIR
+        content_store.DATA_DIR = Path(self.tmpdir)
+        content_store.config.DESIGNER_CHAT_ID = "777"
+        content_store.IMG_PORTFOLIO_DIR = Path(self.img_tmpdir) / "portfolio"
+        content_store.IMG_ABOUT_DIR = Path(self.img_tmpdir) / "about"
+        content_store.IMG_PORTFOLIO_DIR.mkdir(parents=True)
+        content_store.IMG_ABOUT_DIR.mkdir(parents=True)
+        self.actor = "777"
+
+        # Небольшой, но представительный dataset: одно значение на
+        # категорию, каждое с "ORIGINAL_"-маркером — после restore можно
+        # однозначно отличить "вернулось из бэкапа" от "случайно не менялось".
+        portfolio = {
+            "cases": [{
+                "id": "case_e2e", "title": "ORIGINAL_TITLE", "type": "e2e_type",
+                "cover": "img/portfolio/e2e_cover.jpg", "images": ["img/portfolio/e2e_cover.jpg"],
+                "task": "ORIGINAL_TASK", "related_service": "E2E_SVC",
+            }],
+            "types": [{"id": "e2e_type", "label": "ORIGINAL_TYPE_LABEL", "related_service": "E2E_SVC"}],
+        }
+        pricing = {
+            "services": [{
+                "id": "E2E_SVC", "name": "ORIGINAL_SERVICE_NAME", "base_price": 10000,
+                "term_min": 1, "term_max": 2, "includes": "ORIGINAL_INCLUDES",
+            }],
+            "options": [{"service_id": "E2E_SVC", "id": "E2E_OPT", "name": "ORIGINAL_OPTION", "price": 500, "days": 1, "multipliable": False}],
+            "groups": [],
+            "coefficients": {"urgent": {"label": "Срочно", "multiplier": 1.25}},
+            "rounding": {"price_from_factor": 0.95, "price_to_factor": 1.05, "round_to": 500},
+        }
+        about = {
+            "needs_review_fields": [], "avatar": "img/about/e2e_avatar.jpg",
+            "name": "ORIGINAL_NAME", "tagline": "ORIGINAL_TAGLINE", "location": "",
+            "specialization": [], "tools": [], "skills": [], "experience_years": "1",
+            "experience_text": "ORIGINAL_EXPERIENCE", "approach": "ORIGINAL_APPROACH",
+            "experience": [], "education": {"enabled": False, "items": []}, "links": [],
+        }
+        faq = {"faq": [{"id": 1, "type": "static", "question": "ORIGINAL_Q", "answer": "ORIGINAL_A", "needs_review": False}]}
+        ui_config = {"menu": {"faq": True, "portfolio": True}}
+        leads = {"leads": [{
+            "id": 1, "draft_id": None, "status": "NEW", "created_at": "2026-01-01T00:00:00+00:00",
+            "updated_at": None, "payload": {"service_name": "ORIGINAL_LEAD_MARKER"},
+            "telegram": {"user_id": 555, "username": "e2e_client"}, "calc_summary": None,
+            "awaiting_tz_file": False, "awaiting_tz_file_source": None,
+        }]}
+
+        for name, data in (
+            ("portfolio.json", portfolio), ("pricing.json", pricing), ("faq.json", faq),
+            ("about.json", about), ("ui_config.json", ui_config), ("leads.json", leads),
+        ):
+            (Path(self.tmpdir) / name).write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+        (content_store.IMG_PORTFOLIO_DIR / "e2e_cover.jpg").write_bytes(b"ORIGINAL_IMAGE_BYTES")
+
+    def tearDown(self):
+        content_store.DATA_DIR = self._orig_data_dir
+        content_store.config.DESIGNER_CHAT_ID = self._orig_designer
+        content_store.IMG_PORTFOLIO_DIR = self._orig_img_portfolio
+        content_store.IMG_ABOUT_DIR = self._orig_img_about
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+        shutil.rmtree(self.img_tmpdir, ignore_errors=True)
+
+    # ---- B: export archive integrity + export не мутирует источник ----
+
+    async def test_export_produces_exact_expected_archive_without_mutating_source(self):
+        pre_export_bytes = {name: (Path(self.tmpdir) / name).read_bytes() for name in content_store.DATA_FILENAMES}
+
+        zip_bytes = await content_store.export_backup_bytes()
+
+        # читается стандартным ZipFile без ошибок структуры
+        with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
+            self.assertIsNone(zf.testzip())  # None == нет повреждённых записей
+            names = set(zf.namelist())
+            expected = {f"data/{n}" for n in content_store.DATA_FILENAMES} | {"img/portfolio/e2e_cover.jpg"}
+            self.assertEqual(names, expected)  # ровно ожидаемые файлы, ни одного лишнего
+            self.assertEqual(
+                json.loads(zf.read("data/pricing.json"))["services"][0]["name"],
+                "ORIGINAL_SERVICE_NAME",
+            )
+
+        # export только читает — исходные файлы на диске побайтово не тронуты
+        for name in content_store.DATA_FILENAMES:
+            self.assertEqual((Path(self.tmpdir) / name).read_bytes(), pre_export_bytes[name])
+        self.assertEqual((content_store.IMG_PORTFOLIO_DIR / "e2e_cover.jpg").read_bytes(), b"ORIGINAL_IMAGE_BYTES")
+
+    # ---- A-E: полный сквозной цикл по всем категориям + cross-file integrity ----
+
+    async def test_full_export_mutate_restore_cycle_recovers_every_category(self):
+        zip_bytes = await content_store.export_backup_bytes()
+
+        # ---- C: намеренная, заметная мутация каждой категории ----
+        self.assertTrue(await content_store.update_service(self.actor, "E2E_SVC", name="MUTATED_SERVICE_NAME"))
+        self.assertTrue(await content_store.update_case(self.actor, "case_e2e", title="MUTATED_TITLE"))
+        self.assertTrue(await content_store.update_about_field(self.actor, "tagline", "MUTATED_TAGLINE"))
+        self.assertTrue(await content_store.update_faq(self.actor, 1, answer="MUTATED_ANSWER"))
+        self.assertTrue(await content_store.update_lead_status(self.actor, 1, "DONE"))
+        self.assertTrue(await content_store.set_menu_item_enabled(self.actor, "faq", False))
+        (content_store.IMG_PORTFOLIO_DIR / "e2e_cover.jpg").write_bytes(b"MUTATED_IMAGE_BYTES")
+
+        # sanity: мутации реально применились (иначе restore-проверка ниже
+        # ничего бы не доказывала — тест был бы ложно-зелёным)
+        services = await content_store.list_services()
+        self.assertEqual(next(s for s in services if s["id"] == "E2E_SVC")["name"], "MUTATED_SERVICE_NAME")
+        cases = await content_store.list_cases()
+        self.assertEqual(next(c for c in cases if c["id"] == "case_e2e")["title"], "MUTATED_TITLE")
+        self.assertEqual((await content_store.get_about())["tagline"], "MUTATED_TAGLINE")
+        self.assertEqual(next(f for f in await content_store.list_faq() if f["id"] == 1)["answer"], "MUTATED_ANSWER")
+        leads_before_restore = (await content_store._read("leads.json"))["leads"]
+        self.assertEqual(next(l for l in leads_before_restore if l["id"] == 1)["status"], "DONE")
+        self.assertFalse((await content_store.get_ui_config())["menu"]["faq"])
+        self.assertEqual((content_store.IMG_PORTFOLIO_DIR / "e2e_cover.jpg").read_bytes(), b"MUTATED_IMAGE_BYTES")
+
+        # ---- D: restore через реальный production-путь ----
+        result = await content_store.import_backup_bytes(self.actor, zip_bytes)
+
+        # ---- E: все категории вернулись к ORIGINAL_*, мутации исчезли,
+        # ничего не восстановлено частично ----
+        self.assertEqual(sorted(result.restored_json), sorted(content_store.DATA_FILENAMES))
+        self.assertEqual(result.missing_json, [])
+        self.assertEqual(result.failed_images, [])
+        self.assertIn("img/portfolio/e2e_cover.jpg", result.restored_images)
+
+        services = await content_store.list_services()
+        service = next(s for s in services if s["id"] == "E2E_SVC")
+        self.assertEqual(service["name"], "ORIGINAL_SERVICE_NAME")
+
+        cases = await content_store.list_cases()
+        case = next(c for c in cases if c["id"] == "case_e2e")
+        self.assertEqual(case["title"], "ORIGINAL_TITLE")
+
+        about = await content_store.get_about()
+        self.assertEqual(about["tagline"], "ORIGINAL_TAGLINE")
+
+        faq_item = next(f for f in await content_store.list_faq() if f["id"] == 1)
+        self.assertEqual(faq_item["answer"], "ORIGINAL_A")
+
+        leads_after_restore = (await content_store._read("leads.json"))["leads"]
+        lead = next(l for l in leads_after_restore if l["id"] == 1)
+        self.assertEqual(lead["status"], "NEW")
+        self.assertEqual(lead["payload"]["service_name"], "ORIGINAL_LEAD_MARKER")
+
+        ui_config = await content_store.get_ui_config()
+        self.assertTrue(ui_config["menu"]["faq"])
+
+        self.assertEqual((content_store.IMG_PORTFOLIO_DIR / "e2e_cover.jpg").read_bytes(), b"ORIGINAL_IMAGE_BYTES")
+
+        # ---- cross-file referential integrity после restore: case.type ->
+        # реальный portfolio type, case.related_service/type.related_service
+        # -> реальный pricing service (то же свойство, что Product Readiness
+        # audit проверял вручную для реальных production-данных, здесь —
+        # автоматизированная regression-проверка на E2E-датасете) ----
+        types = await content_store.list_portfolio_types()
+        type_ids = {t["id"] for t in types}
+        service_ids = {s["id"] for s in services}
+        self.assertIn(case["type"], type_ids)
+        self.assertIn(case["related_service"], service_ids)
+        portfolio_type = next(t for t in types if t["id"] == case["type"])
+        self.assertIn(portfolio_type["related_service"], service_ids)
+
+
 class BackupUpstashSafetyTests(unittest.IsolatedAsyncioTestCase):
     """P1-1 (production-hardening аудит), пересечение с P0-1: export должен
     полностью отказывать (не выдавать частичный ZIP), если хотя бы один
