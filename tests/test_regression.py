@@ -2358,6 +2358,118 @@ class AdminSectionNavigationAnchorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(data.get(flow._NAV_ANCHOR_CHAT_KEY), self.actor)
 
 
+class AdminNavigationMenuWorkflowTests(unittest.IsolatedAsyncioTestCase):
+    """P1-3, Batch 9: full functional audit of Admin -> Меню и навигация
+    (menu_nav/nav_toggle). Unlike every other admin domain audited in
+    Batches 5-8, this one is a single flat, stateless toggle screen -- no
+    wizard, no free-text step, no FSM sub-states, no destructive action
+    (a toggle is trivially reversible, the same reason case-image
+    reorder/set-cover never needed a Batch 6-style confirm step either).
+
+    Found no code bug: nav_toggle already defaults to True via
+    ui_config["menu"].get(key, True) and content_store.set_menu_item_enabled
+    is already bool-safe/no-raise on an unknown key, so a stale/malformed
+    callback_data is already a safe no-op, not a crash. menu_nav is
+    already covered by AdminSectionNavigationAnchorTests (one of the 9
+    adminmenu:* entry points). The gap was regression coverage: nav_toggle
+    itself -- the only meaningful ACTION in this screen -- had zero test
+    coverage anywhere in the suite.
+
+    Deliberately NOT fixed here (documented, not silently ignored): the
+    "faq" menu-visibility flag has no enforcement point anywhere in the
+    client-facing product. webapp/js/app.js's tab bar (TAB_SCREENS) never
+    included "faq" to begin with (FAQ is a separate, non-Mini-App inline-
+    keyboard flow -- see EntryPointArchitectureTests), and bot/handlers/
+    start.py's /faq command and reply-keyboard button never check
+    ui_config at all. Toggling "faq" off in this admin screen is
+    therefore silently inert. This is a real cross-domain gap, but fixing
+    it requires deciding what a disabled /faq command should actually do
+    for a non-Mini-App entry point (silently ignore? show a stub
+    message?) -- a product decision, not something safely inferable here,
+    and FAQ's command/keyboard code is a separately-audited, protected
+    domain (Batch 2). Left for a future batch. "calculator" has a
+    narrower but real effect (the Mini App's own /calculator deep-link
+    fallback only, since no bot command/button exposes it since it was
+    folded into the brief flow) -- not a bug, matches the product's own
+    documented evolution."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        real_data_dir = Path(__file__).resolve().parent.parent / "data"
+        for name in ("pricing.json", "portfolio.json", "faq.json", "about.json", "ui_config.json"):
+            shutil.copy(real_data_dir / name, Path(self.tmpdir) / name)
+        self._orig_data_dir = content_store.DATA_DIR
+        self._orig_designer = content_store.config.DESIGNER_CHAT_ID
+        content_store.DATA_DIR = Path(self.tmpdir)
+        content_store.config.DESIGNER_CHAT_ID = "555"
+        self.actor = 555
+
+    def tearDown(self):
+        content_store.DATA_DIR = self._orig_data_dir
+        content_store.config.DESIGNER_CHAT_ID = self._orig_designer
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    async def _menu(self):
+        return (await content_store.get_ui_config())["menu"]
+
+    async def test_nav_toggle_disables_enabled_item(self):
+        self.assertTrue((await self._menu())["portfolio"])  # seed default
+        cb = make_callback("adminnavtoggle:portfolio", chat_id=self.actor, message_id=500)
+        await admin.nav_toggle(cb, state=make_state(self.actor))
+
+        self.assertFalse((await self._menu())["portfolio"])
+        shown_markup = cb.message.edit_text.await_args.kwargs["reply_markup"]
+        texts = [btn.text for row in shown_markup.inline_keyboard for btn in row]
+        self.assertTrue(any(t.startswith("⬜") and "Портфолио" in t for t in texts))
+
+    async def test_nav_toggle_reenables_disabled_item(self):
+        await content_store.set_menu_item_enabled(self.actor, "about", False)
+        cb = make_callback("adminnavtoggle:about", chat_id=self.actor, message_id=510)
+        await admin.nav_toggle(cb, state=make_state(self.actor))
+
+        self.assertTrue((await self._menu())["about"])
+        shown_markup = cb.message.edit_text.await_args.kwargs["reply_markup"]
+        texts = [btn.text for row in shown_markup.inline_keyboard for btn in row]
+        self.assertTrue(any(t.startswith("✅") and "Обо мне" in t for t in texts))
+
+    async def test_nav_toggle_is_idempotent_round_trip(self):
+        state = make_state(self.actor)
+        before = dict(await self._menu())
+        await admin.nav_toggle(make_callback("adminnavtoggle:calculator", chat_id=self.actor, message_id=520), state)
+        await admin.nav_toggle(make_callback("adminnavtoggle:calculator", chat_id=self.actor, message_id=520), state)
+        self.assertEqual(await self._menu(), before)  # ровно вернулись к исходному состоянию
+
+    async def test_nav_toggle_unknown_key_does_not_crash(self):
+        cb = make_callback("adminnavtoggle:not_a_real_menu_item", chat_id=self.actor, message_id=530)
+        before = dict(await self._menu())
+
+        await admin.nav_toggle(cb, state=make_state(self.actor))  # не должно бросить исключение
+
+        self.assertEqual(await self._menu(), before)  # реальные пункты меню не задеты
+        cb.message.edit_text.assert_awaited_once()  # экран всё равно корректно перерисован
+        cb.answer.assert_awaited_once()
+
+    async def test_nav_toggle_persists_across_reentry(self):
+        state = make_state(self.actor)
+        await admin.nav_toggle(make_callback("adminnavtoggle:brief", chat_id=self.actor, message_id=540), state)
+
+        # выходим и заново заходим в раздел -- как отдельная сессия/повторный клик
+        reentry_state = await self._state_with_nav()
+        cb = make_callback("adminmenu:nav", chat_id=self.actor, message_id=550)
+        await admin.menu_nav(cb, reentry_state)
+
+        shown_markup = cb.message.edit_text.await_args.kwargs["reply_markup"]
+        texts = [btn.text for row in shown_markup.inline_keyboard for btn in row]
+        self.assertTrue(any(t.startswith("⬜") and "Заявка" in t for t in texts))
+
+    async def _state_with_nav(self, nav_msg_id: int = 111) -> FSMContext:
+        state = make_state(self.actor)
+        await state.update_data(**{
+            flow._NAV_ANCHOR_MSG_KEY: nav_msg_id, flow._NAV_ANCHOR_CHAT_KEY: self.actor,
+        })
+        return state
+
+
 class AdminFaqEditDeleteAnchorTests(unittest.IsolatedAsyncioTestCase):
     """P1-3, Batch 2: FAQ edit/delete lifecycle. faq_edit_start/
     faq_edit_picked/faq_edit_field (non-"done") и faq_delete_start/
