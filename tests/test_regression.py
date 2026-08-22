@@ -5051,6 +5051,48 @@ class AdminBackupHandlersTests(unittest.IsolatedAsyncioTestCase):
         with zipfile.ZipFile(io.BytesIO(sent_file.data)) as zf:
             self.assertIn("data/portfolio.json", zf.namelist())
 
+    # ---- Product Readiness audit, 2026-08-22: бэкап-меню отражает реальный
+    # storage backend (content_store.is_redis_backed), а не всегда
+    # предполагает эфемерную локальную ФС. Патчим is_redis_backed напрямую
+    # (не UPSTASH_REDIS_REST_URL/TOKEN) — иначе export/import реально пойдёт
+    # в _upstash_command и попытается сделать настоящий сетевой запрос на
+    # fake-хост; здесь проверяется только текст, а не сама Redis-ветка
+    # storage-слоя (та уже покрыта FakeUpstash-тестами в другом месте файла).
+
+    async def test_backup_menu_text_for_local_storage_says_restore_after_each_deploy(self):
+        state = make_state(self.actor)
+        cb = make_callback("adminmenu:backup", chat_id=self.actor)
+        with patch("bot.handlers.admin.content_store.is_redis_backed", return_value=False):
+            await admin.menu_backup(cb, state)
+        text = cb.message.edit_text.await_args.args[0]
+        self.assertIn("переживает деплой, только если вы его восстановите", text)
+
+    async def test_backup_menu_text_for_redis_storage_says_survives_automatically(self):
+        state = make_state(self.actor)
+        cb = make_callback("adminmenu:backup", chat_id=self.actor)
+        with patch("bot.handlers.admin.content_store.is_redis_backed", return_value=True):
+            await admin.menu_backup(cb, state)
+        text = cb.message.edit_text.await_args.args[0]
+        self.assertIn("переживают деплой автоматически", text)
+        self.assertNotIn("восстановите после каждого обновления", text)
+
+    async def test_export_caption_for_local_storage_says_restore_after_deploy(self):
+        state = make_state(self.actor)
+        cb = self._make_export_callback()
+        with patch("bot.handlers.admin.content_store.is_redis_backed", return_value=False):
+            await admin.backup_export(cb, state)
+        caption = cb.message.answer_document.await_args.kwargs["caption"]
+        self.assertIn("восстанавливайте после деплоя", caption)
+
+    async def test_export_caption_for_redis_storage_says_additional_safety_copy(self):
+        state = make_state(self.actor)
+        cb = self._make_export_callback()
+        with patch("bot.handlers.admin.content_store.is_redis_backed", return_value=True):
+            await admin.backup_export(cb, state)
+        caption = cb.message.answer_document.await_args.kwargs["caption"]
+        self.assertIn("дополнительная копия", caption)
+        self.assertNotIn("восстанавливайте после деплоя", caption)
+
     # P1-3, Batch 10: restore теперь требует явного подтверждения (см.
     # backup_restore_do) — единственное destructive-действие в admin.py,
     # которое раньше срабатывало немедленно по факту загрузки файла, без
@@ -6219,8 +6261,13 @@ class StorageConcurrencyTests(unittest.IsolatedAsyncioTestCase):
 
             # Готовим backup с ЗАВЕДОМО другой, легко отличимой сводкой —
             # 1 placeholder-кейс, 1 незаполненное поле about, 1 неотвеченный FAQ.
+            # Остальные обложки переводим с demo_case_N.svg на "реальные" —
+            # иначе после fix demo_case_N-детекции (Product Readiness batch,
+            # 2026-08-22) они тоже считались бы placeholder, и сводка не была
+            # бы отличима от old_summary с тем же числом.
             portfolio = json.loads(fake.store["portfolio.json"])
-            portfolio["cases"][0]["cover"] = "img/portfolio/placeholder.svg"
+            for i, case in enumerate(portfolio["cases"]):
+                case["cover"] = "img/portfolio/placeholder.svg" if i == 0 else f"img/portfolio/{case['id']}.jpg"
             about = json.loads(fake.store["about.json"])
             about["needs_review_fields"] = ["tagline"]
             faq = json.loads(fake.store["faq.json"])
@@ -6540,11 +6587,13 @@ class ContentReadinessSummaryTests(unittest.IsolatedAsyncioTestCase):
         shutil.rmtree(self.tmpdir, ignore_errors=True)
 
     async def test_summary_reflects_current_fixture_state(self):
-        # demo-контент заполнен (см. content fill pass): реальные обложки,
-        # все FAQ отвечены; About.education/links намеренно оставлены
-        # пустыми — банер всё ещё должен предупреждать именно про них.
+        # Текущая реальная data/portfolio.json — все 10 кейсов всё ещё
+        # demo (img/portfolio/demo_case_N.svg), FAQ полностью отвечен;
+        # About.education/links намеренно оставлены пустыми — банер
+        # всё ещё должен предупреждать именно про них (Product Readiness
+        # audit, 2026-08-22 — обновлено вместе с fix demo_case_N-детекции).
         summary = await content_store.content_readiness_summary()
-        self.assertEqual(summary["placeholder_cases"], 0)
+        self.assertEqual(summary["placeholder_cases"], 10)
         self.assertEqual(summary["faq_pending"], 0)
         self.assertGreater(summary["about_pending_fields"], 0)
         text = await admin._admin_root_text()
@@ -6564,6 +6613,44 @@ class ContentReadinessSummaryTests(unittest.IsolatedAsyncioTestCase):
         summary = await content_store.content_readiness_summary()
         self.assertEqual(summary, {"placeholder_cases": 0, "about_pending_fields": 0, "faq_pending": 0})
         self.assertNotIn("⚠️", await admin._admin_root_text())
+
+    # ---- Product Readiness audit, 2026-08-22: demo_case_N.svg detection ----
+
+    async def test_demo_case_cover_is_counted_as_placeholder(self):
+        # img/portfolio/demo_case_N.svg — фактическое имя seed-обложек
+        # (data/portfolio.json), не содержит подстроку "placeholder", раньше
+        # ускользало от detection полностью (найдено Product Readiness audit).
+        cases = await content_store.list_cases()
+        case_id = cases[0]["id"]
+        await content_store.update_case(self.actor, case_id, cover="img/portfolio/demo_case_1.svg")
+        for c in cases[1:]:
+            await content_store.update_case(self.actor, c["id"], cover="img/portfolio/real_photo.jpg")
+
+        summary = await content_store.content_readiness_summary()
+        self.assertEqual(summary["placeholder_cases"], 1)
+
+    async def test_real_looking_cover_is_not_counted(self):
+        # Реальные загруженные обложки идут через save_case_photo() как
+        # img/portfolio/{case_id}{ext} (case_id всегда "case_N", см.
+        # next_case_id) — этот паттерн не должен ловиться ни старой
+        # "placeholder"-подстрокой, ни новым demo_case_N-паттерном.
+        for c in await content_store.list_cases():
+            await content_store.update_case(self.actor, c["id"], cover=f"img/portfolio/{c['id']}.jpg")
+
+        summary = await content_store.content_readiness_summary()
+        self.assertEqual(summary["placeholder_cases"], 0)
+
+    async def test_generic_placeholder_substring_still_detected(self):
+        # Существующее поведение (широкая подстрока "placeholder") должно
+        # остаться нетронутым — fix только ДОБАВЛЯЕТ detection для
+        # demo_case_N, не заменяет старую проверку.
+        cases = await content_store.list_cases()
+        await content_store.update_case(self.actor, cases[0]["id"], cover="img/portfolio/placeholder.svg")
+        for c in cases[1:]:
+            await content_store.update_case(self.actor, c["id"], cover="img/portfolio/real_photo.jpg")
+
+        summary = await content_store.content_readiness_summary()
+        self.assertEqual(summary["placeholder_cases"], 1)
 
 
 class CaseCategoryChangeTests(unittest.IsolatedAsyncioTestCase):

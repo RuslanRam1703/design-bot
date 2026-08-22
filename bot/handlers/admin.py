@@ -1920,17 +1920,37 @@ async def lead_delete_do(callback: CallbackQuery, state: FSMContext) -> None:
 
 
 # ---- Бэкап (экспорт/восстановление data/*.json + фото через .zip) ----
-# На бесплатном Render нет персистентного диска — единственный бесплатный
-# способ пережить redeploy без стороннего сервиса: дизайнер сам выгружает
-# .zip себе в Telegram (сохраняется у него как любой присланный файл) и
-# загружает его обратно после деплоя через "Восстановить".
+# На бесплатном Render нет персистентного диска — без Upstash Redis
+# единственный бесплатный способ пережить redeploy без стороннего сервиса:
+# дизайнер сам выгружает .zip себе в Telegram (сохраняется у него как любой
+# присланный файл) и загружает его обратно после деплоя через
+# "Восстановить". Если же UPSTASH_REDIS_REST_URL/TOKEN заданы (см.
+# content_store.is_redis_backed) — data/*.json и так переживают redeploy
+# сами, и бэкап — просто дополнительная копия на случай сбоя, а не
+# обязательный шаг после каждого деплоя (Product Readiness batch,
+# 2026-08-22 — старая формулировка это не учитывала и могла подтолкнуть
+# восстановить устаревший .zip поверх свежих данных в Redis).
+
+def _backup_menu_text() -> str:
+    if content_store.is_redis_backed():
+        return (
+            "Бэкап данных (заявки, кейсы, «Обо мне», услуги, FAQ, фото) — "
+            "данные хранятся в Redis и переживают деплой автоматически. "
+            "Бэкап нужен как дополнительная копия на всякий случай, "
+            "восстанавливать его после каждого деплоя не требуется:"
+        )
+    return (
+        "Бэкап данных (заявки, кейсы, «Обо мне», услуги, FAQ, фото) — "
+        "переживает деплой, только если вы его восстановите после каждого обновления бота:"
+    )
+
 
 @router.callback_query(F.data == "adminmenu:backup")
 async def menu_backup(callback: CallbackQuery, state: FSMContext) -> None:
     await flow.reset_state_keep_nav(state)
     await flow.step_from_callback(
         callback, state,
-        "Бэкап данных (заявки, кейсы, «Обо мне», услуги, FAQ, фото) — переживает деплой, только если вы его восстановите после каждого обновления бота:",
+        _backup_menu_text(),
         kb.backup_menu_keyboard(),
     )
     await callback.answer()
@@ -1950,9 +1970,17 @@ async def backup_export(callback: CallbackQuery, state: FSMContext) -> None:
         return
     stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d_%H%M")
     filename = f"design-bot-backup-{stamp}.zip"
+    if content_store.is_redis_backed():
+        caption = (
+            "Бэкап готов ✅ Telegram сохранит его у вас как обычный файл. "
+            "Данные хранятся в Redis и деплой переживают сами — этот файл нужен "
+            "только как дополнительная копия на случай непредвиденной потери данных."
+        )
+    else:
+        caption = "Бэкап готов ✅ Telegram сохранит его у вас как обычный файл — этим же файлом восстанавливайте после деплоя."
     await callback.message.answer_document(
         BufferedInputFile(zip_bytes, filename=filename),
-        caption="Бэкап готов ✅ Telegram сохранит его у вас как обычный файл — этим же файлом восстанавливайте после деплоя.",
+        caption=caption,
     )
     await callback.answer()
 

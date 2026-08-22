@@ -53,6 +53,7 @@ import io
 import json
 import logging
 import os
+import re
 import tempfile
 import urllib.error
 import urllib.request
@@ -144,6 +145,16 @@ def _lock(*filenames: str) -> _StorageLock:
 
 def _upstash_enabled() -> bool:
     return bool(config.UPSTASH_REDIS_REST_URL and config.UPSTASH_REDIS_REST_TOKEN)
+
+
+def is_redis_backed() -> bool:
+    """Публичная обёртка над _upstash_enabled() — True, если data/*.json
+    хранятся в Upstash Redis и переживают redeploy автоматически, False —
+    обычные локальные файлы (эфемерны на бесплатном Render). Используется
+    admin.py для формулировки бэкап-меню (Product Readiness batch,
+    2026-08-22) — не отдельный источник истины, просто читает тот же
+    признак, что и остальной модуль."""
+    return _upstash_enabled()
 
 
 def _upstash_command(*args: Any) -> Any:
@@ -934,6 +945,16 @@ async def set_menu_item_enabled(actor_chat_id: int | str, key: str, enabled: boo
 
 # ---- Готовность контента к показу реальным клиентам ----
 
+# Обложки затравочных demo-кейсов называются img/portfolio/demo_case_N.svg
+# (см. data/portfolio.json) — этот паттерн НЕ содержит подстроку "placeholder",
+# поэтому старая общая проверка ниже их не ловила (Product Readiness audit,
+# 2026-08-22). save_case_photo() всегда пишет реальные обложки как
+# img/portfolio/{case_id}{ext}, а next_case_id() всегда генерирует "case_N" —
+# значит паттерн demo_case_N никогда не встретится у настоящей загруженной
+# обложки, проверка узкая и не даёт ложных срабатываний.
+_DEMO_CASE_COVER_RE = re.compile(r"(?:^|/)demo_case_\d+\.\w+$")
+
+
 async def content_readiness_summary() -> dict:
     """Сводка незавершённого клиент-facing контента — кейсы с обложкой-
     заглушкой, незаполненные поля "Обо мне", вопросы FAQ без финального
@@ -947,7 +968,10 @@ async def content_readiness_summary() -> dict:
     получить сводку, посчитанную по смеси до- и после-restore состояния
     разных файлов, если backup restore случится ровно между тремя read."""
     async with _lock("portfolio.json", "about.json", "faq.json"):
-        placeholder_cases = sum(1 for c in await list_cases() if "placeholder" in (c.get("cover") or ""))
+        placeholder_cases = sum(
+            1 for c in await list_cases()
+            if "placeholder" in (c.get("cover") or "") or _DEMO_CASE_COVER_RE.search(c.get("cover") or "")
+        )
         about_pending = len((await get_about()).get("needs_review_fields", []))
         faq_pending = sum(1 for i in await list_faq() if i.get("needs_review"))
         return {
