@@ -1,3 +1,5 @@
+import logging
+
 from aiogram import F, Router
 from aiogram.exceptions import TelegramAPIError
 from aiogram.filters import Command, CommandStart
@@ -8,6 +10,7 @@ from bot import config, content_store, flow, texts
 from bot.keyboards import main_menu_confirm_keyboard, webapp_open_keyboard
 
 router = Router(name="start")
+logger = logging.getLogger(__name__)
 
 
 @router.message(CommandStart())
@@ -128,7 +131,79 @@ async def main_menu_decline(callback: CallbackQuery, state: FSMContext) -> None:
     await callback.answer()
 
 
-# Держим последним в этом роутере: любой не распознанный текст — подсказка меню.
+def _client_identity_line(message: Message) -> str:
+    user = message.from_user
+    name = " ".join(filter(None, [user.first_name, user.last_name])) or "не указано"
+    contact = f"@{user.username}" if user.username else f"id {user.id}"
+    return f"Клиент: {name} ({contact})"
+
+
+# Зарегистрирован ПЕРЕД fallback_text ниже, тем же catch-all F.text — в
+# рамках одного router первый совпавший хендлер побеждает (см. bot/main.py:
+# роутеры пробуются по порядку, а внутри router — тоже по порядку
+# регистрации), поэтому через обычный dispatch fallback_text для клиентов
+# больше не достижим вообще. Единственный оставшийся вызов fallback_text —
+# явный прямой вызов ниже, только для сообщений из DESIGNER_CHAT_ID (сбой
+# самого relay обрабатывается отдельно, своим текстом, см. except ниже, а
+# не падением в generic fallback).
+@router.message(F.text)
+async def relay_client_text_to_designer(message: Message, state: FSMContext) -> None:
+    """Свободный текст клиента -> рабочий чат дизайнера (Stage B) — раньше
+    любой нераспознанный текст уходил в fallback_text и не доходил до
+    дизайнера вообще (см. Stage A аудит). DESIGNER_CHAT_ID исключён явно
+    (str(...) == config.DESIGNER_CHAT_ID, тот же паттерн, что и
+    content_store._require_designer) — иначе собственная идле-переписка
+    дизайнера со своим ботом вне admin FSM (нет активного AdminStates —
+    admin.router её не перехватывает и она долетает досюда) relay'илась бы
+    дизайнеру же, что бессмысленно; для этого случая — прежнее поведение
+    (fallback_text).
+
+    Активная заявка определяется через content_store.ACTIVE_LEAD_STATUSES
+    (NEW/VIEWED/IN_PROGRESS/WAITING_CLIENT) — DONE/CANCELLED намеренно не
+    считаются: сообщение по давно закрытой заявке не должно молча к ней
+    прикрепляться (см. Stage B ТЗ). Ровно одна активная заявка -> сообщение
+    привязывается к ней явно; ноль или несколько -> "Общее обращение" (бот
+    сознательно не угадывает, к какой из нескольких заявок относится текст
+    — это решает дизайнер сам, ему показан список номеров).
+
+    Без parse_mode (обычный текст, не HTML) — текст клиента подставляется
+    как есть, без escape: HTML-режим здесь означал бы риск сломать
+    отправку, если в тексте клиента случайно окажутся "<"/">" (Telegram
+    попытался бы распарсить их как теги и отверг бы сообщение целиком)."""
+    if not config.DESIGNER_CHAT_ID or str(message.chat.id) == config.DESIGNER_CHAT_ID:
+        await fallback_text(message, state)
+        return
+
+    active_leads = [
+        lead for lead in await content_store.list_leads_by_user(message.from_user.id)
+        if lead["status"] in content_store.ACTIVE_LEAD_STATUSES
+    ]
+    identity_line = _client_identity_line(message)
+
+    if len(active_leads) == 1:
+        lines = [f"💬 Сообщение по заявке #{active_leads[0]['id']}", "", identity_line]
+    else:
+        lines = ["💬 Общее обращение", "", identity_line]
+        if active_leads:
+            lead_ids = ", ".join(f"#{lead['id']}" for lead in active_leads)
+            lines.append(f"Активные заявки: {lead_ids}")
+    lines += ["", "Текст клиента:", message.text]
+
+    try:
+        await message.bot.send_message(chat_id=config.DESIGNER_CHAT_ID, text="\n".join(lines))
+    except Exception:
+        logger.exception("Не удалось передать сообщение клиента дизайнеру (user_id=%s)", message.from_user.id)
+        await message.answer("Не получилось отправить сообщение дизайнеру. Попробуйте ещё раз чуть позже.")
+        return
+
+    await message.answer("Сообщение отправлено дизайнеру ✅")
+
+
+# Держим последним в этом роутере (тот же catch-all F.text, что и раньше —
+# сохранён ради этой позиции и общего router-порядка, а не потому что
+# дальнейший dispatch когда-либо сюда попадёт: relay_client_text_to_designer
+# выше матчит тот же F.text и зарегистрирован раньше, поэтому реально вызывается
+# только явно, напрямую из него — для сообщений из DESIGNER_CHAT_ID, см. Stage B).
 @router.message(F.text)
 async def fallback_text(message: Message, state: FSMContext) -> None:
     await flow.open_root(

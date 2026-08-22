@@ -48,22 +48,29 @@ def make_state(chat_id: int = 555) -> FSMContext:
     return FSMContext(storage=MemoryStorage(), key=StorageKey(bot_id=0, chat_id=chat_id, user_id=chat_id))
 
 
-def make_message(document=None, photo=None) -> SimpleNamespace:
+def make_message(document=None, photo=None, video=None, animation=None, chat_id=1) -> SimpleNamespace:
     """Достаточно для _handle_brief_submission/handle_tz_file: message.from_user,
     message.bot (async send_message), message.answer (async) — сам объект не
     обязан быть настоящим aiogram Message, потому что типовые аннотации в
     рантайме не проверяются. first_name/last_name присутствуют, т.к. реальный
     aiogram User их всегда отдаёт (first_name обязателен по Telegram Bot API,
     last_name — опционален, но атрибут есть всегда, просто может быть None).
-    document/photo по умолчанию None — как у настоящего aiogram Message,
-    когда в сообщении нет файла/фото соответственно."""
+    document/photo/video/animation по умолчанию None — как у настоящего
+    aiogram Message, когда в сообщении нет соответствующего вложения
+    (Stage B: video/animation добавлены тем же паттерном). chat.id ==
+    from_user.id по умолчанию — тот же принцип, что и в make_flow_message
+    (в приватном чате с ботом они всегда совпадают)."""
     return SimpleNamespace(
         from_user=SimpleNamespace(id=1, username="client", first_name="Клиент", last_name=None),
+        chat=SimpleNamespace(id=chat_id),
+        text=None,
         bot=SimpleNamespace(send_message=AsyncMock()),
         answer=AsyncMock(),
         forward=AsyncMock(),
         document=document,
         photo=photo,
+        video=video,
+        animation=animation,
     )
 
 
@@ -3801,6 +3808,133 @@ class AdminLeadWorkflowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(data.get(flow._NAV_ANCHOR_MSG_KEY), 111)
 
 
+class LeadMaterialsAdminTests(unittest.IsolatedAsyncioTestCase):
+    """Stage B: карточка заявки -> "📎 Материалы" -> список -> "▶️ Отправить"
+    повторно шлёт сохранённый file_id дизайнеру напрямую через Bot API
+    (send_document/send_photo/send_video/send_animation) — файл никогда не
+    скачивается на Render (см. content_store.record_lead_material,
+    неизменный)."""
+
+    async def asyncSetUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        real_data_dir = Path(__file__).resolve().parent.parent / "data"
+        for name in ("pricing.json", "portfolio.json", "faq.json", "about.json", "ui_config.json"):
+            shutil.copy(real_data_dir / name, Path(self.tmpdir) / name)
+        self._orig_data_dir = content_store.DATA_DIR
+        self._orig_designer = content_store.config.DESIGNER_CHAT_ID
+        content_store.DATA_DIR = Path(self.tmpdir)
+        content_store.config.DESIGNER_CHAT_ID = "333"
+        self.actor = 333
+        self.lead = await content_store.add_lead(
+            {"service_name": "Лендинг"},
+            {"user_id": 66666, "username": "client", "first_name": "Клиент"},
+        )
+        # Индекс в materials[] — 0=document, 1=photo, 2=video, 3=animation.
+        for kind, file_id in (("document", "doc-fid"), ("photo", "photo-fid"), ("video", "video-fid"), ("animation", "gif-fid")):
+            await content_store.record_lead_material(self.lead["id"], file_id, f"{file_id}-uniq", kind, "new")
+
+    def tearDown(self):
+        content_store.DATA_DIR = self._orig_data_dir
+        content_store.config.DESIGNER_CHAT_ID = self._orig_designer
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    async def _state_in_lead_detail(self) -> FSMContext:
+        state = make_state(self.actor)
+        await state.update_data(lead_id=self.lead["id"])
+        await state.set_state(AdminStates.lead_detail)
+        return state
+
+    async def _state_in_materials_list(self) -> FSMContext:
+        state = make_state(self.actor)
+        await state.update_data(lead_id=self.lead["id"])
+        await state.set_state(AdminStates.lead_materials_list)
+        return state
+
+    async def test_lead_detail_keyboard_shows_materials_button_with_count(self):
+        lead = await content_store.get_lead(self.lead["id"])
+        markup = kb.lead_detail_keyboard(lead)
+        button_texts = [btn.text for row in markup.inline_keyboard for btn in row]
+        self.assertIn("📎 Материалы (4)", button_texts)
+
+    async def test_lead_detail_keyboard_hides_materials_button_when_none(self):
+        empty_lead = await content_store.add_lead({"service_name": "Логотип"}, {"user_id": 999, "username": None})
+        markup = kb.lead_detail_keyboard(empty_lead)
+        button_texts = [btn.text for row in markup.inline_keyboard for btn in row]
+        self.assertFalse(any("Материалы" in t for t in button_texts))
+
+    async def test_materials_open_shows_list_and_sets_state(self):
+        state = await self._state_in_lead_detail()
+        cb = make_callback("adminleadaction:materials", chat_id=self.actor)
+        await admin.lead_materials_open(cb, state)
+        cb.message.edit_text.assert_awaited_once()
+        self.assertIn("Материалы заявки", cb.message.edit_text.await_args.args[0])
+        self.assertEqual(await state.get_state(), AdminStates.lead_materials_list.state)
+
+    async def test_materials_back_returns_to_lead_detail(self):
+        state = await self._state_in_materials_list()
+        cb = make_callback("adminleadaction:materialsback", chat_id=self.actor)
+        await admin.lead_materials_back(cb, state)
+        cb.message.edit_text.assert_awaited_once()
+        self.assertIn(f"Заявка #{self.lead['id']}", cb.message.edit_text.await_args.args[0])
+        self.assertEqual(await state.get_state(), AdminStates.lead_detail.state)
+
+    async def test_resend_document_dispatches_send_document(self):
+        state = await self._state_in_materials_list()
+        cb = make_callback("adminmaterialsend:0", chat_id=self.actor)
+        await admin.lead_material_resend(cb, state)
+        cb.bot.send_document.assert_awaited_once_with(chat_id="333", document="doc-fid")
+        cb.answer.assert_awaited_once_with("Отправлено ✅")
+
+    async def test_resend_photo_dispatches_send_photo(self):
+        state = await self._state_in_materials_list()
+        cb = make_callback("adminmaterialsend:1", chat_id=self.actor)
+        await admin.lead_material_resend(cb, state)
+        cb.bot.send_photo.assert_awaited_once_with(chat_id="333", photo="photo-fid")
+
+    async def test_resend_video_dispatches_send_video(self):
+        state = await self._state_in_materials_list()
+        cb = make_callback("adminmaterialsend:2", chat_id=self.actor)
+        await admin.lead_material_resend(cb, state)
+        cb.bot.send_video.assert_awaited_once_with(chat_id="333", video="video-fid")
+
+    async def test_resend_animation_dispatches_send_animation(self):
+        state = await self._state_in_materials_list()
+        cb = make_callback("adminmaterialsend:3", chat_id=self.actor)
+        await admin.lead_material_resend(cb, state)
+        cb.bot.send_animation.assert_awaited_once_with(chat_id="333", animation="gif-fid")
+
+    async def test_invalid_file_id_shows_friendly_error_not_crash(self):
+        state = await self._state_in_materials_list()
+        cb = make_callback("adminmaterialsend:0", chat_id=self.actor)
+        cb.bot.send_document = AsyncMock(side_effect=TelegramAPIError(method=None, message="wrong file_id"))
+        await admin.lead_material_resend(cb, state)  # не должно бросить исключение
+        cb.answer.assert_awaited_once_with("Не удалось получить файл — возможно, он больше недоступен.", show_alert=True)
+
+    async def test_failed_resend_does_not_mutate_lead(self):
+        before = await content_store.get_lead(self.lead["id"])
+        state = await self._state_in_materials_list()
+        cb = make_callback("adminmaterialsend:0", chat_id=self.actor)
+        cb.bot.send_document = AsyncMock(side_effect=TelegramAPIError(method=None, message="wrong file_id"))
+        await admin.lead_material_resend(cb, state)
+        after = await content_store.get_lead(self.lead["id"])
+        self.assertEqual(before, after)
+
+    async def test_successful_resend_does_not_create_duplicate_material(self):
+        before = await content_store.get_lead(self.lead["id"])
+        state = await self._state_in_materials_list()
+        cb = make_callback("adminmaterialsend:0", chat_id=self.actor)
+        await admin.lead_material_resend(cb, state)
+        after = await content_store.get_lead(self.lead["id"])
+        self.assertEqual(len(after["materials"]), len(before["materials"]))
+        self.assertEqual(after["materials"], before["materials"])
+
+    async def test_resend_unknown_index_shows_alert_not_crash(self):
+        state = await self._state_in_materials_list()
+        cb = make_callback("adminmaterialsend:99", chat_id=self.actor)
+        await admin.lead_material_resend(cb, state)
+        cb.answer.assert_awaited_once_with("Материал не найден", show_alert=True)
+
+
 class MainMenuConfirmationTests(unittest.IsolatedAsyncioTestCase):
     """"⌂ Главное меню" (см. production-аудит про дублирование NAV anchor):
     нет активного bot/FSM-состояния -> только cleanup (flow.main_menu_cleanup
@@ -3952,6 +4086,204 @@ class MainMenuConfirmationTests(unittest.IsolatedAsyncioTestCase):
         await admin.admin_main_menu_button(msg, state)
         self.assertEqual(await state.get_state(), AdminStates.add_faq_answer.state)
         msg.answer.assert_awaited()
+
+
+class WorkMessageSurvivesMainMenuTests(unittest.IsolatedAsyncioTestCase):
+    """Stage B, item 8: подтверждаем архитектурную находку Stage A-аудита —
+    "рабочие" сообщения (уведомления о заявке, материалы, ответы дизайнера,
+    статус-уведомления) никогда не регистрируются как TRANSIENT
+    (_ANCHOR_MSG_KEY) и поэтому не могут быть удалены RULE 1/2/3 или
+    "⌂ Главное меню". Не переписываем flow.py — только доказываем текущее
+    поведение реальным хендлером (lead_change_status), а не синтетическим
+    сценарием."""
+
+    async def asyncSetUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        real_data_dir = Path(__file__).resolve().parent.parent / "data"
+        for name in ("pricing.json", "portfolio.json", "faq.json", "about.json", "ui_config.json"):
+            shutil.copy(real_data_dir / name, Path(self.tmpdir) / name)
+        self._orig_data_dir = content_store.DATA_DIR
+        self._orig_designer = content_store.config.DESIGNER_CHAT_ID
+        content_store.DATA_DIR = Path(self.tmpdir)
+        content_store.config.DESIGNER_CHAT_ID = "888"
+        self.actor = 888
+        self.lead = await content_store.add_lead(
+            {"service_name": "Лендинг"}, {"user_id": 55555, "username": "client", "first_name": "Клиент"},
+        )
+
+    def tearDown(self):
+        content_store.DATA_DIR = self._orig_data_dir
+        content_store.config.DESIGNER_CHAT_ID = self._orig_designer
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    async def test_status_notification_does_not_register_as_transient_screen(self):
+        # Реальный "рабочий" send: lead_change_status шлёт уведомление в чат
+        # КЛИЕНТА (lead["telegram"]["user_id"]), не в чат дизайнера, и
+        # никогда не трогает state.data — но даже независимо от chat_id,
+        # ключевая проверка здесь именно в том, что _ANCHOR_MSG_KEY
+        # (единственное, что удаляет "Главное меню"/RULE 1/2/3) остаётся
+        # ровно тем же, что уже отслеживалось ДО этого вызова.
+        TRACKED_SCREEN_ID = 42
+        state = make_state(self.actor)
+        await state.update_data(**{
+            flow._NAV_ANCHOR_MSG_KEY: 111, flow._NAV_ANCHOR_CHAT_KEY: self.actor,
+            flow._ANCHOR_MSG_KEY: TRACKED_SCREEN_ID, flow._ANCHOR_CHAT_KEY: self.actor,
+            "lead_id": self.lead["id"],
+        })
+        cb = make_callback("adminleadstatus:IN_PROGRESS", chat_id=self.actor, message_id=TRACKED_SCREEN_ID)
+
+        await admin.lead_change_status(cb, state)
+
+        # Уведомление реально отправлено клиенту (это и есть "рабочее сообщение").
+        cb.bot.send_message.assert_awaited_once()
+        self.assertEqual(cb.bot.send_message.await_args.kwargs["chat_id"], 55555)
+        # ...но _ANCHOR_MSG_KEY не изменился — уведомление НЕ стало
+        # отслеживаемым TRANSIENT-экраном.
+        data = await state.get_data()
+        self.assertEqual(data.get(flow._ANCHOR_MSG_KEY), TRACKED_SCREEN_ID)
+
+        # Поэтому "Главное меню" удалит РОВНО отслеживаемый экран admin.py
+        # (карточку заявки), а не что-то, связанное с самим уведомлением —
+        # тот же механизм, что уже доказан для чистой навигации в
+        # MainMenuConfirmationTests.test_no_active_state_cleans_up_without_touching_nav_anchor.
+        cleanup_msg = make_flow_message(chat_id=self.actor, text=texts.MAIN_MENU_BUTTON)
+        await start.main_menu_button(cleanup_msg, state)
+        cleanup_msg.bot.delete_message.assert_awaited_once_with(chat_id=self.actor, message_id=TRACKED_SCREEN_ID)
+
+    async def test_material_forward_does_not_register_as_transient_screen(self):
+        # Тот же принцип для handle_tz_file: он вообще не принимает state
+        # (см. Stage A аудит — структурно не может тронуть _ANCHOR_MSG_KEY),
+        # но здесь доказываем именно последствие — ПОСЛЕ прихода материала
+        # уже существующий tracked TRANSIENT-экран admin.py остаётся тем же
+        # и корректно удаляется "Главным меню", материал ему не мешает.
+        TRACKED_SCREEN_ID = 77
+        state = make_state(self.actor)
+        await state.update_data(**{
+            flow._NAV_ANCHOR_MSG_KEY: 111, flow._NAV_ANCHOR_CHAT_KEY: self.actor,
+            flow._ANCHOR_MSG_KEY: TRACKED_SCREEN_ID, flow._ANCHOR_CHAT_KEY: self.actor,
+        })
+
+        message = make_message()
+        await webapp._handle_brief_submission(
+            message, {"service_name": "Лендинг", "attach_tz": True, "draft_id": "wm1"},
+        )
+        message.document = make_fake_document()
+        await webapp.handle_tz_file(message)  # реальный "рабочий" forward клиентского материала
+
+        data = await state.get_data()
+        self.assertEqual(data.get(flow._ANCHOR_MSG_KEY), TRACKED_SCREEN_ID)  # не тронут
+
+        cleanup_msg = make_flow_message(chat_id=self.actor, text=texts.MAIN_MENU_BUTTON)
+        await start.main_menu_button(cleanup_msg, state)
+        cleanup_msg.bot.delete_message.assert_awaited_once_with(chat_id=self.actor, message_id=TRACKED_SCREEN_ID)
+
+
+class ClientTextRelayTests(unittest.IsolatedAsyncioTestCase):
+    """Stage B, item 5: свободный текст клиента -> DESIGNER_CHAT_ID вместо
+    старого generic fallback_text (см. Stage A аудит — раньше сообщение
+    просто терялось, дизайнер о нём не узнавал)."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self._orig_data_dir = content_store.DATA_DIR
+        self._orig_designer = content_store.config.DESIGNER_CHAT_ID
+        content_store.DATA_DIR = Path(self.tmpdir)
+        content_store.config.DESIGNER_CHAT_ID = "999"
+
+    def tearDown(self):
+        content_store.DATA_DIR = self._orig_data_dir
+        content_store.config.DESIGNER_CHAT_ID = self._orig_designer
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    async def test_single_active_lead_relay_is_tagged_with_lead_id(self):
+        # telegram-словарь заявки намеренно совпадает с make_message()'s
+        # дефолтным from_user (id=1, username="client", first_name="Клиент") —
+        # это тот же самый клиент, что и создавал заявку, и теперь пишет
+        # свободным текстом.
+        lead = await content_store.add_lead(
+            {"service_name": "Лендинг"}, {"user_id": 1, "username": "client", "first_name": "Клиент"},
+        )
+        message = make_message(chat_id=1)
+        message.text = "Когда будет готово?"
+
+        await start.relay_client_text_to_designer(message, make_state(1))
+
+        message.bot.send_message.assert_awaited_once()
+        kwargs = message.bot.send_message.await_args.kwargs
+        self.assertEqual(kwargs["chat_id"], "999")
+        self.assertIn(f"по заявке #{lead['id']}", kwargs["text"])
+        self.assertIn("Клиент", kwargs["text"])
+        self.assertIn("@client", kwargs["text"])
+        self.assertIn("Когда будет готово?", kwargs["text"])
+
+    async def test_zero_active_leads_is_general_inquiry(self):
+        message = make_message(chat_id=1)
+        message.text = "Привет, а сколько стоит логотип?"
+
+        await start.relay_client_text_to_designer(message, make_state(1))
+
+        text = message.bot.send_message.await_args.kwargs["text"]
+        self.assertIn("Общее обращение", text)
+        self.assertNotIn("по заявке #", text)
+        self.assertIn("Привет, а сколько стоит логотип?", text)
+
+    async def test_multiple_active_leads_is_general_inquiry_with_ids(self):
+        lead1 = await content_store.add_lead({"service_name": "Лендинг"}, {"user_id": 1, "username": "ivan"})
+        lead2 = await content_store.add_lead({"service_name": "Логотип"}, {"user_id": 1, "username": "ivan"}, draft_id="d2")
+        message = make_message(chat_id=1)
+        message.text = "У меня два заказа, вопрос по обоим"
+
+        await start.relay_client_text_to_designer(message, make_state(1))
+
+        text = message.bot.send_message.await_args.kwargs["text"]
+        self.assertIn("Общее обращение", text)
+        self.assertIn(f"#{lead1['id']}", text)
+        self.assertIn(f"#{lead2['id']}", text)
+
+    async def test_done_and_cancelled_leads_are_not_treated_as_active(self):
+        lead = await content_store.add_lead({"service_name": "Лендинг"}, {"user_id": 1, "username": "ivan"})
+        await content_store.update_lead_status("999", lead["id"], "DONE")
+        message = make_message(chat_id=1)
+        message.text = "Спасибо, было отлично!"
+
+        await start.relay_client_text_to_designer(message, make_state(1))
+
+        text = message.bot.send_message.await_args.kwargs["text"]
+        self.assertIn("Общее обращение", text)  # НЕ привязано к done-заявке
+        self.assertNotIn(f"#{lead['id']}", text)
+
+    async def test_client_receives_acknowledgement(self):
+        message = make_message(chat_id=1)
+        message.text = "Привет"
+
+        await start.relay_client_text_to_designer(message, make_state(1))
+
+        message.answer.assert_awaited_once()
+        self.assertIn("отправлено", message.answer.await_args.args[0].lower())
+
+    async def test_relay_failure_gives_client_a_clear_error_not_generic_hint(self):
+        message = make_message(chat_id=1)
+        message.text = "Привет"
+        message.bot.send_message = AsyncMock(side_effect=TelegramAPIError(method=None, message="boom"))
+
+        await start.relay_client_text_to_designer(message, make_state(1))  # не должно бросить исключение
+
+        message.answer.assert_awaited_once()
+        sent = message.answer.await_args.args[0]
+        self.assertNotIn("Воспользуйтесь кнопками", sent)
+        self.assertIn("Не получилось", sent)
+
+    async def test_designer_own_text_is_not_relayed(self):
+        message = make_message(chat_id=999)  # == DESIGNER_CHAT_ID
+        message.from_user = SimpleNamespace(id=999, username="owner", first_name="Дизайнер", last_name=None)
+        message.text = "заметка себе"
+        state = make_state(999)
+
+        with patch("bot.handlers.start.flow.open_root", new=AsyncMock()) as mocked_open_root:
+            await start.relay_client_text_to_designer(message, state)
+
+        message.bot.send_message.assert_not_awaited()  # НЕ relay'ится дизайнеру же
+        mocked_open_root.assert_awaited_once()  # упало в прежний fallback_text
 
 
 class FaqCleanupRegressionTests(unittest.IsolatedAsyncioTestCase):
@@ -8582,10 +8914,13 @@ class LeadMaterialTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.tmpdir = tempfile.mkdtemp()
         self._orig_data_dir = content_store.DATA_DIR
+        self._orig_designer = content_store.config.DESIGNER_CHAT_ID
         content_store.DATA_DIR = Path(self.tmpdir)
+        content_store.config.DESIGNER_CHAT_ID = "777"
 
     def tearDown(self):
         content_store.DATA_DIR = self._orig_data_dir
+        content_store.config.DESIGNER_CHAT_ID = self._orig_designer
         shutil.rmtree(self.tmpdir, ignore_errors=True)
 
     async def test_material_attaches_to_correct_lead_and_saves_file_id(self):
@@ -8602,6 +8937,99 @@ class LeadMaterialTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(lead["materials"][0]["file_unique_id"], "uniq-1")
         self.assertEqual(lead["materials"][0]["kind"], "document")
         self.assertEqual(lead["materials"][0]["source"], "new")
+
+    # ---- Stage B: video/animation join document/photo, same metadata model ----
+
+    async def test_photo_material_attaches_to_correct_lead(self):
+        message = make_message()
+        await webapp._handle_brief_submission(message, {"service_name": "Лендинг", "attach_tz": True, "draft_id": "m-photo"})
+        lead_id = (await content_store.find_lead_awaiting_file(message.from_user.id))["id"]
+
+        message.photo = [make_fake_document(file_id="photo-1", file_unique_id="photo-uniq-1")]
+        await webapp.handle_tz_file(message)
+
+        lead = await content_store.get_lead(lead_id)
+        self.assertEqual(len(lead["materials"]), 1)
+        self.assertEqual(lead["materials"][0]["file_id"], "photo-1")
+        self.assertEqual(lead["materials"][0]["kind"], "photo")
+
+    async def test_video_material_attaches_to_correct_lead(self):
+        message = make_message()
+        await webapp._handle_brief_submission(message, {"service_name": "Лендинг", "attach_tz": True, "draft_id": "m-video"})
+        lead_id = (await content_store.find_lead_awaiting_file(message.from_user.id))["id"]
+
+        message.video = make_fake_document(file_id="video-1", file_unique_id="video-uniq-1")
+        await webapp.handle_tz_file(message)
+
+        lead = await content_store.get_lead(lead_id)
+        self.assertEqual(len(lead["materials"]), 1)
+        self.assertEqual(lead["materials"][0]["file_id"], "video-1")
+        self.assertEqual(lead["materials"][0]["file_unique_id"], "video-uniq-1")
+        self.assertEqual(lead["materials"][0]["kind"], "video")
+
+    async def test_animation_material_attaches_to_correct_lead(self):
+        message = make_message()
+        await webapp._handle_brief_submission(message, {"service_name": "Лендинг", "attach_tz": True, "draft_id": "m-anim"})
+        lead_id = (await content_store.find_lead_awaiting_file(message.from_user.id))["id"]
+
+        message.animation = make_fake_document(file_id="gif-1", file_unique_id="gif-uniq-1")
+        await webapp.handle_tz_file(message)
+
+        lead = await content_store.get_lead(lead_id)
+        self.assertEqual(len(lead["materials"]), 1)
+        self.assertEqual(lead["materials"][0]["file_id"], "gif-1")
+        self.assertEqual(lead["materials"][0]["kind"], "animation")
+
+    # ---- Stage B: actual delivery to DESIGNER_CHAT_ID, not just metadata ----
+    # (coverage gap identified in Stage A: prior tests only asserted
+    # content_store state, never that message.bot.send_message/forward were
+    # actually called towards the designer)
+
+    async def _assert_delivered_to_designer(self, message: SimpleNamespace, lead_id: int) -> None:
+        message.bot.send_message.assert_awaited_once()
+        self.assertEqual(message.bot.send_message.await_args.kwargs["chat_id"], "777")
+        self.assertIn(f"#{lead_id}", message.bot.send_message.await_args.kwargs["text"])
+        message.forward.assert_awaited_once_with(chat_id="777")
+
+    async def test_document_material_is_delivered_to_designer(self):
+        message = make_message()
+        await webapp._handle_brief_submission(message, {"service_name": "Лендинг", "attach_tz": True, "draft_id": "d-doc"})
+        lead_id = (await content_store.find_lead_awaiting_file(message.from_user.id))["id"]
+        message.bot.send_message.reset_mock()
+
+        message.document = make_fake_document()
+        await webapp.handle_tz_file(message)
+        await self._assert_delivered_to_designer(message, lead_id)
+
+    async def test_photo_material_is_delivered_to_designer(self):
+        message = make_message()
+        await webapp._handle_brief_submission(message, {"service_name": "Лендинг", "attach_tz": True, "draft_id": "d-photo"})
+        lead_id = (await content_store.find_lead_awaiting_file(message.from_user.id))["id"]
+        message.bot.send_message.reset_mock()
+
+        message.photo = [make_fake_document()]
+        await webapp.handle_tz_file(message)
+        await self._assert_delivered_to_designer(message, lead_id)
+
+    async def test_video_material_is_delivered_to_designer(self):
+        message = make_message()
+        await webapp._handle_brief_submission(message, {"service_name": "Лендинг", "attach_tz": True, "draft_id": "d-video"})
+        lead_id = (await content_store.find_lead_awaiting_file(message.from_user.id))["id"]
+        message.bot.send_message.reset_mock()
+
+        message.video = make_fake_document()
+        await webapp.handle_tz_file(message)
+        await self._assert_delivered_to_designer(message, lead_id)
+
+    async def test_animation_material_is_delivered_to_designer(self):
+        message = make_message()
+        await webapp._handle_brief_submission(message, {"service_name": "Лендинг", "attach_tz": True, "draft_id": "d-anim"})
+        lead_id = (await content_store.find_lead_awaiting_file(message.from_user.id))["id"]
+        message.bot.send_message.reset_mock()
+
+        message.animation = make_fake_document()
+        await webapp.handle_tz_file(message)
+        await self._assert_delivered_to_designer(message, lead_id)
 
     async def test_awaiting_state_cleared_after_material_received(self):
         message = make_message()

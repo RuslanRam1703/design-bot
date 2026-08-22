@@ -33,6 +33,18 @@ BUDGET_LABELS = {
     "undecided": "не определился",
 }
 
+# lead["materials"][]["kind"] -> отображаемое название. Единственный источник
+# истины для подписи типа материала — переиспользуется и в карточке заявки
+# (format_lead_admin_detail ниже), и в экране "Материалы" (bot/handlers/
+# admin.py::lead_materials_open), чтобы не разойтись при добавлении нового
+# типа (Stage B: video/animation).
+MATERIAL_KIND_LABELS = {
+    "document": "файл",
+    "photo": "фото",
+    "video": "видео",
+    "animation": "GIF/анимация",
+}
+
 # "direct" (обычный заход в заявку) не показываем — это большинство заявок,
 # и указывать источник имеет смысл только там, где он несёт сигнал: клиент
 # пришёл "разогретым" с конкретного кейса/расчёта, а не просто открыл бриф.
@@ -264,11 +276,10 @@ def format_lead_admin_detail(lead: dict) -> str:
     if materials:
         lines.append("")
         lines.append(f"<b>Материалы ({len(materials)})</b>")
-        kind_labels = {"document": "файл", "photo": "фото"}
         source_labels = {"new": "при создании", "supplement": "из дополнения"}
         for m in materials:
             ts = (m.get("received_at") or "")[:16].replace("T", " ")
-            kind = kind_labels.get(m.get("kind"), m.get("kind"))
+            kind = MATERIAL_KIND_LABELS.get(m.get("kind"), m.get("kind"))
             source = source_labels.get(m.get("source"), m.get("source"))
             lines.append(f"— {kind}, {ts} ({source})")
 

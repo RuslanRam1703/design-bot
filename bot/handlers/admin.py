@@ -18,6 +18,7 @@ from datetime import datetime, timezone
 from typing import Callable
 
 from aiogram import F, Router
+from aiogram.exceptions import TelegramAPIError
 from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State
@@ -1903,6 +1904,76 @@ async def lead_back_to_list(callback: CallbackQuery, state: FSMContext) -> None:
     leads = await content_store.list_leads(status)
     await callback.message.edit_text(f"Заявки ({len(leads)}):", reply_markup=kb.leads_list_keyboard(leads, status))
     await state.set_state(AdminStates.leads_list)
+    await callback.answer()
+
+
+@router.callback_query(AdminStates.lead_detail, F.data == "adminleadaction:materials")
+async def lead_materials_open(callback: CallbackQuery, state: FSMContext) -> None:
+    data = await state.get_data()
+    lead = await content_store.get_lead(data["lead_id"])
+    if lead is None:
+        await callback.answer("Заявка не найдена", show_alert=True)
+        return
+    materials = lead.get("materials") or []
+    await callback.message.edit_text(
+        f"Материалы заявки #{lead['id']} ({len(materials)}):", reply_markup=kb.lead_materials_keyboard(lead)
+    )
+    await state.set_state(AdminStates.lead_materials_list)
+    await callback.answer()
+
+
+# kind -> метод Bot для повторной отправки уже полученного файла по
+# сохранённому file_id — Telegram отдаёт его заново на своей стороне, без
+# скачивания на Render (см. content_store.record_lead_material). Имя kind
+# совпадает с именем keyword-параметра каждого метода не случайно — это
+# официальные имена параметров Bot API (photo/document/video/animation).
+_MATERIAL_RESEND_METHODS = ("document", "photo", "video", "animation")
+
+
+@router.callback_query(AdminStates.lead_materials_list, F.data.startswith("adminmaterialsend:"))
+async def lead_material_resend(callback: CallbackQuery, state: FSMContext) -> None:
+    index = int(callback.data.split(":", 1)[1])
+    data = await state.get_data()
+    lead = await content_store.get_lead(data["lead_id"])
+    if lead is None:
+        await callback.answer("Заявка не найдена", show_alert=True)
+        return
+    materials = lead.get("materials") or []
+    if not (0 <= index < len(materials)):
+        await callback.answer("Материал не найден", show_alert=True)
+        return
+    material = materials[index]
+    kind = material.get("kind")
+    if kind not in _MATERIAL_RESEND_METHODS:
+        await callback.answer("Неизвестный тип материала", show_alert=True)
+        return
+    sender = getattr(callback.bot, f"send_{kind}")
+    try:
+        await sender(chat_id=config.DESIGNER_CHAT_ID, **{kind: material.get("file_id")})
+    except TelegramAPIError:
+        # Не падаем, lead не трогаем — file_id мог устареть на стороне
+        # Telegram (нет официальной гарантии вечного хранения, см. Stage A/B
+        # аудит) или сам материал стать недоступен. Секреты/токен в лог не
+        # попадают — logger.exception здесь не включает ни file_id, ни текст
+        # исключения с деталями Bot API.
+        logger.exception("Не удалось повторно отправить материал заявки #%s (индекс %s)", lead["id"], index)
+        await callback.answer("Не удалось получить файл — возможно, он больше недоступен.", show_alert=True)
+        return
+    await callback.answer("Отправлено ✅")
+
+
+@router.callback_query(AdminStates.lead_materials_list, F.data == "adminleadaction:materialsback")
+async def lead_materials_back(callback: CallbackQuery, state: FSMContext) -> None:
+    data = await state.get_data()
+    lead = await content_store.get_lead(data["lead_id"])
+    if lead is None:
+        leads = await content_store.list_leads("ALL")
+        await callback.message.edit_text(f"Заявка не найдена.\n\nЗаявки ({len(leads)}):", reply_markup=kb.leads_list_keyboard(leads, "ALL"))
+        await state.set_state(AdminStates.leads_list)
+        await callback.answer()
+        return
+    await callback.message.edit_text(lead_format.format_lead_admin_detail(lead), reply_markup=kb.lead_detail_keyboard(lead))
+    await state.set_state(AdminStates.lead_detail)
     await callback.answer()
 
 

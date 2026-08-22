@@ -103,6 +103,7 @@ class AdminStates(StatesGroup):
     lead_detail = State()
     lead_reply_text = State()
     lead_delete_confirm = State()
+    lead_materials_list = State()
 
     # Бэкап (экспорт/восстановление data/*.json + фото через .zip-файл в
     # Telegram) — на бесплатном Render файловая система эфемерна, это

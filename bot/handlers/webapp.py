@@ -93,7 +93,7 @@ async def _handle_brief_submission(message: Message, payload: dict) -> None:
         await message.answer(texts.lead_received_ack(lead["id"], payload.get("service_name"), price_range))
 
 
-@router.message(F.document | F.photo)
+@router.message(F.document | F.photo | F.video | F.animation)
 async def handle_tz_file(message: Message) -> None:
     """Не привязано к FSM-состоянию (раньше — BriefStates.awaiting_tz_file,
     терялось при рестарте бота) — вместо этого ищем заявку САМОГО этого
@@ -104,16 +104,27 @@ async def handle_tz_file(message: Message) -> None:
     add_lead/add_lead_supplement поддерживают инвариант "максимум одна
     ожидающая заявка на клиента" (см. content_store._clear_other_awaiting и
     аудит) — при нескольких заявках одного клиента файл не может уйти не
-    туда. Если ждущей заявки нет — просто ничего не делаем, документ/фото
-    не наш случай (например, админ шлёт архив бэкапа — это отдельный,
-    FSM-scoped хендлер в admin.py, который стоит раньше в порядке
-    роутеров и перехватит его первым)."""
+    туда. Если ждущей заявки нет — просто ничего не делаем, документ/фото/
+    видео/анимация не наш случай (например, админ шлёт архив бэкапа — это
+    отдельный, FSM-scoped хендлер в admin.py, который стоит раньше в
+    порядке роутеров и перехватит его первым).
+
+    video/animation (Stage B) — тот же паттерн, что document/photo: только
+    file_id/file_unique_id, сам файл не скачивается (см. модуль-докстринг
+    content_store.record_lead_material). Message.document/.photo/.video/
+    .animation взаимно исключающие поля одного и того же Update — Telegram
+    заполняет ровно одно из них на сообщение, порядок проверок ниже не
+    влияет на корректность."""
     lead = await content_store.find_lead_awaiting_file(message.from_user.id)
     if lead is None:
         return
 
     if message.document:
         file_id, file_unique_id, kind = message.document.file_id, message.document.file_unique_id, "document"
+    elif message.video:
+        file_id, file_unique_id, kind = message.video.file_id, message.video.file_unique_id, "video"
+    elif message.animation:
+        file_id, file_unique_id, kind = message.animation.file_id, message.animation.file_unique_id, "animation"
     else:
         photo = message.photo[-1]
         file_id, file_unique_id, kind = photo.file_id, photo.file_unique_id, "photo"

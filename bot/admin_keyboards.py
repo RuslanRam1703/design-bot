@@ -1,5 +1,7 @@
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
+from bot.lead import MATERIAL_KIND_LABELS
+
 CASE_FIELD_LABELS = {
     "title": "Название",
     "category": "Категория",
@@ -419,11 +421,29 @@ def lead_detail_keyboard(lead: dict) -> InlineKeyboardMarkup:
         InlineKeyboardButton(text=("▶ " if lead["status"] == key else "") + label, callback_data=f"adminleadstatus:{key}")
     ] for key, label in LEAD_STATUS_LABELS.items()]
     rows.append([InlineKeyboardButton(text="💬 Ответить через бота", callback_data="adminleadaction:reply")])
+    materials = lead.get("materials") or []
+    if materials:
+        rows.append([InlineKeyboardButton(text=f"📎 Материалы ({len(materials)})", callback_data="adminleadaction:materials")])
     username = lead["telegram"].get("username")
     if username:
         rows.append([InlineKeyboardButton(text="🔗 Открыть в Telegram", url=f"https://t.me/{username}")])
     rows.append([InlineKeyboardButton(text="🗑 Удалить заявку", callback_data="adminleadaction:delete")])
     rows.append([InlineKeyboardButton(text="◀️ К списку заявок", callback_data="adminleadaction:back")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def lead_materials_keyboard(lead: dict) -> InlineKeyboardMarkup:
+    """Экран "Материалы" отдельной заявки (Stage B) — по кнопке на материал,
+    индекс в lead["materials"] как единственный идентификатор (материалы
+    append-only, ничего не удаляет/не переставляет их — индекс стабилен на
+    всё время жизни заявки, отдельный id не нужен, см. content_store.
+    record_lead_material)."""
+    rows = []
+    for i, m in enumerate(lead.get("materials") or []):
+        kind = MATERIAL_KIND_LABELS.get(m.get("kind"), m.get("kind"))
+        ts = (m.get("received_at") or "")[:16].replace("T", " ")
+        rows.append([InlineKeyboardButton(text=f"▶️ Отправить: {kind} ({ts})", callback_data=f"adminmaterialsend:{i}")])
+    rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data="adminleadaction:materialsback")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
