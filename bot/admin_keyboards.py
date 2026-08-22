@@ -197,7 +197,10 @@ def case_section_action_keyboard(section_type: str) -> InlineKeyboardMarkup:
 
 def section_image_pick_keyboard(images: list[str]) -> InlineKeyboardMarkup:
     rows = [[InlineKeyboardButton(text=img.split("/")[-1], callback_data=f"admincasesecimgpick:{i}")] for i, img in enumerate(images)]
-    rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data="admincasesecact:back")])
+    # admincasesecact:backimg, не :back (P1-3, Batch 6) — этот экран на
+    # один уровень глубже раздела (не глубже списка разделов), "Назад"
+    # должен возвращать в детали раздела, а не в список разделов.
+    rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data="admincasesecact:backimg")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 

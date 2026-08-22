@@ -4138,7 +4138,13 @@ class AdminCaseConstructorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(case["cover"], case["images"][1])
 
         await admin.case_image_picked(make_callback("admincaseimgpick:1", chat_id=self.actor), state)
+        # P1-3, Batch 6: удаление изображения теперь требует confirm-шага
+        # (было одним кликом) — сначала показывает "Удалить...?", реально
+        # удаляет только admindelcaseimgconfirm:yes.
         await admin.case_image_action(make_callback("admincaseimgact:delete", chat_id=self.actor), state)
+        self.assertEqual(await state.get_state(), AdminStates.case_image_pick_delete.state)
+        self.assertEqual(len((await self._case())["images"]), 2)  # ещё не удалено
+        await admin.case_image_delete_do(make_callback("admindelcaseimgconfirm:yes", chat_id=self.actor), state)
         self.assertEqual(len((await self._case())["images"]), 1)
 
     async def test_opening_sections_menu_does_not_crash_and_add_edit_works(self):
@@ -4279,6 +4285,302 @@ class AdminCaseManagementCompletenessTests(unittest.IsolatedAsyncioTestCase):
         probe.answer.assert_not_awaited()
         data = await state.get_data()
         self.assertEqual(data.get(flow._NAV_ANCHOR_MSG_KEY), 111)
+
+
+class AdminCaseContentWorkflowTests(unittest.IsolatedAsyncioTestCase):
+    """P1-3, Batch 6: Case Images / Sections / Content Workflow.
+
+    Full audit found the anchor-lifecycle class (Batch 4's territory)
+    already closed here too -- every handler in this block either uses
+    flow.step_from_text on its text/photo steps (already migrated in
+    Batches 1-3) or is a self-healing raw edit_text with no intervening
+    reset_state_keep_nav()/finish_flow(). No NEW reset-class bug existed
+    to fix.
+
+    What the audit DID find, backed by direct reproduction (see delivery
+    report):
+
+    1. Section delete and case-level gallery image delete were single-
+       click, irreversible, with no confirm/cancel step -- unlike
+       case-level delete, which already has one (delete_case_confirm).
+       The batch's own required test list ("Delete section -> cancel",
+       "Delete image -> cancel") presupposes this step exists. Added,
+       mirroring cases_delete_confirm/cases_delete_do exactly, reusing
+       the case_section_pick_delete/case_image_pick_delete states that
+       were already declared in bot/states.py but never wired to any
+       handler.
+    2. case_section_edit_value, case_section_remove_image and the
+       "removeimg" branch of case_section_action all read
+       case["sections"][index] directly -- if the section (or the whole
+       case) had been removed by a concurrent session, or the case
+       simply never had a "sections" key yet (add_case never sets one;
+       it's lazily created by the first add_case_section call), this
+       raised KeyError/IndexError/TypeError instead of the established
+       graceful "not found" pattern used everywhere else in this file.
+       Reproduced directly before fixing (see report). Fixed with a
+       single _current_section(case_id, index) -> dict | None helper.
+    3. The exact UX nuance flagged at the end of Batch 5 ("Remove image
+       -> Back skips past the section-detail screen straight to the
+       sections list") was re-examined against this batch's explicit
+       criteria: anchor stayed correct, FSM state stayed correct, no
+       orphan, the section was always reopenable -- but it DID return to
+       the wrong level (2 screens back instead of 1), contradicting the
+       batch's own "correctly return one level back" requirement, and
+       was trivially fixable within the existing architecture (its own
+       callback_data instead of reusing the outer "back to sections"
+       one). Fixed."""
+
+    async def asyncSetUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        real_data_dir = Path(__file__).resolve().parent.parent / "data"
+        for name in ("pricing.json", "portfolio.json", "faq.json", "about.json", "ui_config.json"):
+            shutil.copy(real_data_dir / name, Path(self.tmpdir) / name)
+        self._orig_data_dir = content_store.DATA_DIR
+        self._orig_designer = content_store.config.DESIGNER_CHAT_ID
+        content_store.DATA_DIR = Path(self.tmpdir)
+        content_store.config.DESIGNER_CHAT_ID = "444"
+        self.actor = 444
+        await content_store.add_case(
+            str(self.actor), case_id="case_cw", title="Тест", type_id="landing",
+            cover="img/portfolio/seed.svg", task="t", related_service=None,
+        )
+        await content_store.add_case_section(str(self.actor), "case_cw", section_type="text", title="Задача", content="старый текст")
+
+    def tearDown(self):
+        content_store.DATA_DIR = self._orig_data_dir
+        content_store.config.DESIGNER_CHAT_ID = self._orig_designer
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    async def _case(self):
+        return next(c for c in await content_store.list_cases() if c["id"] == "case_cw")
+
+    async def _state_with_nav(self, nav_msg_id: int = 111) -> FSMContext:
+        state = make_state(self.actor)
+        await state.update_data(**{
+            flow._NAV_ANCHOR_MSG_KEY: nav_msg_id,
+            flow._NAV_ANCHOR_CHAT_KEY: self.actor,
+            flow._ANCHOR_MSG_KEY: nav_msg_id,
+            flow._ANCHOR_CHAT_KEY: self.actor,
+        })
+        return state
+
+    async def _state_in_section_detail(self, section_index: int = 0, msg_id: int = 500) -> FSMContext:
+        state = await self._state_with_nav()
+        await state.update_data(**{flow._ANCHOR_MSG_KEY: msg_id, flow._ANCHOR_CHAT_KEY: self.actor},
+                                 case_id="case_cw", section_index=section_index, cancel_to="sections")
+        await state.set_state(AdminStates.case_section_edit_field_pick)
+        return state
+
+    async def _state_in_images_menu(self, image_path: str = "img/portfolio/seed.svg", msg_id: int = 500) -> FSMContext:
+        state = await self._state_with_nav()
+        await state.update_data(**{flow._ANCHOR_MSG_KEY: msg_id, flow._ANCHOR_CHAT_KEY: self.actor},
+                                 case_id="case_cw", image_path=image_path, cancel_to="images")
+        await state.set_state(AdminStates.case_images_menu)
+        return state
+
+    # ---- 3/25: Add section (gallery type) -> complete in one step ----
+    async def test_add_section_gallery_type_completes_in_one_step(self):
+        state = await self._state_with_nav()
+        await state.update_data(case_id="case_cw", cancel_to="sections")
+        await state.set_state(AdminStates.case_sections_menu)
+        await admin.case_section_add_start(make_callback("admincasesecaction:add", chat_id=self.actor, message_id=111), state)
+        await admin.case_section_add_type(make_callback("admincasesectype:gallery", chat_id=self.actor), state)
+        title_msg = make_flow_message_factory(chat_id=self.actor, start_id=20000)(text="Скриншоты")
+        await admin.case_section_add_title(title_msg, state)
+
+        self.assertEqual(await state.get_state(), AdminStates.case_sections_menu.state)
+        case = await self._case()
+        self.assertEqual(len(case["sections"]), 2)
+        self.assertEqual(case["sections"][1], {"type": "gallery", "title": "Скриншоты", "images": []})
+
+    # ---- 7/8: Delete section -> cancel / confirm (new confirm step) ----
+    async def test_section_delete_shows_confirm_and_does_not_remove_until_confirmed(self):
+        state = await self._state_in_section_detail(section_index=0, msg_id=600)
+        cb = make_callback("admincasesecact:delete", chat_id=self.actor, message_id=600)
+        await admin.case_section_action(cb, state)
+
+        cb.message.edit_text.assert_awaited_once_with(
+            "Удалить раздел «Задача»? Это необратимо.", reply_markup=kb.confirm_keyboard("admindelsecconfirm")
+        )
+        self.assertEqual(await state.get_state(), AdminStates.case_section_pick_delete.state)
+        self.assertEqual(len((await self._case())["sections"]), 1)  # ещё не удалён
+        data = await state.get_data()
+        self.assertEqual(data.get(flow._ANCHOR_MSG_KEY), 600)  # self-healing, тот же message_id
+
+    async def test_section_delete_cancel_preserves_section(self):
+        state = await self._state_in_section_detail(section_index=0, msg_id=610)
+        await state.set_state(AdminStates.case_section_pick_delete)
+        cb = make_callback("admindelsecconfirm:no", chat_id=self.actor, message_id=610)
+        await admin.case_section_delete_do(cb, state)
+
+        cb.message.edit_text.assert_awaited_once()
+        self.assertEqual(cb.message.edit_text.await_args.args[0], "Разделы кейса:")
+        self.assertEqual(await state.get_state(), AdminStates.case_sections_menu.state)
+        self.assertEqual(len((await self._case())["sections"]), 1)
+
+    async def test_section_delete_confirm_yes_removes_section(self):
+        state = await self._state_in_section_detail(section_index=0, msg_id=620)
+        await state.set_state(AdminStates.case_section_pick_delete)
+        cb = make_callback("admindelsecconfirm:yes", chat_id=self.actor, message_id=620)
+        await admin.case_section_delete_do(cb, state)
+
+        cb.message.edit_text.assert_awaited_once()
+        self.assertEqual(cb.message.edit_text.await_args.args[0], "Раздел удалён ✅\n\nРазделы кейса:")
+        self.assertEqual(await state.get_state(), AdminStates.case_sections_menu.state)
+        self.assertEqual(len((await self._case())["sections"]), 0)
+
+    # ---- 9/24: Delete missing section -- graceful, not a crash ----
+    async def test_section_delete_missing_section_shows_not_found_without_crash(self):
+        state = await self._state_in_section_detail(section_index=99, msg_id=630)  # индекс не существует
+        cb = make_callback("admincasesecact:delete", chat_id=self.actor, message_id=630)
+        await admin.case_section_action(cb, state)  # не должно бросить исключение
+
+        cb.message.edit_text.assert_awaited_once_with(
+            "Раздел не найден.\n\nРазделы кейса:", reply_markup=kb.case_sections_menu_keyboard((await self._case())["sections"])
+        )
+        self.assertEqual(await state.get_state(), AdminStates.case_sections_menu.state)
+
+    # ---- 24: Edit / remove-image on a missing section -- graceful, not a crash
+    # (reproduced as a real KeyError/IndexError/TypeError before this batch's fix) ----
+    async def test_case_section_edit_value_missing_section_does_not_crash(self):
+        state = await self._state_in_section_detail(section_index=99, msg_id=640)
+        await state.update_data(section_field="title")
+        await state.set_state(AdminStates.case_section_edit_value)
+        msg = make_flow_message_factory(chat_id=self.actor, start_id=20100)(text="Новое имя")
+
+        await admin.case_section_edit_value(msg, state)  # не должно бросить исключение
+
+        msg.bot.edit_message_text.assert_awaited_once_with(
+            "Раздел не найден.\n\nРазделы кейса:", chat_id=self.actor, message_id=640,
+            reply_markup=kb.case_sections_menu_keyboard((await self._case())["sections"]),
+        )
+        self.assertEqual(await state.get_state(), AdminStates.case_sections_menu.state)
+
+    async def test_case_section_remove_image_missing_section_does_not_crash(self):
+        state = await self._state_in_section_detail(section_index=99, msg_id=650)
+        cb = make_callback("admincasesecimgpick:0", chat_id=self.actor, message_id=650)
+
+        await admin.case_section_remove_image(cb, state)  # не должно бросить исключение
+
+        cb.message.edit_text.assert_awaited_once_with(
+            "Раздел не найден.\n\nРазделы кейса:", reply_markup=kb.case_sections_menu_keyboard((await self._case())["sections"])
+        )
+        self.assertEqual(await state.get_state(), AdminStates.case_sections_menu.state)
+
+    async def test_case_section_action_removeimg_missing_section_does_not_crash(self):
+        state = await self._state_in_section_detail(section_index=99, msg_id=655)
+        cb = make_callback("admincasesecact:removeimg", chat_id=self.actor, message_id=655)
+
+        await admin.case_section_action(cb, state)  # не должно бросить исключение
+
+        cb.answer.assert_awaited_once_with("Раздел не найден", show_alert=True)
+
+    # ---- 13/14: Delete image (case-level gallery) -> cancel / confirm ----
+    async def test_image_delete_shows_confirm_and_does_not_remove_until_confirmed(self):
+        state = await self._state_in_images_menu(image_path="img/portfolio/seed.svg", msg_id=700)
+        cb = make_callback("admincaseimgact:delete", chat_id=self.actor, message_id=700)
+        await admin.case_image_action(cb, state)
+
+        cb.message.edit_text.assert_awaited_once_with(
+            "Удалить seed.svg? Это необратимо.", reply_markup=kb.confirm_keyboard("admindelcaseimgconfirm")
+        )
+        self.assertEqual(await state.get_state(), AdminStates.case_image_pick_delete.state)
+        self.assertIn("img/portfolio/seed.svg", (await self._case())["images"])
+
+    async def test_image_delete_cancel_preserves_image(self):
+        state = await self._state_in_images_menu(image_path="img/portfolio/seed.svg", msg_id=710)
+        await state.set_state(AdminStates.case_image_pick_delete)
+        cb = make_callback("admindelcaseimgconfirm:no", chat_id=self.actor, message_id=710)
+        await admin.case_image_delete_do(cb, state)
+
+        self.assertEqual(await state.get_state(), AdminStates.case_images_menu.state)
+        self.assertIn("img/portfolio/seed.svg", (await self._case())["images"])
+
+    # ---- 15/24: Delete missing image -- graceful, not a crash ----
+    async def test_image_delete_missing_image_does_not_crash(self):
+        state = await self._state_in_images_menu(image_path="img/portfolio/does_not_exist.jpg", msg_id=720)
+        await state.set_state(AdminStates.case_image_pick_delete)
+        cb = make_callback("admindelcaseimgconfirm:yes", chat_id=self.actor, message_id=720)
+
+        await admin.case_image_delete_do(cb, state)  # не должно бросить исключение
+
+        self.assertEqual(await state.get_state(), AdminStates.case_images_menu.state)
+        # реальные изображения кейса не пострадали
+        self.assertIn("img/portfolio/seed.svg", (await self._case())["images"])
+
+    # ---- 16: Remove image (in-section) -> Back returns to section detail,
+    # not the sections list (P1-3, Batch 6 fix; re-examined Batch 5 finding) ----
+    async def test_remove_image_back_returns_to_section_detail_not_sections_list(self):
+        await content_store.add_case_section(str(self.actor), "case_cw", section_type="gallery", title="Галерея", images=["img/a.jpg"])
+        state = await self._state_in_section_detail(section_index=1, msg_id=800)  # индекс 1 -- галерея
+        cb = make_callback("admincasesecact:backimg", chat_id=self.actor, message_id=800)
+
+        await admin.case_section_action(cb, state)
+
+        cb.message.edit_text.assert_awaited_once_with("«Галерея»:", reply_markup=kb.case_section_action_keyboard("gallery"))
+        self.assertEqual(await state.get_state(), AdminStates.case_section_edit_field_pick.state)  # НЕ case_sections_menu
+        # тот же раздел можно открыть повторно (не потерян контекст)
+        data = await state.get_data()
+        self.assertEqual(data.get("section_index"), 1)
+
+    # ---- 17: Remove image (in-section picker) -> Main Menu cleans the screen ----
+    async def test_main_menu_from_remove_image_picker_cleans_screen(self):
+        await content_store.add_case_section(str(self.actor), "case_cw", section_type="gallery", title="Галерея", images=["img/a.jpg"])
+        state = await self._state_in_section_detail(section_index=1, msg_id=810)
+        await admin.case_section_action(make_callback("admincasesecact:removeimg", chat_id=self.actor, message_id=810), state)
+        self.assertEqual(await state.get_state(), AdminStates.case_section_edit_field_pick.state)  # без изменений
+
+        # состояние активно -> "⌂ Главное меню" сперва спрашивает
+        # подтверждение (см. MainMenuConfirmationTests), а не удаляет сразу.
+        trigger = make_flow_message_factory(chat_id=self.actor, start_id=20200)(text=texts.MAIN_MENU_BUTTON)
+        await admin.admin_main_menu_button(trigger, state)
+        self.assertEqual(await state.get_state(), AdminStates.case_section_edit_field_pick.state)  # не сброшено самим показом
+
+        confirm_cb = SimpleNamespace(data="mainmenu:confirm", message=make_flow_message(chat_id=self.actor), answer=AsyncMock())
+        await start.main_menu_confirm(confirm_cb, state)
+        confirm_cb.message.bot.delete_message.assert_awaited_once_with(chat_id=self.actor, message_id=810)
+        confirm_cb.message.answer.assert_not_awaited()  # ни одного нового WELCOME
+        self.assertIsNone(await state.get_state())
+
+    # ---- 25: Cancel mid add-section (before content step) leaves no
+    # partially-created section ----
+    async def test_add_section_cancel_before_content_step_creates_no_partial_section(self):
+        state = await self._state_with_nav()
+        await state.update_data(case_id="case_cw", cancel_to="sections")
+        await state.set_state(AdminStates.case_sections_menu)
+        await admin.case_section_add_start(make_callback("admincasesecaction:add", chat_id=self.actor, message_id=900), state)
+        await admin.case_section_add_type(make_callback("admincasesectype:text", chat_id=self.actor), state)
+        title_msg = make_flow_message_factory(chat_id=self.actor, start_id=20300)(text="Незаконченный раздел")
+        await admin.case_section_add_title(title_msg, state)  # только текст, до content не дошли
+
+        cancel_msg = make_flow_message_factory(chat_id=self.actor, start_id=20400)(text="/cancel")
+        await admin.admin_cancel_command(cancel_msg, state)
+
+        self.assertFalse(any(s["title"] == "Незаконченный раздел" for s in (await self._case())["sections"]))
+
+    # ---- 18/19: re-open case and section after edits -- data really persisted ----
+    async def test_reopen_case_after_section_and_image_edits_persists_data(self):
+        state = await self._state_in_section_detail(section_index=0, msg_id=1000)
+        msg = make_flow_message_factory(chat_id=self.actor, start_id=20500)(text="Новая задача проекта")
+        await state.update_data(section_field="content")
+        await state.set_state(AdminStates.case_section_edit_value)
+        await admin.case_section_edit_value(msg, state)
+
+        img_state = await self._state_in_images_menu(image_path="img/portfolio/seed.svg", msg_id=1100)
+        await admin.case_image_action(make_callback("admincaseimgact:cover", chat_id=self.actor, message_id=1100), img_state)
+
+        # "переоткрываем" кейс с нуля -- те же данные, свежий вызов list_cases()
+        reopened = next(c for c in await content_store.list_cases() if c["id"] == "case_cw")
+        self.assertEqual(reopened["sections"][0]["content"], "Новая задача проекта")
+        self.assertEqual(reopened["cover"], "img/portfolio/seed.svg")
+
+        # тот же раздел снова открывается корректно (не потерян)
+        reopen_cb = make_callback("admincasesecpick:0", chat_id=self.actor, message_id=1200)
+        reopen_state = await self._state_with_nav()
+        await reopen_state.update_data(case_id="case_cw", cancel_to="sections")
+        await reopen_state.set_state(AdminStates.case_sections_menu)
+        await admin.case_section_picked(reopen_cb, reopen_state)
+        reopen_cb.message.edit_text.assert_awaited_once_with("«Задача»:", reply_markup=kb.case_section_action_keyboard("text"))
 
 
 class AdminBackupHandlersTests(unittest.IsolatedAsyncioTestCase):

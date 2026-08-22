@@ -444,6 +444,17 @@ async def _current_case(case_id: str) -> dict | None:
     return next((c for c in await content_store.list_cases() if c["id"] == case_id), None)
 
 
+async def _current_section(case_id: str, index: int) -> dict | None:
+    """P1-3, Batch 6: section_index приходит из state.data, установленный
+    на предыдущем экране — если раздел (или сам кейс) был удалён между
+    экранами (конкурентная сессия, устаревший callback), прямой доступ
+    case["sections"][index] падает с KeyError/IndexError. Единая точка,
+    которая вместо этого гарантированно возвращает None."""
+    case = await _current_case(case_id)
+    sections = case.get("sections", []) if case else []
+    return sections[index] if 0 <= index < len(sections) else None
+
+
 @router.callback_query(AdminStates.case_images_menu, F.data == "admincaseimgaction:add")
 async def case_image_add_start(callback: CallbackQuery, state: FSMContext) -> None:
     await callback.message.edit_text("Пришлите фото для добавления в галерею:", reply_markup=kb.cancel_keyboard())
@@ -504,12 +515,20 @@ async def case_image_action(callback: CallbackQuery, state: FSMContext) -> None:
     data = await state.get_data()
     case_id, image_path = data["case_id"], data.get("image_path")
 
+    if action == "delete":
+        # P1-3, Batch 6: удаление изображения необратимо (как и удаление
+        # всего кейса, у которого уже есть confirm-шаг) — раньше срабатывало
+        # одним кликом без подтверждения, в отличие от delete_case_confirm.
+        name = image_path.split("/")[-1] if image_path else "изображение"
+        await callback.message.edit_text(f"Удалить {name}? Это необратимо.", reply_markup=kb.confirm_keyboard("admindelcaseimgconfirm"))
+        await state.set_state(AdminStates.case_image_pick_delete)
+        await callback.answer()
+        return
+
     if action == "cover":
         await content_store.set_case_cover(callback.message.chat.id, case_id, image_path)
     elif action in ("up", "down"):
         await content_store.reorder_case_image(callback.message.chat.id, case_id, image_path, action)
-    elif action == "delete":
-        await content_store.remove_case_image(callback.message.chat.id, case_id, image_path)
     # "back" — просто возвращает к списку, ничего не меняя
 
     case = await _current_case(case_id)
@@ -517,6 +536,22 @@ async def case_image_action(callback: CallbackQuery, state: FSMContext) -> None:
         "Изображения кейса — ⭐ отмечает текущую обложку:",
         reply_markup=kb.case_images_menu_keyboard(case.get("images", []) if case else [], case.get("cover") if case else None),
     )
+    await callback.answer()
+
+
+@router.callback_query(AdminStates.case_image_pick_delete, F.data.startswith("admindelcaseimgconfirm:"))
+async def case_image_delete_do(callback: CallbackQuery, state: FSMContext) -> None:
+    answer = callback.data.split(":", 1)[1]
+    data = await state.get_data()
+    case_id, image_path = data["case_id"], data.get("image_path")
+    if answer == "yes" and image_path:
+        await content_store.remove_case_image(callback.message.chat.id, case_id, image_path)
+    case = await _current_case(case_id)
+    await callback.message.edit_text(
+        "Изображения кейса — ⭐ отмечает текущую обложку:",
+        reply_markup=kb.case_images_menu_keyboard(case.get("images", []) if case else [], case.get("cover") if case else None),
+    )
+    await state.set_state(AdminStates.case_images_menu)
     await callback.answer()
 
 
@@ -619,12 +654,33 @@ async def case_section_action(callback: CallbackQuery, state: FSMContext) -> Non
         await callback.answer()
         return
     if action == "removeimg":
-        case = await _current_case(case_id)
-        images = case["sections"][index].get("images", []) if case else []
+        # _current_section, не case["sections"][index] напрямую (P1-3,
+        # Batch 6) — раздел мог быть удалён в другой сессии между
+        # экранами; раньше это падало с KeyError/IndexError вместо
+        # graceful "не найден".
+        section = await _current_section(case_id, index)
+        images = section.get("images", []) if section else []
         if not images:
-            await callback.answer("В разделе пока нет изображений", show_alert=True)
+            await callback.answer("Раздел не найден" if section is None else "В разделе пока нет изображений", show_alert=True)
             return
         await callback.message.edit_text("Убрать какое изображение?", reply_markup=kb.section_image_pick_keyboard(images))
+        await callback.answer()
+        return
+    if action == "backimg":
+        # P1-3, Batch 6: "◀️ Назад" из экрана "Убрать какое изображение?"
+        # раньше уходил на 2 уровня назад (в список разделов) через общую
+        # ветку "back" ниже — тот же callback_data admincasesecact:back,
+        # что и у "◀️ Назад к разделам" на экране деталей раздела.
+        # section_image_pick_keyboard теперь шлёт отдельный admincasesecact:backimg,
+        # который возвращает ровно на один уровень — в детали раздела.
+        section = await _current_section(case_id, index)
+        if section is None:
+            case = await _current_case(case_id)
+            await callback.message.edit_text("Раздел не найден.\n\nРазделы кейса:", reply_markup=kb.case_sections_menu_keyboard(case.get("sections", []) if case else []))
+            await state.set_state(AdminStates.case_sections_menu)
+            await callback.answer()
+            return
+        await callback.message.edit_text(f"«{section['title']}»:", reply_markup=kb.case_section_action_keyboard(section["type"]))
         await callback.answer()
         return
     if action in ("up", "down"):
@@ -635,10 +691,18 @@ async def case_section_action(callback: CallbackQuery, state: FSMContext) -> Non
         await callback.answer()
         return
     if action == "delete":
-        await content_store.delete_case_section(callback.message.chat.id, case_id, index)
-        case = await _current_case(case_id)
-        await callback.message.edit_text("Раздел удалён ✅\n\nРазделы кейса:", reply_markup=kb.case_sections_menu_keyboard(case.get("sections", []) if case else []))
-        await state.set_state(AdminStates.case_sections_menu)
+        # P1-3, Batch 6: удаление раздела необратимо (как и удаление
+        # всего кейса, у которого уже есть confirm-шаг) — раньше срабатывало
+        # одним кликом без подтверждения, в отличие от delete_case_confirm.
+        section = await _current_section(case_id, index)
+        if section is None:
+            case = await _current_case(case_id)
+            await callback.message.edit_text("Раздел не найден.\n\nРазделы кейса:", reply_markup=kb.case_sections_menu_keyboard(case.get("sections", []) if case else []))
+            await state.set_state(AdminStates.case_sections_menu)
+            await callback.answer()
+            return
+        await callback.message.edit_text(f"Удалить раздел «{section['title']}»? Это необратимо.", reply_markup=kb.confirm_keyboard("admindelsecconfirm"))
+        await state.set_state(AdminStates.case_section_pick_delete)
         await callback.answer()
         return
     # "back"
@@ -648,16 +712,42 @@ async def case_section_action(callback: CallbackQuery, state: FSMContext) -> Non
     await callback.answer()
 
 
+@router.callback_query(AdminStates.case_section_pick_delete, F.data.startswith("admindelsecconfirm:"))
+async def case_section_delete_do(callback: CallbackQuery, state: FSMContext) -> None:
+    answer = callback.data.split(":", 1)[1]
+    data = await state.get_data()
+    case_id, index = data["case_id"], data["section_index"]
+    if answer == "yes":
+        await content_store.delete_case_section(callback.message.chat.id, case_id, index)
+        text = "Раздел удалён ✅\n\nРазделы кейса:"
+    else:
+        text = "Разделы кейса:"
+    case = await _current_case(case_id)
+    await callback.message.edit_text(text, reply_markup=kb.case_sections_menu_keyboard(case.get("sections", []) if case else []))
+    await state.set_state(AdminStates.case_sections_menu)
+    await callback.answer()
+
+
 @router.callback_query(AdminStates.case_section_edit_field_pick, F.data.startswith("admincasesecimgpick:"))
 async def case_section_remove_image(callback: CallbackQuery, state: FSMContext) -> None:
     img_index = int(callback.data.split(":", 1)[1])
     data = await state.get_data()
-    case = await _current_case(data["case_id"])
-    images = case["sections"][data["section_index"]].get("images", []) if case else []
+    case_id, index = data["case_id"], data["section_index"]
+    # _current_section, не case["sections"][index] напрямую (P1-3, Batch 6)
+    # — см. комментарий в case_section_action: раздел мог исчезнуть между
+    # экранами, раньше это падало с KeyError/IndexError.
+    section = await _current_section(case_id, index)
+    if section is None:
+        case = await _current_case(case_id)
+        await callback.message.edit_text("Раздел не найден.\n\nРазделы кейса:", reply_markup=kb.case_sections_menu_keyboard(case.get("sections", []) if case else []))
+        await state.set_state(AdminStates.case_sections_menu)
+        await callback.answer()
+        return
+    images = section.get("images", [])
     if 0 <= img_index < len(images):
         remaining = [img for i, img in enumerate(images) if i != img_index]
-        await content_store.update_case_section(callback.message.chat.id, data["case_id"], data["section_index"], images=remaining)
-    section = (await _current_case(data["case_id"]))["sections"][data["section_index"]]
+        await content_store.update_case_section(callback.message.chat.id, case_id, index, images=remaining)
+        section = await _current_section(case_id, index) or section
     await callback.message.edit_text(f"«{section['title']}»:", reply_markup=kb.case_section_action_keyboard(section["type"]))
     await callback.answer()
 
@@ -678,8 +768,8 @@ async def case_section_edit_value(message: Message, state: FSMContext) -> None:
             return
         file_id = message.photo[-1].file_id if message.photo else message.document.file_id
         path = await content_store.save_case_photo(message.chat.id, message.bot, file_id, f"{case_id}_{uuid.uuid4().hex[:8]}")
-        case = await _current_case(case_id)
-        images = case["sections"][index].get("images", []) if case else []
+        section_before = await _current_section(case_id, index)
+        images = section_before.get("images", []) if section_before else []
         await content_store.update_case_section(message.chat.id, case_id, index, images=images + [path])
     else:
         if not message.text:
@@ -687,7 +777,16 @@ async def case_section_edit_value(message: Message, state: FSMContext) -> None:
             return
         await content_store.update_case_section(message.chat.id, case_id, index, **{field: message.text.strip()})
 
-    section = (await _current_case(case_id))["sections"][index]
+    # _current_section, не case["sections"][index] напрямую (P1-3, Batch 6)
+    # — раздел (или сам кейс) мог быть удалён между показом prompt'а и
+    # отправкой текста (конкурентная сессия); раньше это падало с
+    # KeyError/IndexError вместо graceful "не найден".
+    section = await _current_section(case_id, index)
+    if section is None:
+        case = await _current_case(case_id)
+        await flow.step_from_text(message, state, "Раздел не найден.\n\nРазделы кейса:", kb.case_sections_menu_keyboard(case.get("sections", []) if case else []))
+        await state.set_state(AdminStates.case_sections_menu)
+        return
     # flow.step_from_text (P1-3, Batch 3) — success-переход в
     # case_section_edit_field_pick (cancel_to="sections" сохраняется).
     await flow.step_from_text(message, state, f"Обновлено ✅\n\n«{section['title']}»:", kb.case_section_action_keyboard(section["type"]))
