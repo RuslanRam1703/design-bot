@@ -7731,6 +7731,108 @@ class LeadStoreTests(unittest.IsolatedAsyncioTestCase):
     async def test_get_lead_returns_none_for_unknown_id(self):
         self.assertIsNone(await content_store.get_lead(999999))
 
+    # ---- Batch 2: Closed lead lifecycle (DONE/CANCELLED hard-block) ----
+
+    async def test_update_lead_status_to_done_clears_awaiting_tz_file(self):
+        lead = await content_store.add_lead({"service_name": "A", "attach_tz": True}, self.telegram)
+        self.assertTrue((await content_store.get_lead(lead["id"]))["awaiting_tz_file"])
+
+        await content_store.update_lead_status(self.actor, lead["id"], "DONE")
+
+        closed = await content_store.get_lead(lead["id"])
+        self.assertFalse(closed["awaiting_tz_file"])
+        self.assertIsNone(closed["awaiting_tz_file_source"])
+
+    async def test_update_lead_status_to_cancelled_clears_awaiting_tz_file(self):
+        lead = await content_store.add_lead({"service_name": "A", "attach_tz": True}, self.telegram)
+        await content_store.update_lead_status(self.actor, lead["id"], "CANCELLED")
+
+        closed = await content_store.get_lead(lead["id"])
+        self.assertFalse(closed["awaiting_tz_file"])
+        self.assertIsNone(closed["awaiting_tz_file_source"])
+
+    async def test_update_lead_status_to_non_terminal_does_not_touch_awaiting_tz_file(self):
+        # Regression guard: только DONE/CANCELLED должны сбрасывать флаг —
+        # обычный переход между активными статусами не должен его трогать.
+        lead = await content_store.add_lead({"service_name": "A", "attach_tz": True}, self.telegram)
+        await content_store.update_lead_status(self.actor, lead["id"], "IN_PROGRESS")
+
+        still_active = await content_store.get_lead(lead["id"])
+        self.assertTrue(still_active["awaiting_tz_file"])
+        self.assertEqual(still_active["awaiting_tz_file_source"], "new")
+
+    async def test_find_lead_awaiting_file_excludes_closed_lead_even_with_stale_flag(self):
+        # Симулирует legacy-заявку: закрыта ДО этого исправления, флаг мог
+        # остаться true с более раннего момента (см. content_store.
+        # find_lead_awaiting_file докстринг). Прямая правка через
+        # update_lead_status не подходит — она теперь сама снимает флаг;
+        # здесь нужен именно "уже закрыта, но флаг ещё стоит" сценарий.
+        lead = await content_store.add_lead({"service_name": "A", "attach_tz": True}, self.telegram)
+        async with content_store._lock("leads.json"):
+            leads = await content_store._read_leads()
+            stored = next(l for l in leads if l["id"] == lead["id"])
+            stored["status"] = "DONE"  # закрыта напрямую, минуя update_lead_status
+            await content_store._write_leads(leads)
+
+        self.assertIsNone(await content_store.find_lead_awaiting_file(self.telegram["user_id"]))
+
+    async def test_record_lead_material_returns_false_for_closed_lead(self):
+        # Прямой вызов (минуя find_lead_awaiting_file) — воспроизводит
+        # гонку "лид был активен на момент проверки, закрылся к моменту
+        # записи" (см. implementation plan, §7.2/7.3).
+        lead = await content_store.add_lead({"service_name": "A"}, self.telegram)
+        await content_store.update_lead_status(self.actor, lead["id"], "CANCELLED")
+
+        result = await content_store.record_lead_material(lead["id"], "file-1", "unique-1", "document", "new")
+
+        self.assertFalse(result)
+        self.assertEqual((await content_store.get_lead(lead["id"]))["materials"], [])
+
+    async def test_add_lead_supplement_raises_for_done_lead(self):
+        lead = await content_store.add_lead({"service_name": "A"}, self.telegram)
+        await content_store.update_lead_status(self.actor, lead["id"], "DONE")
+
+        with self.assertRaises(content_store.LeadClosedError):
+            await content_store.add_lead_supplement(lead["id"], self.telegram, {"comment": "ещё кое-что"})
+
+        self.assertEqual((await content_store.get_lead(lead["id"]))["supplements"], [])
+
+    async def test_add_lead_supplement_raises_for_cancelled_lead(self):
+        lead = await content_store.add_lead({"service_name": "A"}, self.telegram)
+        await content_store.update_lead_status(self.actor, lead["id"], "CANCELLED")
+
+        with self.assertRaises(content_store.LeadClosedError):
+            await content_store.add_lead_supplement(lead["id"], self.telegram, {"comment": "ещё кое-что"})
+
+    async def test_add_lead_draft_upsert_raises_for_closed_lead(self):
+        lead = await content_store.add_lead({"service_name": "A"}, self.telegram, draft_id="d-closed-1")
+        await content_store.update_lead_status(self.actor, lead["id"], "DONE")
+
+        with self.assertRaises(content_store.LeadClosedError):
+            await content_store.add_lead(
+                {"service_name": "A, изменённое"}, self.telegram, draft_id="d-closed-1",
+            )
+
+        unchanged = await content_store.get_lead(lead["id"])
+        self.assertEqual(unchanged["payload"]["service_name"], "A")  # апсерт не применился
+
+    async def test_close_then_reopen_then_supplement_succeeds(self):
+        # Прямое доказательство "reopening restores normal client
+        # interaction path" на уровне content_store (см. implementation
+        # plan §4) — без auto-reopen, только явная смена статуса.
+        lead = await content_store.add_lead({"service_name": "A"}, self.telegram)
+        await content_store.update_lead_status(self.actor, lead["id"], "DONE")
+        with self.assertRaises(content_store.LeadClosedError):
+            await content_store.add_lead_supplement(lead["id"], self.telegram, {"comment": "пока закрыта"})
+
+        await content_store.update_lead_status(self.actor, lead["id"], "IN_PROGRESS")
+        reopened_lead, supplement_id = await content_store.add_lead_supplement(
+            lead["id"], self.telegram, {"comment": "уже после reopen"},
+        )
+
+        self.assertEqual(supplement_id, 1)
+        self.assertEqual(reopened_lead["supplements"][0]["fields"]["comment"], "уже после reopen")
+
 
 class ParseNumberBoundsTests(unittest.TestCase):
     """UX-аудит, находка F12: опечатка в /admin не должна попадать в
@@ -8421,6 +8523,63 @@ class CreateLeadHttpEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(leads), 1)
         self.assertEqual(leads[0]["payload"]["service_name"], "Лендинг, доп. правки")
 
+    async def test_draft_id_upsert_against_closed_lead_is_409(self):
+        # Batch 2 — устаревший draft_id из localStorage клиента совпал с
+        # уже закрытой (DONE/CANCELLED) заявкой (см. implementation plan
+        # §7.1: тот же класс проблемы, что и у mode="supplement", только
+        # через draft_id-апсерт, а не lead_id).
+        from aiohttp.test_utils import TestClient, TestServer
+
+        orig_designer = content_store.config.DESIGNER_CHAT_ID
+        content_store.config.DESIGNER_CHAT_ID = "777"
+        try:
+            app = webserver.create_app(AsyncMock())
+            async with TestClient(TestServer(app)) as client:
+                first = await client.post(
+                    "/api/leads",
+                    headers={"X-Telegram-Init-Data": self._init_data(), "Content-Type": "application/json"},
+                    json={"service_name": "Лендинг", "draft_id": "d-closed-http-1"},
+                )
+                lead_id = (await first.json())["lead_id"]
+                await content_store.update_lead_status("777", lead_id, "DONE")
+
+                second = await client.post(
+                    "/api/leads",
+                    headers={"X-Telegram-Init-Data": self._init_data(), "Content-Type": "application/json"},
+                    json={"service_name": "Лендинг, попытка изменить после закрытия", "draft_id": "d-closed-http-1"},
+                )
+                self.assertEqual(second.status, 409)
+                self.assertEqual(await second.json(), {"error": "lead_closed"})
+
+            lead = await content_store.get_lead(lead_id)
+            self.assertEqual(lead["payload"]["service_name"], "Лендинг")  # апсерт не применился
+        finally:
+            content_store.config.DESIGNER_CHAT_ID = orig_designer
+
+    async def test_draft_id_upsert_against_open_lead_still_works(self):
+        # Regression guard рядом с closed-lead тестом выше — открытые лиды
+        # (любой активный статус) должны продолжать апсертиться как раньше.
+        from aiohttp.test_utils import TestClient, TestServer
+
+        app = webserver.create_app(AsyncMock())
+        async with TestClient(TestServer(app)) as client:
+            first = await client.post(
+                "/api/leads",
+                headers={"X-Telegram-Init-Data": self._init_data(), "Content-Type": "application/json"},
+                json={"service_name": "Лендинг", "draft_id": "d-open-http-1"},
+            )
+            lead_id = (await first.json())["lead_id"]
+
+            second = await client.post(
+                "/api/leads",
+                headers={"X-Telegram-Init-Data": self._init_data(), "Content-Type": "application/json"},
+                json={"service_name": "Лендинг, правки", "draft_id": "d-open-http-1"},
+            )
+            self.assertEqual(second.status, 200)
+
+        lead = await content_store.get_lead(lead_id)
+        self.assertEqual(lead["payload"]["service_name"], "Лендинг, правки")
+
     async def test_source_case_fields_and_calc_summary_are_saved(self):
         from aiohttp.test_utils import TestClient, TestServer
 
@@ -8798,6 +8957,104 @@ class LeadSupplementTests(unittest.IsolatedAsyncioTestCase):
                 json={"mode": "supplement", "lead_id": lead_id, "user_id": 999999, "fields": {"comment": "..."}},
             )
             self.assertEqual(resp.status, 200)  # user_id в body просто игнорируется, не читается вообще
+
+    # ---- Batch 2: Closed lead lifecycle — HTTP layer (409 lead_closed) ----
+
+    async def test_supplement_to_done_lead_is_409(self):
+        from aiohttp.test_utils import TestClient, TestServer
+
+        app = webserver.create_app(AsyncMock())
+        async with TestClient(TestServer(app)) as client:
+            lead_id = await self._create_lead(client)
+            await content_store.update_lead_status("777", lead_id, "DONE")
+            resp = await client.post(
+                "/api/leads",
+                headers={"X-Telegram-Init-Data": self._init_data(), "Content-Type": "application/json"},
+                json={"mode": "supplement", "lead_id": lead_id, "fields": {"comment": "поздно"}},
+            )
+            self.assertEqual(resp.status, 409)
+            self.assertEqual(await resp.json(), {"error": "lead_closed"})
+
+        self.assertEqual((await content_store.get_lead(lead_id))["supplements"], [])
+
+    async def test_supplement_to_cancelled_lead_is_409(self):
+        from aiohttp.test_utils import TestClient, TestServer
+
+        app = webserver.create_app(AsyncMock())
+        async with TestClient(TestServer(app)) as client:
+            lead_id = await self._create_lead(client)
+            await content_store.update_lead_status("777", lead_id, "CANCELLED")
+            resp = await client.post(
+                "/api/leads",
+                headers={"X-Telegram-Init-Data": self._init_data(), "Content-Type": "application/json"},
+                json={"mode": "supplement", "lead_id": lead_id, "fields": {"comment": "поздно"}},
+            )
+            self.assertEqual(resp.status, 409)
+            self.assertEqual(await resp.json(), {"error": "lead_closed"})
+
+    async def test_wants_file_on_closed_lead_is_blocked_via_409(self):
+        from aiohttp.test_utils import TestClient, TestServer
+
+        app = webserver.create_app(AsyncMock())
+        async with TestClient(TestServer(app)) as client:
+            lead_id = await self._create_lead(client)
+            await content_store.update_lead_status("777", lead_id, "DONE")
+            resp = await client.post(
+                "/api/leads",
+                headers={"X-Telegram-Init-Data": self._init_data(), "Content-Type": "application/json"},
+                json={"mode": "supplement", "lead_id": lead_id, "fields": {}, "wants_file": True},
+            )
+            self.assertEqual(resp.status, 409)
+
+        lead = await content_store.get_lead(lead_id)
+        self.assertFalse(lead["awaiting_tz_file"])  # wants_file не применился
+
+    async def test_supplement_no_designer_notification_sent_for_closed_lead(self):
+        # 409 приходит ДО любой попытки уведомить дизайнера — закрытая
+        # заявка не должна генерировать новую активность designer-стороны
+        # (см. implementation plan: "closed leads must not generate new
+        # supplement/material activity").
+        from aiohttp.test_utils import TestClient, TestServer
+
+        fake_bot = AsyncMock()
+        app = webserver.create_app(fake_bot)
+        async with TestClient(TestServer(app)) as client:
+            lead_id = await self._create_lead(client)
+            await content_store.update_lead_status("777", lead_id, "DONE")
+            fake_bot.send_message.reset_mock()  # сбрасываем уведомление о создании заявки
+            await client.post(
+                "/api/leads",
+                headers={"X-Telegram-Init-Data": self._init_data(), "Content-Type": "application/json"},
+                json={"mode": "supplement", "lead_id": lead_id, "fields": {"comment": "поздно"}},
+            )
+
+        fake_bot.send_message.assert_not_awaited()
+
+    async def test_close_then_reopen_then_supplement_succeeds_via_http(self):
+        from aiohttp.test_utils import TestClient, TestServer
+
+        app = webserver.create_app(AsyncMock())
+        async with TestClient(TestServer(app)) as client:
+            lead_id = await self._create_lead(client)
+            await content_store.update_lead_status("777", lead_id, "DONE")
+            blocked = await client.post(
+                "/api/leads",
+                headers={"X-Telegram-Init-Data": self._init_data(), "Content-Type": "application/json"},
+                json={"mode": "supplement", "lead_id": lead_id, "fields": {"comment": "пока закрыта"}},
+            )
+            self.assertEqual(blocked.status, 409)
+
+            await content_store.update_lead_status("777", lead_id, "WAITING_CLIENT")
+            reopened = await client.post(
+                "/api/leads",
+                headers={"X-Telegram-Init-Data": self._init_data(), "Content-Type": "application/json"},
+                json={"mode": "supplement", "lead_id": lead_id, "fields": {"comment": "после reopen"}},
+            )
+            self.assertEqual(reopened.status, 200)
+
+        lead = await content_store.get_lead(lead_id)
+        self.assertEqual(len(lead["supplements"]), 1)
+        self.assertEqual(lead["supplements"][0]["fields"]["comment"], "после reopen")
 
 
 class PublicDataRouteTests(unittest.IsolatedAsyncioTestCase):
@@ -9306,6 +9563,32 @@ class LeadMaterialTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(lead)
         self.assertEqual(lead["id"], lead_id)
         self.assertEqual(lead["awaiting_tz_file_source"], "supplement")
+
+    # ---- Batch 2: closing a lead cuts off the file-attachment path too ----
+
+    async def test_file_sent_after_lead_closed_is_not_recorded_or_acknowledged(self):
+        # Полная цепочка bot-chat стороны: заявка ждёт файл -> дизайнер
+        # закрывает её ДО того, как клиент успел прислать файл -> file
+        # больше не находит ожидающую заявку (find_lead_awaiting_file
+        # исключает закрытые) -> handle_tz_file no-op, тот же silent path,
+        # что и для "вообще нет ожидающей заявки" (см. implementation plan
+        # §7.4 — намеренно НЕ вводим отдельное "заявка закрыта" сообщение
+        # здесь, чтобы не создавать новое late-activity состояние).
+        message = make_message()
+        await webapp._handle_brief_submission(message, {"service_name": "Лендинг", "attach_tz": True, "draft_id": "m-closed"})
+        lead_id = (await content_store.find_lead_awaiting_file(message.from_user.id))["id"]
+        message.answer.reset_mock()
+        message.bot.send_message.reset_mock()
+
+        await content_store.update_lead_status("777", lead_id, "DONE")
+
+        message.document = make_fake_document(file_id="doc-late", file_unique_id="uniq-late")
+        await webapp.handle_tz_file(message)
+
+        message.answer.assert_not_awaited()
+        message.bot.send_message.assert_not_awaited()
+        message.forward.assert_not_awaited()
+        self.assertEqual((await content_store.get_lead(lead_id))["materials"], [])
 
 
 def make_reply_message(chat_id: int, text: str, send_message: AsyncMock) -> SimpleNamespace:

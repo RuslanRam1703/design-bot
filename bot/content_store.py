@@ -1005,6 +1005,14 @@ LEAD_STATUSES = ("NEW", "VIEWED", "IN_PROGRESS", "WAITING_CLIENT", "DONE", "CANC
 # — сам list_leads() ниже.
 ACTIVE_LEAD_STATUSES = ("NEW", "VIEWED", "IN_PROGRESS", "WAITING_CLIENT")
 
+# DONE/CANCELLED — терминальные состояния для КЛИЕНТСКИХ write-путей (Batch 2:
+# Closed lead lifecycle). Дизайнер по-прежнему может вручную вернуть заявку в
+# любой статус через тот же update_lead_status (см. ниже) — это единственный
+# способ "открыть" заявку заново, никакой отдельной reopen-логики не нужно:
+# все проверки ниже читают lead["status"] в момент запроса, а не какой-то
+# отдельный "закрыт когда-то" флаг.
+TERMINAL_LEAD_STATUSES = ("DONE", "CANCELLED")
+
 
 class LeadNotFoundError(Exception):
     """supplement/материал для несуществующего lead_id."""
@@ -1013,6 +1021,17 @@ class LeadNotFoundError(Exception):
 class NotLeadOwnerError(Exception):
     """lead_id существует, но telegram.user_id (из validate_init_data) не
     совпадает с telegram.user_id заявки — попытка дополнить чужую заявку."""
+
+
+class LeadClosedError(Exception):
+    """lead_id существует и принадлежит клиенту, но заявка уже в терминальном
+    статусе (DONE/CANCELLED) — клиентские write-пути (supplement, draft_id-
+    апсерт брифа) для неё намеренно заблокированы (Batch 2 product decision:
+    hard-block, без auto-reopen). lead_id — для логов/сообщения об ошибке."""
+
+    def __init__(self, lead_id: int):
+        super().__init__(lead_id)
+        self.lead_id = lead_id
 
 
 async def _read_leads() -> list[dict]:
@@ -1096,6 +1115,14 @@ async def add_lead(payload: dict, telegram: dict, calc_summary: dict | None = No
                 # для draft_id-апсерта. Ничего не меняем и не пишем при коллизии.
                 if existing.get("telegram", {}).get("user_id") != telegram.get("user_id"):
                     raise NotLeadOwnerError(existing["id"])
+                if existing["status"] in TERMINAL_LEAD_STATUSES:
+                    # Batch 2: тот же stale-draft_id сценарий, что и у
+                    # add_lead_supplement ниже — клиент повторно шлёт (уже не
+                    # актуальный) черновик на заявку, которую дизайнер успел
+                    # закрыть. upsert в закрытую заявку не делаем — ничего не
+                    # меняем и не пишем, вызывающий код (bot/webserver.py)
+                    # покажет клиенту понятную ошибку вместо тихой перезаписи.
+                    raise LeadClosedError(existing["id"])
                 existing.update(
                     payload=payload,
                     telegram=telegram,
@@ -1155,6 +1182,12 @@ async def add_lead_supplement(lead_id: int, telegram: dict, fields: dict, wants_
             raise LeadNotFoundError(lead_id)
         if lead.get("telegram", {}).get("user_id") != telegram.get("user_id"):
             raise NotLeadOwnerError(lead_id)
+        if lead["status"] in TERMINAL_LEAD_STATUSES:
+            # Batch 2 product decision: DONE/CANCELLED — терминальные для
+            # клиента, hard-block без auto-reopen. Дизайнер вручную меняет
+            # статус обратно (update_lead_status) — это единственный путь
+            # снова разрешить supplement, отдельная reopen-логика не нужна.
+            raise LeadClosedError(lead_id)
 
         supplements = lead.setdefault("supplements", [])
         next_supplement_id = max((s["id"] for s in supplements), default=0) + 1
@@ -1185,6 +1218,13 @@ async def record_lead_material(lead_id: int, file_id: str, file_unique_id: str, 
         lead = next((l for l in leads if l["id"] == lead_id), None)
         if lead is None:
             return False
+        if lead["status"] in TERMINAL_LEAD_STATUSES:
+            # Batch 2 — последний рубеж на случай гонки (find_lead_awaiting_file
+            # прочитан, пока заявка ещё была активна, а закрылась уже к моменту
+            # этой записи): материал на закрытую заявку не сохраняем. Основной
+            # путь блокировки — сам find_lead_awaiting_file ниже, эта проверка
+            # его не заменяет, а подстраховывает.
+            return False
         materials = lead.setdefault("materials", [])
         materials.append({
             "file_id": file_id,
@@ -1212,10 +1252,19 @@ async def find_lead_awaiting_file(user_id: int) -> dict | None:
     остаётся только защитой на случай уже существующих в хранилище данных,
     сохранённых до этого исправления.
 
+    Статус DONE/CANCELLED исключён явно (Batch 2) — не только для заявок,
+    закрытых ПОСЛЕ этого исправления (у них awaiting_tz_file уже снят самим
+    update_lead_status), но и для уже существующих в data/leads.json закрытых
+    заявок, у которых этот флаг мог остаться true с более раннего момента —
+    без этой проверки здесь такая устаревшая запись по-прежнему находилась бы
+    и файл клиента продолжал бы восприниматься как ожидаемый.
+
     Tier 0 — pure read, без lock (см. докстринг модуля)."""
     leads = [
         l for l in await _read_leads()
-        if l.get("telegram", {}).get("user_id") == user_id and l.get("awaiting_tz_file")
+        if l.get("telegram", {}).get("user_id") == user_id
+        and l.get("awaiting_tz_file")
+        and l.get("status") not in TERMINAL_LEAD_STATUSES
     ]
     return max(leads, key=lambda l: l["id"], default=None)
 
@@ -1294,6 +1343,13 @@ async def update_lead_status(actor_chat_id: int | str, lead_id: int, status: str
         if lead is None:
             return False
         lead["status"] = status
+        if status in TERMINAL_LEAD_STATUSES:
+            # Batch 2 — закрытие снимает "ожидание файла" сразу же: без этого
+            # find_lead_awaiting_file/record_lead_material оставались бы
+            # единственной линией защиты, а сам факт "заявка ждёт файл" на
+            # закрытой заявке продолжал бы висеть неопределённо долго.
+            lead["awaiting_tz_file"] = False
+            lead["awaiting_tz_file_source"] = None
         lead["updated_at"] = datetime.now(timezone.utc).isoformat()
         await _write_leads(leads)
         return True

@@ -180,6 +180,11 @@ async def _handle_lead_create(payload: dict, telegram_identity: dict, bot: Bot) 
         # draft_id совпал с чужой заявкой (см. content_store.add_lead,
         # production-аудит P1-2) — ничего не создано и не изменено.
         return web.json_response({"error": "forbidden"}, status=403)
+    except content_store.LeadClosedError:
+        # Batch 2 — устаревший draft_id клиента совпал с уже закрытой
+        # (DONE/CANCELLED) заявкой: апсерт в неё не делаем, ничего не
+        # создано и не изменено (см. content_store.add_lead).
+        return web.json_response({"error": "lead_closed"}, status=409)
     created = lead["created"]
 
     # Уведомляем владельца ТОЛЬКО при реальном создании — повторный/
@@ -243,6 +248,14 @@ async def _handle_lead_supplement(payload: dict, telegram_identity: dict, bot: B
         # менялись — различие полезно для логики/логов, наружу его просто не
         # показываем.
         return web.json_response({"error": "not_found"}, status=404)
+    except content_store.LeadClosedError:
+        # Batch 2 — в отличие от LeadNotFoundError/NotLeadOwnerError выше,
+        # здесь владение УЖЕ подтверждено (проверка статуса в
+        # add_lead_supplement идёт после проверки owner) — раскрытие "эта
+        # заявка закрыта" не даёт узнать ничего о чужих lead_id, поэтому
+        # отдельный, содержательный код ответа безопасен (P2-11 сюда не
+        # относится).
+        return web.json_response({"error": "lead_closed"}, status=409)
 
     text = format_lead_supplement_message(lead_id, fields)
     if config.DESIGNER_CHAT_ID:

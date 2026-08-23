@@ -1370,6 +1370,17 @@ async function submitBrief() {
       headers: { "Content-Type": "application/json", "X-Telegram-Init-Data": TG.initData() },
       body: JSON.stringify(payload),
     });
+    if (res.status === 409) {
+      // Batch 2 — draft_id из localStorage совпал с уже закрытой
+      // (DONE/CANCELLED) заявкой (см. content_store.add_lead, упсерт по
+      // draft_id) — черновик НЕ трогаем (та же ветка catch ниже его бы
+      // тоже не тронула), просто отдельное, понятное сообщение вместо
+      // generic "проверьте соединение", которое было бы неверным здесь.
+      state.submitting = false;
+      state.briefSubmitError = "Эта заявка уже закрыта. Начните новую заявку.";
+      render();
+      return;
+    }
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const result = await res.json();
     // Черновик чистим только после подтверждённого успеха с сервера — в
@@ -1682,6 +1693,14 @@ function myLeadStatusClass(status) {
   return "";
 }
 
+// Batch 2 — DONE/CANCELLED терминальны для клиента (hard-block, см.
+// bot/content_store.py::TERMINAL_LEAD_STATUSES, тот же список статусов).
+// Используется только для UI-подсказки здесь; backend — единственный
+// реальный источник правды, блокирует запись независимо от этого.
+function isLeadClosed(status) {
+  return status === "DONE" || status === "CANCELLED";
+}
+
 // created_at всегда есть; updated_at показываем отдельной строкой только
 // если день реально отличается от дня создания — иначе "Обновлено" в тот
 // же день, что и "Создана", не несёт клиенту новой информации.
@@ -1869,7 +1888,9 @@ function renderMyLeadDetail(lead) {
     ${ownerCommentBlock}
     ${supplementsBlock}
     ${materialsBlock}
-    <button class="btn btn-primary" id="my-lead-continue">Дополнить информацию</button>
+    ${isLeadClosed(lead.status)
+      ? `<p class="hint">Заявка закрыта — дополнить её нельзя. Если нужно что-то уточнить, напишите нам в чат.</p>`
+      : `<button class="btn btn-primary" id="my-lead-continue">Дополнить информацию</button>`}
     <button class="btn btn-secondary" id="my-lead-start-new">Начать новую заявку</button>
   `;
 }
@@ -2097,6 +2118,16 @@ async function submitSupplement() {
       headers: { "Content-Type": "application/json", "X-Telegram-Init-Data": TG.initData() },
       body: JSON.stringify({ mode: "supplement", lead_id: s.leadId, fields, wants_file: s.wantsFile }),
     });
+    if (res.status === 409) {
+      // Batch 2 — заявку закрыли (DONE/CANCELLED), пока клиент заполнял
+      // экран; отдельное, содержательное сообщение вместо generic "не
+      // получилось отправить" ниже — тот случай про сеть/сервер, этот
+      // про реальное состояние заявки, которое клиенту стоит понимать.
+      state.supplement.submitting = false;
+      state.supplement.error = "Эта заявка уже закрыта — дополнить её нельзя.";
+      render();
+      return;
+    }
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const result = await res.json();
     state.supplement.submitting = false;
