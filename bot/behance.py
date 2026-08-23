@@ -95,8 +95,27 @@ _OG_IMAGE_PATTERNS = (
 
 # Путь конкретного проекта: /gallery/<числовой id>/<slug>. Профиль
 # (/username), главная (/) и прочие страницы Behance сюда не подходят —
-# см. is_behance_project_url.
-_PROJECT_PATH_PATTERN = re.compile(r"^/gallery/\d+(/|$)")
+# см. is_behance_project_url. Группа — сам id проекта, он же понадобится
+# для отбора нужной картинки (см. extract_project_cdn_url).
+_PROJECT_PATH_PATTERN = re.compile(r"^/gallery/(\d+)(?:/|$)")
+
+# Читалка r.jina.ai. Прямой запрос к www.behance.net с Render получает 403
+# на edge Adobe/Fastly (воспроизведено дважды в production, в том числе с
+# полным набором browser-заголовков) — при этом Render → r.jina.ai →
+# Behance измерен из того же egress и работает: HTTP 200, ~32 КБ, ~0.35 с.
+# Обычный режим (markdown) выбран намеренно: он на порядок легче, чем
+# x-respond-with: html (~1.4 МБ), и уже содержит нужные CDN-ссылки.
+_JINA_ENDPOINT = "https://r.jina.ai/"
+
+# Картинки самого проекта лежат под /project_modules/<size>/<file>.
+# ВАЖНО: в ответе есть и /projects/... — это превью ЧУЖИХ проектов из
+# блоков рекомендаций, и они идут РАНЬШЕ нужных нам (проверено на реальном
+# ответе: первые 6 ссылок — чужие работы). Поэтому брать "первую попавшуюся"
+# CDN-ссылку нельзя: обложкой кейса стала бы чужая картинка.
+_CDN_MODULE_PATTERN = re.compile(
+    r"https://mir-s3-cdn-cf\.behance\.net/project_modules/[^/\s\"'()\[\]]+/[^\s\"'()\[\]]+",
+    re.IGNORECASE,
+)
 
 # CDN-адрес вида .../project_modules/<size>/<file> — единственная форма, в
 # которой безопасно подменять size-вариант (см. _disp_variant).
@@ -134,6 +153,36 @@ def is_behance_project_url(url: str) -> bool:
     if (parsed.hostname or "").lower() not in _ALLOWED_HOSTS:
         return False
     return bool(_PROJECT_PATH_PATTERN.match(parsed.path))
+
+
+def project_id_from_url(url: str) -> str | None:
+    """id проекта из /gallery/<id>/... — им отбирается нужная картинка среди
+    множества CDN-ссылок в ответе r.jina.ai (см. extract_project_cdn_url)."""
+    try:
+        parsed = urllib.parse.urlparse((url or "").strip())
+    except ValueError:
+        return None
+    match = _PROJECT_PATH_PATTERN.match(parsed.path)
+    return match.group(1) if match else None
+
+
+def extract_project_cdn_url(text: str, project_id: str) -> str | None:
+    """Первая /project_modules/-ссылка, у которой ИМЯ ФАЙЛА содержит id
+    проекта.
+
+    Отбор по id обязателен, а не для красоты: в ответе r.jina.ai рядом
+    лежат превью чужих проектов из рекомендаций, и они встречаются раньше
+    (проверено на реальном ответе — первые шесть ссылок чужие). Имя файла
+    модуля выглядит как "<префикс><project_id>.<hash>.<ext>", поэтому
+    вхождение id в basename однозначно привязывает картинку к нужному
+    проекту."""
+    if not text or not project_id:
+        return None
+    for url in _CDN_MODULE_PATTERN.findall(text):
+        basename = url.rsplit("/", 1)[-1]
+        if project_id in basename.split(".", 1)[0]:
+            return url
+    return None
 
 
 def extract_og_image(html_text: str) -> str | None:
@@ -215,25 +264,32 @@ async def resolve_cover_url(project_url: str, *, prefer_disp: bool = True) -> st
     portfolio.json и станет битой картинкой у клиента."""
     if not is_behance_project_url(project_url):
         raise BehanceResolveError(f"не ссылка на Behance: {project_url!r}")
+    project_id = project_id_from_url(project_url)
+    if not project_id:
+        raise BehanceResolveError(f"не удалось определить id проекта: {project_url!r}")
 
+    # Читаем страницу ЧЕРЕЗ r.jina.ai, а не напрямую: прямой запрос к
+    # www.behance.net с Render блокируется на edge Adobe (HTTP 403).
     try:
-        status, body = await asyncio.to_thread(_http_get, project_url)
+        status, body = await asyncio.to_thread(_http_get, _JINA_ENDPOINT + project_url)
     except urllib.error.URLError as e:
-        raise BehanceResolveError(f"Behance недоступен: {e.reason}") from e
+        raise BehanceResolveError(f"r.jina.ai недоступен: {e.reason}") from e
     if status != 200:
-        raise BehanceResolveError(f"Behance вернул HTTP {status}")
+        raise BehanceResolveError(f"r.jina.ai вернул HTTP {status}")
 
-    og_image = extract_og_image(body.decode("utf-8", errors="replace"))
-    if not og_image:
-        raise BehanceResolveError("на странице нет og:image")
-    if not og_image.startswith("https://"):
-        raise BehanceResolveError(f"og:image не https-ссылка: {og_image!r}")
+    text = body.decode("utf-8", errors="replace")
+    image_url = extract_project_cdn_url(text, project_id)
+    if not image_url:
+        # Сюда же попадает случай, когда r.jina.ai сменит формат ответа:
+        # подходящей ссылки просто не найдётся, и мы честно сообщим об
+        # ошибке вместо того, чтобы записать чужую или битую картинку.
+        raise BehanceResolveError(f"в ответе r.jina.ai нет изображения проекта {project_id}")
 
     if prefer_disp:
-        candidate = _disp_variant(og_image)
+        candidate = _disp_variant(image_url)
         if candidate and await _is_accessible(candidate):
             return candidate
 
-    if not await _is_accessible(og_image):
-        raise BehanceResolveError(f"изображение недоступно: {og_image}")
-    return og_image
+    if not await _is_accessible(image_url):
+        raise BehanceResolveError(f"изображение недоступно: {image_url}")
+    return image_url

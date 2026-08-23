@@ -10441,15 +10441,32 @@ class BehanceCoverResolverTests(unittest.IsolatedAsyncioTestCase):
     CDN_1400 = "https://mir-s3-cdn-cf.behance.net/project_modules/1400/b63348237585701.69036215a8d6b.jpg"
     CDN_DISP = "https://mir-s3-cdn-cf.behance.net/project_modules/disp/b63348237585701.69036215a8d6b.jpg"
 
-    def _page(self, og_image: str | None) -> bytes:
-        tag = f'<meta property="og:image" content="{og_image}" />' if og_image else ""
-        return (
-            '<html><head><meta property="og:title" content="X" />'
-            f'{tag}'
-            '<meta property="og:image:width" content="1400" />'
-            '<meta property="og:image:height" content="1459" />'
-            "</head><body></body></html>"
-        ).encode("utf-8")
+    PROJECT_ID = "237585701"
+    # Превью ЧУЖИХ проектов из блока рекомендаций. В реальном ответе
+    # r.jina.ai они идут ПЕРВЫМИ (проверено на живом ответе: первые шесть
+    # ссылок — чужие работы), поэтому фикстура обязана их воспроизводить:
+    # иначе тест не поймает регрессию "берём первую попавшуюся картинку".
+    FOREIGN_URLS = (
+        "https://mir-s3-cdn-cf.behance.net/projects/original/c123d9245908309.Y3JvcCwx.gif",
+        "https://mir-s3-cdn-cf.behance.net/projects/max_808/63e4c3213437641.Y3JvcCwx.jpg",
+        "https://mir-s3-cdn-cf.behance.net/project_modules/1400_webp/99999999999999.deadbeef.jpg",
+    )
+
+    def _page(self, project_image: str | None) -> bytes:
+        """Похоже на реальный markdown-ответ r.jina.ai: заголовок, ссылки
+        навигации и превью чужих проектов ПЕРЕД картинкой нужного проекта."""
+        lines = [
+            "Title: UI/UX Design for Marketing Agency Website",
+            "",
+            f"URL Source: {self.REAL_URL}",
+            "",
+            "Markdown Content:",
+            "Sign In",
+            *(f"![Image]({u})" for u in self.FOREIGN_URLS),
+        ]
+        if project_image:
+            lines.append(f"![Image]({project_image})")
+        return "\n".join(lines).encode("utf-8")
 
     # ---- URL validation (host + path), до любого сетевого запроса ----
 
@@ -10470,7 +10487,59 @@ class BehanceCoverResolverTests(unittest.IsolatedAsyncioTestCase):
         for bad in ("not-a-url", "", "   ", None, "ftp://www.behance.net/gallery/1/x"):
             self.assertFalse(behance.is_behance_project_url(bad), f"expected reject: {bad!r}")
 
-    # ---- og:image extraction ----
+    # ---- project id + CDN extraction via r.jina.ai ----
+
+    def test_project_id_extracted_from_url(self):
+        self.assertEqual(behance.project_id_from_url(self.REAL_URL), self.PROJECT_ID)
+        self.assertIsNone(behance.project_id_from_url("https://www.behance.net/someuser"))
+        self.assertIsNone(behance.project_id_from_url("not-a-url"))
+
+    def test_extract_picks_project_image_not_foreign_recommendations(self):
+        # Ключевая регрессия: в реальном ответе ссылки на чужие проекты идут
+        # ПЕРЕД нужной. Наивное "взять первую CDN-ссылку" поставило бы в
+        # обложку кейса чужую картинку.
+        text = self._page(self.CDN_1400).decode()
+        found = behance.extract_project_cdn_url(text, self.PROJECT_ID)
+        self.assertEqual(found, self.CDN_1400)
+        for foreign in self.FOREIGN_URLS:
+            self.assertNotEqual(found, foreign)
+
+    def test_extract_returns_none_when_project_image_absent(self):
+        text = self._page(None).decode()  # только чужие превью
+        self.assertIsNone(behance.extract_project_cdn_url(text, self.PROJECT_ID))
+
+    def test_extract_returns_none_for_empty_or_missing_id(self):
+        self.assertIsNone(behance.extract_project_cdn_url("", self.PROJECT_ID))
+        self.assertIsNone(behance.extract_project_cdn_url("some text", ""))
+
+    def test_resolver_requests_via_jina_not_behance_directly(self):
+        captured = {}
+
+        def fake_get(url, timeout=15):
+            captured["url"] = url
+            return 200, self._page(self.CDN_1400)
+
+        with patch.object(behance, "_http_get", side_effect=fake_get), \
+             patch.object(behance, "_http_head", return_value=200):
+            asyncio.run(behance.resolve_cover_url(self.REAL_URL))
+        self.assertTrue(captured["url"].startswith("https://r.jina.ai/"))
+        self.assertNotEqual(captured["url"], self.REAL_URL)
+
+    async def test_jina_http_error_surfaces_as_controlled_error(self):
+        with patch.object(behance, "_http_get", return_value=(500, b"")):
+            with self.assertRaises(behance.BehanceResolveError) as ctx:
+                await behance.resolve_cover_url(self.REAL_URL)
+        msg = str(ctx.exception)
+        self.assertIn("500", msg)
+        self.assertNotIn("Traceback", msg)
+
+    async def test_jina_empty_or_changed_format_surfaces_as_controlled_error(self):
+        for body in (b"", b"completely different format, no cdn links"):
+            with patch.object(behance, "_http_get", return_value=(200, body)):
+                with self.assertRaises(behance.BehanceResolveError):
+                    await behance.resolve_cover_url(self.REAL_URL)
+
+    # ---- og:image extraction (сохранена как отдельная утилита) ----
 
     def test_extracts_og_image_both_attribute_orders(self):
         forward = '<meta property="og:image" content="https://cdn/x.jpg" />'
@@ -10663,9 +10732,11 @@ class BehanceCoverResolverTests(unittest.IsolatedAsyncioTestCase):
              patch.object(behance, "_http_head", side_effect=head):
             await behance.resolve_cover_url(self.REAL_URL)
 
-        # _http_get вызван РОВНО один раз и только для HTML-страницы проекта.
+        # _http_get вызван РОВНО один раз и только за текстом страницы —
+        # через r.jina.ai, а не напрямую к www.behance.net (Render получает
+        # оттуда 403).
         mock_get.assert_called_once()
-        self.assertEqual(mock_get.call_args.args[0], self.REAL_URL)
+        self.assertEqual(mock_get.call_args.args[0], behance._JINA_ENDPOINT + self.REAL_URL)
         # Картинка запрашивалась только через HEAD.
         self.assertTrue(all("mir-s3-cdn-cf.behance.net" in u for u in captured))
 
