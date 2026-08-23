@@ -34,6 +34,7 @@ from aiogram.utils.web_app import check_webapp_signature as aiogram_check_webapp
 
 import bot.admin_keyboards as kb
 import bot.content_store as content_store
+import bot.behance as behance
 import bot.r2_storage as r2_storage
 import bot.handlers.admin as admin
 import bot.handlers.faq as faq
@@ -1274,7 +1275,12 @@ class AdminMultiStepWizardAnchorTests(unittest.IsolatedAsyncioTestCase):
         title_msg = make_flow_message_factory(chat_id=self.actor, start_id=4000)(text="Новый лендинг")
         await admin.cases_add_title(title_msg, state)
         title_msg.bot.edit_message_text.assert_awaited_once_with(
-            "Пришлите фото кейса (как фото):", chat_id=self.actor, message_id=500, reply_markup=kb.cancel_keyboard()
+            # Текст промпта расширен вместе с Behance-интеграцией: на этом же
+            # шаге теперь принимается и ссылка на проект Behance (см.
+            # admin.cases_add_photo_behance). Проверяемое здесь поведение —
+            # RULE 3 / anchor, а не сама формулировка.
+            "Пришлите фото кейса (как фото) — или ссылку на проект Behance:",
+            chat_id=self.actor, message_id=500, reply_markup=kb.cancel_keyboard()
         )
         title_msg.answer.assert_not_awaited()  # RULE 3: редактирование на месте, не новое сообщение
 
@@ -10421,6 +10427,382 @@ class FormatStatusNotificationTests(unittest.TestCase):
     def test_fallback_on_whitespace_only(self):
         text = lead_format.format_status_notification("   ", "IN_PROGRESS")
         self.assertIn("Ваша заявка обновлена\nВаша заявка\nСтатус:", text)
+
+
+class BehanceCoverResolverTests(unittest.IsolatedAsyncioTestCase):
+    """E2E-эксперимент: обложка кейса берётся напрямую с CDN Behance по
+    og:image, без нашего object storage и без proxy (см. bot/behance.py).
+
+    Сеть здесь НЕ трогается: _http_get/_http_head замоканы. Живая проверка
+    против реального проекта выполнялась отдельно, вне suite — тесты не
+    должны зависеть от доступности Behance."""
+
+    REAL_URL = "https://www.behance.net/gallery/237585701/UIUX-Design-for-Marketing-Agency-Website"
+    CDN_1400 = "https://mir-s3-cdn-cf.behance.net/project_modules/1400/b63348237585701.69036215a8d6b.jpg"
+    CDN_DISP = "https://mir-s3-cdn-cf.behance.net/project_modules/disp/b63348237585701.69036215a8d6b.jpg"
+
+    def _page(self, og_image: str | None) -> bytes:
+        tag = f'<meta property="og:image" content="{og_image}" />' if og_image else ""
+        return (
+            '<html><head><meta property="og:title" content="X" />'
+            f'{tag}'
+            '<meta property="og:image:width" content="1400" />'
+            '<meta property="og:image:height" content="1459" />'
+            "</head><body></body></html>"
+        ).encode("utf-8")
+
+    # ---- URL validation (host + path), до любого сетевого запроса ----
+
+    def test_accepts_real_project_url(self):
+        self.assertTrue(behance.is_behance_project_url(self.REAL_URL))
+
+    def test_rejects_non_behance_host(self):
+        self.assertFalse(behance.is_behance_project_url("https://example.com/gallery/123/x"))
+
+    def test_rejects_behance_homepage_and_profile(self):
+        # Регрессия на реально воспроизведённую проблему: у главной/профиля
+        # тоже есть og:image (generic SEO-логотип Behance), и без проверки
+        # пути такая ссылка молча становилась бы "обложкой кейса".
+        self.assertFalse(behance.is_behance_project_url("https://www.behance.net/"))
+        self.assertFalse(behance.is_behance_project_url("https://www.behance.net/someuser"))
+
+    def test_rejects_malformed_and_empty(self):
+        for bad in ("not-a-url", "", "   ", None, "ftp://www.behance.net/gallery/1/x"):
+            self.assertFalse(behance.is_behance_project_url(bad), f"expected reject: {bad!r}")
+
+    # ---- og:image extraction ----
+
+    def test_extracts_og_image_both_attribute_orders(self):
+        forward = '<meta property="og:image" content="https://cdn/x.jpg" />'
+        reverse = '<meta content="https://cdn/x.jpg" property="og:image" />'
+        self.assertEqual(behance.extract_og_image(forward), "https://cdn/x.jpg")
+        self.assertEqual(behance.extract_og_image(reverse), "https://cdn/x.jpg")
+
+    def test_does_not_confuse_og_image_width_for_og_image(self):
+        html_only_dimensions = '<meta property="og:image:width" content="1400" />'
+        self.assertIsNone(behance.extract_og_image(html_only_dimensions))
+
+    def test_decodes_html_entities_in_url(self):
+        raw = '<meta property="og:image" content="https://cdn/x.jpg?a=1&amp;b=2" />'
+        self.assertEqual(behance.extract_og_image(raw), "https://cdn/x.jpg?a=1&b=2")
+
+    def test_returns_none_when_no_og_image(self):
+        self.assertIsNone(behance.extract_og_image("<html><head></head></html>"))
+
+    # ---- disp size variant ----
+
+    def test_disp_variant_substitution(self):
+        self.assertEqual(behance._disp_variant(self.CDN_1400), self.CDN_DISP)
+
+    def test_disp_variant_returns_none_for_unknown_url_shape(self):
+        # Не ломаем URL искусственно: если форма не та, подмены не делаем.
+        self.assertIsNone(behance._disp_variant("https://example.com/some/other/image.jpg"))
+        self.assertIsNone(behance._disp_variant(self.CDN_DISP))  # уже disp
+
+    # ---- resolve_cover_url ----
+
+    async def test_resolve_prefers_disp_when_accessible(self):
+        with patch.object(behance, "_http_get", return_value=(200, self._page(self.CDN_1400))), \
+             patch.object(behance, "_http_head", return_value=200):
+            cover = await behance.resolve_cover_url(self.REAL_URL)
+        self.assertEqual(cover, self.CDN_DISP)
+
+    async def test_resolve_falls_back_to_original_when_disp_unavailable(self):
+        def head(url, timeout=10):
+            return 404 if "/disp/" in url else 200
+
+        with patch.object(behance, "_http_get", return_value=(200, self._page(self.CDN_1400))), \
+             patch.object(behance, "_http_head", side_effect=head):
+            cover = await behance.resolve_cover_url(self.REAL_URL)
+        self.assertEqual(cover, self.CDN_1400)
+
+    async def test_resolve_raises_when_no_og_image(self):
+        with patch.object(behance, "_http_get", return_value=(200, self._page(None))):
+            with self.assertRaises(behance.BehanceResolveError):
+                await behance.resolve_cover_url(self.REAL_URL)
+
+    async def test_resolve_raises_on_non_200_page(self):
+        with patch.object(behance, "_http_get", return_value=(404, b"")):
+            with self.assertRaises(behance.BehanceResolveError):
+                await behance.resolve_cover_url(self.REAL_URL)
+
+    async def test_resolve_raises_when_behance_unreachable(self):
+        with patch.object(behance, "_http_get", side_effect=urllib.error.URLError("network down")):
+            with self.assertRaises(behance.BehanceResolveError):
+                await behance.resolve_cover_url(self.REAL_URL)
+
+    async def test_resolve_raises_when_image_inaccessible(self):
+        with patch.object(behance, "_http_get", return_value=(200, self._page(self.CDN_1400))), \
+             patch.object(behance, "_http_head", return_value=403):
+            with self.assertRaises(behance.BehanceResolveError):
+                await behance.resolve_cover_url(self.REAL_URL)
+
+    async def test_resolve_rejects_non_https_og_image(self):
+        with patch.object(behance, "_http_get", return_value=(200, self._page("http://cdn/insecure.jpg"))):
+            with self.assertRaises(behance.BehanceResolveError):
+                await behance.resolve_cover_url(self.REAL_URL)
+
+    async def test_non_behance_url_never_triggers_network_call(self):
+        # Гарантия, что модуль не превращается в универсальный web-fetcher:
+        # посторонний URL отсекается ДО первого запроса.
+        with patch.object(behance, "_http_get") as mock_get:
+            with self.assertRaises(behance.BehanceResolveError):
+                await behance.resolve_cover_url("https://example.com/gallery/1/x")
+        mock_get.assert_not_called()
+
+    async def test_image_bytes_are_never_downloaded(self):
+        # Ключевое свойство эксперимента: проверяем доступность картинки
+        # HEAD-запросом, байты через Render не проходят.
+        captured = []
+
+        def head(url, timeout=10):
+            captured.append(url)
+            return 200
+
+        with patch.object(behance, "_http_get", return_value=(200, self._page(self.CDN_1400))) as mock_get, \
+             patch.object(behance, "_http_head", side_effect=head):
+            await behance.resolve_cover_url(self.REAL_URL)
+
+        # _http_get вызван РОВНО один раз и только для HTML-страницы проекта.
+        mock_get.assert_called_once()
+        self.assertEqual(mock_get.call_args.args[0], self.REAL_URL)
+        # Картинка запрашивалась только через HEAD.
+        self.assertTrue(all("mir-s3-cdn-cf.behance.net" in u for u in captured))
+
+
+class BehanceCoverIntegrationTests(unittest.IsolatedAsyncioTestCase):
+    """Цепочка external_url -> resolver -> cover -> portfolio.json, целиком
+    на существующих функциях content_store (add_case/update_case). Storage
+    abstraction (upload_image/delete_image/is_configured) не участвует."""
+
+    async def asyncSetUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        real_data_dir = Path(__file__).resolve().parent.parent / "data"
+        for name in ("pricing.json", "portfolio.json", "faq.json", "about.json", "ui_config.json"):
+            shutil.copy(real_data_dir / name, Path(self.tmpdir) / name)
+        self._orig_data_dir = content_store.DATA_DIR
+        self._orig_designer = content_store.config.DESIGNER_CHAT_ID
+        content_store.DATA_DIR = Path(self.tmpdir)
+        content_store.config.DESIGNER_CHAT_ID = "999"
+        self.actor = "999"
+
+    def tearDown(self):
+        content_store.DATA_DIR = self._orig_data_dir
+        content_store.config.DESIGNER_CHAT_ID = self._orig_designer
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    async def test_behance_case_stores_project_url_and_resolved_cover_separately(self):
+        project_url = BehanceCoverResolverTests.REAL_URL
+        resolved = BehanceCoverResolverTests.CDN_DISP
+
+        with patch.object(behance, "_http_get", return_value=(200, (
+                f'<meta property="og:image" content="{BehanceCoverResolverTests.CDN_1400}" />'
+            ).encode("utf-8"))), \
+             patch.object(behance, "_http_head", return_value=200):
+            cover = await behance.resolve_cover_url(project_url)
+
+        await content_store.add_case(
+            self.actor, case_id="case_behance_test", title="TEST — Behance Cover",
+            type_id="landing", cover=cover, task="E2E", related_service=None,
+        )
+        await content_store.update_case(self.actor, "case_behance_test", external_url=project_url)
+
+        case = next(c for c in await content_store.list_cases() if c["id"] == "case_behance_test")
+        # Семантика полей не смешивается: ссылка на проект остаётся ссылкой,
+        # cover — прямой URL картинки.
+        self.assertEqual(case["external_url"], project_url)
+        self.assertEqual(case["cover"], resolved)
+        self.assertTrue(case["cover"].startswith("https://"))
+        self.assertIn(resolved, case["images"])
+
+    async def test_existing_local_cover_cases_are_untouched(self):
+        # Регрессия: эксперимент не должен менять уже существующие кейсы с
+        # относительными путями к демо-SVG.
+        cases = await content_store.list_cases()
+        legacy = [c for c in cases if str(c.get("cover", "")).startswith("img/portfolio/")]
+        self.assertTrue(legacy, "ожидались демо-кейсы с относительными путями")
+        for case in legacy:
+            self.assertFalse(case["cover"].startswith("http"))
+
+
+class BehanceAdminFlowTests(unittest.IsolatedAsyncioTestCase):
+    """Интеграция Behance resolver в существующий admin flow: создание кейса
+    ссылкой вместо фото и смена external_url у существующего кейса.
+
+    Сеть не трогается — behance._http_get/_http_head замоканы. Проверяется
+    именно admin-цепочка, сам resolver покрыт BehanceCoverResolverTests."""
+
+    PROJECT_URL = BehanceCoverResolverTests.REAL_URL
+    CDN_1400 = BehanceCoverResolverTests.CDN_1400
+    CDN_DISP = BehanceCoverResolverTests.CDN_DISP
+
+    async def asyncSetUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        real_data_dir = Path(__file__).resolve().parent.parent / "data"
+        for name in ("pricing.json", "portfolio.json", "faq.json", "about.json", "ui_config.json"):
+            shutil.copy(real_data_dir / name, Path(self.tmpdir) / name)
+        self._orig_data_dir = content_store.DATA_DIR
+        self._orig_designer = content_store.config.DESIGNER_CHAT_ID
+        content_store.DATA_DIR = Path(self.tmpdir)
+        content_store.config.DESIGNER_CHAT_ID = "999"
+        self.actor = 999
+
+    def tearDown(self):
+        content_store.DATA_DIR = self._orig_data_dir
+        content_store.config.DESIGNER_CHAT_ID = self._orig_designer
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def _mock_behance_ok(self):
+        page = f'<meta property="og:image" content="{self.CDN_1400}" />'.encode("utf-8")
+        return (
+            patch.object(behance, "_http_get", return_value=(200, page)),
+            patch.object(behance, "_http_head", return_value=200),
+        )
+
+    async def _case(self, case_id):
+        return next((c for c in await content_store.list_cases() if c["id"] == case_id), None)
+
+    # ---- Test A + B: create via Behance URL sets cover, keeps external_url ----
+
+    async def test_A_B_create_case_from_behance_url_sets_cover_and_keeps_project_url(self):
+        state = make_state(self.actor)
+        await state.set_state(AdminStates.add_case_photo)
+        case_id = await content_store.next_case_id()
+        await state.update_data(case_id=case_id, title="TEST — Behance Cover", type_id="site")
+
+        get_p, head_p = self._mock_behance_ok()
+        with get_p, head_p:
+            await admin.cases_add_photo_behance(
+                make_flow_message_factory(chat_id=self.actor, start_id=7000)(text=self.PROJECT_URL), state
+            )
+        # Перешли к описанию — тот же шаг, что и после загрузки фото.
+        self.assertEqual(await state.get_state(), AdminStates.add_case_description.state)
+        self.assertEqual((await state.get_data())["cover"], self.CDN_DISP)
+
+        await admin.cases_add_description(
+            make_flow_message_factory(chat_id=self.actor, start_id=7100)(text="E2E описание"), state
+        )
+
+        case = await self._case(case_id)
+        self.assertIsNotNone(case)
+        # Test A: cover — CDN-ссылка Behance (disp-вариант)
+        self.assertEqual(case["cover"], self.CDN_DISP)
+        # Test B: external_url — исходная ссылка на проект, НЕ подменена картинкой
+        self.assertEqual(case["external_url"], self.PROJECT_URL)
+        self.assertNotEqual(case["external_url"], case["cover"])
+
+    # ---- Test C: invalid / non-project URL -> controlled error ----
+
+    async def test_C_non_project_behance_url_is_rejected_without_creating_case(self):
+        state = make_state(self.actor)
+        await state.set_state(AdminStates.add_case_photo)
+        await state.update_data(case_id="case_should_not_exist", title="X", type_id="site")
+
+        msg = make_flow_message_factory(chat_id=self.actor, start_id=7200)(text="https://www.behance.net/someuser")
+        with patch.object(behance, "_http_get") as mock_get:
+            await admin.cases_add_photo_behance(msg, state)
+        mock_get.assert_not_called()  # отсечено до сети
+        # Остались на том же шаге, cover не выставлен, кейс не создан.
+        self.assertEqual(await state.get_state(), AdminStates.add_case_photo.state)
+        self.assertIsNone((await state.get_data()).get("cover"))
+        self.assertIsNone(await self._case("case_should_not_exist"))
+
+    async def test_C_resolver_failure_shows_friendly_error_without_traceback(self):
+        state = make_state(self.actor)
+        await state.set_state(AdminStates.add_case_photo)
+        await state.update_data(case_id="case_fail", title="X", type_id="site")
+
+        msg = make_flow_message_factory(chat_id=self.actor, start_id=7300)(text=self.PROJECT_URL)
+        with patch.object(behance, "_http_get", return_value=(404, b"")):
+            await admin.cases_add_photo_behance(msg, state)
+
+        # step_from_text редактирует anchor, если он засеян в state, иначе
+        # шлёт новое сообщение (см. bot/flow.py) — здесь anchor не засеян.
+        if msg.bot.edit_message_text.await_args is not None:
+            shown = msg.bot.edit_message_text.await_args.args[0]
+        else:
+            shown = msg.answer.await_args.args[0]
+        self.assertIn("Не удалось получить обложку с Behance", shown)
+        self.assertNotIn("Traceback", shown)
+        self.assertNotIn("BehanceResolveError", shown)
+        self.assertEqual(await state.get_state(), AdminStates.add_case_photo.state)
+        self.assertIsNone((await state.get_data()).get("cover"))
+
+    # ---- Test D: existing upload flow unchanged ----
+
+    async def test_D_existing_photo_upload_flow_still_uses_storage_backend(self):
+        state = make_state(self.actor)
+        await state.set_state(AdminStates.add_case_photo)
+        await state.update_data(case_id="case_photo_flow", title="X", type_id="site")
+
+        photo_msg = make_photo_message(self.actor)
+        with patch.object(content_store, "save_case_photo", new=AsyncMock(return_value="img/portfolio/case_x.jpg")) as mock_save:
+            await admin.cases_add_photo(photo_msg, state)
+
+        # Обычная загрузка по-прежнему идёт через существующий storage.
+        mock_save.assert_awaited_once()
+        self.assertEqual((await state.get_data())["cover"], "img/portfolio/case_x.jpg")
+        # Behance тут не участвует — external_url не появляется.
+        self.assertIsNone((await state.get_data()).get("external_url"))
+        self.assertEqual(await state.get_state(), AdminStates.add_case_description.state)
+
+    # ---- Test E: non-Behance case unaffected; edit path ----
+
+    async def test_E_editing_non_behance_external_url_does_not_touch_cover(self):
+        await content_store.add_case(
+            self.actor, case_id="case_plain", title="Plain", type_id="site",
+            cover="img/portfolio/demo_case_1.svg", task="t", related_service=None,
+        )
+        state = make_state(self.actor)
+        await state.set_state(AdminStates.edit_case_value)
+        await state.update_data(case_id="case_plain", field="external_url")
+
+        msg = make_flow_message_factory(chat_id=self.actor, start_id=7400)(text="https://example.com/portfolio")
+        with patch.object(behance, "_http_get") as mock_get:
+            await admin.cases_edit_value(msg, state)
+        mock_get.assert_not_called()
+
+        case = await self._case("case_plain")
+        self.assertEqual(case["external_url"], "https://example.com/portfolio")
+        self.assertEqual(case["cover"], "img/portfolio/demo_case_1.svg")  # обложка не тронута
+
+    async def test_edit_external_url_to_behance_updates_cover(self):
+        await content_store.add_case(
+            self.actor, case_id="case_to_behance", title="X", type_id="site",
+            cover="img/portfolio/demo_case_2.svg", task="t", related_service=None,
+        )
+        state = make_state(self.actor)
+        await state.set_state(AdminStates.edit_case_value)
+        await state.update_data(case_id="case_to_behance", field="external_url")
+
+        get_p, head_p = self._mock_behance_ok()
+        with get_p, head_p:
+            await admin.cases_edit_value(
+                make_flow_message_factory(chat_id=self.actor, start_id=7500)(text=self.PROJECT_URL), state
+            )
+
+        case = await self._case("case_to_behance")
+        self.assertEqual(case["external_url"], self.PROJECT_URL)
+        self.assertEqual(case["cover"], self.CDN_DISP)
+
+    async def test_editing_other_text_field_is_unaffected(self):
+        await content_store.add_case(
+            self.actor, case_id="case_title_edit", title="Old", type_id="site",
+            cover="img/portfolio/demo_case_3.svg", task="t", related_service=None,
+        )
+        state = make_state(self.actor)
+        await state.set_state(AdminStates.edit_case_value)
+        await state.update_data(case_id="case_title_edit", field="title")
+
+        with patch.object(behance, "_http_get") as mock_get:
+            await admin.cases_edit_value(
+                make_flow_message_factory(chat_id=self.actor, start_id=7600)(text="New title"), state
+            )
+        mock_get.assert_not_called()
+
+        case = await self._case("case_title_edit")
+        self.assertEqual(case["title"], "New title")
+        self.assertEqual(case["cover"], "img/portfolio/demo_case_3.svg")
 
 
 if __name__ == "__main__":

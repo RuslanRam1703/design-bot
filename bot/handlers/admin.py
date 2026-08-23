@@ -25,7 +25,7 @@ from aiogram.fsm.state import State
 from aiogram.types import BufferedInputFile, CallbackQuery, InlineKeyboardMarkup, Message
 
 from bot import admin_keyboards as kb
-from bot import config, content_store, flow, r2_storage, texts
+from bot import behance, config, content_store, flow, r2_storage, texts
 from bot import lead as lead_format
 from bot.handlers.start import main_menu_or_confirm
 from bot.states import AdminStates
@@ -314,7 +314,11 @@ async def cases_add_title(message: Message, state: FSMContext) -> None:
     # границу primitives.
     case_id = await content_store.next_case_id()
     await state.update_data(title=message.text.strip(), case_id=case_id)
-    await flow.step_from_text(message, state, "Пришлите фото кейса (как фото):", kb.cancel_keyboard())
+    await flow.step_from_text(
+        message, state,
+        "Пришлите фото кейса (как фото) — или ссылку на проект Behance:",
+        kb.cancel_keyboard(),
+    )
     await state.set_state(AdminStates.add_case_photo)
 
 
@@ -332,6 +336,48 @@ async def cases_add_photo(message: Message, state: FSMContext) -> None:
         await flow.step_from_text(message, state, "Не удалось загрузить изображение, попробуйте ещё раз 🙁", kb.cancel_keyboard())
         return
     await state.update_data(cover=cover)
+    await flow.step_from_text(message, state, "Короткое описание задачи (пара предложений):", kb.cancel_keyboard())
+    await state.set_state(AdminStates.add_case_description)
+
+
+@router.message(AdminStates.add_case_photo, F.text)
+async def cases_add_photo_behance(message: Message, state: FSMContext) -> None:
+    """Альтернатива загрузке фото на этом же шаге: ссылка на проект Behance.
+    Обложка берётся из og:image самого Behance (см. bot/behance.py) и живёт
+    на его CDN — наш storage backend (save_case_photo/R2) в этом пути НЕ
+    участвует вообще, ни одного байта картинки через Render не проходит.
+
+    Зарегистрирован СТРОГО между cases_add_photo (F.photo | F.document) и
+    catch-all cases_add_photo_wrong: внутри одного router выигрывает первый
+    совпавший хендлер, поэтому фото по-прежнему уходит в обычный upload,
+    текст — сюда, а всё остальное (стикер/голос) — в прежний fallback.
+
+    external_url здесь только запоминается в state: add_case() не принимает
+    это поле (менять content_store.py в этой задаче нельзя), поэтому оно
+    проставляется отдельным update_case() уже после создания кейса —
+    см. cases_add_description ниже."""
+    url = message.text.strip()
+    if not behance.is_behance_project_url(url):
+        await flow.step_from_text(
+            message, state,
+            "Нужно фото 📎 или ссылка на проект Behance вида behance.net/gallery/…",
+            kb.cancel_keyboard(),
+        )
+        return
+    try:
+        cover = await behance.resolve_cover_url(url)
+    except behance.BehanceResolveError as e:
+        # Пользователю — понятная формулировка без traceback и внутренних
+        # деталей; сама причина уходит только в логи.
+        logger.warning("Behance cover resolve failed (new case): %s", e)
+        await flow.step_from_text(
+            message, state,
+            "Не удалось получить обложку с Behance 🙁 Проверьте, что это ссылка "
+            "на публичный проект, и пришлите её ещё раз — либо загрузите фото.",
+            kb.cancel_keyboard(),
+        )
+        return
+    await state.update_data(cover=cover, external_url=url)
     await flow.step_from_text(message, state, "Короткое описание задачи (пара предложений):", kb.cancel_keyboard())
     await state.set_state(AdminStates.add_case_description)
 
@@ -354,6 +400,14 @@ async def cases_add_description(message: Message, state: FSMContext) -> None:
         task=message.text.strip(),
         related_service=related_service,
     )
+    # Кейс создан из Behance-ссылки: сохраняем сам URL проекта отдельным
+    # полем через уже существующий update_case (add_case не принимает
+    # external_url, а content_store.py в этой задаче не меняется).
+    # Семантика полей не смешивается: external_url — ссылка на проект,
+    # cover — прямой URL картинки на CDN Behance.
+    behance_url = data.get("external_url")
+    if behance_url:
+        await content_store.update_case(message.chat.id, data["case_id"], external_url=behance_url)
     # step_from_text, затем finish_flow, НЕ reset_state_keep_nav (P1-3,
     # Batch 4 — исправляет собственную находку Batch 1): когда edit
     # внутри step_from_text успевает отредактировать существующий anchor
@@ -881,7 +935,27 @@ async def cases_edit_value(message: Message, state: FSMContext) -> None:
         if not message.text:
             await flow.step_from_text(message, state, "Нужен текст.", kb.cancel_keyboard())
             return
-        await content_store.update_case(message.chat.id, data["case_id"], **{field: message.text.strip()})
+        value = message.text.strip()
+        if field == "external_url" and behance.is_behance_project_url(value):
+            # Смена ссылки на Behance-проект заодно обновляет обложку из
+            # og:image нового проекта. Старую обложку НЕ удаляем через
+            # storage: если она была на Behance CDN — она нам не принадлежит,
+            # а если это был обычный загруженный файл, его удаление — забота
+            # существующего cover-flow, который здесь не затрагивается.
+            try:
+                cover = await behance.resolve_cover_url(value)
+            except behance.BehanceResolveError as e:
+                logger.warning("Behance cover resolve failed (edit case %s): %s", data["case_id"], e)
+                await flow.step_from_text(
+                    message, state,
+                    "Не удалось получить обложку с Behance 🙁 Проверьте, что это ссылка "
+                    "на публичный проект, и пришлите её ещё раз.",
+                    kb.cancel_keyboard(),
+                )
+                return
+            await content_store.update_case(message.chat.id, data["case_id"], external_url=value, cover=cover)
+        else:
+            await content_store.update_case(message.chat.id, data["case_id"], **{field: value})
     # flow.step_from_text (P1-3, Batch 3) — success-переход в
     # edit_case_field_pick (cancel_to="cases" сохраняется).
     await flow.step_from_text(message, state, "Обновлено ✅\n\nЧто ещё изменить?", kb.case_field_keyboard())
