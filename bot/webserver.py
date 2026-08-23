@@ -1,7 +1,6 @@
 import dataclasses
 import json
 import logging
-import re
 from pathlib import Path
 
 from aiogram import Bot
@@ -42,64 +41,6 @@ async def handle_index(request: web.Request) -> web.Response:
 
 async def handle_health(request: web.Request) -> web.Response:
     return web.Response(text="ok")
-
-
-# ---------------------------------------------------------------------------
-# ВРЕМЕННЫЙ ДИАГНОСТИЧЕСКИЙ ENDPOINT — УДАЛИТЬ СРАЗУ ПОСЛЕ ЗАМЕРА.
-# Единственная задача: выяснить, доходит ли egress Render до r.jina.ai и
-# возвращает ли тот содержимое страницы Behance (сама www.behance.net с
-# Render отдаёт 403 на edge Adobe/Fastly).
-#
-# URL захардкожен намеренно — endpoint НЕ принимает произвольный адрес,
-# иначе это был бы SSRF-примитив, открытый анонимно. Замеряются оба режима
-# сразу (обычный и x-respond-with: html), чтобы не делать второй деплой.
-# bot/behance.py не импортируется и не изменяется.
-_JINA_PROBE_URL = (
-    "https://r.jina.ai/https://www.behance.net/gallery/237585701/"
-    "UIUX-Design-for-Marketing-Agency-Website"
-)
-_JINA_CDN_RE = re.compile(r"https://mir-s3-cdn-cf\.behance\.net/project_modules/[^\s\"'\)\]]+")
-_JINA_KNOWN_ASSET = "b63348237585701.69036215a8d6b"
-
-
-async def handle_jina_probe(request: web.Request) -> web.Response:
-    import asyncio
-    import time
-    import urllib.error
-    import urllib.request
-
-    def _get(extra_headers: dict) -> dict:
-        headers = {"User-Agent": "DesignAssistantBot/1.0 diagnostic-probe", **extra_headers}
-        req = urllib.request.Request(_JINA_PROBE_URL, headers=headers, method="GET")
-        started = time.monotonic()
-        try:
-            with urllib.request.urlopen(req, timeout=40) as resp:
-                body = resp.read()
-                text = body.decode("utf-8", errors="replace")
-                found = _JINA_CDN_RE.findall(text)
-                return {
-                    "status": resp.status,
-                    "elapsed_s": round(time.monotonic() - started, 2),
-                    "bytes": len(body),
-                    "cdn_urls_found": len(found),
-                    "first_cdn_url": found[0] if found else None,
-                    "matches_known_asset": bool(found and _JINA_KNOWN_ASSET in found[0]),
-                    "error": None,
-                }
-        except urllib.error.HTTPError as e:
-            return {"status": e.code, "elapsed_s": round(time.monotonic() - started, 2),
-                    "bytes": 0, "cdn_urls_found": 0, "first_cdn_url": None,
-                    "matches_known_asset": False, "error": f"HTTPError {e.code} {e.reason}"}
-        except Exception as e:
-            return {"status": None, "elapsed_s": round(time.monotonic() - started, 2),
-                    "bytes": 0, "cdn_urls_found": 0, "first_cdn_url": None,
-                    "matches_known_asset": False, "error": f"{type(e).__name__}: {e}"}
-
-    default_mode = await asyncio.to_thread(_get, {})
-    html_mode = await asyncio.to_thread(_get, {"x-respond-with": "html"})
-    result = {"default": default_mode, "html_mode": html_mode}
-    logger.info("JINA PROBE result: %s", result)
-    return web.json_response(result)
 
 
 async def handle_public_data(request: web.Request) -> web.Response:
@@ -357,7 +298,6 @@ def create_app(bot: Bot) -> web.Application:
     for path in ("/", "/portfolio", "/about", "/calculator", "/brief", "/myleads"):
         app.router.add_get(path, handle_index)
     app.router.add_get("/health", handle_health)
-    app.router.add_get("/api/_jina_probe", handle_jina_probe)  # ВРЕМЕННО — удалить после замера
     app.router.add_get("/api/my-leads", handle_my_leads)
     app.router.add_post("/api/leads", handle_create_lead)
     app.router.add_static("/css/", WEBAPP_DIR / "css")
