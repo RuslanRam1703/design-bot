@@ -48,18 +48,21 @@ def make_state(chat_id: int = 555) -> FSMContext:
     return FSMContext(storage=MemoryStorage(), key=StorageKey(bot_id=0, chat_id=chat_id, user_id=chat_id))
 
 
-def make_message(document=None, photo=None, video=None, animation=None, chat_id=1) -> SimpleNamespace:
+def make_message(
+    document=None, photo=None, video=None, animation=None, voice=None, video_note=None, sticker=None, chat_id=1,
+) -> SimpleNamespace:
     """Достаточно для _handle_brief_submission/handle_tz_file: message.from_user,
     message.bot (async send_message), message.answer (async) — сам объект не
     обязан быть настоящим aiogram Message, потому что типовые аннотации в
     рантайме не проверяются. first_name/last_name присутствуют, т.к. реальный
     aiogram User их всегда отдаёт (first_name обязателен по Telegram Bot API,
     last_name — опционален, но атрибут есть всегда, просто может быть None).
-    document/photo/video/animation по умолчанию None — как у настоящего
-    aiogram Message, когда в сообщении нет соответствующего вложения
-    (Stage B: video/animation добавлены тем же паттерном). chat.id ==
-    from_user.id по умолчанию — тот же принцип, что и в make_flow_message
-    (в приватном чате с ботом они всегда совпадают)."""
+    document/photo/video/animation/voice/video_note/sticker по умолчанию None —
+    как у настоящего aiogram Message, когда в сообщении нет соответствующего
+    вложения (Stage B: video/animation добавлены тем же паттерном; Stage C
+    Batch 1: voice/video_note/sticker — тем же). chat.id == from_user.id по
+    умолчанию — тот же принцип, что и в make_flow_message (в приватном чате
+    с ботом они всегда совпадают)."""
     return SimpleNamespace(
         from_user=SimpleNamespace(id=1, username="client", first_name="Клиент", last_name=None),
         chat=SimpleNamespace(id=chat_id),
@@ -71,6 +74,9 @@ def make_message(document=None, photo=None, video=None, animation=None, chat_id=
         photo=photo,
         video=video,
         animation=animation,
+        voice=voice,
+        video_note=video_note,
+        sticker=sticker,
     )
 
 
@@ -3476,6 +3482,32 @@ class AdminLeadsQueueUxTests(unittest.IsolatedAsyncioTestCase):
         texts = " ".join(self._button_texts(cb.message.edit_text.await_args.kwargs["reply_markup"]))
         self.assertIn(f"#{done_lead['id']}", texts)
 
+    # ---- Stage C Batch 1, Finding 5: filter "Назад" returns to Leads, not Admin root ----
+
+    def test_leads_filter_keyboard_back_button_targets_leads_not_root(self):
+        markup = kb.leads_filter_keyboard()
+        back_buttons = [btn for row in markup.inline_keyboard for btn in row if btn.text == "◀️ Назад"]
+        self.assertEqual(len(back_buttons), 1)
+        self.assertEqual(back_buttons[0].callback_data, "adminmenu:leads")
+
+    async def test_leads_filter_back_returns_to_leads_list_not_root(self):
+        # Симулируем реальный тап "Назад": callback_data теперь "adminmenu:leads",
+        # что означает вызов ровно menu_leads (тот же обработчик, что и вход
+        # в "Заявки" из корня) — сохранённое поведение по умолчанию (ACTIVE),
+        # не сохранение прежнего фильтра (см. implementation plan).
+        await content_store.add_lead({"service_name": "Активная"}, self.telegram)
+        state = make_state(self.actor)
+        cb = make_callback("adminleadaction:filter", chat_id=self.actor)
+        await admin.leads_filter_start(cb, state)  # открыли фильтр
+
+        back_cb = make_callback("adminmenu:leads", chat_id=self.actor)
+        await admin.menu_leads(back_cb, state)  # тап "Назад"
+
+        self.assertEqual(await state.get_state(), AdminStates.leads_list.state)
+        shown_text = back_cb.message.edit_text.await_args.args[0]
+        self.assertIn("Заявки", shown_text)
+        self.assertEqual((await state.get_data())["lead_filter"], "ACTIVE")
+
     async def test_list_keyboard_shows_status_and_updated_at(self):
         lead = await content_store.add_lead({"service_name": "Лендинг"}, self.telegram)
         await content_store.update_lead_status(self.actor, lead["id"], "WAITING_CLIENT")
@@ -4215,6 +4247,86 @@ class ClientTextRelayTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Клиент", kwargs["text"])
         self.assertIn("@client", kwargs["text"])
         self.assertIn("Когда будет готово?", kwargs["text"])
+
+    # ---- Stage C Batch 1, Finding 4: relay stays under Telegram's 4096-char limit ----
+
+    async def test_normal_relay_message_is_unchanged(self):
+        # Regression guard: short client text must survive byte-for-byte,
+        # not just "present as a substring" — proves the new clamp helper
+        # is a true no-op below the threshold.
+        await content_store.add_lead(
+            {"service_name": "Лендинг"}, {"user_id": 1, "username": "client", "first_name": "Клиент"},
+        )
+        message = make_message(chat_id=1)
+        message.text = "Обычное короткое сообщение."
+
+        await start.relay_client_text_to_designer(message, make_state(1))
+
+        text = message.bot.send_message.await_args.kwargs["text"]
+        self.assertTrue(text.endswith("Текст клиента:\nОбычное короткое сообщение."))
+        self.assertNotIn("…", text)
+
+    async def test_oversized_client_text_is_truncated_and_stays_under_telegram_limit(self):
+        await content_store.add_lead(
+            {"service_name": "Лендинг"}, {"user_id": 1, "username": "client", "first_name": "Клиент"},
+        )
+        message = make_message(chat_id=1)
+        message.text = "x" * 4500  # заведомо длиннее, чем Telegram вообще пропустил бы на входе клиенту
+
+        await start.relay_client_text_to_designer(message, make_state(1))
+
+        text = message.bot.send_message.await_args.kwargs["text"]
+        self.assertLessEqual(len(text), 4096)  # реальный Telegram-лимит на исходящее сообщение
+        self.assertIn("…", text)  # явный маркер обрезки
+        # Заголовок/идентичность/лид-контекст сохранены целиком, не обрезаны.
+        self.assertIn("Сообщение по заявке #", text)
+        self.assertIn("Клиент: Клиент (@client)", text)
+        self.assertIn("Текст клиента:", text)
+
+    async def test_oversized_client_text_still_gets_normal_acknowledgement(self):
+        # Обрезка происходит ДО send_message — значит "успешная" отправка
+        # (никакого TelegramBadRequest на длину) и клиент получает обычное
+        # подтверждение, а не текст из except-ветки ("Не получилось...").
+        message = make_message(chat_id=1)
+        message.text = "y" * 4500
+
+        await start.relay_client_text_to_designer(message, make_state(1))
+
+        message.answer.assert_awaited_once_with("Сообщение отправлено дизайнеру ✅")
+
+    # ---- Stage C Batch 1, Finding 4 fix (after read-only review): pathological
+    # header no longer breaks the "guaranteed under Telegram limit" contract ----
+
+    def test_clamp_returns_empty_string_when_no_room_for_client_text(self):
+        # Regression guard for the exact confirmed bug: раньше, когда для
+        # текста клиента не оставалось места (available == 0), функция всё
+        # равно возвращала маркер "…" — непустую строку без единого символа
+        # текста клиента, что и приводило к превышению бюджета
+        # (header_len + маркер). header в 3999 символов -> header_len=4000 ->
+        # available=0 (см. _MAX_RELAY_LENGTH=4000).
+        header_lines = ["x" * 3999]
+        clamped = start._clamp_relay_client_text(header_lines, "нужно ли тут что-то поместить")
+        self.assertEqual(clamped, "")
+
+    async def test_pathological_large_header_still_stays_under_telegram_hard_limit(self):
+        # Прямое воспроизведение сценария из read-only review: у одного
+        # клиента патологически много активных заявок -> строка "Активные
+        # заявки: ..." раздувает сам header далеко за пределы бюджета.
+        # list_leads_by_user замокан синтетическим списком (900 записей) —
+        # через content_store.add_lead это заняло бы ~24с на один тест
+        # (реальная файловая запись на каждый lead), что неприемлемо для
+        # regression-suite; семантика list_leads_by_user (list[dict] с
+        # "status"/"id") воспроизведена точно.
+        synthetic_leads = [{"id": i, "status": "NEW"} for i in range(1, 900)]
+        message = make_message(chat_id=1)
+        message.text = "обычный текст клиента"
+
+        with patch.object(content_store, "list_leads_by_user", AsyncMock(return_value=synthetic_leads)):
+            await start.relay_client_text_to_designer(message, make_state(1))
+
+        text = message.bot.send_message.await_args.kwargs["text"]
+        self.assertLessEqual(len(text), 4096)  # реальный Telegram-лимит — теперь гарантированно соблюдён
+        message.answer.assert_awaited_once_with("Сообщение отправлено дизайнеру ✅")  # не ушло в except-ветку
 
     async def test_zero_active_leads_is_general_inquiry(self):
         message = make_message(chat_id=1)
@@ -9030,6 +9142,70 @@ class LeadMaterialTests(unittest.IsolatedAsyncioTestCase):
         message.animation = make_fake_document()
         await webapp.handle_tz_file(message)
         await self._assert_delivered_to_designer(message, lead_id)
+
+    # ---- Stage C Batch 1, Finding 2: unsupported media while awaiting a file ----
+    # (voice/video_note/sticker — narrow fallback, see handle_unsupported_tz_media)
+
+    async def test_voice_while_awaiting_file_gets_unsupported_message(self):
+        message = make_message()
+        await webapp._handle_brief_submission(message, {"service_name": "Лендинг", "attach_tz": True, "draft_id": "u-voice"})
+        lead_id = (await content_store.find_lead_awaiting_file(message.from_user.id))["id"]
+        message.answer.reset_mock()
+        message.bot.send_message.reset_mock()  # _handle_brief_submission уже уведомил дизайнера о новой заявке
+
+        message.voice = make_fake_document()
+        await webapp.handle_unsupported_tz_media(message)
+
+        message.answer.assert_awaited_once_with(texts.TZ_FILE_UNSUPPORTED_TYPE)
+        message.bot.send_message.assert_not_awaited()  # ничего не пересылается дизайнеру
+        message.forward.assert_not_awaited()
+        lead = await content_store.get_lead(lead_id)
+        self.assertEqual(lead.get("materials", []), [])  # не записано как материал
+        self.assertTrue(lead["awaiting_tz_file"])  # флаг не снят
+
+    async def test_video_note_while_awaiting_file_gets_unsupported_message(self):
+        message = make_message()
+        await webapp._handle_brief_submission(message, {"service_name": "Лендинг", "attach_tz": True, "draft_id": "u-vnote"})
+        message.answer.reset_mock()
+
+        message.video_note = make_fake_document()
+        await webapp.handle_unsupported_tz_media(message)
+
+        message.answer.assert_awaited_once_with(texts.TZ_FILE_UNSUPPORTED_TYPE)
+
+    async def test_sticker_while_awaiting_file_gets_unsupported_message(self):
+        message = make_message()
+        await webapp._handle_brief_submission(message, {"service_name": "Лендинг", "attach_tz": True, "draft_id": "u-sticker"})
+        message.answer.reset_mock()
+
+        message.sticker = make_fake_document()
+        await webapp.handle_unsupported_tz_media(message)
+
+        message.answer.assert_awaited_once_with(texts.TZ_FILE_UNSUPPORTED_TYPE)
+
+    async def test_unsupported_media_when_not_awaiting_file_does_nothing(self):
+        # Нет заявки, ожидающей файл, вообще — тот же no-op, что уже
+        # сегодня для document/photo/video/animation в этой же ситуации
+        # (handle_tz_file, найти лид -> None -> return).
+        message = make_message()
+        message.voice = make_fake_document()
+
+        await webapp.handle_unsupported_tz_media(message)
+
+        message.answer.assert_not_awaited()
+
+    async def test_designer_own_voice_message_not_captured(self):
+        # У дизайнера (тот же chat_id, что и DESIGNER_CHAT_ID) в норме нет
+        # своей заявки, ожидающей файл — тот же guard (find_lead_awaiting_file
+        # по from_user.id), что уже защищает handle_tz_file, без отдельной
+        # DESIGNER_CHAT_ID-проверки.
+        message = make_message()
+        message.from_user = SimpleNamespace(id=777, username="owner", first_name="Дизайнер", last_name=None)
+        message.voice = make_fake_document()
+
+        await webapp.handle_unsupported_tz_media(message)
+
+        message.answer.assert_not_awaited()
 
     async def test_awaiting_state_cleared_after_material_received(self):
         message = make_message()

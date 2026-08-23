@@ -69,6 +69,8 @@ def lead_ack_ask_file(lead_id: int, service_name: str | None, price_range: str |
 
 TZ_FILE_FORWARDED = "Файл получен, спасибо! Я его изучу."
 
+TZ_FILE_UNSUPPORTED_TYPE = "Такой тип файла не поддерживается 🙁 Пришлите, пожалуйста, документом, фото, видео или GIF."
+
 CASE_INTEREST_ACK = "Хорошо! Открываю заявку с указанием этой услуги 👇"
 
 WEBAPP_OPEN_ERROR = (

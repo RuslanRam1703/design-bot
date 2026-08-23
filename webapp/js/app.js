@@ -210,6 +210,21 @@ function persistBriefDraft() {
   }
 }
 
+// render() уже вызывает persistBriefDraft() первым делом (см. ниже), но
+// свободнотекстовые поля (task/name/contact/tz-детали) намеренно НЕ вызывают
+// render() на каждый input — полная перерисовка DOM на каждое нажатие сбила
+// бы фокус и позицию курсора в textarea/input. Из-за этого набранный текст
+// не попадал в localStorage до следующей навигационной кнопки — если
+// Telegram пересоздаст WebView раньше (см. коммент выше про "не переживает
+// полный перезапуск"), только что напечатанное терялось (Stage C аудит).
+// Debounce — тот же persistBriefDraft(), просто с задержкой и БЕЗ render():
+// ни один DOM-узел не трогается, фокус/курсор не задеты.
+let _briefPersistDebounceTimer = null;
+function persistBriefDraftDebounced() {
+  clearTimeout(_briefPersistDebounceTimer);
+  _briefPersistDebounceTimer = setTimeout(persistBriefDraft, 400);
+}
+
 // Возвращает true, только если в localStorage реально лежал корректно
 // разбираемый черновик и он был влит в state.brief — это и есть сигнал
 // "существует восстановленный draft" для briefEntryPending (см. init()).
@@ -1185,6 +1200,7 @@ function attachBriefEvents() {
       counter.textContent = `${state.brief.task.length}/${TASK_MAXLEN}`;
       counter.classList.toggle("over", state.brief.task.length > TASK_MAXLEN);
       document.getElementById("brief-next").disabled = state.brief.task.trim().length < 10;
+      persistBriefDraftDebounced();
     });
   }
 
@@ -1221,10 +1237,12 @@ function attachBriefEvents() {
   if (nameInput) nameInput.addEventListener("input", () => {
     state.brief.name = nameInput.value;
     validateNameContactStep();
+    persistBriefDraftDebounced();
   });
   if (contactInput) contactInput.addEventListener("input", () => {
     state.brief.contactValue = contactInput.value;
     validateNameContactStep();
+    persistBriefDraftDebounced();
   });
   document.querySelectorAll("[data-tz-pick]").forEach((el) =>
     el.addEventListener("click", () => {
@@ -1239,6 +1257,7 @@ function attachBriefEvents() {
     if (el) el.addEventListener("input", () => {
       state.brief.tzDetails[key] = el.value;
       validateContactStep();
+      persistBriefDraftDebounced();
     });
   }
 
@@ -1945,9 +1964,19 @@ function renderSupplement() {
   if (!s) return `<div class="empty-state">Заявка не выбрана.</div>`;
 
   if (s.sent) {
+    // Тот же паттерн, что и renderSubmitted()'s tzLine — тот случай уже
+    // корректно объясняет клиенту, что файл нужно отправить отдельным
+    // сообщением в чат с ботом, а не через Mini App; здесь тот же
+    // actionable-текст, только вводная фраза под формулировку чекбокса
+    // самого supplement-экрана ("Пришлю файл следующим сообщением", а не
+    // "файл ТЗ" из брифа).
+    const wantsFileLine = s.wantsFile
+      ? `<p class="hint">Вы отметили, что пришлёте файл — отправьте его следующим сообщением прямо в этот чат с ботом (не через Mini App).</p>`
+      : "";
     return `
       <div class="topbar"><h1>Дополнение отправлено ✅</h1></div>
       <div class="case-block"><div class="label">Заявка №${s.leadId}</div><p>Дизайнер увидит дополнение в чате.</p></div>
+      ${wantsFileLine}
       <div class="btn-row">
         <button class="btn btn-primary" id="supplement-back-to-lead">Вернуться к заявке</button>
       </div>

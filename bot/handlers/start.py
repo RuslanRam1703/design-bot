@@ -138,6 +138,52 @@ def _client_identity_line(message: Message) -> str:
     return f"Клиент: {name} ({contact})"
 
 
+# Presentation-only защита от Telegram-лимита на длину исходящего сообщения
+# (4096 символов) — тот же принцип, что и bot/lead.py::_MAX_DETAIL_LENGTH/
+# _clamp_to_telegram_limit (запас под сам маркер обрезки), но не та же
+# функция: там обрезаются целыми СТРОКАМИ с конца списка (подходит для
+# карточки заявки с множеством коротких строк), здесь единственное поле
+# переменной длины — сам текст клиента, поэтому обрезается только оно,
+# заголовок/идентичность/список активных заявок всегда сохраняются целиком.
+_MAX_RELAY_LENGTH = 4000
+
+# Реальный жёсткий лимит Telegram на исходящее текстовое сообщение.
+_TELEGRAM_HARD_LIMIT = 4096
+
+
+def _clamp_relay_client_text(header_lines: list[str], client_text: str) -> str:
+    header_len = len("\n".join(header_lines)) + 1  # +1 — перевод строки перед текстом клиента
+    available = max(_MAX_RELAY_LENGTH - header_len, 0)
+    if len(client_text) <= available:
+        return client_text
+    if available == 0:
+        # Патологический случай (Stage C Batch 1 review) — самому header'у
+        # уже некуда деться, добавлять маркер "…" здесь означало бы вернуть
+        # непустую строку без единого символа текста клиента под ней, что
+        # раньше и приводило к превышению бюджета (header_len + маркер).
+        # Пустая строка честно отражает "текста клиента здесь не поместилось".
+        return ""
+    marker = "…"
+    return client_text[: available - len(marker)] + marker
+
+
+def _enforce_telegram_hard_limit(text: str) -> str:
+    """Последний, безусловный рубеж (Stage C Batch 1, fix после review) —
+    _clamp_relay_client_text ограничивает только текст клиента и рассчитан
+    на header в разумных пределах; сам header (номер заявки, identity,
+    список активных заявок) сознательно не обрезается там, чтобы не терять
+    контекст в обычном случае. Но если header патологически большой
+    (например, у одного клиента сотни активных заявок — ничем в этом файле
+    не ограничено), даже пустой текст клиента не спасает: собранное
+    сообщение всё равно может быть длиннее реального лимита Telegram.
+    Эта функция — safety net поверх уже полностью собранной строки,
+    применяется последней, прямо перед отправкой."""
+    if len(text) <= _TELEGRAM_HARD_LIMIT:
+        return text
+    marker = "…"
+    return text[: _TELEGRAM_HARD_LIMIT - len(marker)] + marker
+
+
 # Зарегистрирован ПЕРЕД fallback_text ниже, тем же catch-all F.text — в
 # рамках одного router первый совпавший хендлер побеждает (см. bot/main.py:
 # роутеры пробуются по порядку, а внутри router — тоже по порядку
@@ -187,10 +233,12 @@ async def relay_client_text_to_designer(message: Message, state: FSMContext) -> 
         if active_leads:
             lead_ids = ", ".join(f"#{lead['id']}" for lead in active_leads)
             lines.append(f"Активные заявки: {lead_ids}")
-    lines += ["", "Текст клиента:", message.text]
+    header_lines = lines + ["", "Текст клиента:"]
+    lines = header_lines + [_clamp_relay_client_text(header_lines, message.text)]
+    text = _enforce_telegram_hard_limit("\n".join(lines))
 
     try:
-        await message.bot.send_message(chat_id=config.DESIGNER_CHAT_ID, text="\n".join(lines))
+        await message.bot.send_message(chat_id=config.DESIGNER_CHAT_ID, text=text)
     except Exception:
         logger.exception("Не удалось передать сообщение клиента дизайнеру (user_id=%s)", message.from_user.id)
         await message.answer("Не получилось отправить сообщение дизайнеру. Попробуйте ещё раз чуть позже.")

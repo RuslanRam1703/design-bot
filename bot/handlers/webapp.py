@@ -147,3 +147,34 @@ async def handle_tz_file(message: Message) -> None:
         except Exception:
             logger.exception("Не удалось переслать материал дизайнеру (lead #%s)", lead["id"])
     await message.answer(texts.TZ_FILE_FORWARDED)
+
+
+@router.message(F.voice | F.video_note | F.sticker)
+async def handle_unsupported_tz_media(message: Message) -> None:
+    """Узкий fallback (Stage C Batch 1) — раньше voice/video_note/sticker,
+    присланные пока заявка ждёт файл (awaiting_tz_file), не совпадали ни с
+    одним хендлером ни в одном router (см. handle_tz_file выше — фильтр
+    только document/photo/video/animation) и просто пропадали: ни материал
+    не записывался, ни ответ клиенту не уходил, ни awaiting_tz_file не
+    снимался — тихий тупик (Stage C аудит).
+
+    Зарегистрирован в этом же router СРАЗУ ПОСЛЕ handle_tz_file — Telegram
+    заполняет у Message ровно одно из document/photo/video/animation/voice/
+    video_note/sticker на сообщение, так что эти два фильтра никогда не
+    матчат одно и то же обновление, порядок регистрации здесь не влияет на
+    выбор между ними, только гарантирует, что webapp.router (см. bot/main.py,
+    раньше faq/start) вообще получит шанс их обработать.
+
+    Тот же guard, что и у handle_tz_file (find_lead_awaiting_file по
+    message.from_user.id) — единственная причина, по которой это не задевает
+    ни посторонние сообщения клиента (нет ожидающей заявки -> no-op), ни
+    дизайнера/админа (у него в норме нет своей заявки, ожидающей файл, тем
+    же принципом, что и у handle_tz_file, отдельная проверка на
+    DESIGNER_CHAT_ID не нужна). Материал НЕ записывается, ничего не
+    пересылается, awaiting_tz_file НЕ снимается — заявка остаётся ждать
+    подходящий файл, клиент только получает понятное объяснение, что
+    прислать вместо этого."""
+    lead = await content_store.find_lead_awaiting_file(message.from_user.id)
+    if lead is None:
+        return
+    await message.answer(texts.TZ_FILE_UNSUPPORTED_TYPE)

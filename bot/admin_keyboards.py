@@ -390,7 +390,7 @@ LEAD_FILTER_LABELS = {
 
 def leads_filter_keyboard() -> InlineKeyboardMarkup:
     rows = [[InlineKeyboardButton(text=label, callback_data=f"adminleadfilter:{key}")] for key, label in LEAD_FILTER_LABELS.items()]
-    rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data="adminmenu:root")])
+    rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data="adminmenu:leads")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
