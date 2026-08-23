@@ -43,50 +43,6 @@ async def handle_health(request: web.Request) -> web.Response:
     return web.Response(text="ok")
 
 
-# ---------------------------------------------------------------------------
-# ВРЕМЕННЫЙ ДИАГНОСТИЧЕСКИЙ ENDPOINT — УДАЛИТЬ СРАЗУ ПОСЛЕ ЗАМЕРА.
-# Единственная задача: выяснить, доходит ли egress Render до CDN Behance
-# (mir-s3-cdn-cf.behance.net). Страница www.behance.net с Render отдаёт 403
-# на edge Adobe/Fastly; CDN — другая инфраструктура (AmazonS3 + CloudFront),
-# и её достижимость с Render ничем пока не проверена.
-#
-# URL захардкожен намеренно: endpoint НЕ принимает произвольный адрес, иначе
-# это был бы SSRF-примитив, доступный любому анонимному запросу.
-# Заголовки берутся из уже существующего behance._IMAGE_HEADERS (модуль не
-# изменяется, только читается), чтобы замер соответствовал тому, что реально
-# отправлял бы resolver.
-_CDN_PROBE_URL = "https://mir-s3-cdn-cf.behance.net/project_modules/disp/b63348237585701.69036215a8d6b.jpg"
-
-
-async def handle_cdn_probe(request: web.Request) -> web.Response:
-    import asyncio
-    import urllib.error
-    import urllib.request
-
-    from bot import behance
-
-    def _head() -> dict:
-        req = urllib.request.Request(_CDN_PROBE_URL, headers=behance._IMAGE_HEADERS, method="HEAD")
-        try:
-            with urllib.request.urlopen(req, timeout=15) as resp:
-                return {
-                    "status": resp.status,
-                    "content_type": resp.headers.get("Content-Type"),
-                    "content_length": resp.headers.get("Content-Length"),
-                    "error": None,
-                }
-        except urllib.error.HTTPError as e:
-            return {"status": e.code, "content_type": None, "content_length": None,
-                    "error": f"HTTPError {e.code} {e.reason}"}
-        except Exception as e:
-            return {"status": None, "content_type": None, "content_length": None,
-                    "error": f"{type(e).__name__}: {e}"}
-
-    result = await asyncio.to_thread(_head)
-    logger.info("CDN PROBE result: %s", result)
-    return web.json_response(result)
-
-
 async def handle_public_data(request: web.Request) -> web.Response:
     """Отдаёт ТОЛЬКО файлы из PUBLIC_DATA_FILES (см. её докстринг выше) —
     любое другое имя, включая leads.json, получает обычный 404, как если
@@ -342,7 +298,6 @@ def create_app(bot: Bot) -> web.Application:
     for path in ("/", "/portfolio", "/about", "/calculator", "/brief", "/myleads"):
         app.router.add_get(path, handle_index)
     app.router.add_get("/health", handle_health)
-    app.router.add_get("/api/_cdn_probe", handle_cdn_probe)  # ВРЕМЕННО — удалить после замера
     app.router.add_get("/api/my-leads", handle_my_leads)
     app.router.add_post("/api/leads", handle_create_lead)
     app.router.add_static("/css/", WEBAPP_DIR / "css")
