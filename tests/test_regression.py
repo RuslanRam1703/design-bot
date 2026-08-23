@@ -10550,6 +10550,106 @@ class BehanceCoverResolverTests(unittest.IsolatedAsyncioTestCase):
                 await behance.resolve_cover_url("https://example.com/gallery/1/x")
         mock_get.assert_not_called()
 
+    # ---- Fix A: browser-like headers (Render получал 403 от edge Adobe) ----
+
+    def _capture_request(self, fn, *, body=b"<html></html>", content_encoding=None):
+        """Перехватывает urllib.request.Request, который реально уходит."""
+        captured = {}
+
+        class FakeResponse:
+            status = 200
+            headers = {"Content-Encoding": content_encoding}
+
+            def read(self):
+                return body
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        def fake_urlopen(req, timeout=None):
+            captured["req"] = req
+            return FakeResponse()
+
+        with patch.object(behance.urllib.request, "urlopen", side_effect=fake_urlopen):
+            result = fn()
+        return captured["req"], result
+
+    def _headers_of(self, req):
+        return {k.lower(): v for k, v in req.header_items()}
+
+    def test_page_get_sends_browser_like_headers(self):
+        req, _ = self._capture_request(lambda: behance._http_get("https://www.behance.net/gallery/1/x"))
+        h = self._headers_of(req)
+        # User-Agent сохранён без изменений
+        self.assertEqual(h["user-agent"], behance._USER_AGENT)
+        for header in ("accept", "accept-language", "accept-encoding", "upgrade-insecure-requests"):
+            self.assertIn(header, h, f"ожидался заголовок {header}")
+        self.assertTrue(h["accept"].startswith("text/html"))
+        # Sec-Fetch-* соответствуют навигации по документу
+        self.assertEqual(h["sec-fetch-dest"], "document")
+        self.assertEqual(h["sec-fetch-mode"], "navigate")
+
+    def test_image_head_sends_image_appropriate_headers(self):
+        req, _ = self._capture_request(lambda: behance._http_head("https://mir-s3-cdn-cf.behance.net/x.jpg"))
+        h = self._headers_of(req)
+        self.assertEqual(h["user-agent"], behance._USER_AGENT)
+        self.assertTrue(h["accept"].startswith("image/"))
+        self.assertEqual(h["sec-fetch-dest"], "image")
+
+    def test_accept_encoding_never_requests_brotli(self):
+        # br нечем распаковать в stdlib — попросив его, мы получили бы тело,
+        # из которого og:image уже не извлечь.
+        for headers in (behance._PAGE_HEADERS, behance._IMAGE_HEADERS):
+            self.assertNotIn("br", headers["Accept-Encoding"])
+            self.assertIn("gzip", headers["Accept-Encoding"])
+
+    def test_gzip_response_body_is_decompressed(self):
+        import gzip as _gzip
+        payload = b'<meta property="og:image" content="https://cdn/x.jpg" />'
+        _, (status, body) = self._capture_request(
+            lambda: behance._http_get("https://www.behance.net/gallery/1/x"),
+            body=_gzip.compress(payload), content_encoding="gzip",
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(body, payload)
+        self.assertEqual(behance.extract_og_image(body.decode()), "https://cdn/x.jpg")
+
+    def test_deflate_response_body_is_decompressed(self):
+        import zlib as _zlib
+        payload = b"<html>deflate</html>"
+        _, (_, body) = self._capture_request(
+            lambda: behance._http_get("https://www.behance.net/gallery/1/x"),
+            body=_zlib.compress(payload), content_encoding="deflate",
+        )
+        self.assertEqual(body, payload)
+
+    def test_uncompressed_response_passes_through(self):
+        payload = b"<html>plain</html>"
+        _, (_, body) = self._capture_request(
+            lambda: behance._http_get("https://www.behance.net/gallery/1/x"),
+            body=payload, content_encoding=None,
+        )
+        self.assertEqual(body, payload)
+
+    def test_http_error_status_is_returned_not_raised(self):
+        # Поведение при HTTP-ошибке не меняется Fix A: 403 отдаётся как
+        # (код, b"") и превращается в контролируемый BehanceResolveError —
+        # именно этот путь наблюдался на production.
+        err = urllib.error.HTTPError("https://www.behance.net/gallery/1/x", 403, "Forbidden", {}, None)
+        with patch.object(behance.urllib.request, "urlopen", side_effect=err):
+            status, body = behance._http_get("https://www.behance.net/gallery/1/x")
+        self.assertEqual(status, 403)
+        self.assertEqual(body, b"")
+
+    async def test_http_403_still_surfaces_as_controlled_error(self):
+        with patch.object(behance, "_http_get", return_value=(403, b"")):
+            with self.assertRaises(behance.BehanceResolveError) as ctx:
+                await behance.resolve_cover_url(self.REAL_URL)
+        self.assertIn("403", str(ctx.exception))
+
     async def test_image_bytes_are_never_downloaded(self):
         # Ключевое свойство эксперимента: проверяем доступность картинки
         # HEAD-запросом, байты через Render не проходят.

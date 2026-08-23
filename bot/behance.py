@@ -26,12 +26,14 @@ is_configured/generate_object_key/upload_image/delete_image) этим модул
 """
 
 import asyncio
+import gzip
 import html as html_module
 import logging
 import re
 import urllib.error
 import urllib.parse
 import urllib.request
+import zlib
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +45,45 @@ _ALLOWED_HOSTS = ("behance.net", "www.behance.net")
 # Нейтральный UA: некоторые CDN/фронты отвечают 400 на пустой User-Agent
 # (проверено на самом behance.net — /robots.txt без UA отдаёт 400).
 _USER_AGENT = "Mozilla/5.0 (compatible; DesignAssistantBot/1.0; portfolio-cover-resolver)"
+
+# Fix A. Edge Adobe (Fastly/Varnish) отдал Render HTTP 403 на ту же самую
+# страницу, которая локально отдаётся с HTTP 200 тем же кодом и тем же UA
+# (см. production-логи: "Behance вернул HTTP 403", Server: Varnish против
+# server: adobe у успешного ответа). Голый urllib-запрос уходил всего с
+# тремя заголовками (Host / User-Agent / Accept-Encoding: identity) — это
+# заметный bot-сигнал для edge-фильтра. Здесь набор заголовков приводится
+# к тому, что реально шлёт браузер.
+#
+# Accept-Encoding НАМЕРЕННО без "br": brotli нет в stdlib, и попросив br,
+# мы получили бы тело, которое нечем распаковать (og:image перестал бы
+# находиться). gzip/deflate распаковываются вручную в _decode_body ниже —
+# urllib, в отличие от requests, САМ этого не делает.
+_BASE_HEADERS = {
+    "User-Agent": _USER_AGENT,
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate",
+}
+
+# Sec-Fetch-* осмысленны только применительно к типу запроса: страница
+# кейса запрашивается как навигация по документу, обложка на CDN — как
+# изображение с чужого origin.
+_PAGE_HEADERS = {
+    **_BASE_HEADERS,
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Upgrade-Insecure-Requests": "1",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
+}
+
+_IMAGE_HEADERS = {
+    **_BASE_HEADERS,
+    "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+    "Sec-Fetch-Dest": "image",
+    "Sec-Fetch-Mode": "no-cors",
+    "Sec-Fetch-Site": "cross-site",
+}
 
 # Оба порядка атрибутов: content может стоять как после property, так и до.
 # Закрывающая кавычка сразу после og:image обязательна — иначе паттерн
@@ -122,17 +163,33 @@ def _disp_variant(image_url: str) -> str | None:
     return f"{match.group(1)}disp{match.group(3)}"
 
 
+def _decode_body(raw: bytes, content_encoding: str | None) -> bytes:
+    """urllib (в отличие от requests) НЕ распаковывает ответ сам — раз мы
+    просим gzip/deflate в Accept-Encoding, распаковать обязаны здесь, иначе
+    в extract_og_image придут сжатые байты и обложка перестанет находиться.
+    Неизвестная/пустая кодировка — возвращаем как есть."""
+    encoding = (content_encoding or "").strip().lower()
+    if "gzip" in encoding:
+        return gzip.decompress(raw)
+    if "deflate" in encoding:
+        try:
+            return zlib.decompress(raw)
+        except zlib.error:  # raw deflate без zlib-заголовка
+            return zlib.decompress(raw, -zlib.MAX_WBITS)
+    return raw
+
+
 def _http_get(url: str, timeout: int = 15) -> tuple[int, bytes]:
-    request = urllib.request.Request(url, headers={"User-Agent": _USER_AGENT}, method="GET")
+    request = urllib.request.Request(url, headers=_PAGE_HEADERS, method="GET")
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
-            return response.status, response.read()
+            return response.status, _decode_body(response.read(), response.headers.get("Content-Encoding"))
     except urllib.error.HTTPError as e:
         return e.code, b""
 
 
 def _http_head(url: str, timeout: int = 10) -> int:
-    request = urllib.request.Request(url, headers={"User-Agent": _USER_AGENT}, method="HEAD")
+    request = urllib.request.Request(url, headers=_IMAGE_HEADERS, method="HEAD")
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
             return response.status
