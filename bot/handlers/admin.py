@@ -25,7 +25,7 @@ from aiogram.fsm.state import State
 from aiogram.types import BufferedInputFile, CallbackQuery, InlineKeyboardMarkup, Message
 
 from bot import admin_keyboards as kb
-from bot import config, content_store, flow, texts
+from bot import config, content_store, flow, r2_storage, texts
 from bot import lead as lead_format
 from bot.handlers.start import main_menu_or_confirm
 from bot.states import AdminStates
@@ -320,9 +320,17 @@ async def cases_add_title(message: Message, state: FSMContext) -> None:
 
 @router.message(AdminStates.add_case_photo, F.photo | F.document)
 async def cases_add_photo(message: Message, state: FSMContext) -> None:
+    if not _is_valid_image_upload(message):
+        await flow.step_from_text(message, state, "Нужно изображение (фото или файл-картинка) 📎.", kb.cancel_keyboard())
+        return
     data = await state.get_data()
     file_id = message.photo[-1].file_id if message.photo else message.document.file_id
-    cover = await content_store.save_case_photo(message.chat.id, message.bot, file_id, data["case_id"])
+    try:
+        cover = await content_store.save_case_photo(message.chat.id, message.bot, file_id, data["case_id"])
+    except r2_storage.R2UploadError:
+        logger.exception("R2 upload failed for new case photo (case_id=%s)", data["case_id"])
+        await flow.step_from_text(message, state, "Не удалось загрузить изображение, попробуйте ещё раз 🙁", kb.cancel_keyboard())
+        return
     await state.update_data(cover=cover)
     await flow.step_from_text(message, state, "Короткое описание задачи (пара предложений):", kb.cancel_keyboard())
     await state.set_state(AdminStates.add_case_description)
@@ -462,6 +470,19 @@ async def cases_edit_category(callback: CallbackQuery, state: FSMContext) -> Non
 
 # ---- Изображения кейса (вложены в редактирование кейса — case_id уже в data) ----
 
+def _is_valid_image_upload(message: Message) -> bool:
+    """Batch 3 (finding B3-4) — минимальная content-type проверка на всех
+    upload entry points портфолио/about (F.photo | F.document):
+    message.photo — всегда настоящее изображение (Telegram сам конвертирует
+    любое присланное "как фото" в JPEG), проверять нечего; message.document
+    — произвольный файл, mime_type может быть не image/* (например, PDF по
+    ошибке) — такой документ не должен молча стать "картинкой" на сайте с
+    разбитым <img>."""
+    if message.photo:
+        return True
+    return bool(message.document and message.document.mime_type and message.document.mime_type.startswith("image/"))
+
+
 async def _current_case(case_id: str) -> dict | None:
     return next((c for c in await content_store.list_cases() if c["id"] == case_id), None)
 
@@ -487,9 +508,17 @@ async def case_image_add_start(callback: CallbackQuery, state: FSMContext) -> No
 
 @router.message(AdminStates.case_image_add, F.photo | F.document)
 async def case_image_add_receive(message: Message, state: FSMContext) -> None:
+    if not _is_valid_image_upload(message):
+        await flow.step_from_text(message, state, "Нужно изображение (фото или файл-картинка) 📎.", kb.cancel_keyboard())
+        return
     data = await state.get_data()
     file_id = message.photo[-1].file_id if message.photo else message.document.file_id
-    path = await content_store.save_case_photo(message.chat.id, message.bot, file_id, f"{data['case_id']}_{uuid.uuid4().hex[:8]}")
+    try:
+        path = await content_store.save_case_photo(message.chat.id, message.bot, file_id, f"{data['case_id']}_{uuid.uuid4().hex[:8]}")
+    except r2_storage.R2UploadError:
+        logger.exception("R2 upload failed for gallery image (case_id=%s)", data["case_id"])
+        await flow.step_from_text(message, state, "Не удалось загрузить изображение, попробуйте ещё раз 🙁", kb.cancel_keyboard())
+        return
     await content_store.add_case_image(message.chat.id, data["case_id"], path)
     case = await _current_case(data["case_id"])
     # flow.step_from_text (P1-3, Batch 3) — success-переход в case_images_menu
@@ -767,8 +796,7 @@ async def case_section_remove_image(callback: CallbackQuery, state: FSMContext) 
         return
     images = section.get("images", [])
     if 0 <= img_index < len(images):
-        remaining = [img for i, img in enumerate(images) if i != img_index]
-        await content_store.update_case_section(callback.message.chat.id, case_id, index, images=remaining)
+        await content_store.remove_case_section_image(callback.message.chat.id, case_id, index, img_index)
         section = await _current_section(case_id, index) or section
     await callback.message.edit_text(f"«{section['title']}»:", reply_markup=kb.case_section_action_keyboard(section["type"]))
     await callback.answer()
@@ -788,8 +816,16 @@ async def case_section_edit_value(message: Message, state: FSMContext) -> None:
         if not (message.photo or message.document):
             await flow.step_from_text(message, state, "Нужно фото 📎.", kb.cancel_keyboard())
             return
+        if not _is_valid_image_upload(message):
+            await flow.step_from_text(message, state, "Нужно изображение (фото или файл-картинка) 📎.", kb.cancel_keyboard())
+            return
         file_id = message.photo[-1].file_id if message.photo else message.document.file_id
-        path = await content_store.save_case_photo(message.chat.id, message.bot, file_id, f"{case_id}_{uuid.uuid4().hex[:8]}")
+        try:
+            path = await content_store.save_case_photo(message.chat.id, message.bot, file_id, f"{case_id}_{uuid.uuid4().hex[:8]}")
+        except r2_storage.R2UploadError:
+            logger.exception("R2 upload failed for section image (case_id=%s)", case_id)
+            await flow.step_from_text(message, state, "Не удалось загрузить изображение, попробуйте ещё раз 🙁", kb.cancel_keyboard())
+            return
         section_before = await _current_section(case_id, index)
         images = section_before.get("images", []) if section_before else []
         await content_store.update_case_section(message.chat.id, case_id, index, images=images + [path])
@@ -830,8 +866,16 @@ async def cases_edit_value(message: Message, state: FSMContext) -> None:
         if not (message.photo or message.document):
             await flow.step_from_text(message, state, "Нужно фото 📎.", kb.cancel_keyboard())
             return
+        if not _is_valid_image_upload(message):
+            await flow.step_from_text(message, state, "Нужно изображение (фото или файл-картинка) 📎.", kb.cancel_keyboard())
+            return
         file_id = message.photo[-1].file_id if message.photo else message.document.file_id
-        value = await content_store.save_case_photo(message.chat.id, message.bot, file_id, data["case_id"])
+        try:
+            value = await content_store.save_case_photo(message.chat.id, message.bot, file_id, data["case_id"])
+        except r2_storage.R2UploadError:
+            logger.exception("R2 upload failed for cover replacement (case_id=%s)", data["case_id"])
+            await flow.step_from_text(message, state, "Не удалось загрузить изображение, попробуйте ещё раз 🙁", kb.cancel_keyboard())
+            return
         await content_store.update_case(message.chat.id, data["case_id"], cover=value)
     else:
         if not message.text:
@@ -1142,8 +1186,16 @@ async def about_experience_delete_do(callback: CallbackQuery, state: FSMContext)
 
 @router.message(AdminStates.edit_about_photo, F.photo | F.document)
 async def about_edit_photo(message: Message, state: FSMContext) -> None:
+    if not _is_valid_image_upload(message):
+        await flow.step_from_text(message, state, "Нужно изображение (фото или файл-картинка) 📎.", kb.cancel_keyboard())
+        return
     file_id = message.photo[-1].file_id if message.photo else message.document.file_id
-    path = await content_store.save_about_photo(message.chat.id, message.bot, file_id)
+    try:
+        path = await content_store.save_about_photo(message.chat.id, message.bot, file_id)
+    except r2_storage.R2UploadError:
+        logger.exception("R2 upload failed for about photo")
+        await flow.step_from_text(message, state, "Не удалось загрузить изображение, попробуйте ещё раз 🙁", kb.cancel_keyboard())
+        return
     await content_store.update_about_field(message.chat.id, "avatar", path)
     about = await content_store.get_about()
     # flow.step_from_text (P1-3, Batch 3) — success-переход в

@@ -52,6 +52,7 @@ import asyncio
 import io
 import json
 import logging
+import mimetypes
 import os
 import re
 import tempfile
@@ -63,7 +64,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from bot import config
+from bot import config, r2_storage
 
 logger = logging.getLogger(__name__)
 
@@ -349,20 +350,35 @@ async def update_case(actor_chat_id: int | str, case_id: str, **fields: Any) -> 
     новое фото ДОБАВЛЯЕТСЯ в галерею (images) и становится cover, но не
     стирает остальные изображения кейса — за полным управлением галереей
     (добавить/удалить/переставить/назначить обложку без загрузки) см.
-    add_case_image / remove_case_image / reorder_case_image / set_case_cover."""
+    add_case_image / remove_case_image / reorder_case_image / set_case_cover.
+
+    Batch 3 — при замене cover через это поле старый cover (если он
+    отличается от нового и был R2-объектом) удаляется из R2 ПОСЛЕ успешной
+    записи portfolio.json, вне lock'а (тот же принцип, что и в
+    import_backup_bytes Phase 3 — изображения не часть Upstash-транзакции,
+    их удаление best-effort и не должно продлевать критическую секцию).
+    Иначе каждая повторная загрузка обложки (уникальный ключ на файл, см.
+    r2_storage.generate_object_key) оставляла бы предыдущий объект сиротой."""
     _require_designer(actor_chat_id)
+    old_cover: str | None = None
+    found = False
     async with _lock("portfolio.json"):
         data = await _read("portfolio.json")
         for c in data["cases"]:
             if c["id"] == case_id:
+                found = True
+                if "cover" in fields and fields["cover"] != c.get("cover"):
+                    old_cover = c.get("cover")
                 c.update(fields)
                 if "cover" in fields:
                     images = c.setdefault("images", [])
                     if fields["cover"] not in images:
                         images.append(fields["cover"])
                 await _write("portfolio.json", data)
-                return True
-        return False
+                break
+    if old_cover:
+        await r2_storage.delete_image(old_cover)
+    return found
 
 
 def _find_case(data: dict, case_id: str) -> dict | None:
@@ -389,7 +405,11 @@ async def remove_case_image(actor_chat_id: int | str, case_id: str, image_path: 
     """Если удаляемое изображение было обложкой — обложка автоматически
     переходит на первое оставшееся; если изображений не осталось вовсе —
     cover становится None (Mini App показывает пустое состояние, не
-    сломанную картинку — см. renderCase())."""
+    сломанную картинку — см. renderCase()).
+
+    Batch 3 — удаляемое изображение удаляется из R2 ПОСЛЕ успешной записи
+    portfolio.json, вне lock'а (см. update_case выше — тот же принцип).
+    r2_storage.delete_image сам не трогает legacy-локальные (демо SVG) пути."""
     _require_designer(actor_chat_id)
     async with _lock("portfolio.json"):
         data = await _read("portfolio.json")
@@ -400,7 +420,8 @@ async def remove_case_image(actor_chat_id: int | str, case_id: str, image_path: 
         if case.get("cover") == image_path:
             case["cover"] = case["images"][0] if case["images"] else None
         await _write("portfolio.json", data)
-        return True
+    await r2_storage.delete_image(image_path)
+    return True
 
 
 async def reorder_case_image(actor_chat_id: int | str, case_id: str, image_path: str, direction: str) -> bool:
@@ -493,8 +514,16 @@ async def update_case_section(actor_chat_id: int | str, case_id: str, index: int
         return True
 
 
-async def delete_case_section(actor_chat_id: int | str, case_id: str, index: int) -> bool:
+async def remove_case_section_image(actor_chat_id: int | str, case_id: str, index: int, img_index: int) -> bool:
+    """Batch 3 — удаление ОДНОГО изображения из gallery-секции, с R2-cleanup
+    (тот же принцип, что и remove_case_image для верхнеуровневой галереи).
+    Раньше это делалось напрямую через update_case_section(images=remaining)
+    в bot/handlers/admin.py::case_section_remove_image — что убирало ссылку
+    из JSON, но никогда не удаляло сам файл; вынесено сюда отдельной
+    функцией, т.к. update_case_section — общий **fields-сеттер (title/
+    content и т.п.), ему не место знать про R2."""
     _require_designer(actor_chat_id)
+    removed_path: str | None = None
     async with _lock("portfolio.json"):
         data = await _read("portfolio.json")
         case = _find_case(data, case_id)
@@ -503,9 +532,37 @@ async def delete_case_section(actor_chat_id: int | str, case_id: str, index: int
         sections = case.get("sections", [])
         if not (0 <= index < len(sections)):
             return False
+        images = sections[index].get("images", [])
+        if not (0 <= img_index < len(images)):
+            return False
+        removed_path = images[img_index]
+        sections[index]["images"] = [img for i, img in enumerate(images) if i != img_index]
+        await _write("portfolio.json", data)
+    if removed_path:
+        await r2_storage.delete_image(removed_path)
+    return True
+
+
+async def delete_case_section(actor_chat_id: int | str, case_id: str, index: int) -> bool:
+    """Batch 3 — если удаляемая секция была gallery-типа, её images (см.
+    add_case_section) удаляются из R2 после успешной записи (тот же
+    принцип, что и в delete_case выше)."""
+    _require_designer(actor_chat_id)
+    removed_images: list[str] = []
+    async with _lock("portfolio.json"):
+        data = await _read("portfolio.json")
+        case = _find_case(data, case_id)
+        if case is None:
+            return False
+        sections = case.get("sections", [])
+        if not (0 <= index < len(sections)):
+            return False
+        removed_images = sections[index].get("images", [])
         del sections[index]
         await _write("portfolio.json", data)
-        return True
+    for path in removed_images:
+        await r2_storage.delete_image(path)
+    return True
 
 
 async def reorder_case_section(actor_chat_id: int | str, case_id: str, index: int, direction: str) -> bool:
@@ -525,15 +582,27 @@ async def reorder_case_section(actor_chat_id: int | str, case_id: str, index: in
 
 
 async def delete_case(actor_chat_id: int | str, case_id: str) -> bool:
+    """Batch 3 — удаляет из R2 ВСЕ изображения кейса: и верхнеуровневую
+    галерею (case["images"], всегда включает cover — см. add_case/
+    update_case/add_case_image), и images каждой gallery-секции (отдельный,
+    независимый список — см. add_case_section/update_case_section). Сбор
+    путей и запись portfolio.json — под lock'ом; сами R2-удаления — после,
+    best-effort (тот же принцип, что и в update_case/remove_case_image)."""
     _require_designer(actor_chat_id)
+    image_paths: list[str] = []
     async with _lock("portfolio.json"):
         data = await _read("portfolio.json")
-        before = len(data["cases"])
-        data["cases"] = [c for c in data["cases"] if c["id"] != case_id]
-        if len(data["cases"]) == before:
+        case = _find_case(data, case_id)
+        if case is None:
             return False
+        image_paths.extend(case.get("images", []))
+        for section in case.get("sections", []):
+            image_paths.extend(section.get("images", []))
+        data["cases"] = [c for c in data["cases"] if c["id"] != case_id]
         await _write("portfolio.json", data)
-        return True
+    for path in image_paths:
+        await r2_storage.delete_image(path)
+    return True
 
 
 async def save_case_photo(actor_chat_id: int | str, bot: Any, file_id: str, case_id: str) -> str:
@@ -543,10 +612,25 @@ async def save_case_photo(actor_chat_id: int | str, bot: Any, file_id: str, case
     что уже используется для zip-slip защиты в import_backup_bytes: обычный
     "case_N"/"case_N_<hex>" не меняется, а "../../x" или абсолютный путь не
     может вывести запись за пределы IMG_PORTFOLIO_DIR (Product Readiness
-    audit, Batch 3)."""
+    audit, Batch 3).
+
+    Batch 3 (persistent media): если R2 сконфигурирован — загружаем байты в
+    R2 (уникальный ключ на каждый вызов, см. r2_storage.generate_object_key)
+    и возвращаем ПОЛНЫЙ публичный URL; неудача R2-загрузки (R2UploadError)
+    НАМЕРЕННО не перехватывается здесь и долетает до вызывающего
+    admin-хендлера как есть — никакого тихого fallback на локальный диск,
+    когда R2 сконфигурирован (Batch 3 product decision: иначе portfolio.json
+    указывал бы на файл, реально существующий только на эфемерном диске
+    Render — ложный success). Если R2 НЕ сконфигурирован (локальная
+    разработка) — прежнее поведение: запись на локальный диск, без изменений."""
     _require_designer(actor_chat_id)
     file = await bot.get_file(file_id)
     ext = Path(file.file_path).suffix or ".jpg"
+    if r2_storage.is_configured():
+        buf = await bot.download_file(file.file_path)
+        content_type = mimetypes.guess_type(f"x{ext}")[0] or "application/octet-stream"
+        key = r2_storage.generate_object_key("portfolio", Path(case_id).name, ext)
+        return await r2_storage.upload_image(key, buf.read(), content_type)
     safe_case_id = Path(case_id).name
     filename = f"{safe_case_id}{ext}"
     dest = IMG_PORTFOLIO_DIR / filename
@@ -603,15 +687,24 @@ async def get_about() -> dict:
 
 
 async def update_about_field(actor_chat_id: int | str, field: str, value: Any) -> bool:
+    """Batch 3 — при замене "avatar" старое значение (если это был R2-объект)
+    удаляется после успешной записи (тот же принцип, что и update_case для
+    cover — уникальный ключ на каждую загрузку, см. save_about_photo, иначе
+    каждая новая аватарка оставляла бы предыдущую сиротой в R2)."""
     _require_designer(actor_chat_id)
+    old_avatar: str | None = None
     async with _lock("about.json"):
         data = await _read("about.json")
         if field not in data:
             return False
+        if field == "avatar" and value != data.get("avatar"):
+            old_avatar = data.get("avatar")
         data[field] = value
         data["needs_review_fields"] = [f for f in data.get("needs_review_fields", []) if f != field]
         await _write("about.json", data)
-        return True
+    if old_avatar:
+        await r2_storage.delete_image(old_avatar)
+    return True
 
 
 async def add_about_experience(actor_chat_id: int | str, *, role: str, company: str, period: str, description: str = "") -> bool:
@@ -648,9 +741,18 @@ async def delete_about_experience(actor_chat_id: int | str, index: int) -> bool:
 
 
 async def save_about_photo(actor_chat_id: int | str, bot: Any, file_id: str) -> str:
+    """Batch 3 (persistent media) — тот же принцип, что и save_case_photo:
+    R2 сконфигурирован -> загружаем туда, ошибка (R2UploadError) долетает до
+    вызывающего кода как есть, без тихого fallback на локальный диск. R2 не
+    сконфигурирован (локальная разработка) -> прежнее поведение."""
     _require_designer(actor_chat_id)
     file = await bot.get_file(file_id)
     ext = Path(file.file_path).suffix or ".jpg"
+    if r2_storage.is_configured():
+        buf = await bot.download_file(file.file_path)
+        content_type = mimetypes.guess_type(f"x{ext}")[0] or "application/octet-stream"
+        key = r2_storage.generate_object_key("about", "avatar", ext)
+        return await r2_storage.upload_image(key, buf.read(), content_type)
     filename = f"avatar{ext}"
     dest = IMG_ABOUT_DIR / filename
     await bot.download_file(file.file_path, destination=dest)

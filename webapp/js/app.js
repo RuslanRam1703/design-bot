@@ -519,6 +519,16 @@ function escapeHtml(str) {
     .replace(/'/g, "&#39;");
 }
 
+// Batch 3 — портфолио/about-изображения теперь бывают двух видов: старые
+// демо-SVG (относительный путь вида "img/portfolio/demo_case_1.svg",
+// отдаётся тем же локальным static-роутом, что и раньше) и новые R2-загрузки
+// (полный публичный URL, см. bot/r2_storage.py). Различаем по "http" в
+// начале строки — ничего в JSON-схеме не меняется, миграция не нужна:
+// старые записи как были относительными путями, так и остаются.
+function imageSrc(path) {
+  return path.startsWith("http") ? path : `/${path}`;
+}
+
 // ---- Экран: Портфолио ----
 function renderPortfolio() {
   const { types, cases } = state.portfolio;
@@ -535,7 +545,7 @@ function renderPortfolio() {
     .map(
       (c) => `
       <button class="card" data-case="${c.id}">
-        ${c.cover ? `<img src="/${c.cover}" alt="" loading="lazy" />` : '<div class="card-cover-empty"></div>'}
+        ${c.cover ? `<img src="${imageSrc(c.cover)}" alt="" loading="lazy" />` : '<div class="card-cover-empty"></div>'}
         <div class="card-title">${escapeHtml(c.title)}</div>
       </button>`
     )
@@ -573,7 +583,7 @@ function renderCaseContent(c) {
   if (c.sections && c.sections.length) {
     return c.sections.map((s) => {
       if (s.type === "gallery") {
-        const imgs = (s.images || []).map((src) => `<img src="/${src}" alt="" />`).join("");
+        const imgs = (s.images || []).map((src) => `<img src="${imageSrc(src)}" alt="" />`).join("");
         return `<div class="case-block"><div class="label">${escapeHtml(s.title)}</div><div class="case-section-gallery">${imgs || '<p class="hint">Пока нет изображений</p>'}</div></div>`;
       }
       return `<div class="case-block"><div class="label">${escapeHtml(s.title)}</div><p>${escapeHtml(s.content || "")}</p></div>`;
@@ -590,7 +600,7 @@ function renderCase() {
   const c = state.currentCase;
   const hasImages = c.images && c.images.length > 0;
   const images = hasImages
-    ? c.images.map((src, i) => `<img src="/${src}" alt="" data-lightbox-index="${i}" />`).join("")
+    ? c.images.map((src, i) => `<img src="${imageSrc(src)}" alt="" data-lightbox-index="${i}" />`).join("")
     : `<div class="case-images-empty">Пока нет изображений</div>`;
   // external_url — необязательное поле (см. bot/content_store.py -> CASE_FIELD_LABELS);
   // ссылка показывается, только если дизайнер её заполнил для этого конкретного кейса.
@@ -613,7 +623,7 @@ function attachCaseEvents() {
   document.getElementById("back").addEventListener("click", goBack);
   const c = state.currentCase;
   document.querySelectorAll("[data-lightbox-index]").forEach((el) =>
-    el.addEventListener("click", () => openLightbox(c.images.map((s) => `/${s}`), Number(el.dataset.lightboxIndex)))
+    el.addEventListener("click", () => openLightbox(c.images.map(imageSrc), Number(el.dataset.lightboxIndex)))
   );
   document.getElementById("want-similar").addEventListener("click", () => {
     // order_template.service_id (см. data/portfolio.json) — переносим ТОЛЬКО
@@ -761,7 +771,7 @@ function renderAbout() {
     </div>
 
     <div class="about-header">
-      <img class="about-avatar" src="/${a.avatar}" alt="" />
+      <img class="about-avatar" src="${imageSrc(a.avatar)}" alt="" />
       <div class="about-name">${escapeHtml(a.name)}</div>
       <div class="hint">${escapeHtml(a.tagline)}</div>
       ${a.location ? `<div class="hint">📍 ${escapeHtml(a.location)}</div>` : ""}

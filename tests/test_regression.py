@@ -11,12 +11,15 @@ content_store пишет в реальные data/*.json — тесты, кот�
 """
 
 import asyncio
+import hashlib
+import hmac
 import io
 import json
 import shutil
 import tempfile
 import time
 import unittest
+import urllib.error
 import urllib.parse
 import zipfile
 from pathlib import Path
@@ -31,6 +34,7 @@ from aiogram.utils.web_app import check_webapp_signature as aiogram_check_webapp
 
 import bot.admin_keyboards as kb
 import bot.content_store as content_store
+import bot.r2_storage as r2_storage
 import bot.handlers.admin as admin
 import bot.handlers.faq as faq
 import bot.handlers.webapp as webapp
@@ -4944,6 +4948,28 @@ def make_photo_message(chat_id: int) -> SimpleNamespace:
     )
 
 
+def make_non_image_document_message(chat_id: int, mime_type: str = "application/pdf") -> SimpleNamespace:
+    """Batch 3 (finding B3-4) — тот же шаблон, что и make_photo_message, но
+    document с не-image mime_type: воспроизводит "designer прислал файл
+    document с mime_type=None (Telegram не всегда его отдаёт) — не должен
+    провалиться как not (message.photo or message.document); это отдельная,
+    более узкая проверка на mime_type, см. admin._is_valid_image_upload."""
+    return SimpleNamespace(
+        chat=SimpleNamespace(id=chat_id),
+        photo=None,
+        document=SimpleNamespace(file_id="fake_file_id", mime_type=mime_type),
+        text=None,
+        delete=AsyncMock(),
+        bot=SimpleNamespace(
+            get_file=AsyncMock(return_value=SimpleNamespace(file_path="documents/fake.pdf")),
+            download_file=AsyncMock(),
+            delete_message=AsyncMock(),
+            edit_message_text=AsyncMock(),
+        ),
+        answer=AsyncMock(),
+    )
+
+
 def make_text_message(chat_id: int, text: str) -> SimpleNamespace:
     return SimpleNamespace(
         chat=SimpleNamespace(id=chat_id), photo=None, document=None, text=text,
@@ -5740,6 +5766,25 @@ class AdminAboutResumeFieldsTests(unittest.IsolatedAsyncioTestCase):
         about = await content_store.get_about()
         self.assertEqual(about["location"], "Москва, удалённо")
         self.assertNotIn("location", about["needs_review_fields"])
+
+    # ---- Batch 3: R2 cleanup on avatar replacement ----
+
+    async def test_update_avatar_deletes_old_value_from_r2(self):
+        old_avatar = (await content_store.get_about())["avatar"]
+        with patch.object(content_store.r2_storage, "delete_image", new=AsyncMock()) as mock_delete:
+            await content_store.update_about_field(self.actor, "avatar", "https://pub-test.r2.dev/about/avatar_new.jpg")
+        mock_delete.assert_awaited_once_with(old_avatar)
+
+    async def test_update_avatar_to_same_value_does_not_call_delete(self):
+        old_avatar = (await content_store.get_about())["avatar"]
+        with patch.object(content_store.r2_storage, "delete_image", new=AsyncMock()) as mock_delete:
+            await content_store.update_about_field(self.actor, "avatar", old_avatar)
+        mock_delete.assert_not_awaited()
+
+    async def test_update_unrelated_field_does_not_call_delete(self):
+        with patch.object(content_store.r2_storage, "delete_image", new=AsyncMock()) as mock_delete:
+            await content_store.update_about_field(self.actor, "location", "Питер")
+        mock_delete.assert_not_awaited()
 
     async def test_skills_edit_is_comma_split_list_separate_from_tools(self):
         state = await self._state()
@@ -7252,6 +7297,203 @@ class ClientFacingFaqFilterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(shown_text, texts.FAQ_INTRO)
 
 
+class R2StorageTests(unittest.IsolatedAsyncioTestCase):
+    """Batch 3 (persistent media): bot/r2_storage.py — hand-rolled SigV4
+    signing + PUT/DELETE against Cloudflare R2's S3-compatible API.
+    Canonical-request and signing-key-derivation tests below are cross-
+    checked against AWS's own published SigV4 documentation (canonical
+    request/CanonicalHeaders example) and an independent from-scratch
+    reimplementation of the key-derivation chain — not just "does the code
+    agree with itself"."""
+
+    def setUp(self):
+        self._orig = (
+            r2_storage.config.R2_ACCOUNT_ID, r2_storage.config.R2_ACCESS_KEY_ID,
+            r2_storage.config.R2_SECRET_ACCESS_KEY, r2_storage.config.R2_BUCKET_NAME,
+            r2_storage.config.R2_PUBLIC_BASE_URL,
+        )
+        r2_storage.config.R2_ACCOUNT_ID = "test-account-id"
+        r2_storage.config.R2_ACCESS_KEY_ID = "test-access-key-id"
+        r2_storage.config.R2_SECRET_ACCESS_KEY = "test-secret-access-key"
+        r2_storage.config.R2_BUCKET_NAME = "test-bucket"
+        r2_storage.config.R2_PUBLIC_BASE_URL = "https://pub-test.r2.dev"
+
+    def tearDown(self):
+        (
+            r2_storage.config.R2_ACCOUNT_ID, r2_storage.config.R2_ACCESS_KEY_ID,
+            r2_storage.config.R2_SECRET_ACCESS_KEY, r2_storage.config.R2_BUCKET_NAME,
+            r2_storage.config.R2_PUBLIC_BASE_URL,
+        ) = self._orig
+
+    def test_is_configured_true_when_all_vars_set(self):
+        self.assertTrue(r2_storage.is_configured())
+
+    def test_is_configured_false_when_any_var_missing(self):
+        for attr in ("R2_ACCOUNT_ID", "R2_ACCESS_KEY_ID", "R2_SECRET_ACCESS_KEY", "R2_BUCKET_NAME", "R2_PUBLIC_BASE_URL"):
+            original = getattr(r2_storage.config, attr)
+            setattr(r2_storage.config, attr, "")
+            self.assertFalse(r2_storage.is_configured(), f"expected not configured with {attr} empty")
+            setattr(r2_storage.config, attr, original)
+
+    def test_generate_object_key_format(self):
+        key = r2_storage.generate_object_key("portfolio", "case_5", ".jpg")
+        self.assertRegex(key, r"^portfolio/case_5_[0-9a-f]{8}\.jpg$")
+
+    def test_generate_object_key_unique_per_call(self):
+        keys = {r2_storage.generate_object_key("about", "avatar", ".png") for _ in range(20)}
+        self.assertEqual(len(keys), 20)  # ни одного совпадения
+
+    # ---- Cross-checked against AWS's published SigV4 documentation ----
+
+    def test_canonical_request_matches_aws_documented_example(self):
+        # Пример CanonicalHeaders дословно из AWS SigV4 docs (Elements of an
+        # AWS API request signature) — не придуман, взят как есть.
+        headers = {
+            "host": "examplebucket.s3.amazonaws.com",
+            "x-amz-content-sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "x-amz-date": "20130708T220855Z",
+        }
+        payload_hash = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        canonical_request, signed_headers = r2_storage.build_canonical_request("GET", "/test.txt", headers, payload_hash)
+        expected = (
+            "GET\n/test.txt\n\n"
+            "host:examplebucket.s3.amazonaws.com\n"
+            "x-amz-content-sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\n"
+            "x-amz-date:20130708T220855Z\n\n"
+            "host;x-amz-content-sha256;x-amz-date\n"
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        )
+        self.assertEqual(canonical_request, expected)
+        self.assertEqual(signed_headers, "host;x-amz-content-sha256;x-amz-date")
+
+    def test_canonical_headers_are_sorted_regardless_of_input_order(self):
+        headers = {
+            "x-amz-date": "20260101T000000Z",
+            "host": "example.r2.cloudflarestorage.com",
+            "x-amz-content-sha256": "abc",
+        }
+        _, signed_headers = r2_storage.build_canonical_request("PUT", "/bucket/key", headers, "abc")
+        self.assertEqual(signed_headers, "host;x-amz-content-sha256;x-amz-date")  # алфавитный порядок, не порядок dict
+
+    def test_signing_key_derivation_matches_independent_reference_implementation(self):
+        # Независимая реализация той же цепочки (НЕ импортирует ничего из
+        # r2_storage) — по шагам из AWS docs: DateKey -> DateRegionKey ->
+        # DateRegionServiceKey -> SigningKey.
+        def reference_signing_key(secret_key: str, date_stamp: str, region: str, service: str) -> bytes:
+            def h(key: bytes, msg: str) -> bytes:
+                return hmac.new(key, msg.encode("utf-8"), hashlib.sha256).digest()
+            k_date = h(("AWS4" + secret_key).encode("utf-8"), date_stamp)
+            k_region = h(k_date, region)
+            k_service = h(k_region, service)
+            return h(k_service, "aws4_request")
+
+        expected = reference_signing_key("some-secret-key", "20260115", "auto", "s3")
+        actual = r2_storage.derive_signing_key("some-secret-key", "20260115")
+        self.assertEqual(actual, expected)
+
+    def test_signing_key_changes_with_date(self):
+        key1 = r2_storage.derive_signing_key("secret", "20260101")
+        key2 = r2_storage.derive_signing_key("secret", "20260102")
+        self.assertNotEqual(key1, key2)
+
+    def test_authorization_header_structure(self):
+        url, headers = r2_storage.build_authorization_header("PUT", "portfolio/case_1_abcd1234.jpg", b"fake-bytes", {"content-type": "image/jpeg"})
+        self.assertEqual(url, "https://test-account-id.r2.cloudflarestorage.com/test-bucket/portfolio/case_1_abcd1234.jpg")
+        auth = headers["Authorization"]
+        self.assertTrue(auth.startswith("AWS4-HMAC-SHA256 Credential=test-access-key-id/"))
+        self.assertIn("/auto/s3/aws4_request, SignedHeaders=", auth)
+        self.assertIn("content-type", auth.split("SignedHeaders=")[1])
+        self.assertIn(", Signature=", auth)
+        signature = auth.rsplit("Signature=", 1)[1]
+        self.assertRegex(signature, r"^[0-9a-f]{64}$")  # hex-encoded HMAC-SHA256
+        self.assertEqual(headers["content-type"], "image/jpeg")
+        self.assertIn("x-amz-content-sha256", headers)
+        self.assertIn("x-amz-date", headers)
+
+    def test_authorization_header_payload_hash_reflects_actual_content(self):
+        _, headers_a = r2_storage.build_authorization_header("PUT", "k", b"content-a")
+        _, headers_b = r2_storage.build_authorization_header("PUT", "k", b"content-b")
+        self.assertNotEqual(headers_a["x-amz-content-sha256"], headers_b["x-amz-content-sha256"])
+        self.assertEqual(headers_a["x-amz-content-sha256"], hashlib.sha256(b"content-a").hexdigest())
+
+    # ---- upload_image / delete_image (mocked transport, no real network) ----
+
+    async def test_upload_image_success_returns_public_url(self):
+        with patch.object(r2_storage, "_http_request", return_value=(200, b"")):
+            url = await r2_storage.upload_image("portfolio/case_1_abcd1234.jpg", b"bytes", "image/jpeg")
+        self.assertEqual(url, "https://pub-test.r2.dev/portfolio/case_1_abcd1234.jpg")
+
+    async def test_upload_image_201_also_treated_as_success(self):
+        with patch.object(r2_storage, "_http_request", return_value=(201, b"")):
+            url = await r2_storage.upload_image("k", b"bytes", "image/jpeg")
+        self.assertEqual(url, "https://pub-test.r2.dev/k")
+
+    async def test_upload_image_non_2xx_raises_r2_upload_error(self):
+        with patch.object(r2_storage, "_http_request", return_value=(403, b"Forbidden")):
+            with self.assertRaises(r2_storage.R2UploadError):
+                await r2_storage.upload_image("k", b"bytes", "image/jpeg")
+
+    async def test_upload_image_network_error_raises_r2_upload_error(self):
+        with patch.object(r2_storage, "_http_request", side_effect=urllib.error.URLError("simulated network failure")):
+            with self.assertRaises(r2_storage.R2UploadError):
+                await r2_storage.upload_image("k", b"bytes", "image/jpeg")
+
+    async def test_delete_image_skips_non_r2_url_without_http_call(self):
+        with patch.object(r2_storage, "_http_request") as mock_request:
+            await r2_storage.delete_image("img/portfolio/demo_case_1.svg")  # legacy relative path
+        mock_request.assert_not_called()
+
+    async def test_delete_image_skips_url_from_different_base(self):
+        with patch.object(r2_storage, "_http_request") as mock_request:
+            await r2_storage.delete_image("https://someone-elses-bucket.r2.dev/portfolio/x.jpg")
+        mock_request.assert_not_called()
+
+    async def test_delete_image_skips_when_not_configured(self):
+        r2_storage.config.R2_ACCOUNT_ID = ""
+        with patch.object(r2_storage, "_http_request") as mock_request:
+            await r2_storage.delete_image("https://pub-test.r2.dev/portfolio/x.jpg")
+        mock_request.assert_not_called()
+
+    async def test_delete_image_success_no_error_logged(self):
+        with patch.object(r2_storage, "_http_request", return_value=(204, b"")):
+            with self.assertNoLogs(r2_storage.logger.name, level="ERROR"):
+                await r2_storage.delete_image("https://pub-test.r2.dev/portfolio/x.jpg")
+
+    async def test_delete_image_404_treated_as_success_no_error_logged(self):
+        # Объект уже отсутствует в R2 (например, повторная попытка) — не
+        # считаем это ошибкой, орфан явно не остался.
+        with patch.object(r2_storage, "_http_request", return_value=(404, b"Not Found")):
+            with self.assertNoLogs(r2_storage.logger.name, level="ERROR"):
+                await r2_storage.delete_image("https://pub-test.r2.dev/portfolio/x.jpg")
+
+    async def test_delete_image_failure_logs_error_does_not_raise(self):
+        # Batch 3 product decision: "deletion failures must be handled
+        # deliberately and reported, not silently hidden" — логируется как
+        # ERROR, но НЕ бросает исключение (не должно блокировать основное
+        # действие дизайнера, см. content_store.py::remove_case_image и др.)
+        with patch.object(r2_storage, "_http_request", return_value=(500, b"Internal Server Error")):
+            with self.assertLogs(r2_storage.logger.name, level="ERROR") as log_ctx:
+                await r2_storage.delete_image("https://pub-test.r2.dev/portfolio/x.jpg")
+        self.assertTrue(any("orphan" in m.lower() for m in log_ctx.output))
+
+    async def test_delete_image_network_error_logs_error_does_not_raise(self):
+        with patch.object(r2_storage, "_http_request", side_effect=urllib.error.URLError("simulated network failure")):
+            with self.assertLogs(r2_storage.logger.name, level="ERROR") as log_ctx:
+                await r2_storage.delete_image("https://pub-test.r2.dev/portfolio/x.jpg")
+        self.assertTrue(any("orphan" in m.lower() for m in log_ctx.output))
+
+    async def test_delete_image_extracts_correct_key_from_url(self):
+        captured = {}
+
+        def fake_request(method, url, headers, data):
+            captured["url"] = url
+            return 204, b""
+
+        with patch.object(r2_storage, "_http_request", side_effect=fake_request):
+            await r2_storage.delete_image("https://pub-test.r2.dev/portfolio/case_1_abcd1234.jpg")
+        self.assertEqual(captured["url"], "https://test-account-id.r2.cloudflarestorage.com/test-bucket/portfolio/case_1_abcd1234.jpg")
+
+
 class SaveCasePhotoPathSafetyTests(unittest.IsolatedAsyncioTestCase):
     """Security hardening, Batch 3: save_case_photo()'s case_id приходит из
     admin callback data (см. cases_edit_picked в handlers/admin.py) без
@@ -7282,12 +7524,18 @@ class SaveCasePhotoPathSafetyTests(unittest.IsolatedAsyncioTestCase):
         async def get_file(file_id):
             return SimpleNamespace(file_path="photos/fake.jpg")
 
-        async def download_file(file_path, destination):
+        async def download_file(file_path, destination=None):
             # Реальный aiogram Bot.download_file пишет байты напрямую по
             # destination без какой-либо санитизации со своей стороны —
             # вся защита должна быть внутри save_case_photo() ДО этого вызова.
+            # destination=None (Batch 3, R2-путь) — реальный aiogram в этом
+            # случае возвращает io.BytesIO с байтами (см. Bot.download_file),
+            # ничего на диск не пишет.
+            if destination is None:
+                return io.BytesIO(b"fake-image-bytes")
             written.append(Path(destination))
             Path(destination).write_bytes(b"fake-image-bytes")
+            return None
 
         return SimpleNamespace(get_file=get_file, download_file=download_file)
 
@@ -7340,6 +7588,161 @@ class SaveCasePhotoPathSafetyTests(unittest.IsolatedAsyncioTestCase):
         cover = await content_store.save_case_photo(self.actor, bot, "fid", "case_5_a1b2c3d4")
 
         self.assertEqual(cover, "img/portfolio/case_5_a1b2c3d4.jpg")
+
+    # ---- Batch 3: R2-configured path (persistent media) ----
+
+    async def test_save_case_photo_uses_r2_when_configured_not_local_disk(self):
+        written: list = []
+        bot = self._fake_bot(written)
+        with patch.object(content_store.r2_storage, "is_configured", return_value=True), \
+             patch.object(
+                 content_store.r2_storage, "upload_image",
+                 new=AsyncMock(return_value="https://pub-test.r2.dev/portfolio/case_5_deadbeef.jpg"),
+             ) as mock_upload:
+            cover = await content_store.save_case_photo(self.actor, bot, "fid", "case_5")
+
+        self.assertEqual(cover, "https://pub-test.r2.dev/portfolio/case_5_deadbeef.jpg")
+        self.assertEqual(written, [])  # ничего не записано на локальный диск
+        mock_upload.assert_awaited_once()
+        key_arg, content_arg, content_type_arg = mock_upload.await_args.args
+        self.assertTrue(key_arg.startswith("portfolio/case_5_"))
+        self.assertTrue(key_arg.endswith(".jpg"))
+        self.assertEqual(content_arg, b"fake-image-bytes")
+        self.assertEqual(content_type_arg, "image/jpeg")
+
+    async def test_save_case_photo_r2_failure_propagates_no_local_fallback(self):
+        # Batch 3 product decision: R2 сконфигурирован, но загрузка не
+        # удалась -> R2UploadError долетает как есть, НИКАКОГО тихого
+        # fallback на локальный диск (иначе portfolio.json указывал бы на
+        # ложно-успешный локальный файл, реально не переживающий redeploy).
+        written: list = []
+        bot = self._fake_bot(written)
+        with patch.object(content_store.r2_storage, "is_configured", return_value=True), \
+             patch.object(
+                 content_store.r2_storage, "upload_image",
+                 new=AsyncMock(side_effect=r2_storage.R2UploadError("simulated R2 failure")),
+             ):
+            with self.assertRaises(r2_storage.R2UploadError):
+                await content_store.save_case_photo(self.actor, bot, "fid", "case_5")
+
+        self.assertEqual(written, [])  # точно не было тихой записи на диск
+
+    async def test_save_about_photo_uses_r2_when_configured(self):
+        written: list = []
+        bot = self._fake_bot(written)
+        with patch.object(content_store.r2_storage, "is_configured", return_value=True), \
+             patch.object(
+                 content_store.r2_storage, "upload_image",
+                 new=AsyncMock(return_value="https://pub-test.r2.dev/about/avatar_deadbeef.png"),
+             ) as mock_upload:
+            path = await content_store.save_about_photo(self.actor, bot, "fid")
+
+        self.assertEqual(path, "https://pub-test.r2.dev/about/avatar_deadbeef.png")
+        self.assertEqual(written, [])
+        key_arg = mock_upload.await_args.args[0]
+        self.assertTrue(key_arg.startswith("about/avatar_"))
+
+    async def test_save_about_photo_r2_failure_propagates_no_local_fallback(self):
+        written: list = []
+        bot = self._fake_bot(written)
+        with patch.object(content_store.r2_storage, "is_configured", return_value=True), \
+             patch.object(
+                 content_store.r2_storage, "upload_image",
+                 new=AsyncMock(side_effect=r2_storage.R2UploadError("simulated R2 failure")),
+             ):
+            with self.assertRaises(r2_storage.R2UploadError):
+                await content_store.save_about_photo(self.actor, bot, "fid")
+
+        self.assertEqual(written, [])
+
+
+class AdminImageUploadMimeValidationTests(unittest.IsolatedAsyncioTestCase):
+    """Batch 3, finding B3-4 — минимальная content-type проверка на всех
+    5 upload entry points (F.photo | F.document): photo всегда настоящее
+    изображение (Telegram сам конвертирует в JPEG), document — произвольный
+    файл, mime_type может быть не image/*. Прямые unit-тесты самой проверки
+    ниже + по одному handler-level тесту на каждый из двух вариантов сайта
+    (без предварительной "ничего не прислано" проверки и с ней) — логика
+    одна и та же (_is_valid_image_upload) на всех 5, дублировать интеграционный
+    тест на каждый сайт отдельно означало бы просто повторно проверять
+    copy-paste, не новую логику."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        real_data_dir = Path(__file__).resolve().parent.parent / "data"
+        for name in ("pricing.json", "portfolio.json", "faq.json", "about.json", "ui_config.json"):
+            shutil.copy(real_data_dir / name, Path(self.tmpdir) / name)
+        self._orig_data_dir = content_store.DATA_DIR
+        self._orig_designer = content_store.config.DESIGNER_CHAT_ID
+        content_store.DATA_DIR = Path(self.tmpdir)
+        content_store.config.DESIGNER_CHAT_ID = "999"
+        self.actor = 999
+
+    def tearDown(self):
+        content_store.DATA_DIR = self._orig_data_dir
+        content_store.config.DESIGNER_CHAT_ID = self._orig_designer
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    # ---- _is_valid_image_upload() unit tests ----
+
+    def test_photo_is_always_valid(self):
+        msg = make_photo_message(self.actor)
+        self.assertTrue(admin._is_valid_image_upload(msg))
+
+    def test_document_with_image_mime_is_valid(self):
+        msg = make_non_image_document_message(self.actor, mime_type="image/png")
+        self.assertTrue(admin._is_valid_image_upload(msg))
+
+    def test_document_with_pdf_mime_is_invalid(self):
+        msg = make_non_image_document_message(self.actor, mime_type="application/pdf")
+        self.assertFalse(admin._is_valid_image_upload(msg))
+
+    def test_document_with_no_mime_type_is_invalid(self):
+        msg = make_non_image_document_message(self.actor, mime_type=None)
+        self.assertFalse(admin._is_valid_image_upload(msg))
+
+    def test_neither_photo_nor_document_is_invalid(self):
+        msg = SimpleNamespace(photo=None, document=None)
+        self.assertFalse(admin._is_valid_image_upload(msg))
+
+    # ---- handler-level: site WITHOUT a pre-existing "nothing sent" check ----
+
+    async def test_about_edit_photo_rejects_non_image_document(self):
+        await content_store.add_case(  # not needed by about, but keeps setUp uniform across the file
+            self.actor, case_id="case_unused", title="T", type_id="landing", cover="img/portfolio/a.svg", task="t", related_service=None,
+        )
+        state = make_state(self.actor)
+        await state.set_state(AdminStates.edit_about_photo)
+        msg = make_non_image_document_message(self.actor, mime_type="application/pdf")
+        with patch.object(content_store, "save_about_photo", new=AsyncMock()) as mock_save:
+            await admin.about_edit_photo(msg, state)
+        mock_save.assert_not_awaited()
+        # step_from_text без предустановленного anchor падает в message.answer
+        # (см. bot/flow.py::step_from_text) — не edit_message_text.
+        msg.answer.assert_awaited_once()
+        self.assertIn("изображение", msg.answer.await_args.args[0].lower())
+
+    # ---- handler-level: site WITH a pre-existing "nothing sent" check ----
+
+    async def test_cases_edit_value_cover_rejects_non_image_document(self):
+        state = make_state(self.actor)
+        await state.set_state(AdminStates.edit_case_value)
+        await state.update_data(case_id="case_x", field="cover")
+        msg = make_non_image_document_message(self.actor, mime_type="application/pdf")
+        with patch.object(content_store, "save_case_photo", new=AsyncMock()) as mock_save:
+            await admin.cases_edit_value(msg, state)
+        mock_save.assert_not_awaited()
+        msg.answer.assert_awaited_once()
+        self.assertIn("изображение", msg.answer.await_args.args[0].lower())
+
+    async def test_cases_add_photo_rejects_non_image_document(self):
+        state = make_state(self.actor)
+        await state.set_state(AdminStates.add_case_photo)
+        await state.update_data(case_id="case_new")
+        msg = make_non_image_document_message(self.actor, mime_type="text/plain")
+        with patch.object(content_store, "save_case_photo", new=AsyncMock()) as mock_save:
+            await admin.cases_add_photo(msg, state)
+        mock_save.assert_not_awaited()
 
 
 class ContentReadinessSummaryTests(unittest.IsolatedAsyncioTestCase):
@@ -7543,6 +7946,45 @@ class CaseImageManagementTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(await content_store.set_case_cover(self.actor, "case_img_test", "img/portfolio/b.svg"))
         self.assertEqual((await self._case())["cover"], "img/portfolio/b.svg")
 
+    # ---- Batch 3: R2 cleanup on removal/replacement ----
+
+    async def test_remove_case_image_calls_r2_delete_with_removed_path(self):
+        await content_store.add_case_image(self.actor, "case_img_test", "img/portfolio/b.svg")
+        with patch.object(content_store.r2_storage, "delete_image", new=AsyncMock()) as mock_delete:
+            await content_store.remove_case_image(self.actor, "case_img_test", "img/portfolio/b.svg")
+        mock_delete.assert_awaited_once_with("img/portfolio/b.svg")
+
+    async def test_update_case_cover_replacement_deletes_old_cover(self):
+        with patch.object(content_store.r2_storage, "delete_image", new=AsyncMock()) as mock_delete:
+            await content_store.update_case(self.actor, "case_img_test", cover="https://pub-test.r2.dev/portfolio/new.jpg")
+        mock_delete.assert_awaited_once_with("img/portfolio/a.svg")  # старый cover, не новый
+
+    async def test_update_case_setting_same_cover_does_not_call_delete(self):
+        # Regression guard: не должно случайно удалять текущий, всё ещё
+        # действующий cover, если он просто "переустановлен" тем же значением.
+        with patch.object(content_store.r2_storage, "delete_image", new=AsyncMock()) as mock_delete:
+            await content_store.update_case(self.actor, "case_img_test", cover="img/portfolio/a.svg")
+        mock_delete.assert_not_awaited()
+
+    async def test_update_case_unrelated_field_does_not_call_delete(self):
+        with patch.object(content_store.r2_storage, "delete_image", new=AsyncMock()) as mock_delete:
+            await content_store.update_case(self.actor, "case_img_test", title="Новый заголовок")
+        mock_delete.assert_not_awaited()
+
+    async def test_delete_case_calls_r2_delete_for_top_level_and_section_images(self):
+        await content_store.add_case_image(self.actor, "case_img_test", "img/portfolio/b.svg")
+        await content_store.add_case_section(
+            self.actor, "case_img_test", section_type="gallery", title="Галерея",
+            images=["img/portfolio/gallery1.svg", "img/portfolio/gallery2.svg"],
+        )
+        with patch.object(content_store.r2_storage, "delete_image", new=AsyncMock()) as mock_delete:
+            self.assertTrue(await content_store.delete_case(self.actor, "case_img_test"))
+        deleted_paths = {call.args[0] for call in mock_delete.await_args_list}
+        self.assertEqual(
+            deleted_paths,
+            {"img/portfolio/a.svg", "img/portfolio/b.svg", "img/portfolio/gallery1.svg", "img/portfolio/gallery2.svg"},
+        )
+
 
 class CaseSectionManagementTests(unittest.IsolatedAsyncioTestCase):
     """Part 1 ТЗ: гибкие sections вместо жёстких task/solution/result."""
@@ -7598,6 +8040,43 @@ class CaseSectionManagementTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(await content_store.delete_case_section(self.actor, "case_sec_test", 0))
         self.assertEqual(len((await self._case())["sections"]), 1)
         self.assertFalse(await content_store.delete_case_section(self.actor, "case_sec_test", 5))
+
+    # ---- Batch 3: R2 cleanup for section images ----
+
+    async def test_delete_case_section_calls_r2_delete_for_its_images(self):
+        await content_store.add_case_section(
+            self.actor, "case_sec_test", section_type="gallery", title="Скриншоты",
+            images=["img/portfolio/x.svg", "img/portfolio/y.svg"],
+        )
+        with patch.object(content_store.r2_storage, "delete_image", new=AsyncMock()) as mock_delete:
+            self.assertTrue(await content_store.delete_case_section(self.actor, "case_sec_test", 0))
+        deleted_paths = {call.args[0] for call in mock_delete.await_args_list}
+        self.assertEqual(deleted_paths, {"img/portfolio/x.svg", "img/portfolio/y.svg"})
+
+    async def test_delete_text_section_does_not_call_r2_delete(self):
+        await content_store.add_case_section(self.actor, "case_sec_test", section_type="text", title="Т", content="C")
+        with patch.object(content_store.r2_storage, "delete_image", new=AsyncMock()) as mock_delete:
+            self.assertTrue(await content_store.delete_case_section(self.actor, "case_sec_test", 0))
+        mock_delete.assert_not_awaited()
+
+    async def test_remove_case_section_image_deletes_from_r2_and_updates_json(self):
+        await content_store.add_case_section(
+            self.actor, "case_sec_test", section_type="gallery", title="Скриншоты",
+            images=["img/portfolio/x.svg", "img/portfolio/y.svg"],
+        )
+        with patch.object(content_store.r2_storage, "delete_image", new=AsyncMock()) as mock_delete:
+            self.assertTrue(await content_store.remove_case_section_image(self.actor, "case_sec_test", 0, 0))
+        mock_delete.assert_awaited_once_with("img/portfolio/x.svg")
+        section = (await self._case())["sections"][0]
+        self.assertEqual(section["images"], ["img/portfolio/y.svg"])
+
+    async def test_remove_case_section_image_out_of_bounds_returns_false_no_delete(self):
+        await content_store.add_case_section(
+            self.actor, "case_sec_test", section_type="gallery", title="Скриншоты", images=["img/portfolio/x.svg"],
+        )
+        with patch.object(content_store.r2_storage, "delete_image", new=AsyncMock()) as mock_delete:
+            self.assertFalse(await content_store.remove_case_section_image(self.actor, "case_sec_test", 0, 5))
+        mock_delete.assert_not_awaited()
 
 
 class LeadStoreTests(unittest.IsolatedAsyncioTestCase):
