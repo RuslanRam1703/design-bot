@@ -108,7 +108,13 @@ def format_lead_message(payload: dict, calc: CalcResult | None, lead_id: int, fr
 
     have = payload.get("have") or []
     have_text = _clip(", ".join(HAVE_LABELS.get(h, h) for h in have)) or "не указано"
-    lines.append(f"<b>Что уже есть:</b> {have_text}")
+    # _esc обязателен: HAVE_LABELS.get(h, h) возвращает СЫРОЕ значение
+    # клиента, если ключ неизвестен, — то есть в сообщение с
+    # parse_mode="HTML" попадал произвольный HTML клиента. "<b>x</b>"
+    # отрисовывался как настоящая разметка, а незакрытый "<b" ломал разбор
+    # целиком: Telegram отвергал сообщение, ошибка гасилась в webserver.py,
+    # и дизайнер молча не получал заявку — ровно тот же сбой, что чинил M1.
+    lines.append(f"<b>Что уже есть:</b> {_esc(have_text)}")
 
     deadline = DEADLINE_LABELS.get(payload.get("deadline"), "не указано")
     lines.append(f"<b>Когда нужно:</b> {deadline}")
@@ -139,7 +145,10 @@ def format_lead_message(payload: dict, calc: CalcResult | None, lead_id: int, fr
     if calc and calc.valid:
         lines.append("")
         lines.append("<b>Расчёт из калькулятора:</b>")
-        lines.append(f"— {calc.service_name}: {calc.price_from:,} – {calc.price_to:,} ₽".replace(",", " "))
+        # service_name приходит из pricing.json, который дизайнер правит
+        # через /admin — то есть тоже произвольный текст, способный
+        # сломать HTML-разбор собственного уведомления.
+        lines.append(f"— {_esc(calc.service_name)}: {calc.price_from:,} – {calc.price_to:,} ₽".replace(",", " "))
         lines.append(f"— срок: {_fmt_days(calc.term_from)}–{_fmt_days(calc.term_to)} дн.")
         if calc.selected_options:
             opts = ", ".join(
@@ -297,11 +306,15 @@ def format_lead_admin_detail(lead: dict) -> str:
         lines.append(f"— Задача: {_esc(task)}")
     have = payload.get("have") or []
     if have:
-        lines.append(f"— Что уже есть: {', '.join(HAVE_LABELS.get(h, h) for h in have)}")
+        lines.append(f"— Что уже есть: {_esc(', '.join(HAVE_LABELS.get(h, h) for h in have))}")
     if payload.get("deadline"):
-        lines.append(f"— Когда нужно: {DEADLINE_LABELS.get(payload['deadline'], payload['deadline'])}")
+        # Здесь fallback — САМО значение клиента (в отличие от
+        # format_lead_message, где подставляется константа "не указано"),
+        # поэтому неизвестный ключ отдавал сырой клиентский текст прямо в
+        # HTML-сообщение. Та же причина, что и у have выше.
+        lines.append(f"— Когда нужно: {_esc(DEADLINE_LABELS.get(payload['deadline'], payload['deadline']))}")
     if payload.get("budget"):
-        lines.append(f"— Бюджет: {BUDGET_LABELS.get(payload['budget'], payload['budget'])}")
+        lines.append(f"— Бюджет: {_esc(BUDGET_LABELS.get(payload['budget'], payload['budget']))}")
 
     supplements = lead.get("supplements") or []
     if supplements:

@@ -13442,5 +13442,115 @@ class BehanceSourceHandlerTimeoutTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await state.get_state(), AdminStates.add_case_description.state)
 
 
+class LeadHtmlEscapingTests(unittest.TestCase):
+    """N1: свободные значения клиента обязаны быть экранированы перед
+    вставкой в сообщение с parse_mode="HTML".
+
+    HAVE_LABELS/DEADLINE_LABELS/BUDGET_LABELS отдают СЫРОЕ значение
+    клиента, если ключ неизвестен (.get(x, x)), и оно попадало в сообщение
+    без _esc. "<b>x</b>" отрисовывался как настоящая разметка, а
+    незакрытый "<b" ломал разбор целиком — Telegram отвергал сообщение,
+    ошибка гасилась в webserver.py, и дизайнер молча не получал заявку
+    (тот же класс сбоя, что закрывал M1)."""
+
+    INJECT = "<b>BOLD</b><script>alert(1)</script>"
+    BROKEN = "<b"
+
+    def _lead(self, **payload):
+        return lead_format.format_lead_message(
+            payload, None, lead_id=1, from_user_id=42, username="u"
+        )
+
+    def _detail(self, **payload):
+        return lead_format.format_lead_admin_detail({
+            "id": 1, "status": "NEW", "created_at": "2026-01-01T00:00:00",
+            "telegram": {"user_id": 1, "username": "u"}, "payload": payload,
+        })
+
+    # ---- format_lead_message ----
+
+    def test_have_passthrough_is_escaped(self):
+        text = self._lead(have=[self.INJECT])
+        self.assertNotIn("<script>", text)
+        self.assertIn("&lt;script&gt;", text)
+        self.assertIn("&lt;b&gt;BOLD&lt;/b&gt;", text)
+
+    def test_broken_tag_in_have_cannot_unbalance_message(self):
+        text = self._lead(have=[self.BROKEN])
+        self.assertNotIn("<b\n", text)
+        self.assertIn("&lt;b", text)
+        self.assertEqual(text.count("<b>"), text.count("</b>"))
+
+    def test_calc_service_name_is_escaped(self):
+        calc = SimpleNamespace(
+            valid=True, service_name="Лого <b>&</b>", price_from=1000, price_to=2000,
+            term_from=1, term_to=2, selected_options=[], urgent=False, complex_=False,
+        )
+        text = lead_format.format_lead_message({}, calc, lead_id=1, from_user_id=1, username="u")
+        self.assertIn("&lt;b&gt;", text)
+        self.assertIn("&amp;", text)
+
+    # ---- format_lead_admin_detail ----
+
+    def test_admin_detail_have_is_escaped(self):
+        text = self._detail(have=[self.INJECT])
+        self.assertNotIn("<script>", text)
+        self.assertIn("&lt;script&gt;", text)
+
+    def test_admin_detail_deadline_passthrough_is_escaped(self):
+        """Отличие от format_lead_message: здесь fallback — само значение
+        клиента, а не константа «не указано»."""
+        text = self._detail(deadline=self.INJECT)
+        self.assertNotIn("<script>", text)
+        self.assertIn("&lt;b&gt;BOLD&lt;/b&gt;", text)
+
+    def test_admin_detail_budget_passthrough_is_escaped(self):
+        text = self._detail(budget=self.INJECT)
+        self.assertNotIn("<script>", text)
+        self.assertIn("&lt;", text)
+
+    # ---- легитимные значения не изменились ----
+
+    def test_known_label_keys_render_unchanged(self):
+        text = self._lead(have=["text", "brand"], deadline="asap", budget="lt20")
+        self.assertIn("<b>Что уже есть:</b> готовый текст, фирменный стиль", text)
+        self.assertIn("<b>Когда нужно:</b> как можно скорее", text)
+        self.assertIn("<b>Бюджет:</b> до 20 000 ₽", text)
+        self.assertNotIn("&lt;", text)
+        self.assertNotIn("&amp;", text)
+
+    def test_admin_detail_known_keys_render_unchanged(self):
+        text = self._detail(have=["text"], deadline="asap", budget="lt20")
+        self.assertIn("— Что уже есть: готовый текст", text)
+        self.assertIn("— Когда нужно: как можно скорее", text)
+        self.assertIn("— Бюджет: до 20 000 ₽", text)
+
+    # ---- ни одного сырого клиентского значения не осталось ----
+
+    def test_no_raw_client_value_survives_in_either_formatter(self):
+        payload = {
+            "service_name": self.INJECT, "task_description": self.INJECT,
+            "contact": self.INJECT, "have": [self.INJECT],
+            "deadline": self.INJECT, "budget": self.INJECT,
+            "source": "case", "source_case_title": self.INJECT,
+            "tz_details": {"goal": self.INJECT, "must_have": self.INJECT,
+                           "avoid": self.INJECT, "references": self.INJECT},
+        }
+        for name, text in (
+            ("format_lead_message", self._lead(**payload)),
+            ("format_lead_admin_detail", self._detail(**payload)),
+        ):
+            with self.subTest(formatter=name):
+                self.assertNotIn("<script>", text)
+                self.assertNotIn("<b>BOLD</b>", text)
+                self.assertEqual(text.count("<b>"), text.count("</b>"), "разметка разбалансирована")
+                self.assertEqual(text.count("<i>"), text.count("</i>"))
+
+    def test_supplement_values_already_escaped_stay_escaped(self):
+        text = lead_format.format_lead_supplement_message(1, {"comment": self.INJECT})
+        self.assertNotIn("<script>", text)
+        self.assertIn("&lt;script&gt;", text)
+
+
 if __name__ == "__main__":
     unittest.main()
