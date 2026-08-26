@@ -43,6 +43,102 @@ async def handle_health(request: web.Request) -> web.Response:
     return web.Response(text="ok")
 
 
+async def handle_cloudru_probe(request: web.Request) -> web.Response:
+    """ВРЕМЕННЫЙ диагностический probe (Cloud.ru TEST 1) — измеряет сетевую
+    достижимость s3.cloud.ru ИЗ production-контейнера Render. Подлежит
+    немедленному revert после снятия измерения.
+
+    Цель не пройти аутентификацию, а установить факт: доходит ли TCP/TLS/HTTP
+    до Cloud.ru S3 endpoint с egress-IP Render. 400/403 от самого endpoint —
+    положительный признак доступности.
+
+    Target ЖЁСТКО зашит; никакой параметр запроса не влияет на адрес — это
+    намеренно, чтобы probe не стал SSRF-примитивом. Никакие секреты,
+    переменные окружения и заголовки запроса не читаются и не логируются."""
+    import socket
+    import ssl
+    import time
+    import urllib.error
+    import urllib.request
+
+    HOST = "s3.cloud.ru"
+    TARGET = "https://s3.cloud.ru/"
+    out: dict = {"target": TARGET}
+
+    # 1. DNS
+    try:
+        infos = socket.getaddrinfo(HOST, 443, proto=socket.IPPROTO_TCP)
+        out["dns"] = {"ok": True, "addresses": sorted({i[4][0] for i in infos})}
+    except Exception as e:
+        out["dns"] = {"ok": False, "error": f"{type(e).__name__}: {e}"}
+        return web.json_response(out)
+
+    # 2. TCP + TLS отдельно от HTTP — чтобы отличить сетевую блокировку от
+    # прикладного ответа.
+    try:
+        t0 = time.monotonic()
+        with socket.create_connection((HOST, 443), timeout=15) as sock:
+            tcp_ms = round((time.monotonic() - t0) * 1000, 1)
+            ctx = ssl.create_default_context()
+            with ctx.wrap_socket(sock, server_hostname=HOST) as tls:
+                out["tcp"] = {"ok": True, "peer": tls.getpeername()[0], "connect_ms": tcp_ms}
+                out["tls"] = {
+                    "ok": True,
+                    "version": tls.version(),
+                    "cipher": tls.cipher()[0] if tls.cipher() else None,
+                    "handshake_ms": round((time.monotonic() - t0) * 1000, 1),
+                    "cert_subject_cn": next(
+                        (v for rdn in (tls.getpeercert() or {}).get("subject", ()) for k, v in rdn if k == "commonName"),
+                        None,
+                    ),
+                }
+    except Exception as e:
+        out["tcp_tls"] = {"ok": False, "error": f"{type(e).__name__}: {e}"}
+        return web.json_response(out)
+
+    # 3. HTTPS-запрос с подсчётом редиректов.
+    redirects: list[str] = []
+
+    class _CountingRedirects(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, req, fp, code, msg, headers, newurl):
+            redirects.append(f"{code} -> {newurl}")
+            return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+    opener = urllib.request.build_opener(_CountingRedirects)
+    req = urllib.request.Request(TARGET, method="GET", headers={"User-Agent": "DesignAssistantBot/probe"})
+
+    def _do() -> dict:
+        started = time.monotonic()
+        try:
+            with opener.open(req, timeout=20) as resp:
+                body = resp.read(400)
+                return {
+                    "ok": True, "status": resp.status, "final_url": resp.url,
+                    "headers": dict(resp.headers), "body_head": body.decode("utf-8", "replace"),
+                    "elapsed_ms": round((time.monotonic() - started) * 1000, 1),
+                }
+        except urllib.error.HTTPError as e:
+            body = e.read(400)
+            return {
+                "ok": True, "status": e.code, "final_url": e.url,
+                "headers": dict(e.headers), "body_head": body.decode("utf-8", "replace"),
+                "elapsed_ms": round((time.monotonic() - started) * 1000, 1),
+                "note": "HTTPError — ответ пришёл ОТ endpoint, это доступность, а не сбой",
+            }
+        except Exception as e:
+            return {
+                "ok": False, "error": f"{type(e).__name__}: {e}",
+                "elapsed_ms": round((time.monotonic() - started) * 1000, 1),
+            }
+
+    import asyncio
+
+    out["http"] = await asyncio.to_thread(_do)
+    out["redirects"] = redirects
+    out["redirect_count"] = len(redirects)
+    return web.json_response(out, dumps=lambda d: json.dumps(d, ensure_ascii=False, indent=1))
+
+
 async def handle_public_data(request: web.Request) -> web.Response:
     """Отдаёт ТОЛЬКО файлы из PUBLIC_DATA_FILES (см. её докстринг выше) —
     любое другое имя, включая leads.json, получает обычный 404, как если
@@ -298,6 +394,7 @@ def create_app(bot: Bot) -> web.Application:
     for path in ("/", "/portfolio", "/about", "/calculator", "/brief", "/myleads"):
         app.router.add_get(path, handle_index)
     app.router.add_get("/health", handle_health)
+    app.router.add_get("/api/_cloudru_probe", handle_cloudru_probe)  # ВРЕМЕННО (Cloud.ru TEST 1)
     app.router.add_get("/api/my-leads", handle_my_leads)
     app.router.add_post("/api/leads", handle_create_lead)
     app.router.add_static("/css/", WEBAPP_DIR / "css")
