@@ -12720,5 +12720,391 @@ class CoverSourceRouterDispatchTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(r["cover"])
 
 
+class ResolverNetworkTimeoutTests(unittest.IsolatedAsyncioTestCase):
+    """TimeoutError на каждом сетевом слое резолвера.
+
+    Регрессия, которую эти тесты закрывают (production traceback от
+    2026-08-26): read timeout приходит как TimeoutError, который НЕ
+    наследует urllib.error.URLError — оба лишь соседи под OSError. Узкий
+    except пропускал таймаут наружу, и он обрывал весь мастер создания
+    кейса. Все прежние сетевые тесты поднимали только URLError, поэтому
+    728/728 были зелёными при сломанном production."""
+
+    POST = "https://t.me/media_archive_da/3"
+    FULL = "https://cdn4.telesco.pe/file/EMBEDFULLRES"
+    PREVIEW = "https://cdn4.telesco.pe/file/OGPREVIEW"
+    AVATAR = "https://cdn1.telesco.pe/file/CHANNELAVATAR.jpg"
+
+    def _embed(self, media):
+        return (f"<a style=\"background-image:url('{media}')\"></a>").encode("utf-8")
+
+    def _og(self, url):
+        return f'<meta property="og:image" content="{url}" />'.encode("utf-8")
+
+    def _pages(self, *, embed_exc=None, og_exc=None):
+        """_http_get: embed-страница, страница поста, корень канала."""
+        def fake_get(url, timeout=15):
+            if url.endswith("?embed=1"):
+                if embed_exc:
+                    raise embed_exc
+                return 200, self._embed(self.FULL)
+            if og_exc:
+                raise og_exc
+            if url.endswith("/media_archive_da"):
+                return 200, self._og(self.AVATAR)
+            return 200, self._og(self.PREVIEW)
+        return patch.object(telegram_media, "_http_get", side_effect=fake_get)
+
+    # ---- 1. TimeoutError на embed -> откат на og:image ----
+
+    async def test_timeout_on_embed_falls_back_to_og_image(self):
+        with self._pages(embed_exc=TimeoutError("The read operation timed out")), \
+             patch.object(telegram_media, "_http_head", return_value=(200, "image/jpeg", 6514)):
+            cover = await telegram_media.resolve_cover_url(self.POST)
+        self.assertEqual(cover, self.PREVIEW)
+
+    async def test_socket_timeout_alias_also_falls_back(self):
+        import socket
+        self.assertIs(socket.timeout, TimeoutError)  # Python 3.10+
+        with self._pages(embed_exc=socket.timeout("timed out")), \
+             patch.object(telegram_media, "_http_head", return_value=(200, "image/jpeg", 6514)):
+            self.assertEqual(await telegram_media.resolve_cover_url(self.POST), self.PREVIEW)
+
+    async def test_other_os_errors_on_embed_also_fall_back(self):
+        import socket, ssl
+        for exc in (socket.gaierror("dns"), ssl.SSLError("handshake"), ConnectionResetError("reset")):
+            with self.subTest(exc=type(exc).__name__):
+                with self._pages(embed_exc=exc), \
+                     patch.object(telegram_media, "_http_head", return_value=(200, "image/jpeg", 6514)):
+                    self.assertEqual(await telegram_media.resolve_cover_url(self.POST), self.PREVIEW)
+
+    # ---- 2. TimeoutError на og:image -> контролируемая ошибка ----
+
+    async def test_timeout_on_og_image_raises_controlled_resolver_error(self):
+        with self._pages(embed_exc=TimeoutError("t"), og_exc=TimeoutError("The read operation timed out")):
+            with self.assertRaises(telegram_media.TelegramMediaResolveError):
+                await telegram_media.resolve_cover_url(self.POST)
+
+    async def test_timeout_error_message_has_no_reason_attribute_crash(self):
+        """TimeoutError не имеет .reason — форматирование не должно
+        превращать один сбой в AttributeError."""
+        self.assertFalse(hasattr(TimeoutError("x"), "reason"))
+        with self._pages(embed_exc=TimeoutError("t"), og_exc=TimeoutError("read timed out")):
+            with self.assertRaises(telegram_media.TelegramMediaResolveError) as ctx:
+                await telegram_media.resolve_cover_url(self.POST)
+        self.assertIn("TimeoutError", str(ctx.exception))
+
+    # ---- 3. Прежнее поведение URLError не изменилось ----
+
+    async def test_urlerror_on_embed_still_falls_back(self):
+        with self._pages(embed_exc=urllib.error.URLError("network down")), \
+             patch.object(telegram_media, "_http_head", return_value=(200, "image/jpeg", 6514)):
+            self.assertEqual(await telegram_media.resolve_cover_url(self.POST), self.PREVIEW)
+
+    async def test_urlerror_on_og_image_still_raises_resolver_error(self):
+        with self._pages(embed_exc=urllib.error.URLError("down"), og_exc=urllib.error.URLError("down")):
+            with self.assertRaises(telegram_media.TelegramMediaResolveError):
+                await telegram_media.resolve_cover_url(self.POST)
+
+    async def test_head_timeout_marks_image_unusable_not_crash(self):
+        """Третий site: _is_accessible_image. Таймаут HEAD означает
+        «картинка не годится», а не аварию — embed отбрасывается и
+        резолвер откатывается на og:image."""
+        def fake_head(url, timeout=10):
+            if url == self.FULL:
+                raise TimeoutError("The read operation timed out")
+            return 200, "image/jpeg", 6514
+        with self._pages(), patch.object(telegram_media, "_http_head", side_effect=fake_head):
+            self.assertEqual(await telegram_media.resolve_cover_url(self.POST), self.PREVIEW)
+
+    async def test_head_urlerror_still_marks_image_unusable(self):
+        def fake_head(url, timeout=10):
+            if url == self.FULL:
+                raise urllib.error.URLError("down")
+            return 200, "image/jpeg", 6514
+        with self._pages(), patch.object(telegram_media, "_http_head", side_effect=fake_head):
+            self.assertEqual(await telegram_media.resolve_cover_url(self.POST), self.PREVIEW)
+
+
+class ArchiveCleanupContractTests(unittest.IsolatedAsyncioTestCase):
+    """Контракт уборки архивного сообщения: опубликовали -> не смогли
+    разрезолвить -> сообщение обязано исчезнуть, независимо от ТИПА сбоя."""
+
+    COVER = "https://cdn4.telesco.pe/file/RESOLVEDCOVER"
+
+    def setUp(self):
+        self._orig = media_archive.config.MEDIA_ARCHIVE_CHANNEL
+        media_archive.config.MEDIA_ARCHIVE_CHANNEL = "@media_archive_da"
+
+    def tearDown(self):
+        media_archive.config.MEDIA_ARCHIVE_CHANNEL = self._orig
+
+    def _bot(self):
+        return SimpleNamespace(
+            send_photo=AsyncMock(return_value=SimpleNamespace(message_id=42)),
+            delete_message=AsyncMock(),
+        )
+
+    # ---- 4. timeout после публикации -> архив удалён ----
+
+    async def test_timeout_after_publish_deletes_archive_message(self):
+        bot = self._bot()
+        with patch.object(telegram_media, "resolve_cover_url",
+                          side_effect=TimeoutError("The read operation timed out")):
+            with self.assertRaises(TimeoutError):
+                await admin._cover_from_upload(bot, "FILE_ID")
+        bot.delete_message.assert_awaited_once_with(chat_id="@media_archive_da", message_id=42)
+
+    # ---- 5. любой сбой резолвера -> сироты не остаётся ----
+
+    async def test_no_orphan_for_any_failure_type(self):
+        import zlib
+        for exc in (
+            telegram_media.TelegramMediaResolveError("no media"),
+            TimeoutError("timed out"),
+            urllib.error.URLError("down"),
+            zlib.error("bad gzip"),          # НЕ OSError
+            RuntimeError("unexpected bug"),  # программная ошибка
+        ):
+            with self.subTest(exc=type(exc).__name__):
+                bot = self._bot()
+                with patch.object(telegram_media, "resolve_cover_url", side_effect=exc):
+                    with self.assertRaises(type(exc)):
+                        await admin._cover_from_upload(bot, "FILE_ID")
+                bot.delete_message.assert_awaited_once_with(chat_id="@media_archive_da", message_id=42)
+
+    async def test_cancellation_does_not_orphan_archive_message(self):
+        """CancelledError наследует BaseException, поэтому except Exception
+        оставил бы сироту — finally не оставляет."""
+        bot = self._bot()
+        with patch.object(telegram_media, "resolve_cover_url", side_effect=asyncio.CancelledError()):
+            with self.assertRaises(asyncio.CancelledError):
+                await admin._cover_from_upload(bot, "FILE_ID")
+        bot.delete_message.assert_awaited_once()
+
+    # ---- 6. успех -> архив НЕ удаляется ----
+
+    async def test_success_never_deletes_archive_message(self):
+        bot = self._bot()
+        with patch.object(telegram_media, "resolve_cover_url", return_value=self.COVER):
+            cover, fields = await admin._cover_from_upload(bot, "FILE_ID")
+        self.assertEqual(cover, self.COVER)
+        self.assertEqual(fields["source_ref"], "archive:@media_archive_da:42")
+        bot.delete_message.assert_not_awaited()
+
+    async def test_exception_type_and_traceback_are_not_swallowed(self):
+        """finally не подменяет исходное исключение — тип сохраняется."""
+        bot = self._bot()
+        original = TimeoutError("The read operation timed out")
+        with patch.object(telegram_media, "resolve_cover_url", side_effect=original):
+            with self.assertRaises(TimeoutError) as ctx:
+                await admin._cover_from_upload(bot, "FILE_ID")
+        self.assertIs(ctx.exception, original)
+
+    async def test_delete_archive_message_never_raises_invariant(self):
+        """Инвариант, на который опирается finally: если бы уборка бросала,
+        она подменила бы собой настоящую причину сбоя."""
+        bot = SimpleNamespace(delete_message=AsyncMock(side_effect=RuntimeError("api down")))
+        self.assertFalse(await media_archive.delete_archive_message(bot, "archive:@c:1"))
+
+    async def test_failure_inside_cleanup_does_not_mask_original_error(self):
+        bot = self._bot()
+        bot.delete_message = AsyncMock(side_effect=RuntimeError("cleanup exploded"))
+        with patch.object(telegram_media, "resolve_cover_url", side_effect=TimeoutError("orig")):
+            with self.assertRaises(TimeoutError):   # НЕ RuntimeError
+                await admin._cover_from_upload(bot, "FILE_ID")
+
+
+class AddCaseFullFlowIntegrationTests(unittest.IsolatedAsyncioTestCase):
+    """Полный мастер БЕЗ подмены _cover_from_upload.
+
+    Существующий test_completing_add_case_wizard_preserves_nav_anchor
+    патчит _cover_from_upload целиком и поэтому физически не мог поймать
+    таймаут внутри резолвера — именно так дефект и уехал в production.
+    Здесь мокается только транспорт (_http_get/_http_head/send_archive_photo),
+    а вся цепочка cases_add_photo -> _cover_from_upload -> resolve_cover_url
+    -> _resolve_from_embed выполняется по-настоящему."""
+
+    ARCHIVE_MSG = 55
+    FULL = "https://cdn4.telesco.pe/file/EMBEDFULLRES"
+    PREVIEW = "https://cdn4.telesco.pe/file/OGPREVIEW"
+    AVATAR = "https://cdn1.telesco.pe/file/AVATARPLACEHOLDER.jpg"
+
+    async def asyncSetUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        real_data_dir = Path(__file__).resolve().parent.parent / "data"
+        for name in ("pricing.json", "portfolio.json", "faq.json", "about.json", "ui_config.json"):
+            shutil.copy(real_data_dir / name, Path(self.tmpdir) / name)
+        self._orig_data_dir = content_store.DATA_DIR
+        self._orig_designer = content_store.config.DESIGNER_CHAT_ID
+        self._orig_channel = media_archive.config.MEDIA_ARCHIVE_CHANNEL
+        content_store.DATA_DIR = Path(self.tmpdir)
+        content_store.config.DESIGNER_CHAT_ID = "999"
+        media_archive.config.MEDIA_ARCHIVE_CHANNEL = "@media_archive_da"
+        self.actor = 999
+
+    def tearDown(self):
+        content_store.DATA_DIR = self._orig_data_dir
+        content_store.config.DESIGNER_CHAT_ID = self._orig_designer
+        media_archive.config.MEDIA_ARCHIVE_CHANNEL = self._orig_channel
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def _transport(self, *, embed_exc=None, og_exc=None):
+        """Мокается ТОЛЬКО транспорт — резолвер работает по-настоящему."""
+        def fake_get(url, timeout=15):
+            if url.endswith("?embed=1"):
+                if embed_exc:
+                    raise embed_exc
+                return 200, f"<a style=\"background-image:url('{self.FULL}')\"></a>".encode("utf-8")
+            if og_exc:
+                raise og_exc
+            og = self.AVATAR if url.endswith("/media_archive_da") else self.PREVIEW
+            return 200, f'<meta property="og:image" content="{og}" />'.encode("utf-8")
+        return (
+            patch.object(telegram_media, "_http_get", side_effect=fake_get),
+            patch.object(telegram_media, "_http_head", return_value=(200, "image/jpeg", 23807)),
+            patch.object(media_archive, "send_archive_photo",
+                         new=AsyncMock(return_value=(self.ARCHIVE_MSG,
+                                                     f"https://t.me/media_archive_da/{self.ARCHIVE_MSG}"))),
+        )
+
+    async def _state(self, case_id):
+        state = make_state(self.actor)
+        await state.set_state(AdminStates.add_case_photo)
+        await state.update_data(case_id=case_id, title="Тестовый кейс", type_id="site")
+        return state
+
+    async def _case(self, case_id):
+        return next((c for c in await content_store.list_cases() if c["id"] == case_id), None)
+
+    # ---- 9. photo -> description prompt (реальный резолвер) ----
+
+    async def test_photo_reaches_description_prompt_through_real_resolver(self):
+        case_id = await content_store.next_case_id()
+        state = await self._state(case_id)
+        msg = make_photo_message(self.actor)
+        g, h, a = self._transport()
+        with g, h, a:
+            await admin.cases_add_photo(msg, state)
+
+        self.assertEqual(await state.get_state(), AdminStates.add_case_description.state)
+        data = await state.get_data()
+        self.assertEqual(data["cover"], self.FULL)     # embed-вариант, не og:image
+        self.assertEqual(data["source_type"], "upload")
+        shown = (msg.bot.edit_message_text.await_args or msg.answer.await_args).args[0]
+        self.assertIn("Короткое описание задачи", shown)
+
+    async def test_embed_timeout_still_reaches_description_prompt(self):
+        """Ровно production-сценарий: таймаут на ?embed=1 больше не рушит
+        мастер — резолвер откатывается на og:image и flow продолжается."""
+        case_id = await content_store.next_case_id()
+        state = await self._state(case_id)
+        msg = make_photo_message(self.actor)
+        g, h, a = self._transport(embed_exc=TimeoutError("The read operation timed out"))
+        with g, h, a:
+            await admin.cases_add_photo(msg, state)
+
+        self.assertEqual(await state.get_state(), AdminStates.add_case_description.state)
+        self.assertEqual((await state.get_data())["cover"], self.PREVIEW)
+        msg.bot.delete_message.assert_not_called()     # архив НЕ удалён — успех
+
+    # ---- 10. photo -> description -> OK -> финальное меню ----
+
+    async def test_full_wizard_photo_to_final_admin_menu(self):
+        case_id = await content_store.next_case_id()
+        state = await self._state(case_id)
+        g, h, a = self._transport()
+        with g, h, a:
+            await admin.cases_add_photo(make_photo_message(self.actor), state)
+
+        final = make_flow_message_factory(chat_id=self.actor, start_id=9900)(text="Описание кейса")
+        await admin.cases_add_description(final, state)
+
+        case = await self._case(case_id)
+        self.assertIsNotNone(case)
+        self.assertEqual(case["cover"], self.FULL)
+        self.assertEqual(case["source_type"], "upload")
+        self.assertEqual(case["source_ref"], f"archive:@media_archive_da:{self.ARCHIVE_MSG}")
+        self.assertFalse(case.get("external_url"))
+
+        call = final.bot.edit_message_text.await_args or final.answer.await_args
+        self.assertIn("добавлен", call.args[0])
+        self.assertEqual(call.kwargs.get("reply_markup"), kb.admin_cases_menu_keyboard())
+        self.assertIsNone(await state.get_state())     # finish_flow
+
+    # ---- 11. полный сбой резолвера -> контролируемая ошибка + retry ----
+
+    async def test_total_resolver_failure_gives_controlled_error_and_allows_retry(self):
+        case_id = await content_store.next_case_id()
+        state = await self._state(case_id)
+        before = len(await content_store.list_cases())
+        msg = make_photo_message(self.actor)
+        g, h, a = self._transport(embed_exc=TimeoutError("t"), og_exc=TimeoutError("t"))
+        with g, h, a:
+            await admin.cases_add_photo(msg, state)
+
+        shown = (msg.bot.edit_message_text.await_args or msg.answer.await_args).args[0]
+        self.assertIn("Не удалось загрузить изображение", shown)
+        self.assertNotIn("Traceback", shown)
+        self.assertNotIn("TimeoutError", shown)
+        # архивная сирота убрана
+        msg.bot.delete_message.assert_awaited_once_with(
+            chat_id="@media_archive_da", message_id=self.ARCHIVE_MSG
+        )
+        # кейс не создан, шаг прежний -> повтор возможен
+        self.assertEqual(len(await content_store.list_cases()), before)
+        self.assertIsNone((await state.get_data()).get("cover"))
+        self.assertEqual(await state.get_state(), AdminStates.add_case_photo.state)
+
+        # retry: та же FSM-позиция, повторная отправка фото проходит
+        msg2 = make_photo_message(self.actor)
+        g2, h2, a2 = self._transport()
+        with g2, h2, a2:
+            await admin.cases_add_photo(msg2, state)
+        self.assertEqual(await state.get_state(), AdminStates.add_case_description.state)
+
+    async def test_non_oserror_failure_is_controlled_not_a_dead_handler(self):
+        """zlib.error не наследует OSError — расширение except'ов в
+        резолвере его не покрывает, за это отвечает Change 3."""
+        import zlib
+        case_id = await content_store.next_case_id()
+        state = await self._state(case_id)
+        msg = make_photo_message(self.actor)
+        g, h, a = self._transport(embed_exc=zlib.error("bad gzip"), og_exc=zlib.error("bad gzip"))
+        with g, h, a:
+            await admin.cases_add_photo(msg, state)   # НЕ должно бросить наружу
+        shown = (msg.bot.edit_message_text.await_args or msg.answer.await_args).args[0]
+        self.assertIn("Не удалось загрузить изображение", shown)
+        msg.bot.delete_message.assert_awaited_once()
+        self.assertEqual(await state.get_state(), AdminStates.add_case_photo.state)
+
+    # ---- 7. замена обложки: сбой сохраняет старое состояние ----
+
+    async def test_replacement_timeout_preserves_old_cover_and_old_archive(self):
+        await content_store.add_case(
+            self.actor, case_id="case_rep_to", title="S", type_id="site",
+            cover="https://cdn4.telesco.pe/file/OLDCOVER", task="t", related_service=None,
+        )
+        await content_store.update_case(
+            self.actor, "case_rep_to", source_type="upload",
+            source_ref="archive:@media_archive_da:11",
+        )
+        state = make_state(self.actor)
+        await state.set_state(AdminStates.edit_case_value)
+        await state.update_data(case_id="case_rep_to", field="cover")
+        msg = make_photo_message(self.actor)
+        g, h, a = self._transport(embed_exc=TimeoutError("t"), og_exc=TimeoutError("t"))
+        with g, h, a:
+            await admin.cases_edit_value(msg, state)
+
+        case = await self._case("case_rep_to")
+        self.assertEqual(case["cover"], "https://cdn4.telesco.pe/file/OLDCOVER")
+        self.assertEqual(case["source_ref"], "archive:@media_archive_da:11")
+        # удалено ТОЛЬКО новое (осиротевшее) сообщение, старое не тронуто
+        msg.bot.delete_message.assert_awaited_once_with(
+            chat_id="@media_archive_da", message_id=self.ARCHIVE_MSG
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

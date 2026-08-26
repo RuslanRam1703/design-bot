@@ -154,12 +154,34 @@ async def _cover_from_upload(bot: Any, file_id: str) -> tuple[str, dict[str, str
     удаляет вызывающий код и только ПОСЛЕ успешной записи в
     portfolio.json."""
     message_id, post_url = await media_archive.send_archive_photo(bot, file_id)
+    source_ref = media_archive.build_source_ref(message_id)
+
+    # try/finally с флагом, а НЕ except: удалить только что созданное
+    # архивное сообщение нужно при ЛЮБОМ незавершении, а не только при
+    # TelegramMediaResolveError. Прежний узкий except пропускал
+    # TimeoutError, и сообщение оставалось сиротой в канале (проверено в
+    # production).
+    #
+    # Почему finally, а не "except Exception: cleanup; raise":
+    # - здесь нет except вообще, поэтому исключение уходит наверх ровно
+    #   своим типом и со своим traceback — ничего не проглатывается;
+    # - asyncio.CancelledError наследует BaseException, а не Exception,
+    #   поэтому except Exception оставил бы сироту при отмене задачи;
+    # - удаление привязано к флагу, который ставится строкой ниже
+    #   успешного resolve, поэтому после успеха оно невозможно.
+    #
+    # ВАЖНО: delete_archive_message по контракту best-effort и НИКОГДА не
+    # бросает (см. bot/media_archive.py) — иначе исключение из finally
+    # подменило бы собой настоящую причину сбоя. Это инвариант, на который
+    # здесь опираются; он закреплён отдельным тестом.
+    resolved = False
     try:
         cover = await telegram_media.resolve_cover_url(post_url)
-    except telegram_media.TelegramMediaResolveError:
-        await media_archive.delete_archive_message(bot, media_archive.build_source_ref(message_id))
-        raise
-    return cover, _uploaded_cover_fields(media_archive.build_source_ref(message_id))
+        resolved = True
+        return cover, _uploaded_cover_fields(source_ref)
+    finally:
+        if not resolved:
+            await media_archive.delete_archive_message(bot, source_ref)
 
 # Куда возвращает универсальная "❌ Отмена" (cancel_keyboard) — по значению
 # cancel_to, проставленному в state.data в момент входа в конкретный мастер
@@ -493,6 +515,22 @@ async def cases_add_photo(message: Message, state: FSMContext) -> None:
         return
     except (media_archive.MediaArchiveError, telegram_media.TelegramMediaResolveError):
         logger.exception("Cover upload failed for new case (case_id=%s)", data["case_id"])
+        await flow.step_from_text(message, state, _COVER_UPLOAD_ERROR, kb.cancel_keyboard())
+        return
+    except Exception:
+        # Широкий except здесь — не "лишь бы бот не падал", а осознанный
+        # выбор для ОДНОГО шага мастера. Причины:
+        # - zlib.error и http.client.IncompleteRead не наследуют OSError,
+        #   поэтому расширение except'ов в telegram_media их не покрывает,
+        #   а это всё ещё транспортные, а не программные сбои;
+        # - зависший мастер неотличим от «бот умер»: дизайнер не получает
+        #   никакого сигнала и не знает, повторять ли отправку;
+        # - logger.exception сохраняет полный traceback, поэтому НИЧЕГО не
+        #   прячется — настоящая ошибка остаётся видимой в логах.
+        # Архивное сообщение к этому моменту уже убрано (см. finally в
+        # _cover_from_upload), FSM остаётся на этом же шаге, и повторная
+        # отправка фото просто снова входит в этот хендлер.
+        logger.exception("Unexpected cover upload failure for new case (case_id=%s)", data["case_id"])
         await flow.step_from_text(message, state, _COVER_UPLOAD_ERROR, kb.cancel_keyboard())
         return
     await state.update_data(cover=cover, **source_fields)
@@ -1185,6 +1223,14 @@ async def cases_edit_value(message: Message, state: FSMContext) -> None:
             return
         except (media_archive.MediaArchiveError, telegram_media.TelegramMediaResolveError):
             logger.exception("Cover replacement failed (case_id=%s)", data["case_id"])
+            await flow.step_from_text(message, state, _COVER_UPLOAD_ERROR, kb.cancel_keyboard())
+            return
+        except Exception:
+            # См. тот же except в cases_add_photo. Здесь дополнительно
+            # важно, что кейс остаётся НЕТРОНУТЫМ: старая обложка, старое
+            # archive-сообщение и все поля источника на месте — запись в
+            # portfolio.json идёт строго после успешного резолва.
+            logger.exception("Unexpected cover replacement failure (case_id=%s)", data["case_id"])
             await flow.step_from_text(message, state, _COVER_UPLOAD_ERROR, kb.cancel_keyboard())
             return
         # Покрывает все переходы разом: behance -> upload,

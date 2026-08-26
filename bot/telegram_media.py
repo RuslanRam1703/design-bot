@@ -282,10 +282,20 @@ def _http_head(url: str, timeout: int = 10) -> tuple[int, str, int]:
 
 
 async def _fetch_og_image(page_url: str, what: str) -> str | None:
+    # OSError, а не urllib.error.URLError: read timeout приходит как
+    # TimeoutError, который URLError НЕ наследует — оба лишь соседи под
+    # OSError. Узкий except пропускал таймаут наружу, и он обрывал
+    # admin-хендлер вместе со всем мастером создания кейса (production
+    # traceback от 2026-08-26). OSError покрывает URLError, TimeoutError,
+    # socket.gaierror и ssl.SSLError — весь транспорт, но не программные
+    # ошибки. Прежняя семантика сохранена: URLError ⊂ OSError.
+    #
+    # e, а не e.reason: у TimeoutError атрибута reason нет вовсе, и
+    # обращение к нему заменило бы один сбой другим (AttributeError).
     try:
         status, body = await asyncio.to_thread(_http_get, page_url)
-    except urllib.error.URLError as e:
-        raise TelegramMediaResolveError(f"{what} недоступна: {e.reason}") from e
+    except OSError as e:
+        raise TelegramMediaResolveError(f"{what} недоступна: {type(e).__name__}: {e}") from e
     if status != 200:
         raise TelegramMediaResolveError(f"{what} вернула HTTP {status}")
     return extract_og_image(body.decode("utf-8", errors="replace"))
@@ -295,10 +305,12 @@ async def _is_accessible_image(image_url: str) -> bool:
     """200 + image/* + ненулевая длина. Только 200 недостаточно: превью
     может отдать заглушку нулевого размера, и она стала бы битой картинкой
     в карточке кейса."""
+    # OSError (см. _fetch_og_image) — здесь означает НЕ ошибку, а "картинка
+    # недоступна": вызывающий код просто не возьмёт её в обложку.
     try:
         status, content_type, length = await asyncio.to_thread(_http_head, image_url)
-    except urllib.error.URLError as e:
-        logger.warning("Telegram: обложка недоступна (%s): %s", image_url, e.reason)
+    except OSError as e:
+        logger.warning("Telegram: обложка недоступна (%s): %s: %s", image_url, type(e).__name__, e)
         return False
     if status != 200:
         logger.warning("Telegram: обложка вернула HTTP %s (%s)", status, image_url)
@@ -331,10 +343,17 @@ async def _resolve_from_embed(normalized_url: str) -> str | None:
     УЛУЧШЕНИЕ качества, а не обязательный шаг. Если разметка страницы
     когда-нибудь изменится, кейс должен продолжать получать обложку из
     og:image, пусть и меньшего размера, а не падать с ошибкой."""
+    # OSError (см. _fetch_og_image) — здесь означает откат на og:image.
+    # Именно этот site уронил production: read timeout на ?embed=1
+    # пролетал мимо urllib.error.URLError и обрывал весь мастер, хотя
+    # embed — всего лишь улучшение качества, ради которого падать нельзя.
     try:
         status, body = await asyncio.to_thread(_http_get, normalized_url + _EMBED_SUFFIX)
-    except urllib.error.URLError as e:
-        logger.warning("Telegram: embed-страница недоступна (%s): %s", normalized_url, e.reason)
+    except OSError as e:
+        logger.warning(
+            "Telegram: embed-страница недоступна (%s): %s: %s — откат на og:image",
+            normalized_url, type(e).__name__, e,
+        )
         return None
     if status != 200:
         logger.warning("Telegram: embed-страница вернула HTTP %s (%s)", status, normalized_url)
