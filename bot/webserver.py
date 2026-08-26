@@ -43,6 +43,76 @@ async def handle_health(request: web.Request) -> web.Response:
     return web.Response(text="ok")
 
 
+# ---------------------------------------------------------------------------
+# ВРЕМЕННЫЙ ДИАГНОСТИЧЕСКИЙ ENDPOINT — УДАЛИТЬ СРАЗУ ПОСЛЕ ЗАМЕРА (TEST 1).
+# Вопрос: доходит ли egress Render до публичной страницы Telegram-поста и
+# до Telegram CDN. Доступность mir-s3-cdn-cf/r.jina.ai это НЕ доказывает —
+# другой хост, другая инфраструктура.
+#
+# Оба URL захардкожены, параметров у endpoint'а нет: произвольный адрес
+# превратил бы его в анонимный SSRF-примитив. Секреты не логируются —
+# bot token здесь вообще не участвует.
+_TME_PROBE_POST = "https://t.me/telegram/379"     # пост С медиа
+_TME_PROBE_CHANNEL = "https://t.me/telegram"      # корень канала — для отсечения avatar
+
+
+async def handle_tme_probe(request: web.Request) -> web.Response:
+    import asyncio
+    import urllib.error
+    import urllib.request
+
+    from bot import behance  # только чтение: extract_og_image / _IMAGE_HEADERS
+
+    def _get(url: str) -> dict:
+        req = urllib.request.Request(
+            url, headers={"User-Agent": "DesignAssistantBot/1.0 diagnostic-probe"}, method="GET"
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=25) as resp:
+                body = resp.read()
+                return {"status": resp.status, "final_url": resp.url,
+                        "redirected": resp.url != url, "bytes": len(body),
+                        "og_image": behance.extract_og_image(body.decode("utf-8", errors="replace")),
+                        "error": None}
+        except urllib.error.HTTPError as e:
+            return {"status": e.code, "final_url": None, "redirected": None, "bytes": 0,
+                    "og_image": None, "error": f"HTTPError {e.code} {e.reason}"}
+        except Exception as e:
+            return {"status": None, "final_url": None, "redirected": None, "bytes": 0,
+                    "og_image": None, "error": f"{type(e).__name__}: {e}"}
+
+    def _head(url: str) -> dict:
+        req = urllib.request.Request(url, headers=behance._IMAGE_HEADERS, method="HEAD")
+        try:
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                return {"status": resp.status,
+                        "content_type": resp.headers.get("Content-Type"),
+                        "content_length": resp.headers.get("Content-Length"),
+                        "acao": resp.headers.get("Access-Control-Allow-Origin"),
+                        "error": None}
+        except urllib.error.HTTPError as e:
+            return {"status": e.code, "content_type": None, "content_length": None,
+                    "acao": None, "error": f"HTTPError {e.code} {e.reason}"}
+        except Exception as e:
+            return {"status": None, "content_type": None, "content_length": None,
+                    "acao": None, "error": f"{type(e).__name__}: {e}"}
+
+    post = await asyncio.to_thread(_get, _TME_PROBE_POST)
+    channel = await asyncio.to_thread(_get, _TME_PROBE_CHANNEL)
+
+    og = post.get("og_image")
+    cdn = {"skipped": "no og:image on post"}
+    if og:
+        cdn = await asyncio.to_thread(_head, og)
+        cdn["host"] = og.split("/")[2] if "//" in og else None
+        cdn["tokenless"] = "/file/bot" not in og
+        cdn["is_channel_avatar"] = (og == channel.get("og_image"))
+
+    result = {"post": post, "channel_root_og_image_present": bool(channel.get("og_image")), "cdn": cdn}
+    logger.info("TME PROBE result: %s", result)
+    return web.json_response(result)
+
+
 async def handle_public_data(request: web.Request) -> web.Response:
     """Отдаёт ТОЛЬКО файлы из PUBLIC_DATA_FILES (см. её докстринг выше) —
     любое другое имя, включая leads.json, получает обычный 404, как если
@@ -298,6 +368,7 @@ def create_app(bot: Bot) -> web.Application:
     for path in ("/", "/portfolio", "/about", "/calculator", "/brief", "/myleads"):
         app.router.add_get(path, handle_index)
     app.router.add_get("/health", handle_health)
+    app.router.add_get("/api/_tme_probe", handle_tme_probe)  # ВРЕМЕННО — удалить после замера
     app.router.add_get("/api/my-leads", handle_my_leads)
     app.router.add_post("/api/leads", handle_create_lead)
     app.router.add_static("/css/", WEBAPP_DIR / "css")
