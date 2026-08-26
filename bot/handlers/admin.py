@@ -43,6 +43,14 @@ _TELEGRAM_COVER_ERROR = (
     "на публичный пост с изображением."
 )
 
+# Тот же текст, что показывался в ветке создания кейса до вынесения в
+# константу — теперь он нужен ещё и ветке с caption (Telegram
+# «Поделиться»), и оба места обязаны говорить дизайнеру одно и то же.
+_BEHANCE_COVER_ERROR = (
+    "Не удалось получить обложку с Behance 🙁 Проверьте, что это ссылка "
+    "на публичный проект, и пришлите её ещё раз — либо загрузите фото."
+)
+
 # Инвариант источника обложки: external_url осмыслен ТОЛЬКО пока cover —
 # это та самая картинка, которую резолвер получил ИЗ этого external_url.
 # Как только обложкой становится собственный файл дизайнера, ссылка
@@ -74,6 +82,52 @@ _ARCHIVE_NOT_CONFIGURED_ERROR = (
     "Пока можно добавить кейс ссылкой на проект Behance или на публичный "
     "пост в Telegram."
 )
+
+
+def _source_url_from_message(message: Message) -> str | None:
+    """Ссылка на внешний источник обложки из сообщения — из caption, если
+    сообщение с медиа, иначе из text. None, если поддерживаемой ссылки нет.
+
+    Зачем читать caption: Telegram «Поделиться» доставляет публичный пост
+    боту как photo + caption, а НЕ как текст (проверено на реальных
+    aiogram-объектах: при наличии caption message.text == None). Раньше
+    такое сообщение выигрывал фильтр F.photo, ссылка молча терялась, а
+    фотография ещё и переопубликовывалась в архив — то есть кейс со
+    ссылкой на чужой пост становился обычным upload'ом. Приоритет отдан
+    НАМЕРЕНИЮ (что за работа), а не транспорту (чем её прислали).
+
+    Распознаются ровно те же формы, что и для текстовой ветки — теми же
+    валидаторами резолверов. Никакого своего парсинга URL: caption
+    целиком должен быть валидной ссылкой, произвольный текст вокруг
+    ссылки источником не считается (то же поведение, что и у текстовой
+    ветки до этого изменения)."""
+    raw = (message.caption or message.text or "").strip()
+    if not raw:
+        return None
+    if behance.is_behance_project_url(raw) or telegram_media.is_telegram_post_url(raw):
+        return raw
+    return None
+
+
+async def _cover_from_source_url(url: str) -> tuple[str, dict[str, str | None]]:
+    """Внешняя ссылка -> (cover, поля источника). Единственное место, где
+    решается, какой резолвер применить — им пользуются и текстовая ветка,
+    и ветка с caption, и замена обложки, чтобы routing не разъехался между
+    тремя копиями.
+
+    Вызывать только для url, прошедшего _source_url_from_message. Бросает
+    исходное исключение резолвера (BehanceResolveError /
+    TelegramMediaResolveError) — вызывающий код сам решает, какой текст
+    показать дизайнеру.
+
+    Ни архив, ни storage здесь не участвуют: обложка живёт на чужом CDN,
+    ни одного байта картинки через Render не проходит."""
+    if behance.is_behance_project_url(url):
+        cover = await behance.resolve_cover_url(url)
+        return cover, {"source_type": "behance", "external_url": url, "source_ref": url}
+    normalized = telegram_media.normalize_post_url(url)
+    cover = await telegram_media.resolve_cover_url(normalized)
+    return cover, {"source_type": "telegram_post", "external_url": normalized, "source_ref": normalized}
 
 
 async def _cover_from_upload(bot: Any, file_id: str) -> tuple[str, dict[str, str | None]]:
@@ -399,10 +453,37 @@ async def cases_add_title(message: Message, state: FSMContext) -> None:
 
 @router.message(AdminStates.add_case_photo, F.photo | F.document)
 async def cases_add_photo(message: Message, state: FSMContext) -> None:
+    data = await state.get_data()
+
+    # Intent-first: если в caption пришла ссылка на Behance-проект или на
+    # публичный пост Telegram, это НЕ загрузка файла, а тот же сценарий
+    # "кейс по внешней ссылке" — просто доставленный через «Поделиться»
+    # (см. _source_url_from_message). Фотография в таком сообщении —
+    # превью чужой работы, и переопубликовывать её в наш архив нельзя.
+    #
+    # Проверка идёт ДО _is_valid_image_upload намеренно: если ссылка
+    # распознана, сам вложенный файл не используется вообще, и его
+    # mime-type значения не имеет.
+    source_url = _source_url_from_message(message)
+    if source_url:
+        try:
+            cover, source_fields = await _cover_from_source_url(source_url)
+        except behance.BehanceResolveError as e:
+            logger.warning("Behance cover resolve failed (new case, caption): %s", e)
+            await flow.step_from_text(message, state, _BEHANCE_COVER_ERROR, kb.cancel_keyboard())
+            return
+        except telegram_media.TelegramMediaResolveError as e:
+            logger.warning("Telegram cover resolve failed (new case, caption): %s", e)
+            await flow.step_from_text(message, state, _TELEGRAM_COVER_ERROR, kb.cancel_keyboard())
+            return
+        await state.update_data(cover=cover, **source_fields)
+        await flow.step_from_text(message, state, "Короткое описание задачи (пара предложений):", kb.cancel_keyboard())
+        await state.set_state(AdminStates.add_case_description)
+        return
+
     if not _is_valid_image_upload(message):
         await flow.step_from_text(message, state, "Нужно изображение (фото или файл-картинка) 📎.", kb.cancel_keyboard())
         return
-    data = await state.get_data()
     file_id = message.photo[-1].file_id if message.photo else message.document.file_id
     try:
         cover, source_fields = await _cover_from_upload(message.bot, file_id)
@@ -441,47 +522,13 @@ async def cases_add_photo_behance(message: Message, state: FSMContext) -> None:
     их не принимает (менять content_store.py в этой задаче нельзя), поэтому
     они проставляются отдельным update_case() уже после создания кейса —
     см. cases_add_description ниже."""
-    url = message.text.strip()
-
-    if behance.is_behance_project_url(url):
-        try:
-            cover = await behance.resolve_cover_url(url)
-        except behance.BehanceResolveError as e:
-            # Пользователю — понятная формулировка без traceback и внутренних
-            # деталей; сама причина уходит только в логи.
-            logger.warning("Behance cover resolve failed (new case): %s", e)
-            await flow.step_from_text(
-                message, state,
-                "Не удалось получить обложку с Behance 🙁 Проверьте, что это ссылка "
-                "на публичный проект, и пришлите её ещё раз — либо загрузите фото.",
-                kb.cancel_keyboard(),
-            )
-            return
-        # source_ref для внешних источников совпадает с external_url —
-        # оба указывают на саму работу. Отдельным полем он существует
-        # ради upload-кейсов, где ссылки наружу нет, а внутренняя
-        # (archive:<канал>:<id>) есть.
-        await state.update_data(cover=cover, external_url=url, source_type="behance", source_ref=url)
-
-    elif telegram_media.is_telegram_post_url(url):
-        try:
-            cover = await telegram_media.resolve_cover_url(url)
-        except telegram_media.TelegramMediaResolveError as e:
-            logger.warning("Telegram cover resolve failed (new case): %s", e)
-            await flow.step_from_text(message, state, _TELEGRAM_COVER_ERROR, kb.cancel_keyboard())
-            return
-        # external_url — НОРМАЛИЗОВАННАЯ ссылка на пост (без ?single и
-        # прочих параметров отображения), cover — прямой URL картинки на
-        # CDN Telegram. Семантика полей не смешивается.
-        normalized = telegram_media.normalize_post_url(url)
-        await state.update_data(
-            cover=cover,
-            external_url=normalized,
-            source_type="telegram_post",
-            source_ref=normalized,
-        )
-
-    else:
+    # Тот же helper, что и у ветки с caption — один источник истины о том,
+    # какая ссылка каким резолвером обрабатывается (см.
+    # _source_url_from_message / _cover_from_source_url). Поведение самой
+    # текстовой ветки при этом не менялось: те же валидаторы, те же
+    # сообщения об ошибках, те же поля источника.
+    source_url = _source_url_from_message(message)
+    if not source_url:
         await flow.step_from_text(
             message, state,
             "Нужно фото 📎, ссылка на проект Behance вида behance.net/gallery/… "
@@ -489,6 +536,26 @@ async def cases_add_photo_behance(message: Message, state: FSMContext) -> None:
             kb.cancel_keyboard(),
         )
         return
+
+    try:
+        cover, source_fields = await _cover_from_source_url(source_url)
+    except behance.BehanceResolveError as e:
+        # Пользователю — понятная формулировка без traceback и внутренних
+        # деталей; сама причина уходит только в логи.
+        logger.warning("Behance cover resolve failed (new case): %s", e)
+        await flow.step_from_text(message, state, _BEHANCE_COVER_ERROR, kb.cancel_keyboard())
+        return
+    except telegram_media.TelegramMediaResolveError as e:
+        logger.warning("Telegram cover resolve failed (new case): %s", e)
+        await flow.step_from_text(message, state, _TELEGRAM_COVER_ERROR, kb.cancel_keyboard())
+        return
+
+    # source_ref для внешних источников совпадает с external_url — оба
+    # указывают на саму работу; отдельным полем он существует ради
+    # upload-кейсов, где ссылки наружу нет, а внутренняя есть. Для
+    # Telegram обе величины НОРМАЛИЗОВАНЫ (без ?single и прочих
+    # параметров отображения) — см. _cover_from_source_url.
+    await state.update_data(cover=cover, **source_fields)
     await flow.step_from_text(message, state, "Короткое описание задачи (пара предложений):", kb.cancel_keyboard())
     await state.set_state(AdminStates.add_case_description)
 
@@ -1069,6 +1136,32 @@ async def cases_edit_value(message: Message, state: FSMContext) -> None:
     data = await state.get_data()
     field = data["field"]
     if field == "cover":
+        # Тот же intent-first принцип, что и при создании кейса: замена
+        # обложки через Telegram «Поделиться» приходит как photo +
+        # caption, и ссылка в caption означает смену ИСТОЧНИКА, а не
+        # загрузку файла. Без этой ветки такая замена молча превращала бы
+        # кейс в upload и заводила лишнюю копию в архиве.
+        source_url = _source_url_from_message(message)
+        if source_url:
+            old_source_ref = (await _current_case(data["case_id"]) or {}).get("source_ref")
+            try:
+                cover, source_fields = await _cover_from_source_url(source_url)
+            except behance.BehanceResolveError as e:
+                logger.warning("Behance cover resolve failed (edit case %s, caption): %s", data["case_id"], e)
+                await flow.step_from_text(message, state, _BEHANCE_COVER_ERROR, kb.cancel_keyboard())
+                return
+            except telegram_media.TelegramMediaResolveError as e:
+                logger.warning("Telegram cover resolve failed (edit case %s, caption): %s", data["case_id"], e)
+                await flow.step_from_text(message, state, _TELEGRAM_COVER_ERROR, kb.cancel_keyboard())
+                return
+            await content_store.update_case(message.chat.id, data["case_id"], cover=cover, **source_fields)
+            # Прежнее архивное сообщение осиротело — убираем ПОСЛЕ записи
+            # (тот же порядок, что и в остальных переходах).
+            await media_archive.delete_archive_message(message.bot, old_source_ref)
+            await flow.step_from_text(message, state, "Обновлено ✅\n\nЧто ещё изменить?", kb.case_field_keyboard())
+            await state.set_state(AdminStates.edit_case_field_pick)
+            return
+
         if not (message.photo or message.document):
             await flow.step_from_text(message, state, "Нужно фото 📎.", kb.cancel_keyboard())
             return
