@@ -13106,5 +13106,341 @@ class AddCaseFullFlowIntegrationTests(unittest.IsolatedAsyncioTestCase):
         )
 
 
+class LeadNotificationLengthTests(unittest.TestCase):
+    """M1: уведомление дизайнеру обязано укладываться в лимит Telegram.
+
+    Регрессия, которую эти тесты закрывают: свободные поля клиента
+    подставлялись в сообщение без потолка, Telegram отвергал всё, что
+    длиннее 4096, ошибка гасилась в webserver.py (except Exception +
+    logger.exception), клиент получал HTTP 200, заявка сохранялась — а
+    дизайнер о ней НЕ УЗНАВАЛ. Ни один прежний тест длину этих двух
+    форматтеров не проверял."""
+
+    TELEGRAM_LIMIT = 4096
+    BIG = "A" * 20000
+
+    def _lead(self, **payload):
+        return lead_format.format_lead_message(
+            payload, None, lead_id=1, from_user_id=42, username="user"
+        )
+
+    # ---- 1. короткая заявка не меняется ----
+
+    def test_short_lead_is_unchanged_and_unclipped(self):
+        text = self._lead(
+            service_name="Логотип", task_description="Нужен логотип",
+            contact="@me", have=["text"], deadline="asap", budget="lt20",
+        )
+        self.assertIn("🆕 <b>Новая заявка #1</b>", text)
+        self.assertIn("<b>Услуга:</b> Логотип", text)
+        self.assertIn("<b>Задача:</b> Нужен логотип", text)
+        self.assertIn("<b>Контакт:</b> @me", text)
+        self.assertIn("<i>От пользователя @user, id 42</i>", text)
+        self.assertNotIn("обрезано", text)          # потолок не сработал
+        self.assertNotIn("часть истории скрыта", text)  # сетка не сработала
+
+    # ---- 2. каждое поле по отдельности ----
+
+    def test_each_oversized_field_alone_stays_within_limit(self):
+        cases = {
+            "service_name": {"service_name": self.BIG},
+            "source_case_title": {"source": "case", "source_case_title": self.BIG},
+            "task_description": {"task_description": self.BIG},
+            "contact": {"contact": self.BIG},
+            "have": {"have": [self.BIG]},
+            "tz_details.goal": {"tz_details": {"goal": self.BIG}},
+            "tz_details.must_have": {"tz_details": {"must_have": self.BIG}},
+            "tz_details.avoid": {"tz_details": {"avoid": self.BIG}},
+            "tz_details.references": {"tz_details": {"references": self.BIG}},
+        }
+        for name, payload in cases.items():
+            with self.subTest(field=name):
+                text = self._lead(**payload)
+                self.assertLessEqual(len(text), self.TELEGRAM_LIMIT, f"{name}: {len(text)}")
+
+    # ---- 3. все поля одновременно (сумма) ----
+
+    def test_all_fields_oversized_simultaneously_stays_within_limit(self):
+        text = self._lead(
+            service_name=self.BIG, source="case", source_case_title=self.BIG,
+            task_description=self.BIG, contact=self.BIG, have=[self.BIG],
+            tz_details={"goal": self.BIG, "must_have": self.BIG,
+                        "avoid": self.BIG, "references": self.BIG},
+        )
+        self.assertLessEqual(len(text), self.TELEGRAM_LIMIT)
+
+    # ---- 4. дополнение ----
+
+    def test_supplement_all_fields_oversized_stays_within_limit(self):
+        text = lead_format.format_lead_supplement_message(
+            7, {k: self.BIG for k in ("comment", "additional_requirements", "references", "contact")}
+        )
+        self.assertLessEqual(len(text), self.TELEGRAM_LIMIT)
+        self.assertIn("Дополнение к заявке #7", text)
+
+    def test_short_supplement_unchanged(self):
+        text = lead_format.format_lead_supplement_message(3, {"comment": "добавьте синий"})
+        self.assertIn("<b>Что добавить/изменить:</b> добавьте синий", text)
+        self.assertNotIn("обрезано", text)
+
+    # ---- 5. содержимое сохраняется, а не стирается ----
+
+    def test_oversized_field_keeps_a_usable_prefix(self):
+        """Ключевая проверка: наивное переиспользование
+        _clamp_to_telegram_limit выбрасывало бы строку целиком и оставляло
+        дизайнеру сообщение вообще без текста заявки."""
+        text = self._lead(task_description="НАЧАЛО ЗАЯВКИ " + self.BIG)
+        self.assertIn("НАЧАЛО ЗАЯВКИ", text)        # начало запроса на месте
+        self.assertIn("обрезано", text)             # и честно помечено
+        self.assertIn("🆕 <b>Новая заявка #1</b>", text)
+        self.assertGreater(len(text), 500, "сообщение не должно схлопнуться в одну пометку")
+
+    def test_clip_marker_points_designer_to_full_text(self):
+        text = self._lead(task_description=self.BIG)
+        self.assertIn("Заявки", text)   # куда идти за полным текстом
+
+    # ---- 6. обрезка не рвёт HTML-сущности ----
+
+    def test_truncation_never_splits_an_html_entity(self):
+        """_clip режет СЫРОЙ текст до _esc. Если бы резали уже
+        экранированный, '&amp;' мог превратиться в '&am', и Telegram
+        отверг бы сообщение с parse_mode='HTML' — тот же молчаливый сбой."""
+        import re as _re
+        for filler in ("&", "<", ">", "&amp;", "<b>"):
+            with self.subTest(filler=filler):
+                payload_text = filler * 5000
+                text = self._lead(task_description=payload_text)
+                # каждый '&' в выводе обязан быть началом валидной сущности
+                for m in _re.finditer(r"&", text):
+                    tail = text[m.start():m.start() + 10]
+                    self.assertRegex(tail, r"^&(amp|lt|gt|quot|#x?\d*);",
+                                     f"оборванная сущность: {tail!r}")
+
+    def test_escaped_output_has_balanced_bold_tags(self):
+        text = self._lead(task_description=self.BIG, contact="<script>" * 500)
+        self.assertEqual(text.count("<b>"), text.count("</b>"))
+        self.assertEqual(text.count("<i>"), text.count("</i>"))
+
+    # ---- 7. admin detail не задет ----
+
+    def test_admin_detail_behaviour_unchanged(self):
+        lead = {
+            "id": 5, "status": "NEW", "created_at": "2026-01-01",
+            "telegram": {"user_id": 1, "username": "u"},
+            "payload": {"service_name": "Логотип", "task_description": "T" * 50},
+        }
+        text = lead_format.format_lead_admin_detail(lead)
+        self.assertIn("Логотип", text)
+        self.assertNotIn("обрезано", text)   # свой механизм, потолки полей его не трогают
+
+    def test_admin_detail_still_clamps_by_whole_lines(self):
+        lead = {
+            "id": 6, "status": "NEW", "created_at": "2026-01-01",
+            "telegram": {"user_id": 1, "username": "u"},
+            "payload": {"service_name": "X"},
+            "owner_messages": [
+                {"id": i, "text": "M" * 300, "sent_at": "2026-01-01T10:00:00"}
+                for i in range(50)
+            ],
+        }
+        text = lead_format.format_lead_admin_detail(lead)
+        self.assertLessEqual(len(text), 4096)
+
+
+class BehanceResolverTimeoutTests(unittest.IsolatedAsyncioTestCase):
+    """M2: тот же timeout-дефект, что был исправлен для upload-резолвера в
+    264a6ad, оставался открытым в Behance-резолвере.
+
+    TimeoutError не наследует urllib.error.URLError — оба лишь соседи под
+    OSError, поэтому узкий except его пропускал. Все прежние сетевые тесты
+    behance поднимали только URLError."""
+
+    URL = "https://www.behance.net/gallery/237585701/Name"
+    CDN = "https://mir-s3-cdn-cf.behance.net/project_modules/1400/b63348237585701.x.jpg"
+
+    def _page(self):
+        return f'<meta property="og:image" content="{self.CDN}" />'.encode("utf-8")
+
+    # ---- 1-2. терминальный site ----
+
+    async def test_timeout_on_page_fetch_becomes_controlled_error(self):
+        with patch.object(behance, "_http_get", side_effect=TimeoutError("The read operation timed out")):
+            with self.assertRaises(behance.BehanceResolveError) as ctx:
+                await behance.resolve_cover_url(self.URL)
+        self.assertIn("TimeoutError", str(ctx.exception))
+
+    async def test_other_os_errors_on_page_fetch_also_controlled(self):
+        import socket, ssl
+        for exc in (socket.gaierror("dns"), ssl.SSLError("tls"), ConnectionResetError("reset")):
+            with self.subTest(exc=type(exc).__name__):
+                with patch.object(behance, "_http_get", side_effect=exc):
+                    with self.assertRaises(behance.BehanceResolveError):
+                        await behance.resolve_cover_url(self.URL)
+
+    # ---- 3. HEAD site: не авария, а "обложка не годится" ----
+
+    async def test_timeout_on_head_marks_image_unusable_without_raising(self):
+        with patch.object(behance, "_http_head", side_effect=TimeoutError("timed out")):
+            self.assertFalse(await behance._is_accessible(self.CDN))
+
+    async def test_timeout_on_head_makes_resolve_fail_controllably(self):
+        with patch.object(behance, "_http_get", return_value=(200, self._page())), \
+             patch.object(behance, "_http_head", side_effect=TimeoutError("timed out")):
+            with self.assertRaises(behance.BehanceResolveError):
+                await behance.resolve_cover_url(self.URL)
+
+    # ---- 4. прежнее поведение URLError не изменилось ----
+
+    async def test_urlerror_on_page_fetch_still_controlled(self):
+        with patch.object(behance, "_http_get", side_effect=urllib.error.URLError("network down")):
+            with self.assertRaises(behance.BehanceResolveError):
+                await behance.resolve_cover_url(self.URL)
+
+    async def test_urlerror_on_head_still_returns_false(self):
+        with patch.object(behance, "_http_head", side_effect=urllib.error.URLError("down")):
+            self.assertFalse(await behance._is_accessible(self.CDN))
+
+    async def test_no_reason_attribute_crash_on_timeout(self):
+        """У TimeoutError нет .reason — прежнее форматирование заменило бы
+        один сбой другим (AttributeError)."""
+        self.assertFalse(hasattr(TimeoutError("x"), "reason"))
+        with patch.object(behance, "_http_get", side_effect=TimeoutError("read timed out")):
+            with self.assertRaises(behance.BehanceResolveError):
+                await behance.resolve_cover_url(self.URL)
+
+    async def test_successful_resolve_still_works(self):
+        with patch.object(behance, "_http_get", return_value=(200, self._page())), \
+             patch.object(behance, "_http_head", return_value=200):
+            cover = await behance.resolve_cover_url(self.URL)
+        self.assertIn("mir-s3-cdn-cf.behance.net", cover)
+
+
+class BehanceSourceHandlerTimeoutTests(unittest.IsolatedAsyncioTestCase):
+    """M2 на уровне ХЕНДЛЕРОВ: таймаут инжектируется в behance._http_get и
+    проходит настоящую цепочку resolve_cover_url -> _cover_from_source_url
+    -> handler, как в production. Замеряно ДО фикса: все четыре пути
+    выбрасывали TimeoutError наружу и обрывали мастер."""
+
+    BEHANCE_URL = "https://www.behance.net/gallery/237585701/Name"
+
+    async def asyncSetUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        real = Path(__file__).resolve().parent.parent / "data"
+        for name in ("pricing.json", "portfolio.json", "faq.json", "about.json", "ui_config.json"):
+            shutil.copy(real / name, Path(self.tmpdir) / name)
+        self._orig_dir = content_store.DATA_DIR
+        self._orig_designer = content_store.config.DESIGNER_CHAT_ID
+        self._orig_channel = media_archive.config.MEDIA_ARCHIVE_CHANNEL
+        content_store.DATA_DIR = Path(self.tmpdir)
+        content_store.config.DESIGNER_CHAT_ID = "999"
+        media_archive.config.MEDIA_ARCHIVE_CHANNEL = "@media_archive_da"
+        self.actor = 999
+
+    def tearDown(self):
+        content_store.DATA_DIR = self._orig_dir
+        content_store.config.DESIGNER_CHAT_ID = self._orig_designer
+        media_archive.config.MEDIA_ARCHIVE_CHANNEL = self._orig_channel
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    async def _state(self, field=None):
+        state = make_state(self.actor)
+        await state.set_state(AdminStates.edit_case_value if field else AdminStates.add_case_photo)
+        await state.update_data(case_id="case_1", title="t", type_id="site",
+                                **({"field": field} if field else {}))
+        return state
+
+    def _timeout(self):
+        return patch.object(behance, "_http_get", side_effect=TimeoutError("The read operation timed out"))
+
+    async def test_text_behance_url_timeout_is_controlled(self):
+        state = await self._state()
+        msg = make_flow_message_factory(chat_id=self.actor, start_id=9700)(text=self.BEHANCE_URL)
+        with self._timeout(), patch.object(media_archive, "send_archive_photo") as archive:
+            await admin.cases_add_photo_behance(msg, state)   # НЕ должно бросить
+        archive.assert_not_called()
+        self.assertEqual(await state.get_state(), AdminStates.add_case_photo.state)
+        self.assertIsNone((await state.get_data()).get("cover"))
+
+    async def test_photo_with_behance_caption_timeout_is_controlled(self):
+        state = await self._state()
+        msg = make_photo_message(self.actor, caption=self.BEHANCE_URL)
+        with self._timeout(), patch.object(media_archive, "send_archive_photo") as archive:
+            await admin.cases_add_photo(msg, state)
+        archive.assert_not_called()
+        self.assertIsNone((await state.get_data()).get("cover"))
+
+    async def test_edit_external_url_behance_timeout_is_controlled(self):
+        await content_store.add_case(
+            self.actor, case_id="case_bh_to", title="S", type_id="site",
+            cover="img/portfolio/demo_case_1.svg", task="t", related_service=None,
+        )
+        state = make_state(self.actor)
+        await state.set_state(AdminStates.edit_case_value)
+        await state.update_data(case_id="case_bh_to", field="external_url")
+        msg = make_flow_message_factory(chat_id=self.actor, start_id=9710)(text=self.BEHANCE_URL)
+        with self._timeout(), patch.object(media_archive, "send_archive_photo") as archive:
+            await admin.cases_edit_value(msg, state)
+        archive.assert_not_called()
+        case = next(c for c in await content_store.list_cases() if c["id"] == "case_bh_to")
+        self.assertEqual(case["cover"], "img/portfolio/demo_case_1.svg")   # кейс не тронут
+        self.assertFalse(case.get("external_url"))
+
+    async def test_edit_cover_with_behance_caption_timeout_is_controlled(self):
+        await content_store.add_case(
+            self.actor, case_id="case_bh_cov", title="S", type_id="site",
+            cover="img/portfolio/demo_case_2.svg", task="t", related_service=None,
+        )
+        state = make_state(self.actor)
+        await state.set_state(AdminStates.edit_case_value)
+        await state.update_data(case_id="case_bh_cov", field="cover")
+        msg = make_photo_message(self.actor, caption=self.BEHANCE_URL)
+        msg.bot.delete_message = AsyncMock()
+        with self._timeout(), patch.object(media_archive, "send_archive_photo") as archive:
+            await admin.cases_edit_value(msg, state)
+        archive.assert_not_called()
+        case = next(c for c in await content_store.list_cases() if c["id"] == "case_bh_cov")
+        self.assertEqual(case["cover"], "img/portfolio/demo_case_2.svg")
+
+    async def test_non_oserror_from_behance_is_also_controlled(self):
+        """zlib.error не наследует OSError — за него отвечает defensive catch."""
+        import zlib
+        state = await self._state()
+        msg = make_flow_message_factory(chat_id=self.actor, start_id=9720)(text=self.BEHANCE_URL)
+        with patch.object(behance, "_http_get", side_effect=zlib.error("bad gzip")), \
+             patch.object(media_archive, "send_archive_photo") as archive:
+            await admin.cases_add_photo_behance(msg, state)
+        archive.assert_not_called()
+        self.assertEqual(await state.get_state(), AdminStates.add_case_photo.state)
+
+    async def test_behance_source_never_touches_archive(self):
+        """Фиксирует решение аудита: на Behance-пути архивного сообщения не
+        создаётся, поэтому cleanup-механика upload-пути сюда НЕ переносится."""
+        state = await self._state()
+        page = f'<meta property="og:image" content="{BehanceAdminFlowTests.CDN_1400}" />'.encode("utf-8")
+        msg = make_flow_message_factory(chat_id=self.actor, start_id=9730)(text=BehanceAdminFlowTests.PROJECT_URL)
+        with patch.object(behance, "_http_get", return_value=(200, page)), \
+             patch.object(behance, "_http_head", return_value=200), \
+             patch.object(media_archive, "send_archive_photo") as archive, \
+             patch.object(media_archive, "delete_archive_message") as cleanup:
+            await admin.cases_add_photo_behance(msg, state)
+        archive.assert_not_called()
+        cleanup.assert_not_called()
+        self.assertEqual((await state.get_data())["source_type"], "behance")
+
+    async def test_retry_still_possible_after_timeout(self):
+        state = await self._state()
+        msg = make_flow_message_factory(chat_id=self.actor, start_id=9740)(text=self.BEHANCE_URL)
+        with self._timeout():
+            await admin.cases_add_photo_behance(msg, state)
+        self.assertEqual(await state.get_state(), AdminStates.add_case_photo.state)
+
+        page = f'<meta property="og:image" content="{BehanceAdminFlowTests.CDN_1400}" />'.encode("utf-8")
+        msg2 = make_flow_message_factory(chat_id=self.actor, start_id=9750)(text=BehanceAdminFlowTests.PROJECT_URL)
+        with patch.object(behance, "_http_get", return_value=(200, page)), \
+             patch.object(behance, "_http_head", return_value=200):
+            await admin.cases_add_photo_behance(msg2, state)
+        self.assertEqual(await state.get_state(), AdminStates.add_case_description.state)
+
+
 if __name__ == "__main__":
     unittest.main()

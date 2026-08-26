@@ -248,10 +248,17 @@ def _http_head(url: str, timeout: int = 10) -> int:
 
 async def _is_accessible(image_url: str) -> bool:
     """HEAD, а не GET — доступность проверяем, байты не забираем."""
+    # OSError, а не urllib.error.URLError: read timeout приходит как
+    # TimeoutError, который URLError НЕ наследует — оба лишь соседи под
+    # OSError. Тот же дефект уже ронял upload-путь в production (см.
+    # bot/telegram_media.py и коммит 264a6ad); здесь он оставался открытым.
+    # Здесь OSError означает НЕ аварию, а "обложка не годится": вызывающий
+    # код просто не возьмёт её. e, а не e.reason — у TimeoutError такого
+    # атрибута нет вовсе, и обращение к нему заменило бы один сбой другим.
     try:
         status = await asyncio.to_thread(_http_head, image_url)
-    except urllib.error.URLError as e:
-        logger.warning("Behance: обложка недоступна (%s): %s", image_url, e.reason)
+    except OSError as e:
+        logger.warning("Behance: обложка недоступна (%s): %s: %s", image_url, type(e).__name__, e)
         return False
     return status == 200
 
@@ -270,10 +277,14 @@ async def resolve_cover_url(project_url: str, *, prefer_disp: bool = True) -> st
 
     # Читаем страницу ЧЕРЕЗ r.jina.ai, а не напрямую: прямой запрос к
     # www.behance.net с Render блокируется на edge Adobe (HTTP 403).
+    # OSError (см. _is_accessible) — здесь терминальный: страницу проекта
+    # взять больше неоткуда, поэтому таймаут r.jina.ai должен стать
+    # контролируемой BehanceResolveError, которую вызывающие хендлеры уже
+    # умеют показывать дизайнеру, а не улетать наружу и обрывать мастер.
     try:
         status, body = await asyncio.to_thread(_http_get, _JINA_ENDPOINT + project_url)
-    except urllib.error.URLError as e:
-        raise BehanceResolveError(f"r.jina.ai недоступен: {e.reason}") from e
+    except OSError as e:
+        raise BehanceResolveError(f"r.jina.ai недоступен: {type(e).__name__}: {e}") from e
     if status != 200:
         raise BehanceResolveError(f"r.jina.ai вернул HTTP {status}")
 

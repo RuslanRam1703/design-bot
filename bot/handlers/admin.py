@@ -498,6 +498,16 @@ async def cases_add_photo(message: Message, state: FSMContext) -> None:
             logger.warning("Telegram cover resolve failed (new case, caption): %s", e)
             await flow.step_from_text(message, state, _TELEGRAM_COVER_ERROR, kb.cancel_keyboard())
             return
+        except Exception:
+            # Тот же точечный except, что и на upload-пути (см. ниже):
+            # zlib.error и http.client.IncompleteRead не наследуют OSError,
+            # поэтому расширение except'ов в резолверах их не покрывает, а
+            # зависший мастер неотличим от неработающего бота. Полный
+            # traceback сохраняется — ничего не прячется. Архив на этом
+            # пути не задействован, убирать нечего.
+            logger.exception("Unexpected source resolve failure (new case, caption)")
+            await flow.step_from_text(message, state, _COVER_UPLOAD_ERROR, kb.cancel_keyboard())
+            return
         await state.update_data(cover=cover, **source_fields)
         await flow.step_from_text(message, state, "Короткое описание задачи (пара предложений):", kb.cancel_keyboard())
         await state.set_state(AdminStates.add_case_description)
@@ -586,6 +596,11 @@ async def cases_add_photo_behance(message: Message, state: FSMContext) -> None:
     except telegram_media.TelegramMediaResolveError as e:
         logger.warning("Telegram cover resolve failed (new case): %s", e)
         await flow.step_from_text(message, state, _TELEGRAM_COVER_ERROR, kb.cancel_keyboard())
+        return
+    except Exception:
+        # См. тот же except в ветке с caption выше.
+        logger.exception("Unexpected source resolve failure (new case, text)")
+        await flow.step_from_text(message, state, _COVER_UPLOAD_ERROR, kb.cancel_keyboard())
         return
 
     # source_ref для внешних источников совпадает с external_url — оба
@@ -1192,6 +1207,12 @@ async def cases_edit_value(message: Message, state: FSMContext) -> None:
                 logger.warning("Telegram cover resolve failed (edit case %s, caption): %s", data["case_id"], e)
                 await flow.step_from_text(message, state, _TELEGRAM_COVER_ERROR, kb.cancel_keyboard())
                 return
+            except Exception:
+                # См. тот же except в cases_add_photo. Кейс остаётся
+                # нетронутым: запись идёт строго после успешного резолва.
+                logger.exception("Unexpected source resolve failure (edit case %s, caption)", data["case_id"])
+                await flow.step_from_text(message, state, _COVER_UPLOAD_ERROR, kb.cancel_keyboard())
+                return
             await content_store.update_case(message.chat.id, data["case_id"], cover=cover, **source_fields)
             # Прежнее архивное сообщение осиротело — убираем ПОСЛЕ записи
             # (тот же порядок, что и в остальных переходах).
@@ -1263,6 +1284,10 @@ async def cases_edit_value(message: Message, state: FSMContext) -> None:
                     kb.cancel_keyboard(),
                 )
                 return
+            except Exception:
+                logger.exception("Unexpected Behance source failure (edit case %s)", data["case_id"])
+                await flow.step_from_text(message, state, _COVER_UPLOAD_ERROR, kb.cancel_keyboard())
+                return
             old_source_ref = (await _current_case(data["case_id"]) or {}).get("source_ref")
             await content_store.update_case(
                 message.chat.id, data["case_id"],
@@ -1284,6 +1309,10 @@ async def cases_edit_value(message: Message, state: FSMContext) -> None:
             except telegram_media.TelegramMediaResolveError as e:
                 logger.warning("Telegram cover resolve failed (edit case %s): %s", data["case_id"], e)
                 await flow.step_from_text(message, state, _TELEGRAM_COVER_ERROR, kb.cancel_keyboard())
+                return
+            except Exception:
+                logger.exception("Unexpected Telegram source failure (edit case %s)", data["case_id"])
+                await flow.step_from_text(message, state, _COVER_UPLOAD_ERROR, kb.cancel_keyboard())
                 return
             normalized = telegram_media.normalize_post_url(value)
             old_source_ref = (await _current_case(data["case_id"]) or {}).get("source_ref")

@@ -54,25 +54,60 @@ SOURCE_LABELS = {
 }
 
 
+# Потолок на КАЖДОЕ свободное поле клиента в уведомлении дизайнеру.
+#
+# Зачем отдельный механизм, а не уже существующий _clamp_to_telegram_limit
+# (см. ниже): тот режет ЦЕЛЫМИ строками с конца и создан для админской
+# карточки, длина которой набегает из МНОГИХ строк (supplements/materials/
+# owner_messages). Здесь же переполнение даёт ОДНА строка — "<b>Задача:</b>
+# " плюс сколько угодно текста клиента. Построчная обрезка такую строку не
+# укоротит, а выбросит целиком: замерено — уведомление из трёх строк с
+# 20 000 символов в середине превращалось в 95 символов, где от заявки не
+# оставалось ничего. Это было бы хуже нынешнего бага: сообщение выглядит
+# нормальным, но не содержит запроса клиента, и в логах при этом чисто.
+#
+# 1000 символов на поле: обычная заявка (десятки-сотни символов) не
+# задевается вообще, а шесть полей по 1000 плюс разметка дают ~6 КБ —
+# заведомо конечную величину, которую финальная сетка ниже дожимает до
+# лимита Telegram.
+_MAX_FIELD_LENGTH = 1000
+
+_CLIP_MARKER = "… (обрезано, полный текст — в «Заявки»)"
+
+
+def _clip(value: str) -> str:
+    """Ограничивает свободный текст клиента ДО html-экранирования.
+
+    Порядок принципиален: обрезка уже экранированной строки может разрубить
+    HTML-сущность пополам ("A&amp;" -> "A&am"), Telegram отвергнет такое
+    сообщение с parse_mode="HTML", и дизайнер снова молча не получит
+    заявку — ровно тот сбой, который здесь и чинится. На сыром тексте
+    сущностей ещё нет, а _esc() после обрезки экранирует и текст, и маркер
+    целиком."""
+    if not value or len(value) <= _MAX_FIELD_LENGTH:
+        return value
+    return value[:_MAX_FIELD_LENGTH] + _CLIP_MARKER
+
+
 def format_lead_message(payload: dict, calc: CalcResult | None, lead_id: int, from_user_id: int, username: str | None) -> str:
     lines = [f"🆕 <b>Новая заявка #{lead_id}</b>", ""]
 
-    service_name = payload.get("service_name") or "не указана"
+    service_name = _clip(payload.get("service_name") or "не указана")
     lines.append(f"<b>Услуга:</b> {_esc(service_name)}")
 
     source = payload.get("source")
     source_case_title = payload.get("source_case_title")
     if source == "case" and source_case_title:
-        lines.append(f"<b>Источник:</b> кейс «{_esc(source_case_title)}» — похожий проект")
+        lines.append(f"<b>Источник:</b> кейс «{_esc(_clip(source_case_title))}» — похожий проект")
     elif source in SOURCE_LABELS:
         lines.append(f"<b>Источник:</b> {SOURCE_LABELS[source]}")
 
-    task = (payload.get("task_description") or "").strip()
+    task = _clip((payload.get("task_description") or "").strip())
     if task:
         lines.append(f"<b>Задача:</b> {_esc(task)}")
 
     have = payload.get("have") or []
-    have_text = ", ".join(HAVE_LABELS.get(h, h) for h in have) or "не указано"
+    have_text = _clip(", ".join(HAVE_LABELS.get(h, h) for h in have)) or "не указано"
     lines.append(f"<b>Что уже есть:</b> {have_text}")
 
     deadline = DEADLINE_LABELS.get(payload.get("deadline"), "не указано")
@@ -81,7 +116,7 @@ def format_lead_message(payload: dict, calc: CalcResult | None, lead_id: int, fr
     budget = BUDGET_LABELS.get(payload.get("budget"), "не указано")
     lines.append(f"<b>Бюджет:</b> {budget}")
 
-    contact = (payload.get("contact") or "").strip()
+    contact = _clip((payload.get("contact") or "").strip())
     if contact:
         lines.append(f"<b>Контакт:</b> {_esc(contact)}")
 
@@ -93,13 +128,13 @@ def format_lead_message(payload: dict, calc: CalcResult | None, lead_id: int, fr
         lines.append("")
         lines.append("<b>Техническое задание (от клиента):</b>")
         if tz_details.get("goal"):
-            lines.append(f"— Цель: {_esc(tz_details['goal'])}")
+            lines.append(f"— Цель: {_esc(_clip(tz_details['goal']))}")
         if tz_details.get("must_have"):
-            lines.append(f"— Обязательно: {_esc(tz_details['must_have'])}")
+            lines.append(f"— Обязательно: {_esc(_clip(tz_details['must_have']))}")
         if tz_details.get("avoid"):
-            lines.append(f"— Избегать: {_esc(tz_details['avoid'])}")
+            lines.append(f"— Избегать: {_esc(_clip(tz_details['avoid']))}")
         if tz_details.get("references"):
-            lines.append(f"— Референсы: {_esc(tz_details['references'])}")
+            lines.append(f"— Референсы: {_esc(_clip(tz_details['references']))}")
 
     if calc and calc.valid:
         lines.append("")
@@ -123,7 +158,14 @@ def format_lead_message(payload: dict, calc: CalcResult | None, lead_id: int, fr
     username_part = f"@{username}" if username else "нет username"
     lines.append(f"<i>От пользователя {username_part}, id {from_user_id}</i>")
 
-    return "\n".join(lines)
+    # Финальная сетка поверх пофайловых потолков: сами по себе _clip выше
+    # уже делают длину конечной, поэтому здесь это почти всегда no-op — но
+    # полей много, они складываются, и превысить лимит суммой всё ещё
+    # теоретически возможно. Раньше этой проверки не было вовсе: Telegram
+    # отвергал слишком длинное сообщение, ошибка гасилась в webserver.py
+    # (except Exception + logger), клиент получал HTTP 200, а дизайнер не
+    # узнавал о заявке вообще.
+    return _clamp_to_telegram_limit(lines)
 
 
 def _fmt_days(value: float) -> str:
@@ -154,8 +196,9 @@ def format_lead_supplement_message(lead_id: int, fields: dict) -> str:
     for key, label in SUPPLEMENT_FIELD_LABELS.items():
         value = (fields.get(key) or "").strip()
         if value:
-            lines.append(f"<b>{label}:</b> {_esc(value)}")
-    return "\n".join(lines)
+            lines.append(f"<b>{label}:</b> {_esc(_clip(value))}")
+    # Та же финальная сетка, что и у format_lead_message выше.
+    return _clamp_to_telegram_limit(lines)
 
 
 def format_material_message(lead_id: int) -> str:
