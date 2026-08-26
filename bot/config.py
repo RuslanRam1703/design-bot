@@ -26,6 +26,19 @@ UPSTASH_REDIS_REST_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN", "")
 # публичный адрес, с которого отдаются загруженные объекты (r2.dev или
 # кастомный домен) — намеренно отделён от самого R2_ACCOUNT_ID/API-эндпоинта,
 # чтобы смену r2.dev на кастомный домен не требовала правок кода.
+# Публичный канал-архив для обложек, загруженных дизайнером напрямую
+# (см. bot/media_archive.py). Обложка публикуется туда одним сообщением,
+# после чего её tokenless CDN-адрес берётся из веб-превью t.me — это
+# единственный способ получить browser-loadable URL из file_id, не
+# раскрывая BOT_TOKEN. Значение вида "@media_archive_da".
+#
+# Никаких отдельных credentials не требует — используется тот же BOT_TOKEN
+# и тот же Bot-инстанс. Значение НЕ отдаётся фронтенду: /data/* отдаёт
+# только PUBLIC_DATA_FILES (см. bot/webserver.py), config туда не попадает.
+# Если не задан — прямая загрузка обложки продолжает работать через
+# прежний storage-путь (см. bot/handlers/admin.py), ничего не ломается.
+MEDIA_ARCHIVE_CHANNEL = os.getenv("MEDIA_ARCHIVE_CHANNEL", "").strip()
+
 R2_ACCOUNT_ID = os.getenv("R2_ACCOUNT_ID", "")
 R2_ACCESS_KEY_ID = os.getenv("R2_ACCESS_KEY_ID", "")
 R2_SECRET_ACCESS_KEY = os.getenv("R2_SECRET_ACCESS_KEY", "")

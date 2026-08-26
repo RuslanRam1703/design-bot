@@ -12,7 +12,7 @@ CASE_FIELD_LABELS = {
     "solution": "Решение",
     "result": "Результат",
     "related_service": "Похожая услуга",
-    "external_url": "Ссылка (Behance и т.п., необязательно)",
+    "external_url": "Ссылка (Behance / пост Telegram, необязательно)",
 }
 
 SECTION_TYPE_LABELS = {"text": "📝 Текстовый блок", "gallery": "🖼 Галерея"}

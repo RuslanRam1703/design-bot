@@ -35,6 +35,8 @@ from aiogram.utils.web_app import check_webapp_signature as aiogram_check_webapp
 import bot.admin_keyboards as kb
 import bot.content_store as content_store
 import bot.behance as behance
+import bot.telegram_media as telegram_media
+import bot.media_archive as media_archive
 import bot.r2_storage as r2_storage
 import bot.handlers.admin as admin
 import bot.handlers.faq as faq
@@ -1275,17 +1277,19 @@ class AdminMultiStepWizardAnchorTests(unittest.IsolatedAsyncioTestCase):
         title_msg = make_flow_message_factory(chat_id=self.actor, start_id=4000)(text="Новый лендинг")
         await admin.cases_add_title(title_msg, state)
         title_msg.bot.edit_message_text.assert_awaited_once_with(
-            # Текст промпта расширен вместе с Behance-интеграцией: на этом же
-            # шаге теперь принимается и ссылка на проект Behance (см.
+            # Текст промпта расширялся вместе с источниками обложки: сперва
+            # Behance, теперь ещё и публичный пост Telegram (см.
             # admin.cases_add_photo_behance). Проверяемое здесь поведение —
             # RULE 3 / anchor, а не сама формулировка.
-            "Пришлите фото кейса (как фото) — или ссылку на проект Behance:",
+            "Пришлите фото кейса (как фото) — или ссылку на проект Behance "
+            "либо на публичный пост в Telegram:",
             chat_id=self.actor, message_id=500, reply_markup=kb.cancel_keyboard()
         )
         title_msg.answer.assert_not_awaited()  # RULE 3: редактирование на месте, не новое сообщение
 
         photo_msg = make_photo_message(self.actor)
-        await admin.cases_add_photo(photo_msg, state)
+        with patch_archive_upload():
+            await admin.cases_add_photo(photo_msg, state)
         photo_msg.bot.edit_message_text.assert_awaited_once_with(
             "Короткое описание задачи (пара предложений):", chat_id=self.actor, message_id=500, reply_markup=kb.cancel_keyboard()
         )
@@ -2153,7 +2157,8 @@ class AdminNavAnchorResetTests(unittest.IsolatedAsyncioTestCase):
         await admin.cases_add_start(make_callback("admincasesaction:add", chat_id=self.actor), state)
         await admin.cases_add_category(make_callback("admincat:landing", chat_id=self.actor), state)
         await admin.cases_add_title(make_msg(text="Новый лендинг"), state)
-        await admin.cases_add_photo(make_photo_message(self.actor), state)
+        with patch_archive_upload():
+            await admin.cases_add_photo(make_photo_message(self.actor), state)
         final_msg = make_msg(text="Короткое описание задачи")
         await admin.cases_add_description(final_msg, state)  # один из 24 сайтов
 
@@ -4951,6 +4956,28 @@ def make_photo_message(chat_id: int) -> SimpleNamespace:
             edit_message_text=AsyncMock(),
         ),
         answer=AsyncMock(),
+    )
+
+
+UPLOAD_TEST_COVER = "https://cdn4.telesco.pe/file/UPLOADTESTCOVER"
+
+
+def patch_archive_upload(cover: str = UPLOAD_TEST_COVER, message_id: int = 1):
+    """Успешная публикация обложки в архив — для тестов, чью суть архив НЕ
+    составляет (anchor-поведение, переходы источников, навигация).
+
+    После hardening обложки идут ТОЛЬКО через Telegram-архив: молчаливого
+    отката на save_case_photo больше нет, поэтому такие тесты обязаны
+    подменить именно этот шаг. Внутренности архива (sendPhoto, resolver,
+    жизненный цикл сообщений) проверяются отдельно — см.
+    ArchiveUploadFlowTests и MediaArchiveModuleTests."""
+    return patch.object(
+        admin, "_cover_from_upload",
+        new=AsyncMock(return_value=(
+            cover,
+            {"source_type": "upload", "external_url": None,
+             "source_ref": f"archive:@media_archive_da:{message_id}"},
+        )),
     )
 
 
@@ -10907,12 +10934,15 @@ class BehanceAdminFlowTests(unittest.IsolatedAsyncioTestCase):
         await state.update_data(case_id="case_photo_flow", title="X", type_id="site")
 
         photo_msg = make_photo_message(self.actor)
-        with patch.object(content_store, "save_case_photo", new=AsyncMock(return_value="img/portfolio/case_x.jpg")) as mock_save:
+        # Обложки после hardening идут через Telegram-архив, а не через
+        # save_case_photo — но проверяется здесь по-прежнему одно: путь
+        # "прислали фото" отделён от Behance-пути и внешней ссылки не
+        # создаёт.
+        with patch_archive_upload() as mock_upload:
             await admin.cases_add_photo(photo_msg, state)
 
-        # Обычная загрузка по-прежнему идёт через существующий storage.
-        mock_save.assert_awaited_once()
-        self.assertEqual((await state.get_data())["cover"], "img/portfolio/case_x.jpg")
+        mock_upload.assert_awaited_once()
+        self.assertEqual((await state.get_data())["cover"], UPLOAD_TEST_COVER)
         # Behance тут не участвует — external_url не появляется.
         self.assertIsNone((await state.get_data()).get("external_url"))
         self.assertEqual(await state.get_state(), AdminStates.add_case_description.state)
@@ -10974,6 +11004,1304 @@ class BehanceAdminFlowTests(unittest.IsolatedAsyncioTestCase):
         case = await self._case("case_title_edit")
         self.assertEqual(case["title"], "New title")
         self.assertEqual(case["cover"], "img/portfolio/demo_case_3.svg")
+
+
+class TelegramPostUrlValidationTests(unittest.TestCase):
+    """Валидация ссылки на пост — целиком офлайн, до любого сетевого запроса."""
+
+    def test_valid_public_post_urls_accepted(self):
+        for url in (
+            "https://t.me/telegram/379",
+            "http://t.me/telegram/379",
+            "https://t.me/telegram/379/",
+            "https://t.me/telegram/379?single",
+            "https://telegram.me/telegram/379",
+            "https://T.ME/Telegram/379",
+        ):
+            with self.subTest(url=url):
+                self.assertTrue(telegram_media.is_telegram_post_url(url))
+
+    def test_profile_and_channel_root_rejected(self):
+        # Корень канала отдаёт og:image (аватарку) с HTTP 200 — без этой
+        # проверки он бы "успешно резолвился" в аватарку вместо обложки.
+        for url in ("https://t.me/telegram", "https://t.me/telegram/", "https://t.me/"):
+            with self.subTest(url=url):
+                self.assertFalse(telegram_media.is_telegram_post_url(url))
+
+    def test_private_c_urls_rejected(self):
+        # t.me/c/<internal_id>/<msg> синтаксически подходит под шаблон
+        # <segment>/<digits>, но публичного превью не имеет (проверено:
+        # HTTP 200 с ПУСТЫМ og:image).
+        for url in ("https://t.me/c/1234567890/5", "https://t.me/C/1234567890/5"):
+            with self.subTest(url=url):
+                self.assertFalse(telegram_media.is_telegram_post_url(url))
+
+    def test_reserved_and_foreign_urls_rejected(self):
+        for url in (
+            "https://t.me/s/telegram/379",
+            "https://t.me/joinchat/AAAAAE",
+            "https://t.me/addstickers/Foo",
+            "https://t.me/proxy/1",
+            "https://example.com/telegram/379",
+            "https://www.behance.net/gallery/123456/Name",
+            "ftp://t.me/telegram/379",
+            "not a url",
+            "",
+        ):
+            with self.subTest(url=url):
+                self.assertFalse(telegram_media.is_telegram_post_url(url))
+
+    def test_non_string_input_rejected(self):
+        for value in (None, 123, [], {}):
+            with self.subTest(value=value):
+                self.assertFalse(telegram_media.is_telegram_post_url(value))
+
+    def test_normalization_strips_query_and_forces_https(self):
+        self.assertEqual(
+            telegram_media.normalize_post_url("http://t.me/telegram/379?single#frag"),
+            "https://t.me/telegram/379",
+        )
+        self.assertEqual(
+            telegram_media.normalize_post_url("https://telegram.me/telegram/379/"),
+            "https://t.me/telegram/379",
+        )
+        self.assertIsNone(telegram_media.normalize_post_url("https://t.me/telegram"))
+
+    def test_channel_root_url_derived_from_post(self):
+        self.assertEqual(
+            telegram_media.channel_root_url("https://t.me/telegram/379?single"),
+            "https://t.me/telegram",
+        )
+        self.assertIsNone(telegram_media.channel_root_url("https://t.me/c/1/2"))
+
+    def test_cdn_host_validation(self):
+        self.assertTrue(telegram_media.is_valid_cdn_url("https://cdn1.telesco.pe/file/AbC"))
+        self.assertTrue(telegram_media.is_valid_cdn_url("https://cdn4.telesco.pe/file/AbC.jpg"))
+        for bad in (
+            "http://cdn1.telesco.pe/file/AbC",           # не https
+            "https://evil.example.com/file/AbC",         # чужой host
+            "https://cdn1.telesco.pe.evil.com/file/A",   # подстановка домена
+            "https://api.telegram.org/file/bot123:ABC/photos/x.jpg",  # токен
+            "", None,
+        ):
+            with self.subTest(url=bad):
+                self.assertFalse(telegram_media.is_valid_cdn_url(bad))
+
+
+class TelegramPostCoverResolverTests(unittest.IsolatedAsyncioTestCase):
+    """Resolver обложки из поста. Сеть замокана; форма ответов взята с
+    РЕАЛЬНЫХ страниц t.me (og:image на cdn1.telesco.pe, аватарка канала с
+    расширением .jpg, картинка поста — без него)."""
+
+    POST_URL = "https://t.me/telegram/379"
+    MEDIA_CDN = "https://cdn1.telesco.pe/file/SzULyMCwsx4wcJaOlVBN5SDFBlfKw6bDbT-hbk3IBgrZ"
+    AVATAR_CDN = "https://cdn1.telesco.pe/file/P9UOyxQw4jdg6NbBActm6vNe9lavfrpDUYhQ2BZLqxRK.jpg"
+
+    @staticmethod
+    def _page(og_image):
+        return f'<meta property="og:image" content="{og_image}" />'.encode("utf-8")
+
+    def _mock_pages(self, post_image, avatar_image):
+        """_http_get вызывается дважды: сперва страница поста, затем корень
+        канала (см. resolve_cover_url)."""
+        def fake_get(url, timeout=15):
+            if url == telegram_media.channel_root_url(self.POST_URL):
+                return 200, self._page(avatar_image)
+            return 200, self._page(post_image)
+        return patch.object(telegram_media, "_http_get", side_effect=fake_get)
+
+    async def test_valid_post_resolves_to_tokenless_cdn_url(self):
+        with self._mock_pages(self.MEDIA_CDN, self.AVATAR_CDN), \
+             patch.object(telegram_media, "_http_head", return_value=(200, "image/jpeg", 13522)):
+            cover = await telegram_media.resolve_cover_url(self.POST_URL)
+        self.assertEqual(cover, self.MEDIA_CDN)
+        self.assertTrue(telegram_media.is_valid_cdn_url(cover))
+        # Никакого bot token в том, что уедет в публичный portfolio.json.
+        self.assertNotIn("api.telegram.org", cover)
+        self.assertNotIn("/bot", cover)
+
+    async def test_avatar_result_rejected_as_no_media(self):
+        # Ключевая ловушка: текстовый пост отдаёт HTTP 200 и og:image,
+        # равный аватарке канала. Наивный резолвер поставил бы аватарку
+        # обложкой кейса.
+        with self._mock_pages(self.AVATAR_CDN, self.AVATAR_CDN), \
+             patch.object(telegram_media, "_http_head") as head:
+            with self.assertRaises(telegram_media.TelegramMediaResolveError):
+                await telegram_media.resolve_cover_url(self.POST_URL)
+        head.assert_not_called()
+
+    async def test_nonexistent_post_rejected_via_same_discriminator(self):
+        # Несуществующий пост (t.me/telegram/999999) вживую отдаёт ровно тот
+        # же URL аватарки — сценарий опечатки в номере поста.
+        with self._mock_pages(self.AVATAR_CDN, self.AVATAR_CDN):
+            with self.assertRaises(telegram_media.TelegramMediaResolveError):
+                await telegram_media.resolve_cover_url("https://t.me/telegram/999999")
+
+    async def test_missing_og_image_rejected(self):
+        with patch.object(telegram_media, "_http_get", return_value=(200, b"<html>no meta</html>")):
+            with self.assertRaises(telegram_media.TelegramMediaResolveError):
+                await telegram_media.resolve_cover_url(self.POST_URL)
+
+    async def test_empty_og_image_rejected(self):
+        # Приватный t.me/c/... отдаёт именно content="" при HTTP 200.
+        with patch.object(telegram_media, "_http_get", return_value=(200, self._page(""))):
+            with self.assertRaises(telegram_media.TelegramMediaResolveError):
+                await telegram_media.resolve_cover_url(self.POST_URL)
+
+    async def test_http_failure_rejected(self):
+        with patch.object(telegram_media, "_http_get", return_value=(404, b"")):
+            with self.assertRaises(telegram_media.TelegramMediaResolveError):
+                await telegram_media.resolve_cover_url(self.POST_URL)
+
+    async def test_network_error_rejected(self):
+        with patch.object(telegram_media, "_http_get", side_effect=urllib.error.URLError("boom")):
+            with self.assertRaises(telegram_media.TelegramMediaResolveError):
+                await telegram_media.resolve_cover_url(self.POST_URL)
+
+    async def test_foreign_host_og_image_rejected(self):
+        with self._mock_pages("https://evil.example.com/x.jpg", self.AVATAR_CDN), \
+             patch.object(telegram_media, "_http_head") as head:
+            with self.assertRaises(telegram_media.TelegramMediaResolveError):
+                await telegram_media.resolve_cover_url(self.POST_URL)
+        head.assert_not_called()
+
+    async def test_invalid_url_rejected_without_any_network_call(self):
+        with patch.object(telegram_media, "_http_get") as get:
+            for bad in ("https://t.me/telegram", "https://t.me/c/1/2", "https://example.com/a/1"):
+                with self.subTest(url=bad):
+                    with self.assertRaises(telegram_media.TelegramMediaResolveError):
+                        await telegram_media.resolve_cover_url(bad)
+        get.assert_not_called()
+
+    async def test_non_image_content_type_rejected(self):
+        with self._mock_pages(self.MEDIA_CDN, self.AVATAR_CDN), \
+             patch.object(telegram_media, "_http_head", return_value=(200, "text/html", 500)):
+            with self.assertRaises(telegram_media.TelegramMediaResolveError):
+                await telegram_media.resolve_cover_url(self.POST_URL)
+
+    async def test_zero_length_image_rejected(self):
+        with self._mock_pages(self.MEDIA_CDN, self.AVATAR_CDN), \
+             patch.object(telegram_media, "_http_head", return_value=(200, "image/jpeg", 0)):
+            with self.assertRaises(telegram_media.TelegramMediaResolveError):
+                await telegram_media.resolve_cover_url(self.POST_URL)
+
+    async def test_image_http_error_rejected(self):
+        with self._mock_pages(self.MEDIA_CDN, self.AVATAR_CDN), \
+             patch.object(telegram_media, "_http_head", return_value=(404, "", 0)):
+            with self.assertRaises(telegram_media.TelegramMediaResolveError):
+                await telegram_media.resolve_cover_url(self.POST_URL)
+
+    async def test_resolver_never_downloads_image_bytes(self):
+        """Байты картинки не должны проходить через Render — только HEAD."""
+        with self._mock_pages(self.MEDIA_CDN, self.AVATAR_CDN), \
+             patch.object(telegram_media, "_http_head", return_value=(200, "image/jpeg", 100)) as head, \
+             patch.object(telegram_media, "_http_get") as get:
+            get.side_effect = lambda url, timeout=15: (
+                (200, self._page(self.AVATAR_CDN)) if url.endswith("/telegram")
+                else (200, self._page(self.MEDIA_CDN))
+            )
+            await telegram_media.resolve_cover_url(self.POST_URL)
+        # GET уходил только на страницы t.me, не на сам CDN.
+        for call in get.call_args_list:
+            self.assertNotIn("telesco.pe", call.args[0])
+        head.assert_called_once()
+
+
+class TelegramPostAdminFlowTests(unittest.IsolatedAsyncioTestCase):
+    """Интеграция Telegram resolver в существующий admin flow. Сеть
+    замокана — проверяется admin-цепочка, сам resolver покрыт выше."""
+
+    POST_URL = TelegramPostCoverResolverTests.POST_URL
+    MEDIA_CDN = TelegramPostCoverResolverTests.MEDIA_CDN
+    AVATAR_CDN = TelegramPostCoverResolverTests.AVATAR_CDN
+
+    async def asyncSetUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        real_data_dir = Path(__file__).resolve().parent.parent / "data"
+        for name in ("pricing.json", "portfolio.json", "faq.json", "about.json", "ui_config.json"):
+            shutil.copy(real_data_dir / name, Path(self.tmpdir) / name)
+        self._orig_data_dir = content_store.DATA_DIR
+        self._orig_designer = content_store.config.DESIGNER_CHAT_ID
+        content_store.DATA_DIR = Path(self.tmpdir)
+        content_store.config.DESIGNER_CHAT_ID = "999"
+        self.actor = 999
+
+    def tearDown(self):
+        content_store.DATA_DIR = self._orig_data_dir
+        content_store.config.DESIGNER_CHAT_ID = self._orig_designer
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def _mock_ok(self):
+        def fake_get(url, timeout=15):
+            page = self.AVATAR_CDN if url.endswith("/telegram") else self.MEDIA_CDN
+            return 200, f'<meta property="og:image" content="{page}" />'.encode("utf-8")
+        return (
+            patch.object(telegram_media, "_http_get", side_effect=fake_get),
+            patch.object(telegram_media, "_http_head", return_value=(200, "image/jpeg", 13522)),
+        )
+
+    async def _case(self, case_id):
+        return next((c for c in await content_store.list_cases() if c["id"] == case_id), None)
+
+    async def test_create_case_from_telegram_post_sets_cover_url_and_source_type(self):
+        state = make_state(self.actor)
+        await state.set_state(AdminStates.add_case_photo)
+        case_id = await content_store.next_case_id()
+        await state.update_data(case_id=case_id, title="TEST — Telegram Cover", type_id="site")
+
+        get_p, head_p = self._mock_ok()
+        with get_p, head_p:
+            await admin.cases_add_photo_behance(
+                make_flow_message_factory(chat_id=self.actor, start_id=7700)(text=self.POST_URL), state
+            )
+        self.assertEqual(await state.get_state(), AdminStates.add_case_description.state)
+
+        await admin.cases_add_description(
+            make_flow_message_factory(chat_id=self.actor, start_id=7710)(text="Описание"), state
+        )
+
+        case = await self._case(case_id)
+        self.assertIsNotNone(case)
+        self.assertEqual(case["cover"], self.MEDIA_CDN)
+        self.assertEqual(case["external_url"], self.POST_URL)
+        self.assertEqual(case["source_type"], "telegram_post")
+        # Семантика полей не смешана: ссылка на пост != ссылка на картинку.
+        self.assertNotEqual(case["external_url"], case["cover"])
+
+    async def test_create_normalizes_post_url_in_external_url(self):
+        state = make_state(self.actor)
+        await state.set_state(AdminStates.add_case_photo)
+        case_id = await content_store.next_case_id()
+        await state.update_data(case_id=case_id, title="Norm", type_id="site")
+
+        get_p, head_p = self._mock_ok()
+        with get_p, head_p:
+            await admin.cases_add_photo_behance(
+                make_flow_message_factory(chat_id=self.actor, start_id=7720)(
+                    text="http://t.me/telegram/379?single"
+                ), state
+            )
+        await admin.cases_add_description(
+            make_flow_message_factory(chat_id=self.actor, start_id=7730)(text="d"), state
+        )
+        self.assertEqual((await self._case(case_id))["external_url"], self.POST_URL)
+
+    async def test_failed_telegram_resolve_shows_controlled_error_and_creates_nothing(self):
+        state = make_state(self.actor)
+        await state.set_state(AdminStates.add_case_photo)
+        case_id = await content_store.next_case_id()
+        await state.update_data(case_id=case_id, title="Fail", type_id="site")
+        before = len(await content_store.list_cases())
+
+        msg = make_flow_message_factory(chat_id=self.actor, start_id=7740)(text=self.POST_URL)
+        with patch.object(telegram_media, "_http_get", return_value=(404, b"")):
+            await admin.cases_add_photo_behance(msg, state)
+
+        # Остались на том же шаге, кейс не создан, cover не записан.
+        self.assertEqual(await state.get_state(), AdminStates.add_case_photo.state)
+        self.assertIsNone((await state.get_data()).get("cover"))
+        self.assertEqual(len(await content_store.list_cases()), before)
+
+    async def test_unrecognized_text_still_hits_controlled_error(self):
+        state = make_state(self.actor)
+        await state.set_state(AdminStates.add_case_photo)
+        await state.update_data(case_id="case_x", title="t", type_id="site")
+        with patch.object(telegram_media, "_http_get") as tg_get, \
+             patch.object(behance, "_http_get") as bh_get:
+            await admin.cases_add_photo_behance(
+                make_flow_message_factory(chat_id=self.actor, start_id=7750)(text="просто текст"), state
+            )
+        tg_get.assert_not_called()
+        bh_get.assert_not_called()
+        self.assertEqual(await state.get_state(), AdminStates.add_case_photo.state)
+
+    # ---- edit flow ----
+
+    async def test_edit_external_url_to_telegram_post_updates_cover(self):
+        await content_store.add_case(
+            self.actor, case_id="case_tg_edit", title="Old", type_id="site",
+            cover="img/portfolio/demo_case_2.svg", task="t", related_service=None,
+        )
+        state = make_state(self.actor)
+        await state.set_state(AdminStates.edit_case_value)
+        await state.update_data(case_id="case_tg_edit", field="external_url")
+
+        get_p, head_p = self._mock_ok()
+        with get_p, head_p:
+            await admin.cases_edit_value(
+                make_flow_message_factory(chat_id=self.actor, start_id=7760)(text=self.POST_URL), state
+            )
+
+        case = await self._case("case_tg_edit")
+        self.assertEqual(case["cover"], self.MEDIA_CDN)
+        self.assertEqual(case["external_url"], self.POST_URL)
+        self.assertEqual(case["source_type"], "telegram_post")
+
+    async def test_edit_failed_telegram_resolve_leaves_case_untouched(self):
+        await content_store.add_case(
+            self.actor, case_id="case_tg_fail", title="Old", type_id="site",
+            cover="img/portfolio/demo_case_2.svg", task="t", related_service=None,
+        )
+        state = make_state(self.actor)
+        await state.set_state(AdminStates.edit_case_value)
+        await state.update_data(case_id="case_tg_fail", field="external_url")
+
+        with patch.object(telegram_media, "_http_get", return_value=(500, b"")):
+            await admin.cases_edit_value(
+                make_flow_message_factory(chat_id=self.actor, start_id=7770)(text=self.POST_URL), state
+            )
+
+        case = await self._case("case_tg_fail")
+        self.assertEqual(case["cover"], "img/portfolio/demo_case_2.svg")
+        self.assertNotIn("external_url", case)
+
+    async def test_edit_non_telegram_text_field_does_not_call_telegram_resolver(self):
+        await content_store.add_case(
+            self.actor, case_id="case_plain_tg", title="Old", type_id="site",
+            cover="img/portfolio/demo_case_2.svg", task="t", related_service=None,
+        )
+        state = make_state(self.actor)
+        await state.set_state(AdminStates.edit_case_value)
+        await state.update_data(case_id="case_plain_tg", field="external_url")
+
+        with patch.object(telegram_media, "_http_get") as tg_get:
+            await admin.cases_edit_value(
+                make_flow_message_factory(chat_id=self.actor, start_id=7780)(
+                    text="https://example.com/portfolio"
+                ), state
+            )
+        tg_get.assert_not_called()
+
+        case = await self._case("case_plain_tg")
+        self.assertEqual(case["external_url"], "https://example.com/portfolio")
+        self.assertEqual(case["cover"], "img/portfolio/demo_case_2.svg")
+        self.assertNotIn("source_type", case)
+
+
+class TelegramPostCoexistenceTests(unittest.IsolatedAsyncioTestCase):
+    """Новый источник не должен ломать два уже работающих: обычную загрузку
+    фото и Behance. Проверяется именно РАЗВЕТВЛЕНИЕ, а не сами резолверы."""
+
+    async def asyncSetUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        real_data_dir = Path(__file__).resolve().parent.parent / "data"
+        for name in ("pricing.json", "portfolio.json", "faq.json", "about.json", "ui_config.json"):
+            shutil.copy(real_data_dir / name, Path(self.tmpdir) / name)
+        self._orig_data_dir = content_store.DATA_DIR
+        self._orig_designer = content_store.config.DESIGNER_CHAT_ID
+        content_store.DATA_DIR = Path(self.tmpdir)
+        content_store.config.DESIGNER_CHAT_ID = "999"
+        self.actor = 999
+
+    def tearDown(self):
+        content_store.DATA_DIR = self._orig_data_dir
+        content_store.config.DESIGNER_CHAT_ID = self._orig_designer
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    async def test_photo_upload_still_uses_storage_and_no_telegram_resolver(self):
+        state = make_state(self.actor)
+        await state.set_state(AdminStates.add_case_photo)
+        await state.update_data(case_id="case_upload", title="t", type_id="site")
+
+        with patch_archive_upload() as upload, \
+             patch.object(telegram_media, "_http_get") as tg_get, \
+             patch.object(behance, "_http_get") as bh_get:
+            await admin.cases_add_photo(make_photo_message(self.actor), state)
+
+        upload.assert_awaited_once()
+        # Резолверы ВНЕШНИХ ссылок не трогаются: загрузка — это свой путь.
+        tg_get.assert_not_called()
+        bh_get.assert_not_called()
+        data = await state.get_data()
+        self.assertEqual(data["cover"], UPLOAD_TEST_COVER)
+        self.assertEqual(data["source_type"], "upload")
+        # Upload не создаёт external_url -> "Смотреть подробнее" не появится
+        # (см. webapp/js/app.js renderCase: кнопка зависит от external_url).
+        self.assertIsNone(data.get("external_url"))
+
+    async def test_behance_url_still_routes_to_behance_not_telegram(self):
+        state = make_state(self.actor)
+        await state.set_state(AdminStates.add_case_photo)
+        await state.update_data(case_id="case_bh", title="t", type_id="site")
+
+        behance_url = BehanceAdminFlowTests.PROJECT_URL
+        page = f'<meta property="og:image" content="{BehanceAdminFlowTests.CDN_1400}" />'.encode("utf-8")
+        with patch.object(behance, "_http_get", return_value=(200, page)), \
+             patch.object(behance, "_http_head", return_value=200), \
+             patch.object(telegram_media, "_http_get") as tg_get:
+            await admin.cases_add_photo_behance(
+                make_flow_message_factory(chat_id=self.actor, start_id=7800)(text=behance_url), state
+            )
+
+        tg_get.assert_not_called()
+        data = await state.get_data()
+        self.assertEqual(data["source_type"], "behance")
+        self.assertEqual(data["external_url"], behance_url)
+
+    async def test_legacy_cases_without_source_type_remain_valid(self):
+        # Демо-кейсы из data/portfolio.json не мигрируются: ни source_type,
+        # ни external_url у них нет, и это штатное состояние.
+        for case in await content_store.list_cases():
+            with self.subTest(case_id=case["id"]):
+                self.assertNotIn("source_type", case)
+                self.assertTrue(case["cover"])
+
+    async def test_details_button_visibility_is_driven_by_external_url_only(self):
+        """Mini App показывает "Смотреть подробнее" по наличию external_url
+        (webapp/js/app.js renderCase) — поэтому telegram_post и behance
+        кнопку получают, а upload нет, без единой правки фронтенда."""
+        app_js = (Path(__file__).resolve().parent.parent / "webapp" / "js" / "app.js").read_text(encoding="utf-8")
+        self.assertIn("c.external_url", app_js)
+        self.assertIn("Смотреть подробнее", app_js)
+        # Кнопка не завязана на source_type — фронтенд про него не знает.
+        self.assertNotIn("source_type", app_js)
+
+
+class CoverSourceTransitionTests(unittest.IsolatedAsyncioTestCase):
+    """Инвариант источника обложки во ВСЕХ переходах между behance /
+    telegram_post / upload / legacy.
+
+    Суть защищаемого дефекта: "Смотреть подробнее" в Mini App показывается
+    по одному лишь наличию external_url (см. webapp/js/app.js renderCase).
+    Если обложку заменили своей загрузкой, а внешняя ссылка осталась —
+    клиент увидит СВОЮ картинку и кнопку, ведущую на чужой проект/пост."""
+
+    BEHANCE_URL = BehanceAdminFlowTests.PROJECT_URL
+    BEHANCE_CDN = BehanceAdminFlowTests.CDN_DISP
+    BEHANCE_CDN_RAW = BehanceAdminFlowTests.CDN_1400
+    POST_URL = TelegramPostCoverResolverTests.POST_URL
+    TG_CDN = TelegramPostCoverResolverTests.MEDIA_CDN
+    TG_AVATAR = TelegramPostCoverResolverTests.AVATAR_CDN
+    UPLOADED = "img/portfolio/case_tr_uploaded.jpg"
+
+    async def asyncSetUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        real_data_dir = Path(__file__).resolve().parent.parent / "data"
+        for name in ("pricing.json", "portfolio.json", "faq.json", "about.json", "ui_config.json"):
+            shutil.copy(real_data_dir / name, Path(self.tmpdir) / name)
+        self._orig_data_dir = content_store.DATA_DIR
+        self._orig_designer = content_store.config.DESIGNER_CHAT_ID
+        content_store.DATA_DIR = Path(self.tmpdir)
+        content_store.config.DESIGNER_CHAT_ID = "999"
+        self.actor = 999
+
+    def tearDown(self):
+        content_store.DATA_DIR = self._orig_data_dir
+        content_store.config.DESIGNER_CHAT_ID = self._orig_designer
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    async def _case(self, case_id):
+        return next((c for c in await content_store.list_cases() if c["id"] == case_id), None)
+
+    async def _seed(self, case_id, *, cover, external_url=None, source_type=None):
+        await content_store.add_case(
+            self.actor, case_id=case_id, title="Seed", type_id="site",
+            cover=cover, task="t", related_service=None,
+        )
+        extra = {}
+        if external_url is not None:
+            extra["external_url"] = external_url
+        if source_type is not None:
+            extra["source_type"] = source_type
+        if extra:
+            await content_store.update_case(self.actor, case_id, **extra)
+
+    def _mock_behance(self):
+        page = f'<meta property="og:image" content="{self.BEHANCE_CDN_RAW}" />'.encode("utf-8")
+        return (
+            patch.object(behance, "_http_get", return_value=(200, page)),
+            patch.object(behance, "_http_head", return_value=200),
+        )
+
+    def _mock_telegram(self):
+        def fake_get(url, timeout=15):
+            og = self.TG_AVATAR if url.endswith("/telegram") else self.TG_CDN
+            return 200, f'<meta property="og:image" content="{og}" />'.encode("utf-8")
+        return (
+            patch.object(telegram_media, "_http_get", side_effect=fake_get),
+            patch.object(telegram_media, "_http_head", return_value=(200, "image/jpeg", 13522)),
+        )
+
+    async def _upload_cover(self, case_id, start_id):
+        """Замена обложки обычной загрузкой через существующий edit flow.
+
+        После hardening обложка уходит в Telegram-архив; для этих тестов
+        важен не архив, а инвариант источника — см. patch_archive_upload."""
+        state = make_state(self.actor)
+        await state.set_state(AdminStates.edit_case_value)
+        await state.update_data(case_id=case_id, field="cover")
+        msg = make_photo_message(self.actor)
+        msg.bot.delete_message = AsyncMock()
+        with patch_archive_upload(cover=self.UPLOADED):
+            await admin.cases_edit_value(msg, state)
+
+    async def _set_external(self, case_id, url, start_id, *, telegram: bool):
+        state = make_state(self.actor)
+        await state.set_state(AdminStates.edit_case_value)
+        await state.update_data(case_id=case_id, field="external_url")
+        get_p, head_p = self._mock_telegram() if telegram else self._mock_behance()
+        with get_p, head_p:
+            await admin.cases_edit_value(
+                make_flow_message_factory(chat_id=self.actor, start_id=start_id)(text=url), state
+            )
+
+    def _assert_upload_source(self, case):
+        self.assertEqual(case["cover"], self.UPLOADED)
+        self.assertEqual(case["source_type"], "upload")
+        # Ключевая проверка дефекта: ссылка не должна пережить замену обложки.
+        self.assertFalse(case.get("external_url"))
+
+    # ---- 1. Behance -> Upload ----
+
+    async def test_behance_to_upload_clears_external_url(self):
+        await self._seed("case_bh_up", cover=self.BEHANCE_CDN,
+                         external_url=self.BEHANCE_URL, source_type="behance")
+        await self._upload_cover("case_bh_up", 8000)
+        self._assert_upload_source(await self._case("case_bh_up"))
+
+    # ---- 2. Telegram -> Upload ----
+
+    async def test_telegram_to_upload_clears_external_url(self):
+        await self._seed("case_tg_up", cover=self.TG_CDN,
+                         external_url=self.POST_URL, source_type="telegram_post")
+        await self._upload_cover("case_tg_up", 8010)
+        self._assert_upload_source(await self._case("case_tg_up"))
+
+    # ---- 3. Upload -> Behance ----
+
+    async def test_upload_to_behance_sets_all_three_fields(self):
+        await self._seed("case_up_bh", cover=self.UPLOADED, source_type="upload")
+        await self._set_external("case_up_bh", self.BEHANCE_URL, 8020, telegram=False)
+        case = await self._case("case_up_bh")
+        self.assertEqual(case["cover"], self.BEHANCE_CDN)
+        self.assertEqual(case["external_url"], self.BEHANCE_URL)
+        self.assertEqual(case["source_type"], "behance")
+
+    # ---- 4. Upload -> Telegram ----
+
+    async def test_upload_to_telegram_sets_all_three_fields(self):
+        await self._seed("case_up_tg", cover=self.UPLOADED, source_type="upload")
+        await self._set_external("case_up_tg", self.POST_URL, 8030, telegram=True)
+        case = await self._case("case_up_tg")
+        self.assertEqual(case["cover"], self.TG_CDN)
+        self.assertEqual(case["external_url"], self.POST_URL)
+        self.assertEqual(case["source_type"], "telegram_post")
+
+    # ---- 5. Behance -> Telegram ----
+
+    async def test_behance_to_telegram_replaces_all_three_fields(self):
+        await self._seed("case_bh_tg", cover=self.BEHANCE_CDN,
+                         external_url=self.BEHANCE_URL, source_type="behance")
+        await self._set_external("case_bh_tg", self.POST_URL, 8040, telegram=True)
+        case = await self._case("case_bh_tg")
+        self.assertEqual(case["cover"], self.TG_CDN)
+        self.assertEqual(case["external_url"], self.POST_URL)
+        self.assertEqual(case["source_type"], "telegram_post")
+        self.assertNotIn("behance.net", case["cover"])
+
+    # ---- 6. Telegram -> Behance ----
+
+    async def test_telegram_to_behance_replaces_all_three_fields(self):
+        await self._seed("case_tg_bh", cover=self.TG_CDN,
+                         external_url=self.POST_URL, source_type="telegram_post")
+        await self._set_external("case_tg_bh", self.BEHANCE_URL, 8050, telegram=False)
+        case = await self._case("case_tg_bh")
+        self.assertEqual(case["cover"], self.BEHANCE_CDN)
+        self.assertEqual(case["external_url"], self.BEHANCE_URL)
+        self.assertEqual(case["source_type"], "behance")
+        self.assertNotIn("telesco.pe", case["cover"])
+
+    # ---- legacy / upload -> upload ----
+
+    async def test_legacy_case_without_source_type_to_upload(self):
+        await self._seed("case_legacy_up", cover="img/portfolio/demo_case_4.svg")
+        case_before = await self._case("case_legacy_up")
+        self.assertNotIn("source_type", case_before)
+        await self._upload_cover("case_legacy_up", 8060)
+        self._assert_upload_source(await self._case("case_legacy_up"))
+
+    async def test_upload_to_upload_stays_upload_without_external_url(self):
+        await self._seed("case_up_up", cover="img/portfolio/old.jpg", source_type="upload")
+        await self._upload_cover("case_up_up", 8070)
+        self._assert_upload_source(await self._case("case_up_up"))
+
+    # ---- второй путь смены обложки: выбор картинки из галереи ----
+
+    async def test_picking_gallery_image_as_cover_also_clears_stale_external_url(self):
+        """Обложку можно сменить не только загрузкой, но и звёздочкой в
+        «Изображениях». Для внешнего кейса это тот же уход от резолвнутой
+        картинки — ссылка так же обязана уйти."""
+        await self._seed("case_gal", cover=self.TG_CDN,
+                         external_url=self.POST_URL, source_type="telegram_post")
+        await content_store.add_case_image(self.actor, "case_gal", self.UPLOADED)
+
+        state = make_state(self.actor)
+        await state.set_state(AdminStates.case_images_menu)
+        await state.update_data(case_id="case_gal", image_path=self.UPLOADED)
+        await admin.case_image_action(
+            make_callback("admincaseimgaction:cover", chat_id=self.actor), state
+        )
+
+        case = await self._case("case_gal")
+        self.assertEqual(case["cover"], self.UPLOADED)
+        self.assertEqual(case["source_type"], "upload")
+        self.assertFalse(case.get("external_url"))
+
+    async def test_repicking_the_same_cover_does_not_clear_external_url(self):
+        """Повторный выбор той же картинки ничего не меняет — ссылка на
+        месте, иначе безобидный клик ломал бы корректный кейс."""
+        await self._seed("case_gal_same", cover=self.TG_CDN,
+                         external_url=self.POST_URL, source_type="telegram_post")
+        state = make_state(self.actor)
+        await state.set_state(AdminStates.case_images_menu)
+        await state.update_data(case_id="case_gal_same", image_path=self.TG_CDN)
+        await admin.case_image_action(
+            make_callback("admincaseimgaction:cover", chat_id=self.actor), state
+        )
+        case = await self._case("case_gal_same")
+        self.assertEqual(case["external_url"], self.POST_URL)
+        self.assertEqual(case["source_type"], "telegram_post")
+
+    # ---- регрессия: ничего из уже работавшего не сломано ----
+
+    async def test_upload_path_goes_through_archive_not_storage(self):
+        await self._seed("case_store", cover="img/portfolio/x.jpg", source_type="upload")
+        state = make_state(self.actor)
+        await state.set_state(AdminStates.edit_case_value)
+        await state.update_data(case_id="case_store", field="cover")
+        msg = make_photo_message(self.actor)
+        msg.bot.delete_message = AsyncMock()
+        with patch_archive_upload(cover=self.UPLOADED) as upload, \
+             patch.object(content_store, "save_case_photo") as save:
+            await admin.cases_edit_value(msg, state)
+        upload.assert_awaited_once()
+        save.assert_not_called()
+
+    async def test_non_cover_text_edit_does_not_touch_source_fields(self):
+        await self._seed("case_txt", cover=self.TG_CDN,
+                         external_url=self.POST_URL, source_type="telegram_post")
+        state = make_state(self.actor)
+        await state.set_state(AdminStates.edit_case_value)
+        await state.update_data(case_id="case_txt", field="task")
+        await admin.cases_edit_value(
+            make_flow_message_factory(chat_id=self.actor, start_id=8080)(text="Новая задача"), state
+        )
+        case = await self._case("case_txt")
+        self.assertEqual(case["task"], "Новая задача")
+        self.assertEqual(case["external_url"], self.POST_URL)
+        self.assertEqual(case["source_type"], "telegram_post")
+
+    async def test_cleared_external_url_is_falsy_for_mini_app(self):
+        """external_url=None уезжает в JSON как null — Mini App проверяет
+        именно истинность значения (c.external_url ? ... : ""), поэтому
+        кнопка исчезает без единой правки app.js."""
+        await self._seed("case_json", cover=self.TG_CDN,
+                         external_url=self.POST_URL, source_type="telegram_post")
+        await self._upload_cover("case_json", 8090)
+        raw = json.loads((Path(self.tmpdir) / "portfolio.json").read_text(encoding="utf-8"))
+        case = next(c for c in raw["cases"] if c["id"] == "case_json")
+        self.assertIsNone(case["external_url"])
+        self.assertFalse(case["external_url"])
+
+
+class TelegramEmbedResolutionTests(unittest.IsolatedAsyncioTestCase):
+    """?embed=1 отдаёт САМЫЙ КРУПНЫЙ вариант картинки, og:image — превью
+    ~320px. Формы разметки взяты с живых страниц t.me."""
+
+    POST = "https://t.me/media_archive_da/3"
+    FULL = "https://cdn4.telesco.pe/file/N034uDv1t09XN6wxUSovcc1U5FULL"
+    PREVIEW = "https://cdn4.telesco.pe/file/YGUrrTxX5Y8MnAMX_NQksd1oPREVIEW"
+    AVATAR = "https://cdn1.telesco.pe/file/GPAY9UVY86V-aVCRTQo6aXnKAVATAR.jpg"
+
+    def _embed_html(self, media=None, avatar=None):
+        parts = []
+        if avatar:
+            parts.append(f'<i class="tgme_widget_message_user_photo bgcolor4"><img src="{avatar}"></i>')
+        if media:
+            parts.append(f'<a class="tgme_widget_message_photo_wrap" style="width:800px;'
+                         f"background-image:url('{media}')\"></a>")
+        return ("<html>" + "".join(parts) + "</html>").encode("utf-8")
+
+    def _og_html(self, url):
+        return f'<meta property="og:image" content="{url}" />'.encode("utf-8")
+
+    def test_extract_embed_media_excludes_avatar(self):
+        html = self._embed_html(media=self.FULL, avatar=self.AVATAR).decode()
+        urls = telegram_media.extract_embed_media_urls(html)
+        self.assertEqual(urls, [self.FULL])
+        self.assertNotIn(self.AVATAR, urls)
+
+    def test_extract_embed_media_empty_for_text_only_post(self):
+        # Текстовый пост: аватарка есть, background-image нет вообще.
+        html = self._embed_html(media=None, avatar=self.AVATAR).decode()
+        self.assertEqual(telegram_media.extract_embed_media_urls(html), [])
+
+    async def test_embed_variant_preferred_over_og_image(self):
+        def fake_get(url, timeout=15):
+            if url.endswith("?embed=1"):
+                return 200, self._embed_html(media=self.FULL, avatar=self.AVATAR)
+            return 200, self._og_html(self.PREVIEW)
+        with patch.object(telegram_media, "_http_get", side_effect=fake_get), \
+             patch.object(telegram_media, "_http_head", return_value=(200, "image/jpeg", 23807)):
+            cover = await telegram_media.resolve_cover_url(self.POST)
+        self.assertEqual(cover, self.FULL)
+
+    async def test_falls_back_to_og_image_when_embed_has_no_media(self):
+        def fake_get(url, timeout=15):
+            if url.endswith("?embed=1"):
+                return 200, self._embed_html(media=None, avatar=self.AVATAR)
+            if url.endswith("/media_archive_da"):
+                return 200, self._og_html(self.AVATAR)
+            return 200, self._og_html(self.PREVIEW)
+        with patch.object(telegram_media, "_http_get", side_effect=fake_get), \
+             patch.object(telegram_media, "_http_head", return_value=(200, "image/jpeg", 6514)):
+            cover = await telegram_media.resolve_cover_url(self.POST)
+        self.assertEqual(cover, self.PREVIEW)
+
+    async def test_falls_back_when_embed_page_errors(self):
+        def fake_get(url, timeout=15):
+            if url.endswith("?embed=1"):
+                return 500, b""
+            if url.endswith("/media_archive_da"):
+                return 200, self._og_html(self.AVATAR)
+            return 200, self._og_html(self.PREVIEW)
+        with patch.object(telegram_media, "_http_get", side_effect=fake_get), \
+             patch.object(telegram_media, "_http_head", return_value=(200, "image/jpeg", 6514)):
+            self.assertEqual(await telegram_media.resolve_cover_url(self.POST), self.PREVIEW)
+
+    async def test_embed_avatar_only_never_becomes_cover(self):
+        """Даже если аватарка каким-то образом окажется в background-image,
+        она отсеивается вычитанием множества user_photo."""
+        html = (f'<i class="tgme_widget_message_user_photo"><img src="{self.AVATAR}"></i>'
+                f"<a style=\"background-image:url('{self.AVATAR}')\"></a>").encode("utf-8")
+        def fake_get(url, timeout=15):
+            if url.endswith("?embed=1"):
+                return 200, html
+            if url.endswith("/media_archive_da"):
+                return 200, self._og_html(self.AVATAR)
+            return 200, self._og_html(self.AVATAR)
+        with patch.object(telegram_media, "_http_get", side_effect=fake_get):
+            with self.assertRaises(telegram_media.TelegramMediaResolveError):
+                await telegram_media.resolve_cover_url(self.POST)
+
+    async def test_embed_non_image_content_type_falls_back(self):
+        def fake_get(url, timeout=15):
+            if url.endswith("?embed=1"):
+                return 200, self._embed_html(media=self.FULL)
+            if url.endswith("/media_archive_da"):
+                return 200, self._og_html(self.AVATAR)
+            return 200, self._og_html(self.PREVIEW)
+        def fake_head(url, timeout=10):
+            return (200, "text/html", 10) if url == self.FULL else (200, "image/jpeg", 6514)
+        with patch.object(telegram_media, "_http_get", side_effect=fake_get), \
+             patch.object(telegram_media, "_http_head", side_effect=fake_head):
+            self.assertEqual(await telegram_media.resolve_cover_url(self.POST), self.PREVIEW)
+
+    async def test_embed_foreign_host_ignored(self):
+        def fake_get(url, timeout=15):
+            if url.endswith("?embed=1"):
+                return 200, b"<a style=\"background-image:url('https://evil.example.com/x.jpg')\"></a>"
+            if url.endswith("/media_archive_da"):
+                return 200, self._og_html(self.AVATAR)
+            return 200, self._og_html(self.PREVIEW)
+        with patch.object(telegram_media, "_http_get", side_effect=fake_get), \
+             patch.object(telegram_media, "_http_head", return_value=(200, "image/jpeg", 6514)):
+            self.assertEqual(await telegram_media.resolve_cover_url(self.POST), self.PREVIEW)
+
+    async def test_prefer_full_resolution_false_skips_embed_entirely(self):
+        def fake_get(url, timeout=15):
+            if url.endswith("?embed=1"):
+                raise AssertionError("embed не должен запрашиваться")
+            if url.endswith("/media_archive_da"):
+                return 200, self._og_html(self.AVATAR)
+            return 200, self._og_html(self.PREVIEW)
+        with patch.object(telegram_media, "_http_get", side_effect=fake_get), \
+             patch.object(telegram_media, "_http_head", return_value=(200, "image/jpeg", 6514)):
+            cover = await telegram_media.resolve_cover_url(self.POST, prefer_full_resolution=False)
+        self.assertEqual(cover, self.PREVIEW)
+
+    async def test_private_and_invalid_urls_still_rejected_before_network(self):
+        with patch.object(telegram_media, "_http_get") as get:
+            for bad in ("https://t.me/c/1/2", "https://t.me/media_archive_da", "https://x.com/a/1"):
+                with self.subTest(url=bad):
+                    with self.assertRaises(telegram_media.TelegramMediaResolveError):
+                        await telegram_media.resolve_cover_url(bad)
+        get.assert_not_called()
+
+
+class MediaArchiveModuleTests(unittest.IsolatedAsyncioTestCase):
+    """Модуль архива. Никакого настоящего токена и никакой сети."""
+
+    def setUp(self):
+        self._orig = media_archive.config.MEDIA_ARCHIVE_CHANNEL
+        media_archive.config.MEDIA_ARCHIVE_CHANNEL = "@media_archive_da"
+
+    def tearDown(self):
+        media_archive.config.MEDIA_ARCHIVE_CHANNEL = self._orig
+
+    def test_source_ref_roundtrip(self):
+        ref = media_archive.build_source_ref(42)
+        self.assertEqual(ref, "archive:@media_archive_da:42")
+        self.assertEqual(media_archive.parse_source_ref(ref), ("@media_archive_da", 42))
+
+    def test_source_ref_supports_numeric_chat_id(self):
+        self.assertEqual(
+            media_archive.parse_source_ref("archive:-1004426058510:7"),
+            ("-1004426058510", 7),
+        )
+
+    def test_parse_rejects_non_archive_values(self):
+        for bad in (None, "", "https://t.me/x/1", "archive:onlychat", "archive:chat:abc", 123):
+            with self.subTest(value=bad):
+                self.assertIsNone(media_archive.parse_source_ref(bad))
+
+    def test_archive_post_url_strips_at_sign(self):
+        self.assertEqual(media_archive.archive_post_url(9), "https://t.me/media_archive_da/9")
+
+    def test_is_configured_reflects_config(self):
+        self.assertTrue(media_archive.is_configured())
+        media_archive.config.MEDIA_ARCHIVE_CHANNEL = ""
+        self.assertFalse(media_archive.is_configured())
+
+    async def test_send_archive_photo_returns_id_and_url(self):
+        bot = SimpleNamespace(send_photo=AsyncMock(return_value=SimpleNamespace(message_id=77)))
+        message_id, url = await media_archive.send_archive_photo(bot, "FILE_ID")
+        self.assertEqual(message_id, 77)
+        self.assertEqual(url, "https://t.me/media_archive_da/77")
+        bot.send_photo.assert_awaited_once_with(chat_id="@media_archive_da", photo="FILE_ID")
+
+    async def test_send_archive_photo_without_config_raises(self):
+        media_archive.config.MEDIA_ARCHIVE_CHANNEL = ""
+        bot = SimpleNamespace(send_photo=AsyncMock())
+        with self.assertRaises(media_archive.MediaArchiveError):
+            await media_archive.send_archive_photo(bot, "FILE_ID")
+        bot.send_photo.assert_not_awaited()
+
+    async def test_send_archive_photo_wraps_telegram_error(self):
+        bot = SimpleNamespace(send_photo=AsyncMock(side_effect=RuntimeError("CHAT_ADMIN_REQUIRED")))
+        with self.assertRaises(media_archive.MediaArchiveError):
+            await media_archive.send_archive_photo(bot, "FILE_ID")
+
+    async def test_delete_archive_message_deletes_exact_id(self):
+        bot = SimpleNamespace(delete_message=AsyncMock())
+        ok = await media_archive.delete_archive_message(bot, "archive:@media_archive_da:5")
+        self.assertTrue(ok)
+        bot.delete_message.assert_awaited_once_with(chat_id="@media_archive_da", message_id=5)
+
+    async def test_delete_archive_message_ignores_non_archive_ref(self):
+        bot = SimpleNamespace(delete_message=AsyncMock())
+        for ref in (None, "https://www.behance.net/gallery/1/x", "https://t.me/telegram/379"):
+            with self.subTest(ref=ref):
+                self.assertFalse(await media_archive.delete_archive_message(bot, ref))
+        bot.delete_message.assert_not_awaited()
+
+    async def test_delete_archive_message_never_raises(self):
+        bot = SimpleNamespace(delete_message=AsyncMock(side_effect=RuntimeError("MESSAGE_ID_INVALID")))
+        self.assertFalse(await media_archive.delete_archive_message(bot, "archive:@c:1"))
+
+
+class ArchiveUploadFlowTests(unittest.IsolatedAsyncioTestCase):
+    """Прямая загрузка обложки -> архив -> resolver -> cover, и жизненный
+    цикл архивных сообщений."""
+
+    ARCHIVE_COVER = "https://cdn4.telesco.pe/file/ARCHIVEDCOVER"
+    NEW_COVER = "https://cdn4.telesco.pe/file/NEWARCHIVEDCOVER"
+
+    async def asyncSetUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        real_data_dir = Path(__file__).resolve().parent.parent / "data"
+        for name in ("pricing.json", "portfolio.json", "faq.json", "about.json", "ui_config.json"):
+            shutil.copy(real_data_dir / name, Path(self.tmpdir) / name)
+        self._orig_data_dir = content_store.DATA_DIR
+        self._orig_designer = content_store.config.DESIGNER_CHAT_ID
+        self._orig_channel = media_archive.config.MEDIA_ARCHIVE_CHANNEL
+        content_store.DATA_DIR = Path(self.tmpdir)
+        content_store.config.DESIGNER_CHAT_ID = "999"
+        media_archive.config.MEDIA_ARCHIVE_CHANNEL = "@media_archive_da"
+        self.actor = 999
+
+    def tearDown(self):
+        content_store.DATA_DIR = self._orig_data_dir
+        content_store.config.DESIGNER_CHAT_ID = self._orig_designer
+        media_archive.config.MEDIA_ARCHIVE_CHANNEL = self._orig_channel
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    async def _case(self, case_id):
+        return next((c for c in await content_store.list_cases() if c["id"] == case_id), None)
+
+    def _photo_msg(self, message_id=101):
+        msg = make_photo_message(self.actor)
+        msg.bot.send_photo = AsyncMock(return_value=SimpleNamespace(message_id=message_id))
+        msg.bot.delete_message = AsyncMock()
+        return msg
+
+    # ---- create ----
+
+    async def test_direct_upload_create_uses_archive_not_storage(self):
+        state = make_state(self.actor)
+        await state.set_state(AdminStates.add_case_photo)
+        await state.update_data(case_id="case_arch", title="t", type_id="site")
+        msg = self._photo_msg(101)
+
+        with patch.object(telegram_media, "resolve_cover_url", return_value=self.ARCHIVE_COVER) as resolve, \
+             patch.object(content_store, "save_case_photo") as save:
+            await admin.cases_add_photo(msg, state)
+
+        save.assert_not_called()  # storage для обложек больше не используется
+        msg.bot.send_photo.assert_awaited_once_with(chat_id="@media_archive_da", photo="fake_file_id")
+        resolve.assert_awaited_once_with("https://t.me/media_archive_da/101")
+        data = await state.get_data()
+        self.assertEqual(data["cover"], self.ARCHIVE_COVER)
+        self.assertEqual(data["source_type"], "upload")
+        self.assertEqual(data["source_ref"], "archive:@media_archive_da:101")
+        self.assertIsNone(data["external_url"])
+
+    async def test_created_case_persists_source_ref(self):
+        state = make_state(self.actor)
+        await state.set_state(AdminStates.add_case_photo)
+        case_id = await content_store.next_case_id()
+        await state.update_data(case_id=case_id, title="t", type_id="site")
+        with patch.object(telegram_media, "resolve_cover_url", return_value=self.ARCHIVE_COVER):
+            await admin.cases_add_photo(self._photo_msg(102), state)
+        await admin.cases_add_description(
+            make_flow_message_factory(chat_id=self.actor, start_id=9000)(text="d"), state
+        )
+        case = await self._case(case_id)
+        self.assertEqual(case["cover"], self.ARCHIVE_COVER)
+        self.assertEqual(case["source_type"], "upload")
+        self.assertEqual(case["source_ref"], "archive:@media_archive_da:102")
+        self.assertFalse(case.get("external_url"))
+
+    async def test_missing_archive_config_is_controlled_error_not_storage_fallback(self):
+        """Скрытый откат на прежний storage запрещён: он означал бы две
+        одновременно живущие production-архитектуры."""
+        media_archive.config.MEDIA_ARCHIVE_CHANNEL = ""
+        state = make_state(self.actor)
+        await state.set_state(AdminStates.add_case_photo)
+        await state.update_data(case_id="case_nocfg", title="t", type_id="site")
+        msg = self._photo_msg()
+
+        with patch.object(content_store, "save_case_photo") as save:
+            await admin.cases_add_photo(msg, state)
+
+        save.assert_not_called()          # никакого отката в старое хранилище
+        msg.bot.send_photo.assert_not_awaited()   # и никакого orphan-сообщения
+        data = await state.get_data()
+        self.assertIsNone(data.get("cover"))
+        self.assertIsNone(data.get("source_ref"))
+        # Остались на том же шаге — кейс не создан.
+        self.assertEqual(await state.get_state(), AdminStates.add_case_photo.state)
+
+    async def test_missing_archive_config_message_is_clean_and_actionable(self):
+        media_archive.config.MEDIA_ARCHIVE_CHANNEL = ""
+        state = make_state(self.actor)
+        await state.set_state(AdminStates.add_case_photo)
+        await state.update_data(case_id="case_msg", title="t", type_id="site")
+        msg = self._photo_msg()
+        await admin.cases_add_photo(msg, state)
+
+        # Без засеянного anchor flow.step_from_text отвечает через
+        # message.answer — берём тот путь, который реально сработал.
+        call = msg.bot.edit_message_text.await_args or msg.answer.await_args
+        shown = call.args[0]
+        self.assertIn("канал-архив", shown)
+        for leak in ("Traceback", "MediaArchive", "MEDIA_ARCHIVE_CHANNEL", "Error", "chat_id"):
+            self.assertNotIn(leak, shown)
+
+    async def test_missing_archive_config_on_cover_replacement_keeps_case_intact(self):
+        await self._seed_upload_case("case_cfg_repl", 250)
+        media_archive.config.MEDIA_ARCHIVE_CHANNEL = ""
+        state = make_state(self.actor)
+        await state.set_state(AdminStates.edit_case_value)
+        await state.update_data(case_id="case_cfg_repl", field="cover")
+        msg = self._photo_msg()
+
+        with patch.object(content_store, "save_case_photo") as save:
+            await admin.cases_edit_value(msg, state)
+
+        save.assert_not_called()
+        msg.bot.delete_message.assert_not_awaited()
+        case = await self._case("case_cfg_repl")
+        self.assertEqual(case["cover"], self.ARCHIVE_COVER)
+        self.assertEqual(case["source_ref"], "archive:@media_archive_da:250")
+
+    async def test_section_image_upload_still_uses_storage_without_archive(self):
+        """Изображения разделов — не обложки: архив их не касается ни при
+        каком состоянии MEDIA_ARCHIVE_CHANNEL."""
+        await content_store.add_case(
+            self.actor, case_id="case_sec_up", title="S", type_id="site",
+            cover="img/portfolio/demo_case_1.svg", task="t", related_service=None,
+        )
+        await content_store.add_case_section(
+            self.actor, "case_sec_up", section_type="gallery", title="G", images=[],
+        )
+        state = make_state(self.actor)
+        await state.set_state(AdminStates.case_section_edit_value)
+        await state.update_data(case_id="case_sec_up", section_index=0, section_field="addimg")
+        msg = self._photo_msg()
+        with patch.object(content_store, "save_case_photo", return_value="img/portfolio/s.jpg") as save:
+            await admin.case_section_edit_value(msg, state)
+        save.assert_awaited_once()
+        msg.bot.send_photo.assert_not_awaited()
+
+    async def test_behance_and_telegram_flows_unaffected_by_missing_archive_config(self):
+        media_archive.config.MEDIA_ARCHIVE_CHANNEL = ""
+        state = make_state(self.actor)
+        await state.set_state(AdminStates.add_case_photo)
+        await state.update_data(case_id="case_ext_ok", title="t", type_id="site")
+        page = f'<meta property="og:image" content="{BehanceAdminFlowTests.CDN_1400}" />'.encode("utf-8")
+        with patch.object(behance, "_http_get", return_value=(200, page)), \
+             patch.object(behance, "_http_head", return_value=200):
+            await admin.cases_add_photo_behance(
+                make_flow_message_factory(chat_id=self.actor, start_id=9500)(
+                    text=BehanceAdminFlowTests.PROJECT_URL
+                ), state
+            )
+        data = await state.get_data()
+        self.assertEqual(data["source_type"], "behance")
+        self.assertEqual(data["cover"], BehanceAdminFlowTests.CDN_DISP)
+
+    async def test_resolve_failure_deletes_orphan_archive_message(self):
+        """Публикация прошла, резолв упал — мусор в канале убирается."""
+        state = make_state(self.actor)
+        await state.set_state(AdminStates.add_case_photo)
+        await state.update_data(case_id="case_orphan", title="t", type_id="site")
+        msg = self._photo_msg(103)
+        with patch.object(telegram_media, "resolve_cover_url",
+                          side_effect=telegram_media.TelegramMediaResolveError("no media")):
+            await admin.cases_add_photo(msg, state)
+        msg.bot.delete_message.assert_awaited_once_with(chat_id="@media_archive_da", message_id=103)
+        self.assertIsNone((await state.get_data()).get("cover"))
+        self.assertEqual(await state.get_state(), AdminStates.add_case_photo.state)
+
+    async def test_send_failure_creates_nothing(self):
+        state = make_state(self.actor)
+        await state.set_state(AdminStates.add_case_photo)
+        await state.update_data(case_id="case_sendfail", title="t", type_id="site")
+        msg = make_photo_message(self.actor)
+        msg.bot.send_photo = AsyncMock(side_effect=RuntimeError("CHAT_ADMIN_REQUIRED"))
+        msg.bot.delete_message = AsyncMock()
+        await admin.cases_add_photo(msg, state)
+        self.assertIsNone((await state.get_data()).get("cover"))
+        msg.bot.delete_message.assert_not_awaited()
+
+    # ---- replace (lifecycle) ----
+
+    async def _seed_upload_case(self, case_id, message_id=200):
+        await content_store.add_case(
+            self.actor, case_id=case_id, title="Seed", type_id="site",
+            cover=self.ARCHIVE_COVER, task="t", related_service=None,
+        )
+        await content_store.update_case(
+            self.actor, case_id, source_type="upload",
+            source_ref=f"archive:@media_archive_da:{message_id}",
+        )
+
+    async def test_replace_deletes_old_archive_only_after_persist(self):
+        await self._seed_upload_case("case_repl", 200)
+        state = make_state(self.actor)
+        await state.set_state(AdminStates.edit_case_value)
+        await state.update_data(case_id="case_repl", field="cover")
+        msg = self._photo_msg(201)
+
+        with patch.object(telegram_media, "resolve_cover_url", return_value=self.NEW_COVER):
+            await admin.cases_edit_value(msg, state)
+
+        case = await self._case("case_repl")
+        self.assertEqual(case["cover"], self.NEW_COVER)
+        self.assertEqual(case["source_ref"], "archive:@media_archive_da:201")
+        msg.bot.delete_message.assert_awaited_once_with(chat_id="@media_archive_da", message_id=200)
+
+    async def test_replace_failure_keeps_old_cover_and_old_archive(self):
+        await self._seed_upload_case("case_keep", 300)
+        state = make_state(self.actor)
+        await state.set_state(AdminStates.edit_case_value)
+        await state.update_data(case_id="case_keep", field="cover")
+        msg = make_photo_message(self.actor)
+        msg.bot.send_photo = AsyncMock(side_effect=RuntimeError("boom"))
+        msg.bot.delete_message = AsyncMock()
+
+        await admin.cases_edit_value(msg, state)
+
+        case = await self._case("case_keep")
+        self.assertEqual(case["cover"], self.ARCHIVE_COVER)
+        self.assertEqual(case["source_ref"], "archive:@media_archive_da:300")
+        msg.bot.delete_message.assert_not_awaited()
+
+    async def test_failed_cleanup_after_persist_does_not_break_update(self):
+        await self._seed_upload_case("case_cleanupfail", 400)
+        state = make_state(self.actor)
+        await state.set_state(AdminStates.edit_case_value)
+        await state.update_data(case_id="case_cleanupfail", field="cover")
+        msg = self._photo_msg(401)
+        msg.bot.delete_message = AsyncMock(side_effect=RuntimeError("MESSAGE_ID_INVALID"))
+
+        with patch.object(telegram_media, "resolve_cover_url", return_value=self.NEW_COVER):
+            await admin.cases_edit_value(msg, state)
+
+        case = await self._case("case_cleanupfail")
+        self.assertEqual(case["cover"], self.NEW_COVER)
+        self.assertEqual(case["source_ref"], "archive:@media_archive_da:401")
+
+    # ---- transitions carrying source_ref ----
+
+    async def test_upload_to_behance_clears_archive_and_deletes_message(self):
+        await self._seed_upload_case("case_u2b", 500)
+        state = make_state(self.actor)
+        await state.set_state(AdminStates.edit_case_value)
+        await state.update_data(case_id="case_u2b", field="external_url")
+        msg = make_flow_message_factory(chat_id=self.actor, start_id=9100)(text=BehanceAdminFlowTests.PROJECT_URL)
+        msg.bot.delete_message = AsyncMock()
+        page = f'<meta property="og:image" content="{BehanceAdminFlowTests.CDN_1400}" />'.encode("utf-8")
+        with patch.object(behance, "_http_get", return_value=(200, page)), \
+             patch.object(behance, "_http_head", return_value=200):
+            await admin.cases_edit_value(msg, state)
+
+        case = await self._case("case_u2b")
+        self.assertEqual(case["source_type"], "behance")
+        self.assertEqual(case["source_ref"], BehanceAdminFlowTests.PROJECT_URL)
+        self.assertEqual(case["external_url"], BehanceAdminFlowTests.PROJECT_URL)
+        msg.bot.delete_message.assert_awaited_once_with(chat_id="@media_archive_da", message_id=500)
+
+    async def test_behance_to_upload_sets_archive_ref_and_clears_link(self):
+        await content_store.add_case(
+            self.actor, case_id="case_b2u", title="S", type_id="site",
+            cover=BehanceAdminFlowTests.CDN_DISP, task="t", related_service=None,
+        )
+        await content_store.update_case(
+            self.actor, "case_b2u", source_type="behance",
+            external_url=BehanceAdminFlowTests.PROJECT_URL,
+            source_ref=BehanceAdminFlowTests.PROJECT_URL,
+        )
+        state = make_state(self.actor)
+        await state.set_state(AdminStates.edit_case_value)
+        await state.update_data(case_id="case_b2u", field="cover")
+        msg = self._photo_msg(600)
+        with patch.object(telegram_media, "resolve_cover_url", return_value=self.NEW_COVER):
+            await admin.cases_edit_value(msg, state)
+
+        case = await self._case("case_b2u")
+        self.assertEqual(case["source_type"], "upload")
+        self.assertEqual(case["source_ref"], "archive:@media_archive_da:600")
+        self.assertFalse(case.get("external_url"))
+        # Behance-проект нам не принадлежит — удалять там нечего.
+        msg.bot.delete_message.assert_not_awaited()
+
+    # ---- delete case ----
+
+    async def test_delete_case_removes_own_archive_message(self):
+        await self._seed_upload_case("case_del", 700)
+        state = make_state(self.actor)
+        await state.set_state(AdminStates.delete_case_confirm)
+        await state.update_data(case_id="case_del")
+        cb = make_callback("admindelcaseconfirm:yes", chat_id=self.actor)
+        cb.bot.delete_message = AsyncMock()
+
+        await admin.cases_delete_do(cb, state)
+
+        self.assertIsNone(await self._case("case_del"))
+        cb.bot.delete_message.assert_awaited_once_with(chat_id="@media_archive_da", message_id=700)
+
+    async def test_delete_case_does_not_touch_external_source(self):
+        await content_store.add_case(
+            self.actor, case_id="case_del_ext", title="S", type_id="site",
+            cover=BehanceAdminFlowTests.CDN_DISP, task="t", related_service=None,
+        )
+        await content_store.update_case(
+            self.actor, "case_del_ext", source_type="behance",
+            external_url=BehanceAdminFlowTests.PROJECT_URL,
+            source_ref=BehanceAdminFlowTests.PROJECT_URL,
+        )
+        state = make_state(self.actor)
+        await state.set_state(AdminStates.delete_case_confirm)
+        await state.update_data(case_id="case_del_ext")
+        cb = make_callback("admindelcaseconfirm:yes", chat_id=self.actor)
+        cb.bot.delete_message = AsyncMock()
+
+        await admin.cases_delete_do(cb, state)
+        cb.bot.delete_message.assert_not_awaited()
+
+    async def test_delete_case_survives_archive_cleanup_failure(self):
+        await self._seed_upload_case("case_del_fail", 800)
+        state = make_state(self.actor)
+        await state.set_state(AdminStates.delete_case_confirm)
+        await state.update_data(case_id="case_del_fail")
+        cb = make_callback("admindelcaseconfirm:yes", chat_id=self.actor)
+        cb.bot.delete_message = AsyncMock(side_effect=RuntimeError("nope"))
+
+        await admin.cases_delete_do(cb, state)
+        self.assertIsNone(await self._case("case_del_fail"))
+
+    # ---- gallery / non-cover media untouched ----
+
+    async def test_gallery_image_upload_still_uses_storage_not_archive(self):
+        """В архив уходят ТОЛЬКО обложки. Картинки галереи по-прежнему
+        идут через save_case_photo — второй storage не появился."""
+        await content_store.add_case(
+            self.actor, case_id="case_gal_up", title="S", type_id="site",
+            cover="img/portfolio/demo_case_1.svg", task="t", related_service=None,
+        )
+        state = make_state(self.actor)
+        await state.set_state(AdminStates.case_image_add)
+        await state.update_data(case_id="case_gal_up")
+        msg = self._photo_msg()
+        with patch.object(content_store, "save_case_photo", return_value="img/portfolio/g.jpg") as save:
+            await admin.case_image_add_receive(msg, state)
+        save.assert_awaited_once()
+        msg.bot.send_photo.assert_not_awaited()
+
+    async def test_gallery_pick_as_cover_clears_link_and_drops_archive_ref(self):
+        await self._seed_upload_case("case_gal_pick", 900)
+        await content_store.update_case(
+            self.actor, "case_gal_pick", external_url="https://t.me/telegram/379",
+            source_type="telegram_post", source_ref="https://t.me/telegram/379",
+        )
+        await content_store.add_case_image(self.actor, "case_gal_pick", "img/portfolio/local.jpg")
+        state = make_state(self.actor)
+        await state.set_state(AdminStates.case_images_menu)
+        await state.update_data(case_id="case_gal_pick", image_path="img/portfolio/local.jpg")
+        cb = make_callback("admincaseimgaction:cover", chat_id=self.actor)
+        cb.bot.delete_message = AsyncMock()
+
+        await admin.case_image_action(cb, state)
+
+        case = await self._case("case_gal_pick")
+        self.assertEqual(case["cover"], "img/portfolio/local.jpg")
+        self.assertEqual(case["source_type"], "upload")
+        self.assertFalse(case.get("external_url"))
+        # Картинки галереи не архивируются -> архивной ссылки у неё нет.
+        self.assertIsNone(case["source_ref"])
+
+    async def test_legacy_case_untouched_by_archive_logic(self):
+        for case in await content_store.list_cases():
+            with self.subTest(case_id=case["id"]):
+                self.assertNotIn("source_ref", case)
+                self.assertNotIn("source_type", case)
+
+
+class ArchiveSecurityTests(unittest.IsolatedAsyncioTestCase):
+    """Ничего секретного не должно оказаться в данных кейса или во фронте."""
+
+    def test_source_ref_is_not_rendered_as_a_link_by_mini_app(self):
+        app_js = (Path(__file__).resolve().parent.parent / "webapp" / "js" / "app.js").read_text(encoding="utf-8")
+        self.assertNotIn("source_ref", app_js)
+        self.assertNotIn("source_type", app_js)
+        self.assertNotIn("MEDIA_ARCHIVE", app_js)
+
+    def test_archive_channel_is_not_a_public_data_file(self):
+        from bot import webserver
+        self.assertNotIn("config.json", webserver.PUBLIC_DATA_FILES)
+        for name in webserver.PUBLIC_DATA_FILES:
+            self.assertFalse(name.startswith("."), name)
+
+    def test_no_bot_api_file_url_can_become_a_cover(self):
+        for bad in (
+            "https://api.telegram.org/file/bot123456:AAAA/photos/file_1.jpg",
+            "http://cdn1.telesco.pe/file/x",
+            "data:image/svg+xml;base64,AAAA",
+        ):
+            with self.subTest(url=bad):
+                self.assertFalse(telegram_media.is_valid_cdn_url(bad))
 
 
 if __name__ == "__main__":

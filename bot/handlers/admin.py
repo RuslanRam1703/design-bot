@@ -15,7 +15,7 @@ import logging
 import uuid
 import zipfile
 from datetime import datetime, timezone
-from typing import Callable
+from typing import Any, Callable
 
 from aiogram import F, Router
 from aiogram.exceptions import TelegramAPIError
@@ -25,13 +25,87 @@ from aiogram.fsm.state import State
 from aiogram.types import BufferedInputFile, CallbackQuery, InlineKeyboardMarkup, Message
 
 from bot import admin_keyboards as kb
-from bot import behance, config, content_store, flow, r2_storage, texts
+from bot import behance, config, content_store, flow, media_archive, r2_storage, telegram_media, texts
 from bot import lead as lead_format
 from bot.handlers.start import main_menu_or_confirm
 from bot.states import AdminStates
 
 router = Router(name="admin")
 logger = logging.getLogger(__name__)
+
+# Единая формулировка на оба места, где резолвится обложка из Telegram
+# (создание и редактирование кейса) — чтобы дизайнер видел одно и то же
+# объяснение независимо от пути. Никаких внутренних деталей: ни traceback,
+# ни класса исключения, ни HTTP-кодов, ни тем более токенов — причина
+# уходит только в логи (см. logger.warning рядом с вызовами).
+_TELEGRAM_COVER_ERROR = (
+    "Не удалось получить обложку из Telegram 🙁 Проверьте, что это ссылка "
+    "на публичный пост с изображением."
+)
+
+# Инвариант источника обложки: external_url осмыслен ТОЛЬКО пока cover —
+# это та самая картинка, которую резолвер получил ИЗ этого external_url.
+# Как только обложкой становится собственный файл дизайнера, ссылка
+# протухает — а "Смотреть подробнее" в Mini App показывается по ОДНОМУ
+# лишь наличию external_url (см. webapp/js/app.js renderCase). Не сбросив
+# её, мы бы увели клиента на чужой Behance-проект или на Telegram-пост,
+# не имеющий отношения к картинке, которую он видит на обложке.
+#
+# external_url=None, а не удаление ключа: update_case делает c.update(...)
+# и удалять поля не умеет, а None уезжает в JSON как null и одинаково
+# falsy и в Python, и в JS — то есть кнопка исчезает, а content_store.py
+# менять не приходится.
+def _uploaded_cover_fields(source_ref: str | None) -> dict[str, str | None]:
+    """Поля источника для обложки, загруженной дизайнером напрямую.
+    source_ref — ссылка на архивное сообщение (archive:<канал>:<id>) либо
+    None, когда архив не сконфигурирован и обложка легла в прежний
+    storage."""
+    return {"source_type": "upload", "external_url": None, "source_ref": source_ref}
+
+
+_COVER_UPLOAD_ERROR = "Не удалось загрузить изображение, попробуйте ещё раз 🙁"
+
+# Отдельный текст именно для незаданного MEDIA_ARCHIVE_CHANNEL: "попробуйте
+# ещё раз" здесь было бы прямой ложью — повтор не поможет, пока переменная
+# окружения не выставлена. Ни имени переменной со значением, ни traceback,
+# ни каких-либо секретов; что именно чинить — видно в логах.
+_ARCHIVE_NOT_CONFIGURED_ERROR = (
+    "Загрузка обложек сейчас недоступна: не настроен канал-архив ⚙️\n\n"
+    "Пока можно добавить кейс ссылкой на проект Behance или на публичный "
+    "пост в Telegram."
+)
+
+
+async def _cover_from_upload(bot: Any, file_id: str) -> tuple[str, dict[str, str | None]]:
+    """Загруженное фото -> (cover_url, поля источника).
+
+    Публикуем фото в публичный архив-канал и берём tokenless CDN-адрес из
+    веб-превью поста — так обложка получает browser-loadable URL, не
+    раскрывая BOT_TOKEN (см. bot/media_archive.py). Ни одного байта
+    картинки через Render при этом не проходит: в архив уходит file_id, а
+    не файл.
+
+    Отката на прежний save_case_photo здесь НЕТ сознательно: если
+    MEDIA_ARCHIVE_CHANNEL не задан, поднимается
+    MediaArchiveNotConfigured, и загрузка обложки честно не выполняется.
+    Тихий откат означал бы две одновременно живущие production-
+    архитектуры — часть обложек уезжала бы в старое хранилище незаметно
+    для дизайнера. Галерея и изображения разделов при этом продолжают
+    работать через прежний storage: в архив идут ТОЛЬКО обложки.
+
+    Lifecycle: если после успешного sendPhoto обложку не удалось
+    разрезолвить, только что созданное архивное сообщение удаляется здесь
+    же — иначе в канале оставался бы мусор, на который никто не
+    ссылается. Старое архивное сообщение кейса тут НЕ трогается: его
+    удаляет вызывающий код и только ПОСЛЕ успешной записи в
+    portfolio.json."""
+    message_id, post_url = await media_archive.send_archive_photo(bot, file_id)
+    try:
+        cover = await telegram_media.resolve_cover_url(post_url)
+    except telegram_media.TelegramMediaResolveError:
+        await media_archive.delete_archive_message(bot, media_archive.build_source_ref(message_id))
+        raise
+    return cover, _uploaded_cover_fields(media_archive.build_source_ref(message_id))
 
 # Куда возвращает универсальная "❌ Отмена" (cancel_keyboard) — по значению
 # cancel_to, проставленному в state.data в момент входа в конкретный мастер
@@ -316,7 +390,8 @@ async def cases_add_title(message: Message, state: FSMContext) -> None:
     await state.update_data(title=message.text.strip(), case_id=case_id)
     await flow.step_from_text(
         message, state,
-        "Пришлите фото кейса (как фото) — или ссылку на проект Behance:",
+        "Пришлите фото кейса (как фото) — или ссылку на проект Behance "
+        "либо на публичный пост в Telegram:",
         kb.cancel_keyboard(),
     )
     await state.set_state(AdminStates.add_case_photo)
@@ -330,54 +405,90 @@ async def cases_add_photo(message: Message, state: FSMContext) -> None:
     data = await state.get_data()
     file_id = message.photo[-1].file_id if message.photo else message.document.file_id
     try:
-        cover = await content_store.save_case_photo(message.chat.id, message.bot, file_id, data["case_id"])
-    except r2_storage.R2UploadError:
-        logger.exception("R2 upload failed for new case photo (case_id=%s)", data["case_id"])
-        await flow.step_from_text(message, state, "Не удалось загрузить изображение, попробуйте ещё раз 🙁", kb.cancel_keyboard())
+        cover, source_fields = await _cover_from_upload(message.bot, file_id)
+    except media_archive.MediaArchiveNotConfigured:
+        logger.error("MEDIA_ARCHIVE_CHANNEL не задан — загрузка обложки невозможна (case_id=%s)", data["case_id"])
+        await flow.step_from_text(message, state, _ARCHIVE_NOT_CONFIGURED_ERROR, kb.cancel_keyboard())
         return
-    await state.update_data(cover=cover)
+    except (media_archive.MediaArchiveError, telegram_media.TelegramMediaResolveError):
+        logger.exception("Cover upload failed for new case (case_id=%s)", data["case_id"])
+        await flow.step_from_text(message, state, _COVER_UPLOAD_ERROR, kb.cancel_keyboard())
+        return
+    await state.update_data(cover=cover, **source_fields)
     await flow.step_from_text(message, state, "Короткое описание задачи (пара предложений):", kb.cancel_keyboard())
     await state.set_state(AdminStates.add_case_description)
 
 
 @router.message(AdminStates.add_case_photo, F.text)
 async def cases_add_photo_behance(message: Message, state: FSMContext) -> None:
-    """Альтернатива загрузке фото на этом же шаге: ссылка на проект Behance.
-    Обложка берётся из og:image самого Behance (см. bot/behance.py) и живёт
-    на его CDN — наш storage backend (save_case_photo/R2) в этом пути НЕ
-    участвует вообще, ни одного байта картинки через Render не проходит.
+    """Альтернатива загрузке фото на этом же шаге: ссылка на уже
+    опубликованную работу — проект Behance ИЛИ публичный пост Telegram.
+    Обложка в обоих случаях берётся с чужого CDN (см. bot/behance.py и
+    bot/telegram_media.py) — наш storage backend (save_case_photo/R2) в
+    этом пути НЕ участвует вообще, ни одного байта картинки через Render
+    не проходит.
 
     Зарегистрирован СТРОГО между cases_add_photo (F.photo | F.document) и
     catch-all cases_add_photo_wrong: внутри одного router выигрывает первый
     совпавший хендлер, поэтому фото по-прежнему уходит в обычный upload,
     текст — сюда, а всё остальное (стикер/голос) — в прежний fallback.
 
-    external_url здесь только запоминается в state: add_case() не принимает
-    это поле (менять content_store.py в этой задаче нельзя), поэтому оно
-    проставляется отдельным update_case() уже после создания кейса —
+    Имя функции сохранено историческим (…_behance), хотя ветка теперь и
+    Telegram: его переименование потребовало бы править уже проходящие
+    Behance-тесты, ничего не меняя по существу.
+
+    external_url/source_type здесь только запоминаются в state: add_case()
+    их не принимает (менять content_store.py в этой задаче нельзя), поэтому
+    они проставляются отдельным update_case() уже после создания кейса —
     см. cases_add_description ниже."""
     url = message.text.strip()
-    if not behance.is_behance_project_url(url):
+
+    if behance.is_behance_project_url(url):
+        try:
+            cover = await behance.resolve_cover_url(url)
+        except behance.BehanceResolveError as e:
+            # Пользователю — понятная формулировка без traceback и внутренних
+            # деталей; сама причина уходит только в логи.
+            logger.warning("Behance cover resolve failed (new case): %s", e)
+            await flow.step_from_text(
+                message, state,
+                "Не удалось получить обложку с Behance 🙁 Проверьте, что это ссылка "
+                "на публичный проект, и пришлите её ещё раз — либо загрузите фото.",
+                kb.cancel_keyboard(),
+            )
+            return
+        # source_ref для внешних источников совпадает с external_url —
+        # оба указывают на саму работу. Отдельным полем он существует
+        # ради upload-кейсов, где ссылки наружу нет, а внутренняя
+        # (archive:<канал>:<id>) есть.
+        await state.update_data(cover=cover, external_url=url, source_type="behance", source_ref=url)
+
+    elif telegram_media.is_telegram_post_url(url):
+        try:
+            cover = await telegram_media.resolve_cover_url(url)
+        except telegram_media.TelegramMediaResolveError as e:
+            logger.warning("Telegram cover resolve failed (new case): %s", e)
+            await flow.step_from_text(message, state, _TELEGRAM_COVER_ERROR, kb.cancel_keyboard())
+            return
+        # external_url — НОРМАЛИЗОВАННАЯ ссылка на пост (без ?single и
+        # прочих параметров отображения), cover — прямой URL картинки на
+        # CDN Telegram. Семантика полей не смешивается.
+        normalized = telegram_media.normalize_post_url(url)
+        await state.update_data(
+            cover=cover,
+            external_url=normalized,
+            source_type="telegram_post",
+            source_ref=normalized,
+        )
+
+    else:
         await flow.step_from_text(
             message, state,
-            "Нужно фото 📎 или ссылка на проект Behance вида behance.net/gallery/…",
+            "Нужно фото 📎, ссылка на проект Behance вида behance.net/gallery/… "
+            "или ссылка на публичный пост Telegram вида t.me/канал/123",
             kb.cancel_keyboard(),
         )
         return
-    try:
-        cover = await behance.resolve_cover_url(url)
-    except behance.BehanceResolveError as e:
-        # Пользователю — понятная формулировка без traceback и внутренних
-        # деталей; сама причина уходит только в логи.
-        logger.warning("Behance cover resolve failed (new case): %s", e)
-        await flow.step_from_text(
-            message, state,
-            "Не удалось получить обложку с Behance 🙁 Проверьте, что это ссылка "
-            "на публичный проект, и пришлите её ещё раз — либо загрузите фото.",
-            kb.cancel_keyboard(),
-        )
-        return
-    await state.update_data(cover=cover, external_url=url)
     await flow.step_from_text(message, state, "Короткое описание задачи (пара предложений):", kb.cancel_keyboard())
     await state.set_state(AdminStates.add_case_description)
 
@@ -400,14 +511,25 @@ async def cases_add_description(message: Message, state: FSMContext) -> None:
         task=message.text.strip(),
         related_service=related_service,
     )
-    # Кейс создан из Behance-ссылки: сохраняем сам URL проекта отдельным
-    # полем через уже существующий update_case (add_case не принимает
-    # external_url, а content_store.py в этой задаче не меняется).
-    # Семантика полей не смешивается: external_url — ссылка на проект,
-    # cover — прямой URL картинки на CDN Behance.
-    behance_url = data.get("external_url")
-    if behance_url:
-        await content_store.update_case(message.chat.id, data["case_id"], external_url=behance_url)
+    # Кейс создан из внешней ссылки (Behance или публичный пост Telegram):
+    # сохраняем сам URL работы отдельным полем через уже существующий
+    # update_case (add_case не принимает ни external_url, ни source_type, а
+    # content_store.py в этой задаче не меняется). Семантика полей не
+    # смешивается: external_url — ссылка на работу, cover — прямой URL
+    # картинки на чужом CDN.
+    #
+    # source_type пишется отдельно от external_url и БЕЗ него тоже (случай
+    # upload): поле аддитивное, у legacy-кейсов его просто нет, и ни бот, ни
+    # Mini App на его отсутствие не смотрят — "Смотреть подробнее"
+    # по-прежнему определяется наличием external_url (см. app.js
+    # renderCase), поэтому старые кейсы продолжают работать как раньше.
+    extra: dict[str, str | None] = {}
+    for key in ("external_url", "source_type", "source_ref"):
+        value = data.get(key)
+        if value:
+            extra[key] = value
+    if extra:
+        await content_store.update_case(message.chat.id, data["case_id"], **extra)
     # step_from_text, затем finish_flow, НЕ reset_state_keep_nav (P1-3,
     # Batch 4 — исправляет собственную находку Batch 1): когда edit
     # внутри step_from_text успевает отредактировать существующий anchor
@@ -631,7 +753,37 @@ async def case_image_action(callback: CallbackQuery, state: FSMContext) -> None:
         return
 
     if action == "cover":
+        # Второй путь смены обложки, кроме загрузки нового файла: назначить
+        # обложкой картинку, УЖЕ лежащую в галерее кейса. Для внешнего
+        # кейса (behance/telegram_post) это тоже уход от резолвнутой
+        # картинки — дизайнер мог добавить в галерею свой файл и выбрать
+        # его звёздочкой, и тогда external_url так же протухает.
+        #
+        # Условие "было что сбрасывать И обложка реально меняется": у
+        # резолвнутого кейса единственная обложка, согласованная с
+        # external_url, — текущая, поэтому любой ДРУГОЙ выбор делает
+        # ссылку неверной. Повторный выбор той же самой картинки ничего
+        # не меняет и ссылку не трогает.
+        case_before = await _current_case(case_id)
+        cover_changed = bool(case_before and image_path != case_before.get("cover"))
+        stale_external = bool(cover_changed and case_before.get("external_url"))
+        old_source_ref = case_before.get("source_ref") if case_before else None
+
         await content_store.set_case_cover(callback.message.chat.id, case_id, image_path)
+
+        if stale_external:
+            # source_ref=None, а не "архивная ссылка выбранной картинки":
+            # картинки галереи в архив-канал НЕ публикуются (туда идут
+            # только обложки, см. _cover_from_upload) — они лежат в
+            # прежнем storage через save_case_photo. Архивной ссылки у
+            # такой картинки просто не существует, и выдумывать её нельзя.
+            await content_store.update_case(
+                callback.message.chat.id, case_id, **_uploaded_cover_fields(None),
+            )
+        if cover_changed and old_source_ref and old_source_ref != image_path:
+            # Прежняя обложка была архивной, а теперь ею стала картинка из
+            # галереи — архивное сообщение осиротело. Убираем ПОСЛЕ записи.
+            await media_archive.delete_archive_message(callback.bot, old_source_ref)
     elif action in ("up", "down"):
         await content_store.reorder_case_image(callback.message.chat.id, case_id, image_path, action)
     # "back" — просто возвращает к списку, ничего не меняя
@@ -924,13 +1076,32 @@ async def cases_edit_value(message: Message, state: FSMContext) -> None:
             await flow.step_from_text(message, state, "Нужно изображение (фото или файл-картинка) 📎.", kb.cancel_keyboard())
             return
         file_id = message.photo[-1].file_id if message.photo else message.document.file_id
+        # Порядок шагов задан Task 6 (lifecycle) и важен именно в таком
+        # виде: сперва публикуем НОВОЕ архивное сообщение и резолвим
+        # обложку, потом пишем portfolio.json, и только ПОСЛЕ успешной
+        # записи убираем СТАРОЕ архивное сообщение. При падении на любом
+        # шаге до записи кейс остаётся ровно тем, чем был — старая обложка
+        # на месте, старое архивное сообщение не тронуто.
+        case_before = await _current_case(data["case_id"])
+        old_source_ref = case_before.get("source_ref") if case_before else None
         try:
-            value = await content_store.save_case_photo(message.chat.id, message.bot, file_id, data["case_id"])
-        except r2_storage.R2UploadError:
-            logger.exception("R2 upload failed for cover replacement (case_id=%s)", data["case_id"])
-            await flow.step_from_text(message, state, "Не удалось загрузить изображение, попробуйте ещё раз 🙁", kb.cancel_keyboard())
+            value, source_fields = await _cover_from_upload(message.bot, file_id)
+        except media_archive.MediaArchiveNotConfigured:
+            logger.error("MEDIA_ARCHIVE_CHANNEL не задан — замена обложки невозможна (case_id=%s)", data["case_id"])
+            await flow.step_from_text(message, state, _ARCHIVE_NOT_CONFIGURED_ERROR, kb.cancel_keyboard())
             return
-        await content_store.update_case(message.chat.id, data["case_id"], cover=value)
+        except (media_archive.MediaArchiveError, telegram_media.TelegramMediaResolveError):
+            logger.exception("Cover replacement failed (case_id=%s)", data["case_id"])
+            await flow.step_from_text(message, state, _COVER_UPLOAD_ERROR, kb.cancel_keyboard())
+            return
+        # Покрывает все переходы разом: behance -> upload,
+        # telegram_post -> upload, legacy (без source_type) -> upload и
+        # upload -> upload (с заменой archive-ссылки).
+        await content_store.update_case(
+            message.chat.id, data["case_id"], cover=value, **source_fields,
+        )
+        if old_source_ref and old_source_ref != source_fields.get("source_ref"):
+            await media_archive.delete_archive_message(message.bot, old_source_ref)
     else:
         if not message.text:
             await flow.step_from_text(message, state, "Нужен текст.", kb.cancel_keyboard())
@@ -953,7 +1124,36 @@ async def cases_edit_value(message: Message, state: FSMContext) -> None:
                     kb.cancel_keyboard(),
                 )
                 return
-            await content_store.update_case(message.chat.id, data["case_id"], external_url=value, cover=cover)
+            old_source_ref = (await _current_case(data["case_id"]) or {}).get("source_ref")
+            await content_store.update_case(
+                message.chat.id, data["case_id"],
+                external_url=value, cover=cover, source_type="behance", source_ref=value,
+            )
+            # upload -> behance: архивное сообщение прежней обложки больше
+            # никому не принадлежит. Удаляем ПОСЛЕ записи (Task 6).
+            await media_archive.delete_archive_message(message.bot, old_source_ref)
+        elif field == "external_url" and telegram_media.is_telegram_post_url(value):
+            # Тот же принцип, что и у Behance-ветки выше: смена ссылки на
+            # публичный пост Telegram заодно обновляет обложку из og:image
+            # этого поста. Старую обложку НЕ удаляем через storage — если
+            # она была на чужом CDN, она нам не принадлежит; если это был
+            # загруженный файл, его удаление уже делает update_case (см.
+            # content_store.update_case, Batch 3), и здесь дублировать
+            # эту логику не нужно.
+            try:
+                cover = await telegram_media.resolve_cover_url(value)
+            except telegram_media.TelegramMediaResolveError as e:
+                logger.warning("Telegram cover resolve failed (edit case %s): %s", data["case_id"], e)
+                await flow.step_from_text(message, state, _TELEGRAM_COVER_ERROR, kb.cancel_keyboard())
+                return
+            normalized = telegram_media.normalize_post_url(value)
+            old_source_ref = (await _current_case(data["case_id"]) or {}).get("source_ref")
+            await content_store.update_case(
+                message.chat.id, data["case_id"],
+                external_url=normalized, cover=cover,
+                source_type="telegram_post", source_ref=normalized,
+            )
+            await media_archive.delete_archive_message(message.bot, old_source_ref)
         else:
             await content_store.update_case(message.chat.id, data["case_id"], **{field: value})
     # flow.step_from_text (P1-3, Batch 3) — success-переход в
@@ -991,7 +1191,23 @@ async def cases_delete_do(callback: CallbackQuery, state: FSMContext) -> None:
     answer = callback.data.split(":", 1)[1]
     data = await state.get_data()
     if answer == "yes":
+        # source_ref читаем ДО удаления — после него кейса уже нет.
+        # Удаляем только СВОЁ архивное сообщение (source_type == upload):
+        # Behance-проект и чужой Telegram-пост нам не принадлежат, трогать
+        # их нельзя в принципе.
+        case_before = await _current_case(data["case_id"])
+        archive_ref = (
+            case_before.get("source_ref")
+            if case_before and case_before.get("source_type") == "upload"
+            else None
+        )
         await content_store.delete_case(callback.message.chat.id, data["case_id"])
+        # Уборка архива — best-effort и НЕ откатывает уже удалённый кейс
+        # (delete_archive_message не бросает, а логирует). Формулировка
+        # для дизайнера намеренно не обещает удаления самой картинки:
+        # проверено вживую, что выданный ранее cdn*.telesco.pe URL
+        # продолжает отдавать изображение и после deleteMessage.
+        await media_archive.delete_archive_message(callback.bot, archive_ref)
         text = "Кейс удалён ✅"
     else:
         text = "Отменено."
