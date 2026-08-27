@@ -8,6 +8,7 @@ from aiogram.types import Message
 from bot import config, content_store, texts
 from bot.calculator import calculate
 from bot.data import load_pricing
+from bot.handlers.start import relay_client_media_to_designer
 from bot.lead import format_lead_message, format_material_message
 
 router = Router(name="webapp")
@@ -117,6 +118,14 @@ async def handle_tz_file(message: Message) -> None:
     влияет на корректность."""
     lead = await content_store.find_lead_awaiting_file(message.from_user.id)
     if lead is None:
+        # Ожидающей заявки нет — материал не записываем и заявку не трогаем
+        # (это и есть защита от перехвата посторонних файлов). Но и молча
+        # терять файл нельзя: раньше он исчезал бесследно, без ответа
+        # клиенту и без единого следа у дизайнера. Пересылаем как обычное
+        # обращение — тем же способом, что и свободный текст клиента.
+        # Внутри есть та же защита от собственных файлов дизайнера
+        # (DESIGNER_CHAT_ID), что и у текстового relay.
+        await relay_client_media_to_designer(message)
         return
 
     if message.document:

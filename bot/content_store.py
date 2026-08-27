@@ -578,6 +578,46 @@ async def update_case_section(actor_chat_id: int | str, case_id: str, index: int
         return True
 
 
+async def add_case_section_image(
+    actor_chat_id: int | str,
+    case_id: str,
+    index: int,
+    image_path: str,
+    *,
+    archive_ref: str | None = None,
+) -> bool:
+    """Добавляет изображение в gallery-секцию и запоминает его архивную
+    ссылку — ровно тем же механизмом, что и верхнеуровневая галерея.
+
+    Ссылка кладётся в тот же case["image_refs"], а не в отдельный словарь
+    внутри секции: ключ там — сам путь картинки, а пути уникальны в
+    пределах кейса, поэтому один словарь корректно обслуживает и галерею,
+    и секции. Побочная выгода — удаление кейса уже убирает архивные
+    сообщения через case_gallery_refs(), и секционные картинки попадают
+    туда автоматически, без второго места для уборки.
+
+    Раньше этот путь шёл через save_case_photo -> локальный диск Render:
+    R2 в production не сконфигурирован, а диск там эфемерный, поэтому
+    картинка исчезала при следующем деплое, оставляя в sections[].images
+    ссылку на несуществующий файл."""
+    _require_designer(actor_chat_id)
+    async with _lock("portfolio.json"):
+        data = await _read("portfolio.json")
+        case = _find_case(data, case_id)
+        if case is None:
+            return False
+        sections = case.get("sections", [])
+        if not (0 <= index < len(sections)):
+            return False
+        images = sections[index].setdefault("images", [])
+        if image_path not in images:
+            images.append(image_path)
+        if archive_ref:
+            case.setdefault("image_refs", {})[image_path] = archive_ref
+        await _write("portfolio.json", data)
+        return True
+
+
 async def remove_case_section_image(actor_chat_id: int | str, case_id: str, index: int, img_index: int) -> bool:
     """Batch 3 — удаление ОДНОГО изображения из gallery-секции, с R2-cleanup
     (тот же принцип, что и remove_case_image для верхнеуровневой галереи).
@@ -601,6 +641,13 @@ async def remove_case_section_image(actor_chat_id: int | str, case_id: str, inde
             return False
         removed_path = images[img_index]
         sections[index]["images"] = [img for i, img in enumerate(images) if i != img_index]
+        # Архивная ссылка уходит вместе с картинкой (см. add_case_section_image).
+        # Само сообщение удаляет вызывающий хендлер — у него есть bot.
+        refs = case.get("image_refs")
+        if isinstance(refs, dict):
+            refs.pop(removed_path, None)
+            if not refs:
+                case.pop("image_refs", None)
         await _write("portfolio.json", data)
     if removed_path:
         await r2_storage.delete_image(removed_path)
@@ -769,6 +816,33 @@ async def update_about_field(actor_chat_id: int | str, field: str, value: Any) -
     if old_avatar:
         await r2_storage.delete_image(old_avatar)
     return True
+
+
+async def set_about_avatar(actor_chat_id: int | str, url: str, archive_ref: str | None = None) -> str | None:
+    """Аватар «Обо мне» + архивная ссылка на него. Возвращает ПРЕЖНЮЮ
+    архивную ссылку, чтобы вызывающий хендлер убрал осиротевшее сообщение.
+
+    Отдельная функция, а не update_about_field("avatar_ref", ...): тот
+    сеттер по контракту отказывается писать поле, которого ещё нет в
+    about.json (`if field not in data: return False`), а avatar_ref у
+    существующих данных отсутствует. Плюс avatar и ссылка на него обязаны
+    меняться одной записью — иначе при сбое между двумя вызовами ссылка
+    указывала бы не на ту картинку.
+
+    avatar_ref — необязательное поле: у демо-плейсхолдера и старых данных
+    его нет, и это штатное состояние (см. case["image_refs"])."""
+    _require_designer(actor_chat_id)
+    async with _lock("about.json"):
+        data = await _read("about.json")
+        old_ref = data.get("avatar_ref")
+        data["avatar"] = url
+        if archive_ref:
+            data["avatar_ref"] = archive_ref
+        else:
+            data.pop("avatar_ref", None)
+        data["needs_review_fields"] = [f for f in data.get("needs_review_fields", []) if f != "avatar"]
+        await _write("about.json", data)
+    return old_ref if isinstance(old_ref, str) and old_ref else None
 
 
 async def add_about_experience(actor_chat_id: int | str, *, role: str, company: str, period: str, description: str = "") -> bool:

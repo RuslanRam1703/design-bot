@@ -155,9 +155,15 @@ class BriefLifecycleTests(unittest.IsolatedAsyncioTestCase):
         stranger_message.from_user = SimpleNamespace(id=999, username="stranger", first_name="Чужой", last_name=None)
         await webapp.handle_tz_file(stranger_message)
 
+        # Главное (security): чужая заявка не тронута и материал не записан.
         self.assertIsNotNone(await content_store.find_lead_awaiting_file(1))  # заявка владельца всё ещё ждёт файл
-        stranger_message.forward.assert_not_awaited()
-        stranger_message.answer.assert_not_awaited()  # чужому отправителю тоже ничего не отвечаем
+        owner_lead = await content_store.find_lead_awaiting_file(1)
+        self.assertEqual(owner_lead.get("materials", []), [])
+        # Файл постороннего к чужой заявке НЕ прикрепляется, но и не
+        # исчезает: у него нет своей ожидающей заявки, поэтому он уходит
+        # дизайнеру как обычное обращение (см. relay_client_media_to_designer)
+        # — ровно так же, как ушёл бы его текст.
+        stranger_message.forward.assert_awaited_once_with(chat_id=content_store.config.DESIGNER_CHAT_ID)
 
     async def test_awaiting_state_survives_simulated_restart(self):
         # "Persistence через restart/redeploy" — здесь эмулируется тем, что
@@ -1931,7 +1937,10 @@ class AdminSuccessorStalenessAnchorTests(unittest.IsolatedAsyncioTestCase):
     async def test_about_edit_photo_success_deletes_current_prompt_on_cancel(self):
         state = await self._state_with_anchor(anchor_id=630, field="avatar")
         photo = make_photo_message(self.actor)
-        await admin.about_edit_photo(photo, state)
+        # Суть теста — anchor мастера, а не хранилище: аватар теперь идёт
+        # через архивный конвейер, подменяем именно этот шаг.
+        with patch_gallery_upload():
+            await admin.about_edit_photo(photo, state)
         photo.bot.edit_message_text.assert_awaited_once()
         self.assertEqual(photo.bot.edit_message_text.await_args.kwargs["message_id"], 630)
         self.assertEqual(await state.get_state(), AdminStates.edit_about_field_pick.state)
@@ -8424,6 +8433,180 @@ class GalleryImageDeletionHandlerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(ids.count(70), 1)
 
 
+class PersistentSectionAndAvatarTests(unittest.IsolatedAsyncioTestCase):
+    """Финальный fix set: изображения РАЗДЕЛОВ кейса и аватар «Обо мне»
+    переведены на тот же архивный конвейер, что обложки и галерея.
+
+    Защищаемый дефект: оба шли через save_case_photo/save_about_photo, а те
+    пишут в R2 только если он сконфигурирован. В production R2 не настроен,
+    диск Render эфемерный (free plan, диск не подключён) — картинка
+    исчезала при следующем деплое, оставляя в JSON ссылку на файл, которого
+    больше нет."""
+
+    CDN = "https://cdn4.telesco.pe/file/SECTIONORAVATAR"
+    REF = "archive:@media_archive_da:501"
+
+    async def asyncSetUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        real_data_dir = Path(__file__).resolve().parent.parent / "data"
+        for name in ("pricing.json", "portfolio.json", "faq.json", "about.json", "ui_config.json"):
+            shutil.copy(real_data_dir / name, Path(self.tmpdir) / name)
+        self._orig_data_dir = content_store.DATA_DIR
+        self._orig_designer = content_store.config.DESIGNER_CHAT_ID
+        self._orig_channel = media_archive.config.MEDIA_ARCHIVE_CHANNEL
+        content_store.DATA_DIR = Path(self.tmpdir)
+        content_store.config.DESIGNER_CHAT_ID = "999"
+        media_archive.config.MEDIA_ARCHIVE_CHANNEL = "@media_archive_da"
+        self.actor = 999
+        await content_store.add_case(
+            str(self.actor), case_id="case_persist", title="T", type_id="landing",
+            cover="img/portfolio/a.svg", task="t", related_service=None,
+        )
+        await content_store.add_case_section(
+            str(self.actor), "case_persist", section_type="gallery", title="Галерея", images=[],
+        )
+
+    def tearDown(self):
+        content_store.DATA_DIR = self._orig_data_dir
+        content_store.config.DESIGNER_CHAT_ID = self._orig_designer
+        media_archive.config.MEDIA_ARCHIVE_CHANNEL = self._orig_channel
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    async def _case(self):
+        return next(c for c in await content_store.list_cases() if c["id"] == "case_persist")
+
+    async def _section_state(self):
+        state = make_state(self.actor)
+        await state.set_state(AdminStates.case_section_edit_value)
+        await state.update_data(case_id="case_persist", section_index=0, section_field="addimg")
+        return state
+
+    # ---- Секции: хранение ----
+
+    async def test_section_image_stored_as_cdn_url_with_archive_ref(self):
+        await content_store.add_case_section_image(
+            str(self.actor), "case_persist", 0, self.CDN, archive_ref=self.REF,
+        )
+        case = await self._case()
+        self.assertEqual(case["sections"][0]["images"], [self.CDN])
+        # Ссылка живёт в общем image_refs кейса — одном для галереи и секций.
+        self.assertEqual(case["image_refs"], {self.CDN: self.REF})
+        # images секции остаётся списком СТРОК.
+        self.assertTrue(all(isinstance(i, str) for i in case["sections"][0]["images"]))
+
+    async def test_section_image_without_ref_creates_no_field(self):
+        await content_store.add_case_section_image(str(self.actor), "case_persist", 0, "img/portfolio/legacy.svg")
+        self.assertNotIn("image_refs", await self._case())
+
+    async def test_removing_section_image_drops_its_ref(self):
+        await content_store.add_case_section_image(str(self.actor), "case_persist", 0, self.CDN, archive_ref=self.REF)
+        self.assertTrue(await content_store.remove_case_section_image(str(self.actor), "case_persist", 0, 0))
+        case = await self._case()
+        self.assertEqual(case["sections"][0]["images"], [])
+        self.assertNotIn("image_refs", case)
+
+    async def test_delete_case_cleans_section_image_refs_too(self):
+        """Секционные ссылки лежат в том же image_refs, поэтому уборка при
+        удалении кейса подхватывает их без второго механизма."""
+        await content_store.add_case_section_image(str(self.actor), "case_persist", 0, self.CDN, archive_ref=self.REF)
+        case = await self._case()
+        self.assertIn(self.REF, content_store.case_gallery_refs(case))
+
+    # ---- Секции: боевой хендлер ----
+
+    async def test_section_upload_handler_uses_archive_not_local(self):
+        state = await self._section_state()
+        msg = make_photo_message(self.actor)
+        msg.bot.send_photo = AsyncMock(return_value=SimpleNamespace(message_id=88))
+        with patch.object(telegram_media, "resolve_cover_url", new=AsyncMock(return_value=self.CDN)), \
+             patch.object(content_store, "save_case_photo", new=AsyncMock()) as save_local:
+            await admin.case_section_edit_value(msg, state)
+        save_local.assert_not_awaited()
+        msg.bot.send_photo.assert_awaited_once_with(chat_id="@media_archive_da", photo="fake_file_id")
+        case = await self._case()
+        self.assertEqual(case["sections"][0]["images"], [self.CDN])
+        self.assertEqual(case["image_refs"], {self.CDN: "archive:@media_archive_da:88"})
+
+    async def test_section_upload_resolver_failure_cleans_up_and_keeps_case(self):
+        state = await self._section_state()
+        msg = make_photo_message(self.actor)
+        msg.bot.send_photo = AsyncMock(return_value=SimpleNamespace(message_id=89))
+        msg.bot.delete_message = AsyncMock()
+        before = await self._case()
+        with patch.object(telegram_media, "resolve_cover_url",
+                          new=AsyncMock(side_effect=telegram_media.TelegramMediaResolveError("boom"))):
+            await admin.case_section_edit_value(msg, state)
+        msg.bot.delete_message.assert_awaited_once_with(chat_id="@media_archive_da", message_id=89)
+        self.assertEqual(await self._case(), before)
+
+    async def test_section_upload_without_archive_config_does_not_fall_back_to_disk(self):
+        media_archive.config.MEDIA_ARCHIVE_CHANNEL = ""
+        state = await self._section_state()
+        msg = make_photo_message(self.actor)
+        before = await self._case()
+        with patch.object(content_store, "save_case_photo", new=AsyncMock()) as save_local:
+            await admin.case_section_edit_value(msg, state)
+        save_local.assert_not_awaited()
+        self.assertEqual(await self._case(), before)
+
+    # ---- Аватар «Обо мне» ----
+
+    async def test_set_about_avatar_stores_url_and_ref_and_returns_old(self):
+        first = await content_store.set_about_avatar(str(self.actor), self.CDN, self.REF)
+        self.assertIsNone(first)  # прежней архивной ссылки не было
+        about = await content_store.get_about()
+        self.assertEqual(about["avatar"], self.CDN)
+        self.assertEqual(about["avatar_ref"], self.REF)
+
+        old = await content_store.set_about_avatar(str(self.actor), "https://cdn4.telesco.pe/file/NEW", "archive:@ch:502")
+        self.assertEqual(old, self.REF)  # старую ссылку вернули для уборки
+        about = await content_store.get_about()
+        self.assertEqual(about["avatar_ref"], "archive:@ch:502")
+
+    async def test_about_avatar_handler_uses_archive_not_local(self):
+        state = make_state(self.actor)
+        await state.set_state(AdminStates.edit_about_photo)
+        msg = make_photo_message(self.actor)
+        msg.bot.send_photo = AsyncMock(return_value=SimpleNamespace(message_id=90))
+        with patch.object(telegram_media, "resolve_cover_url", new=AsyncMock(return_value=self.CDN)), \
+             patch.object(content_store, "save_about_photo", new=AsyncMock()) as save_local:
+            await admin.about_edit_photo(msg, state)
+        save_local.assert_not_awaited()
+        msg.bot.send_photo.assert_awaited_once_with(chat_id="@media_archive_da", photo="fake_file_id")
+        about = await content_store.get_about()
+        self.assertEqual(about["avatar"], self.CDN)
+        self.assertEqual(about["avatar_ref"], "archive:@media_archive_da:90")
+
+    async def test_about_avatar_replacement_deletes_old_archive_message(self):
+        await content_store.set_about_avatar(str(self.actor), "https://cdn4.telesco.pe/file/OLD", "archive:@media_archive_da:77")
+        state = make_state(self.actor)
+        await state.set_state(AdminStates.edit_about_photo)
+        msg = make_photo_message(self.actor)
+        msg.bot.send_photo = AsyncMock(return_value=SimpleNamespace(message_id=91))
+        msg.bot.delete_message = AsyncMock()
+        with patch.object(telegram_media, "resolve_cover_url", new=AsyncMock(return_value=self.CDN)):
+            await admin.about_edit_photo(msg, state)
+        msg.bot.delete_message.assert_awaited_once_with(chat_id="@media_archive_da", message_id=77)
+
+    async def test_about_avatar_failure_keeps_previous_avatar(self):
+        before = (await content_store.get_about())["avatar"]
+        state = make_state(self.actor)
+        await state.set_state(AdminStates.edit_about_photo)
+        msg = make_photo_message(self.actor)
+        msg.bot.send_photo = AsyncMock(return_value=SimpleNamespace(message_id=92))
+        msg.bot.delete_message = AsyncMock()
+        with patch.object(telegram_media, "resolve_cover_url",
+                          new=AsyncMock(side_effect=telegram_media.TelegramMediaResolveError("boom"))):
+            await admin.about_edit_photo(msg, state)
+        self.assertEqual((await content_store.get_about())["avatar"], before)
+        msg.bot.delete_message.assert_awaited_once_with(chat_id="@media_archive_da", message_id=92)
+
+    async def test_legacy_about_without_avatar_ref_still_readable(self):
+        about = await content_store.get_about()
+        self.assertNotIn("avatar_ref", about)  # демо-данные поля не имеют
+        self.assertTrue(about["avatar"])
+
+
 class CaseSectionManagementTests(unittest.IsolatedAsyncioTestCase):
     """Part 1 ТЗ: гибкие sections вместо жёстких task/solution/result."""
 
@@ -10413,6 +10596,117 @@ class PublicDataRouteUpstashTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIn(name, self.fake.store)
 
 
+class ClientMediaRelayOutsideAwaitingTests(unittest.IsolatedAsyncioTestCase):
+    """Медиа клиента, присланное ВНЕ ожидания файла.
+
+    Защищаемый дефект: свободный текст клиента дизайнеру доходил (см.
+    relay_client_text_to_designer), а фото/документ — нет. Файл без
+    ожидающей заявки исчезал бесследно: ни материала, ни пересылки, ни
+    ответа клиенту. Человек считал, что отправил.
+
+    Ключевой инвариант, который тесты обязаны удерживать: такой файл НЕ
+    привязывается к заявке автоматически и не меняет awaiting_tz_file."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self._orig_data_dir = content_store.DATA_DIR
+        self._orig_designer = content_store.config.DESIGNER_CHAT_ID
+        content_store.DATA_DIR = Path(self.tmpdir)
+        content_store.config.DESIGNER_CHAT_ID = "777"
+
+    def tearDown(self):
+        content_store.DATA_DIR = self._orig_data_dir
+        content_store.config.DESIGNER_CHAT_ID = self._orig_designer
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    async def test_media_without_any_lead_is_relayed_and_acknowledged(self):
+        message = make_message(document=make_fake_document(file_id="loose-1"))
+        await webapp.handle_tz_file(message)
+
+        message.bot.send_message.assert_awaited_once()
+        header = message.bot.send_message.await_args.kwargs["text"]
+        self.assertIn("Материал", header)
+        self.assertIn("не прикреплён", header)
+        message.forward.assert_awaited_once_with(chat_id="777")
+        message.answer.assert_awaited_once()
+        self.assertIn("отправлен дизайнеру", message.answer.await_args.args[0])
+        # Никаких заявок не создано и ничего не ждёт файл.
+        self.assertEqual(await content_store.list_leads_by_user(message.from_user.id), [])
+        self.assertIsNone(await content_store.find_lead_awaiting_file(message.from_user.id))
+
+    async def test_media_with_active_lead_is_relayed_but_not_attached(self):
+        message = make_message()
+        await webapp._handle_brief_submission(message, {"service_name": "Лендинг", "attach_tz": False, "draft_id": "r1"})
+        lead_id = (await content_store.list_leads_by_user(message.from_user.id))[0]["id"]
+        message.bot.send_message.reset_mock(); message.answer.reset_mock()
+
+        message.document = make_fake_document(file_id="loose-2")
+        await webapp.handle_tz_file(message)
+
+        # Номер активной заявки в шапке — как и у текстового relay...
+        self.assertIn(f"#{lead_id}", message.bot.send_message.await_args.kwargs["text"])
+        message.forward.assert_awaited_once_with(chat_id="777")
+        # ...но материал к заявке НЕ прикреплён и ожидание не включено.
+        lead = await content_store.get_lead(lead_id)
+        self.assertEqual(lead.get("materials", []), [])
+        self.assertFalse(lead.get("awaiting_tz_file"))
+
+    async def test_relay_does_not_touch_awaiting_path(self):
+        """Файл, который заявка ЖДЁТ, идёт прежним путём: материал
+        записывается, relay «общего обращения» не вызывается."""
+        message = make_message()
+        await webapp._handle_brief_submission(message, {"service_name": "Лендинг", "attach_tz": True, "draft_id": "r2"})
+        lead_id = (await content_store.find_lead_awaiting_file(message.from_user.id))["id"]
+        message.bot.send_message.reset_mock(); message.answer.reset_mock()
+
+        message.document = make_fake_document(file_id="doc-await", file_unique_id="u-await")
+        await webapp.handle_tz_file(message)
+
+        lead = await content_store.get_lead(lead_id)
+        self.assertEqual(len(lead["materials"]), 1)
+        self.assertEqual(lead["materials"][0]["file_id"], "doc-await")
+        self.assertEqual(message.answer.await_args.args[0], texts.TZ_FILE_FORWARDED)
+        self.assertNotIn("не прикреплён", message.bot.send_message.await_args.kwargs["text"])
+
+    async def test_designer_own_media_is_not_relayed_to_himself(self):
+        message = make_message(document=make_fake_document(), chat_id=777)
+        message.from_user = SimpleNamespace(id=777, username="designer", first_name="Дизайнер", last_name=None)
+        await webapp.handle_tz_file(message)
+        message.bot.send_message.assert_not_awaited()
+        message.forward.assert_not_awaited()
+        message.answer.assert_not_awaited()
+
+    async def test_relay_failure_tells_client_instead_of_silent_loss(self):
+        message = make_message(document=make_fake_document())
+        message.bot.send_message = AsyncMock(side_effect=RuntimeError("telegram down"))
+        await webapp.handle_tz_file(message)
+        message.answer.assert_awaited_once()
+        self.assertIn("Не получилось", message.answer.await_args.args[0])
+        self.assertEqual(await content_store.list_leads_by_user(message.from_user.id), [])
+
+    async def test_all_supported_media_kinds_are_relayed(self):
+        for kind, kwargs in (
+            ("document", {"document": make_fake_document()}),
+            ("photo", {"photo": [make_fake_document()]}),
+            ("video", {"video": make_fake_document()}),
+            ("animation", {"animation": make_fake_document()}),
+        ):
+            with self.subTest(kind=kind):
+                message = make_message(**kwargs)
+                await webapp.handle_tz_file(message)
+                message.forward.assert_awaited_once_with(chat_id="777")
+
+    async def test_unsupported_media_outside_awaiting_stays_silent(self):
+        """voice/video_note/sticker вне ожидания — прежнее поведение:
+        отдельный хендлер и no-op, relay их не касается."""
+        for kwargs in ({"voice": make_fake_document()}, {"video_note": make_fake_document()}, {"sticker": make_fake_document()}):
+            with self.subTest(kind=list(kwargs)[0]):
+                message = make_message(**kwargs)
+                await webapp.handle_unsupported_tz_media(message)
+                message.answer.assert_not_awaited()
+                message.forward.assert_not_awaited()
+
+
 class LeadMaterialTests(unittest.IsolatedAsyncioTestCase):
     """Файл ТЗ теперь не просто пересылается — file_id/file_unique_id
     сохраняются на самой заявке (см. аудит: раньше связь "файл ↔ заявка"
@@ -10723,10 +11017,13 @@ class LeadMaterialTests(unittest.IsolatedAsyncioTestCase):
         message.document = make_fake_document(file_id="doc-late", file_unique_id="uniq-late")
         await webapp.handle_tz_file(message)
 
-        message.answer.assert_not_awaited()
-        message.bot.send_message.assert_not_awaited()
-        message.forward.assert_not_awaited()
+        # Ключевое неизменно: материал к ЗАКРЫТОЙ заявке не записывается.
         self.assertEqual((await content_store.get_lead(lead_id))["materials"], [])
+        self.assertIsNone(await content_store.find_lead_awaiting_file(message.from_user.id))
+        # Раньше файл в этой ситуации исчезал молча. Теперь он уходит
+        # дизайнеру как общее обращение — заявку это не воскрешает и
+        # ничего к ней не прикрепляет.
+        message.forward.assert_awaited_once_with(chat_id=content_store.config.DESIGNER_CHAT_ID)
 
 
 def make_reply_message(chat_id: int, text: str, send_message: AsyncMock) -> SimpleNamespace:
@@ -12725,9 +13022,13 @@ class ArchiveUploadFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(case["cover"], self.ARCHIVE_COVER)
         self.assertEqual(case["source_ref"], "archive:@media_archive_da:250")
 
-    async def test_section_image_upload_still_uses_storage_without_archive(self):
-        """Изображения разделов — не обложки: архив их не касается ни при
-        каком состоянии MEDIA_ARCHIVE_CHANNEL."""
+    async def test_section_image_upload_uses_archive_not_local_storage(self):
+        """Инвариант тот же — storage ровно ОДИН; изменилось, какой именно.
+
+        Раньше здесь проверялось обратное: изображения разделов шли через
+        save_case_photo, а архив их не касался. Перевёрнуто сознательно:
+        R2 в production не сконфигурирован, диск Render эфемерный, поэтому
+        картинка раздела исчезала при следующем деплое."""
         await content_store.add_case(
             self.actor, case_id="case_sec_up", title="S", type_id="site",
             cover="img/portfolio/demo_case_1.svg", task="t", related_service=None,
@@ -12739,10 +13040,16 @@ class ArchiveUploadFlowTests(unittest.IsolatedAsyncioTestCase):
         await state.set_state(AdminStates.case_section_edit_value)
         await state.update_data(case_id="case_sec_up", section_index=0, section_field="addimg")
         msg = self._photo_msg()
-        with patch.object(content_store, "save_case_photo", return_value="img/portfolio/s.jpg") as save:
+        with patch.object(content_store, "save_case_photo") as save,              patch.object(telegram_media, "resolve_cover_url",
+                          new=AsyncMock(return_value=GALLERY_TEST_URL)):
             await admin.case_section_edit_value(msg, state)
-        save.assert_awaited_once()
-        msg.bot.send_photo.assert_not_awaited()
+        # Локальный/R2 путь не задействован...
+        save.assert_not_awaited()
+        # ...картинка ушла в тот же архив-канал, и ссылка сохранена.
+        msg.bot.send_photo.assert_awaited_once()
+        case = next(c for c in await content_store.list_cases() if c["id"] == "case_sec_up")
+        self.assertEqual(case["sections"][0]["images"], [GALLERY_TEST_URL])
+        self.assertIn(GALLERY_TEST_URL, case["image_refs"])
 
     async def test_behance_and_telegram_flows_unaffected_by_missing_archive_config(self):
         media_archive.config.MEDIA_ARCHIVE_CHANNEL = ""

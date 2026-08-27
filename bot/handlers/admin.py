@@ -12,7 +12,6 @@
 """
 
 import logging
-import uuid
 import zipfile
 from datetime import datetime, timezone
 from typing import Any, Callable
@@ -25,7 +24,7 @@ from aiogram.fsm.state import State
 from aiogram.types import BufferedInputFile, CallbackQuery, InlineKeyboardMarkup, Message
 
 from bot import admin_keyboards as kb
-from bot import behance, config, content_store, flow, media_archive, r2_storage, telegram_media, texts
+from bot import behance, config, content_store, flow, media_archive, telegram_media, texts
 from bot import lead as lead_format
 from bot.handlers.start import main_menu_or_confirm
 from bot.states import AdminStates
@@ -1187,7 +1186,12 @@ async def case_section_remove_image(callback: CallbackQuery, state: FSMContext) 
         return
     images = section.get("images", [])
     if 0 <= img_index < len(images):
+        # Архивную ссылку читаем ДО удаления — после него её в кейсе уже
+        # нет (тот же порядок, что и в case_image_delete_do). У неархивных
+        # картинок (старые данные) ссылки нет — уборка ничего не делает.
+        image_ref = content_store.case_image_ref(await _current_case(case_id), images[img_index])
         await content_store.remove_case_section_image(callback.message.chat.id, case_id, index, img_index)
+        await media_archive.delete_archive_message(callback.bot, image_ref)
         section = await _current_section(case_id, index) or section
     await callback.message.edit_text(f"«{section['title']}»:", reply_markup=kb.case_section_action_keyboard(section["type"]))
     await callback.answer()
@@ -1211,15 +1215,25 @@ async def case_section_edit_value(message: Message, state: FSMContext) -> None:
             await flow.step_from_text(message, state, "Нужно изображение (фото или файл-картинка) 📎.", kb.cancel_keyboard())
             return
         file_id = message.photo[-1].file_id if message.photo else message.document.file_id
+        # Тот же архивный конвейер, что у обложки и галереи (см.
+        # _gallery_image_from_upload): save_case_photo писал на диск Render,
+        # а он эфемерный — картинка раздела исчезала при следующем деплое.
+        # All-or-nothing: пока нет CDN-адреса, в кейс не пишется ничего.
         try:
-            path = await content_store.save_case_photo(message.chat.id, message.bot, file_id, f"{case_id}_{uuid.uuid4().hex[:8]}")
-        except r2_storage.R2UploadError:
-            logger.exception("R2 upload failed for section image (case_id=%s)", case_id)
-            await flow.step_from_text(message, state, "Не удалось загрузить изображение, попробуйте ещё раз 🙁", kb.cancel_keyboard())
+            path, archive_ref = await _gallery_image_from_upload(message.bot, file_id)
+        except media_archive.MediaArchiveNotConfigured:
+            logger.error("MEDIA_ARCHIVE_CHANNEL не задан — загрузка картинки раздела невозможна (case_id=%s)", case_id)
+            await flow.step_from_text(message, state, _ARCHIVE_NOT_CONFIGURED_ERROR, kb.cancel_keyboard())
             return
-        section_before = await _current_section(case_id, index)
-        images = section_before.get("images", []) if section_before else []
-        await content_store.update_case_section(message.chat.id, case_id, index, images=images + [path])
+        except (media_archive.MediaArchiveError, telegram_media.TelegramMediaResolveError):
+            logger.exception("Section image upload failed (case_id=%s)", case_id)
+            await flow.step_from_text(message, state, _COVER_UPLOAD_ERROR, kb.cancel_keyboard())
+            return
+        except Exception:
+            logger.exception("Unexpected section image upload failure (case_id=%s)", case_id)
+            await flow.step_from_text(message, state, _COVER_UPLOAD_ERROR, kb.cancel_keyboard())
+            return
+        await content_store.add_case_section_image(message.chat.id, case_id, index, path, archive_ref=archive_ref)
     else:
         if not message.text:
             await flow.step_from_text(message, state, "Нужен текст.", kb.cancel_keyboard())
@@ -1725,13 +1739,28 @@ async def about_edit_photo(message: Message, state: FSMContext) -> None:
         await flow.step_from_text(message, state, "Нужно изображение (фото или файл-картинка) 📎.", kb.cancel_keyboard())
         return
     file_id = message.photo[-1].file_id if message.photo else message.document.file_id
+    # Тот же архивный конвейер, что у обложек, галереи и картинок разделов:
+    # save_about_photo писал аватар на эфемерный диск Render, и он исчезал
+    # при следующем деплое, оставляя в about.json битый путь.
     try:
-        path = await content_store.save_about_photo(message.chat.id, message.bot, file_id)
-    except r2_storage.R2UploadError:
-        logger.exception("R2 upload failed for about photo")
-        await flow.step_from_text(message, state, "Не удалось загрузить изображение, попробуйте ещё раз 🙁", kb.cancel_keyboard())
+        path, archive_ref = await _gallery_image_from_upload(message.bot, file_id)
+    except media_archive.MediaArchiveNotConfigured:
+        logger.error("MEDIA_ARCHIVE_CHANNEL не задан — загрузка аватара невозможна")
+        await flow.step_from_text(message, state, _ARCHIVE_NOT_CONFIGURED_ERROR, kb.cancel_keyboard())
         return
-    await content_store.update_about_field(message.chat.id, "avatar", path)
+    except (media_archive.MediaArchiveError, telegram_media.TelegramMediaResolveError):
+        logger.exception("About avatar upload failed")
+        await flow.step_from_text(message, state, _COVER_UPLOAD_ERROR, kb.cancel_keyboard())
+        return
+    except Exception:
+        logger.exception("Unexpected about avatar upload failure")
+        await flow.step_from_text(message, state, _COVER_UPLOAD_ERROR, kb.cancel_keyboard())
+        return
+    # Прежнее архивное сообщение убираем ПОСЛЕ успешной записи — тот же
+    # порядок, что и при замене обложки кейса.
+    old_ref = await content_store.set_about_avatar(message.chat.id, path, archive_ref)
+    if old_ref and old_ref != archive_ref:
+        await media_archive.delete_archive_message(message.bot, old_ref)
     about = await content_store.get_about()
     # flow.step_from_text (P1-3, Batch 3) — success-переход в
     # edit_about_field_pick (AdminStates-активное, /cancel остаётся

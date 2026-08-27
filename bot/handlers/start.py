@@ -247,6 +247,61 @@ async def relay_client_text_to_designer(message: Message, state: FSMContext) -> 
     await message.answer("Сообщение отправлено дизайнеру ✅")
 
 
+async def relay_client_media_to_designer(message: Message) -> None:
+    """Медиа клиента -> рабочий чат дизайнера, когда файл НЕ ожидается ни
+    одной заявкой (см. bot/handlers/webapp.py::handle_tz_file).
+
+    Зачем: свободный текст клиента дизайнеру уже доходит (см.
+    relay_client_text_to_designer выше), а фото/документ — нет. Файл, у
+    которого не оказалось ожидающей заявки, просто исчезал: ни материала,
+    ни пересылки, ни ответа клиенту. Человек считал, что отправил.
+
+    Что этот путь НЕ делает, намеренно: не создаёт заявку, не изменяет
+    существующую, не пишет материал и не трогает awaiting_tz_file. Файл,
+    пришедший ВНЕ ожидания, к заявке автоматически не привязывается — это
+    решает дизайнер. Заголовок сообщения устроен так же, как у текстового
+    relay: одна активная заявка -> её номер, иначе «общее обращение» со
+    списком активных номеров.
+
+    Вызывается напрямую из handle_tz_file, а не отдельным хендлером:
+    aiogram останавливает propagation на первом совпавшем фильтре
+    ("stops propagation on first match"), а handle_tz_file уже матчит
+    document/photo/video/animation — до отдельного хендлера в этом роутере
+    обновление просто не дошло бы."""
+    if not config.DESIGNER_CHAT_ID or str(message.chat.id) == config.DESIGNER_CHAT_ID:
+        return
+
+    active_leads = [
+        lead for lead in await content_store.list_leads_by_user(message.from_user.id)
+        if lead["status"] in content_store.ACTIVE_LEAD_STATUSES
+    ]
+    identity_line = _client_identity_line(message)
+    if len(active_leads) == 1:
+        lines = [f"📎 Материал по заявке #{active_leads[0]['id']}", "", identity_line]
+    else:
+        lines = ["📎 Материал (общее обращение)", "", identity_line]
+        if active_leads:
+            lines.append("Активные заявки: " + ", ".join(f"#{lead['id']}" for lead in active_leads))
+    # Явно предупреждаем дизайнера: этот файл НЕ привязан к заявке, в
+    # отличие от материалов, полученных в режиме ожидания.
+    lines.append("")
+    lines.append("Файл прислан вне запроса материалов — к заявке не прикреплён.")
+
+    try:
+        await message.bot.send_message(
+            chat_id=config.DESIGNER_CHAT_ID, text=_enforce_telegram_hard_limit("\n".join(lines)),
+        )
+        # forward, а не скачивание: файл остаётся у Telegram, ни одного
+        # байта через Render — тот же принцип, что и у handle_tz_file.
+        await message.forward(chat_id=config.DESIGNER_CHAT_ID)
+    except Exception:
+        logger.exception("Не удалось передать медиа клиента дизайнеру (user_id=%s)", message.from_user.id)
+        await message.answer("Не получилось отправить файл дизайнеру. Попробуйте ещё раз чуть позже.")
+        return
+
+    await message.answer("Файл отправлен дизайнеру ✅")
+
+
 # Держим последним в этом роутере (тот же catch-all F.text, что и раньше —
 # сохранён ради этой позиции и общего router-порядка, а не потому что
 # дальнейший dispatch когда-либо сюда попадёт: relay_client_text_to_designer
