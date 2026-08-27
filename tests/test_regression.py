@@ -1867,7 +1867,9 @@ class AdminSuccessorStalenessAnchorTests(unittest.IsolatedAsyncioTestCase):
         )
         state = await self._state_with_anchor(anchor_id=500, case_id="case_img", cancel_to="images")
         photo = make_photo_message(self.actor)
-        await admin.case_image_add_receive(photo, state)
+        # Суть теста — anchor/staleness мастера, а не хранилище картинки.
+        with patch_gallery_upload():
+            await admin.case_image_add_receive(photo, state)
         photo.bot.edit_message_text.assert_awaited_once()
         self.assertEqual(photo.bot.edit_message_text.await_args.kwargs["chat_id"], self.actor)
         self.assertEqual(photo.bot.edit_message_text.await_args.kwargs["message_id"], 500)
@@ -4998,6 +5000,24 @@ def patch_archive_upload(cover: str = UPLOAD_TEST_COVER, message_id: int = 1):
     )
 
 
+GALLERY_TEST_URL = "https://cdn4.telesco.pe/file/GALLERYTESTIMAGE"
+
+
+def patch_gallery_upload(url: str = GALLERY_TEST_URL, message_id: int = 2):
+    """Успешная публикация КАРТИНКИ ГАЛЕРЕИ в архив — зеркало
+    patch_archive_upload для тестов, чья суть архив не составляет
+    (навигация по меню изображений, anchor-поведение мастера).
+
+    Картинки галереи, как и обложки, идут только через Telegram-архив:
+    save_case_photo писал их на эфемерный диск Render, и они исчезали при
+    деплое. Поэтому такие тесты обязаны подменять именно этот шаг —
+    внутренности проверяются отдельно (см. GalleryImageUploadHandlerTests)."""
+    return patch.object(
+        admin, "_gallery_image_from_upload",
+        new=AsyncMock(return_value=(url, f"archive:@media_archive_da:{message_id}")),
+    )
+
+
 def make_non_image_document_message(chat_id: int, mime_type: str = "application/pdf", caption: str | None = None) -> SimpleNamespace:
     """Batch 3 (finding B3-4) — тот же шаблон, что и make_photo_message, но
     document с не-image mime_type: воспроизводит "designer прислал файл
@@ -5072,7 +5092,10 @@ class AdminCaseConstructorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await state.get_state(), AdminStates.case_images_menu.state)
 
         await admin.case_image_add_start(make_callback("admincaseimgaction:add", chat_id=self.actor), state)
-        await admin.case_image_add_receive(make_photo_message(self.actor), state)
+        # Суть теста — навигация по меню изображений, а не хранилище:
+        # архивный шаг подменяем (см. patch_gallery_upload).
+        with patch_gallery_upload():
+            await admin.case_image_add_receive(make_photo_message(self.actor), state)
         self.assertEqual(len((await self._case())["images"]), 2)
 
         await admin.case_image_picked(make_callback("admincaseimgpick:1", chat_id=self.actor), state)
@@ -8035,6 +8058,352 @@ class CaseImageManagementTests(unittest.IsolatedAsyncioTestCase):
             deleted_paths,
             {"img/portfolio/a.svg", "img/portfolio/b.svg", "img/portfolio/gallery1.svg", "img/portfolio/gallery2.svg"},
         )
+
+
+class GalleryImageArchiveRefTests(unittest.IsolatedAsyncioTestCase):
+    """Персистентность галерейных картинок: они лежат в Telegram-архиве, а
+    ссылка на архивное сообщение хранится в case["image_refs"].
+
+    Раньше галерея шла через save_case_photo -> локальный диск Render (R2 в
+    production не сконфигурирован), а диск там эфемерный: картинка
+    исчезала при следующем деплое, оставляя в images[] мёртвую ссылку."""
+
+    ARCHIVE_URL = "https://cdn4.telesco.pe/file/GALLERYONE"
+    ARCHIVE_REF = "archive:@media_archive_da:42"
+
+    async def asyncSetUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        real_data_dir = Path(__file__).resolve().parent.parent / "data"
+        for name in ("pricing.json", "portfolio.json", "faq.json", "about.json", "ui_config.json"):
+            shutil.copy(real_data_dir / name, Path(self.tmpdir) / name)
+        # leads.json нужен export_backup_bytes (он требует ВСЕ DATA_FILENAMES);
+        # реальный не копируем — пустой список достаточен и ничего не тащит.
+        (Path(self.tmpdir) / "leads.json").write_text('{"leads": []}', encoding="utf-8")
+        self._orig_data_dir = content_store.DATA_DIR
+        self._orig_designer = content_store.config.DESIGNER_CHAT_ID
+        content_store.DATA_DIR = Path(self.tmpdir)
+        content_store.config.DESIGNER_CHAT_ID = "999"
+        self.actor = "999"
+        await content_store.add_case(
+            self.actor, case_id="case_gal_ref", title="Т", type_id="landing",
+            cover="img/portfolio/a.svg", task="t", related_service=None,
+        )
+
+    def tearDown(self):
+        content_store.DATA_DIR = self._orig_data_dir
+        content_store.config.DESIGNER_CHAT_ID = self._orig_designer
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    async def _case(self):
+        return next(c for c in await content_store.list_cases() if c["id"] == "case_gal_ref")
+
+    # ---- Хранение ссылки ----
+
+    async def test_archive_ref_stored_and_images_stay_list_of_strings(self):
+        await content_store.add_case_image(
+            self.actor, "case_gal_ref", self.ARCHIVE_URL, archive_ref=self.ARCHIVE_REF,
+        )
+        case = await self._case()
+        # images[] остаётся списком СТРОК — это контракт для Mini App,
+        # backup и всех остальных операций.
+        self.assertEqual(case["images"], ["img/portfolio/a.svg", self.ARCHIVE_URL])
+        self.assertTrue(all(isinstance(i, str) for i in case["images"]))
+        self.assertEqual(case["image_refs"], {self.ARCHIVE_URL: self.ARCHIVE_REF})
+        # cover-семантика не тронута: галерейная картинка обложкой не стала.
+        self.assertEqual(case["cover"], "img/portfolio/a.svg")
+        self.assertNotIn("source_ref", case)
+
+    async def test_without_archive_ref_field_is_not_created_at_all(self):
+        # Легаси-путь (демо-картинки, старые данные) не должен обзаводиться
+        # пустым image_refs — иначе поле появилось бы у всех кейсов подряд.
+        await content_store.add_case_image(self.actor, "case_gal_ref", "img/portfolio/b.svg")
+        self.assertNotIn("image_refs", await self._case())
+
+    async def test_ref_lookup_tolerates_missing_field_and_foreign_types(self):
+        case = await self._case()
+        self.assertIsNone(content_store.case_image_ref(case, "img/portfolio/a.svg"))
+        self.assertIsNone(content_store.case_image_ref(None, "x"))
+        self.assertIsNone(content_store.case_image_ref({"image_refs": "не словарь"}, "x"))
+        self.assertIsNone(content_store.case_image_ref({"image_refs": {"x": ""}}, "x"))
+        self.assertEqual(content_store.case_gallery_refs({"image_refs": "не словарь"}), [])
+
+    # ---- Удаление ----
+
+    async def test_removing_image_drops_its_ref_and_empties_field(self):
+        await content_store.add_case_image(
+            self.actor, "case_gal_ref", self.ARCHIVE_URL, archive_ref=self.ARCHIVE_REF,
+        )
+        await content_store.remove_case_image(self.actor, "case_gal_ref", self.ARCHIVE_URL)
+        case = await self._case()
+        self.assertNotIn(self.ARCHIVE_URL, case["images"])
+        # Пустой словарь не остаётся висеть в JSON.
+        self.assertNotIn("image_refs", case)
+
+    async def test_removing_one_of_two_keeps_the_other_ref(self):
+        second_url, second_ref = "https://cdn4.telesco.pe/file/GALLERYTWO", "archive:@media_archive_da:43"
+        await content_store.add_case_image(self.actor, "case_gal_ref", self.ARCHIVE_URL, archive_ref=self.ARCHIVE_REF)
+        await content_store.add_case_image(self.actor, "case_gal_ref", second_url, archive_ref=second_ref)
+        await content_store.remove_case_image(self.actor, "case_gal_ref", self.ARCHIVE_URL)
+        self.assertEqual((await self._case())["image_refs"], {second_url: second_ref})
+
+    async def test_removing_legacy_image_does_not_disturb_archive_refs(self):
+        await content_store.add_case_image(self.actor, "case_gal_ref", self.ARCHIVE_URL, archive_ref=self.ARCHIVE_REF)
+        await content_store.remove_case_image(self.actor, "case_gal_ref", "img/portfolio/a.svg")
+        self.assertEqual((await self._case())["image_refs"], {self.ARCHIVE_URL: self.ARCHIVE_REF})
+
+    # ---- Порядок и обложка ----
+
+    async def test_reorder_keeps_mapping_bound_to_its_own_image(self):
+        # Ключ — сам путь картинки, поэтому перестановка images[] не может
+        # рассинхронизировать mapping (в отличие от параллельного списка).
+        await content_store.add_case_image(self.actor, "case_gal_ref", self.ARCHIVE_URL, archive_ref=self.ARCHIVE_REF)
+        self.assertTrue(await content_store.reorder_case_image(self.actor, "case_gal_ref", self.ARCHIVE_URL, "up"))
+        case = await self._case()
+        self.assertEqual(case["images"], [self.ARCHIVE_URL, "img/portfolio/a.svg"])
+        self.assertEqual(case["image_refs"], {self.ARCHIVE_URL: self.ARCHIVE_REF})
+
+    async def test_set_cover_on_archive_image_keeps_mapping_and_does_not_touch_source_ref(self):
+        await content_store.add_case_image(self.actor, "case_gal_ref", self.ARCHIVE_URL, archive_ref=self.ARCHIVE_REF)
+        self.assertTrue(await content_store.set_case_cover(self.actor, "case_gal_ref", self.ARCHIVE_URL))
+        case = await self._case()
+        self.assertEqual(case["cover"], self.ARCHIVE_URL)
+        # Картинка ОСТАЁТСЯ в галерее и сохраняет свою ссылку...
+        self.assertIn(self.ARCHIVE_URL, case["images"])
+        self.assertEqual(case["image_refs"], {self.ARCHIVE_URL: self.ARCHIVE_REF})
+        # ...но галерейная ссылка НЕ становится source_ref: то поле
+        # описывает источник обложки, а не архивное сообщение галереи.
+        self.assertNotIn("source_ref", case)
+        # cover != images[0] — штатное состояние, его никто не «чинит».
+        self.assertNotEqual(case["images"][0], case["cover"])
+
+    # ---- Backup ----
+
+    async def test_image_refs_survive_backup_roundtrip(self):
+        await content_store.add_case_image(
+            self.actor, "case_gal_ref", self.ARCHIVE_URL, archive_ref=self.ARCHIVE_REF,
+        )
+        blob = await content_store.export_backup_bytes()
+        with zipfile.ZipFile(io.BytesIO(blob)) as zf:
+            restored = json.loads(zf.read("data/portfolio.json").decode("utf-8"))
+        case = next(c for c in restored["cases"] if c["id"] == "case_gal_ref")
+        self.assertEqual(case["image_refs"], {self.ARCHIVE_URL: self.ARCHIVE_REF})
+        # CDN-байты в zip не кладутся — только ссылка.
+        with zipfile.ZipFile(io.BytesIO(blob)) as zf:
+            self.assertFalse([n for n in zf.namelist() if "GALLERYONE" in n])
+
+
+class GalleryImageUploadHandlerTests(unittest.IsolatedAsyncioTestCase):
+    """Хендлер добавления картинки в галерею: только архив, никакого
+    локального диска и никакого save_case_photo."""
+
+    CDN = "https://cdn4.telesco.pe/file/GALLERYHANDLER"
+
+    async def asyncSetUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        real_data_dir = Path(__file__).resolve().parent.parent / "data"
+        for name in ("pricing.json", "portfolio.json", "faq.json", "about.json", "ui_config.json"):
+            shutil.copy(real_data_dir / name, Path(self.tmpdir) / name)
+        self._orig_data_dir = content_store.DATA_DIR
+        self._orig_designer = content_store.config.DESIGNER_CHAT_ID
+        self._orig_channel = media_archive.config.MEDIA_ARCHIVE_CHANNEL
+        content_store.DATA_DIR = Path(self.tmpdir)
+        content_store.config.DESIGNER_CHAT_ID = "999"
+        media_archive.config.MEDIA_ARCHIVE_CHANNEL = "@media_archive_da"
+        self.actor = 999
+        await content_store.add_case(
+            str(self.actor), case_id="case_gal_h", title="Т", type_id="landing",
+            cover="img/portfolio/a.svg", task="t", related_service=None,
+        )
+
+    def tearDown(self):
+        content_store.DATA_DIR = self._orig_data_dir
+        content_store.config.DESIGNER_CHAT_ID = self._orig_designer
+        media_archive.config.MEDIA_ARCHIVE_CHANNEL = self._orig_channel
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    async def _state(self):
+        state = make_state(self.actor)
+        await state.set_state(AdminStates.case_image_add)
+        await state.update_data(case_id="case_gal_h")
+        return state
+
+    async def _case(self):
+        return next(c for c in await content_store.list_cases() if c["id"] == "case_gal_h")
+
+    async def test_successful_upload_stores_cdn_url_and_ref_without_local_save(self):
+        state = await self._state()
+        with patch.object(admin, "_gallery_image_from_upload",
+                          new=AsyncMock(return_value=(self.CDN, "archive:@media_archive_da:9"))) as up, \
+             patch.object(content_store, "save_case_photo", new=AsyncMock()) as save_local:
+            await admin.case_image_add_receive(make_photo_message(self.actor), state)
+
+        up.assert_awaited_once()
+        # ГЛАВНОЕ: локальный/R2 путь не задействован вообще.
+        save_local.assert_not_awaited()
+        case = await self._case()
+        self.assertEqual(case["images"], ["img/portfolio/a.svg", self.CDN])
+        self.assertEqual(case["image_refs"], {self.CDN: "archive:@media_archive_da:9"})
+
+    async def test_gallery_upload_goes_through_archive_pipeline(self):
+        # Не мокаем _gallery_image_from_upload — проверяем сам конвейер:
+        # sendPhoto в архив + резолв CDN-адреса из веб-превью поста.
+        state = await self._state()
+        msg = make_photo_message(self.actor)
+        msg.bot.send_photo = AsyncMock(return_value=SimpleNamespace(message_id=55))
+        with patch.object(telegram_media, "resolve_cover_url", new=AsyncMock(return_value=self.CDN)) as resolve, \
+             patch.object(content_store, "save_case_photo", new=AsyncMock()) as save_local:
+            await admin.case_image_add_receive(msg, state)
+
+        msg.bot.send_photo.assert_awaited_once_with(chat_id="@media_archive_da", photo="fake_file_id")
+        resolve.assert_awaited_once_with("https://t.me/media_archive_da/55")
+        save_local.assert_not_awaited()
+        case = await self._case()
+        self.assertEqual(case["image_refs"], {self.CDN: "archive:@media_archive_da:55"})
+
+    async def test_resolver_failure_deletes_archive_message_and_leaves_case_intact(self):
+        state = await self._state()
+        msg = make_photo_message(self.actor)
+        msg.bot.send_photo = AsyncMock(return_value=SimpleNamespace(message_id=56))
+        msg.bot.delete_message = AsyncMock()
+        before = await self._case()
+        with patch.object(telegram_media, "resolve_cover_url",
+                          new=AsyncMock(side_effect=telegram_media.TelegramMediaResolveError("нет og:image"))):
+            await admin.case_image_add_receive(msg, state)
+
+        # Сирота в канале не остаётся...
+        msg.bot.delete_message.assert_awaited_once_with(chat_id="@media_archive_da", message_id=56)
+        # ...и кейс не изменился ни на байт.
+        self.assertEqual(await self._case(), before)
+
+    async def test_timeout_also_cleans_up_archive_message(self):
+        # TimeoutError не наследует TelegramMediaResolveError — раньше
+        # именно такой класс сбоев оставлял сироту в канале (проверено в
+        # production на обложках).
+        state = await self._state()
+        msg = make_photo_message(self.actor)
+        msg.bot.send_photo = AsyncMock(return_value=SimpleNamespace(message_id=57))
+        msg.bot.delete_message = AsyncMock()
+        before = await self._case()
+        with patch.object(telegram_media, "resolve_cover_url", new=AsyncMock(side_effect=TimeoutError())):
+            await admin.case_image_add_receive(msg, state)
+
+        msg.bot.delete_message.assert_awaited_once_with(chat_id="@media_archive_da", message_id=57)
+        self.assertEqual(await self._case(), before)
+
+    async def test_send_failure_leaves_case_unchanged_and_no_local_fallback(self):
+        state = await self._state()
+        msg = make_photo_message(self.actor)
+        msg.bot.send_photo = AsyncMock(side_effect=RuntimeError("CHAT_ADMIN_REQUIRED"))
+        before = await self._case()
+        with patch.object(content_store, "save_case_photo", new=AsyncMock()) as save_local:
+            await admin.case_image_add_receive(msg, state)
+        save_local.assert_not_awaited()
+        self.assertEqual(await self._case(), before)
+
+    async def test_archive_not_configured_is_controlled_error_without_local_fallback(self):
+        media_archive.config.MEDIA_ARCHIVE_CHANNEL = ""
+        state = await self._state()
+        msg = make_photo_message(self.actor)
+        before = await self._case()
+        with patch.object(content_store, "save_case_photo", new=AsyncMock()) as save_local:
+            await admin.case_image_add_receive(msg, state)
+        # Ни тихого отката на диск, ни изменения кейса.
+        save_local.assert_not_awaited()
+        self.assertEqual(await self._case(), before)
+
+    async def test_cleanup_failure_does_not_mask_the_real_error(self):
+        # delete_archive_message по контракту не бросает; проверяем, что
+        # даже при неудачной уборке хендлер отрабатывает контролируемо и
+        # кейс остаётся нетронутым.
+        state = await self._state()
+        msg = make_photo_message(self.actor)
+        msg.bot.send_photo = AsyncMock(return_value=SimpleNamespace(message_id=58))
+        msg.bot.delete_message = AsyncMock(side_effect=RuntimeError("MESSAGE_DELETE_FORBIDDEN"))
+        before = await self._case()
+        with patch.object(telegram_media, "resolve_cover_url",
+                          new=AsyncMock(side_effect=telegram_media.TelegramMediaResolveError("boom"))):
+            await admin.case_image_add_receive(msg, state)
+        self.assertEqual(await self._case(), before)
+
+
+class GalleryImageDeletionHandlerTests(unittest.IsolatedAsyncioTestCase):
+    """Удаление картинки и кейса убирает архивные сообщения галереи."""
+
+    CDN = "https://cdn4.telesco.pe/file/GALLERYDEL"
+    REF = "archive:@media_archive_da:70"
+
+    async def asyncSetUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        real_data_dir = Path(__file__).resolve().parent.parent / "data"
+        for name in ("pricing.json", "portfolio.json", "faq.json", "about.json", "ui_config.json"):
+            shutil.copy(real_data_dir / name, Path(self.tmpdir) / name)
+        self._orig_data_dir = content_store.DATA_DIR
+        self._orig_designer = content_store.config.DESIGNER_CHAT_ID
+        self._orig_channel = media_archive.config.MEDIA_ARCHIVE_CHANNEL
+        content_store.DATA_DIR = Path(self.tmpdir)
+        content_store.config.DESIGNER_CHAT_ID = "999"
+        media_archive.config.MEDIA_ARCHIVE_CHANNEL = "@media_archive_da"
+        self.actor = 999
+        await content_store.add_case(
+            str(self.actor), case_id="case_gal_d", title="Т", type_id="landing",
+            cover="img/portfolio/a.svg", task="t", related_service=None,
+        )
+        await content_store.add_case_image(str(self.actor), "case_gal_d", self.CDN, archive_ref=self.REF)
+
+    def tearDown(self):
+        content_store.DATA_DIR = self._orig_data_dir
+        content_store.config.DESIGNER_CHAT_ID = self._orig_designer
+        media_archive.config.MEDIA_ARCHIVE_CHANNEL = self._orig_channel
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    async def _delete_image(self, image_path: str):
+        state = make_state(self.actor)
+        await state.set_state(AdminStates.case_image_pick_delete)
+        await state.update_data(case_id="case_gal_d", image_path=image_path)
+        bot = SimpleNamespace(delete_message=AsyncMock())
+        cb = make_callback("admindelcaseimgconfirm:yes", chat_id=self.actor, bot=bot)
+        await admin.case_image_delete_do(cb, state)
+        return bot
+
+    async def test_deleting_archive_image_removes_its_archive_message(self):
+        bot = await self._delete_image(self.CDN)
+        bot.delete_message.assert_awaited_once_with(chat_id="@media_archive_da", message_id=70)
+        case = next(c for c in await content_store.list_cases() if c["id"] == "case_gal_d")
+        self.assertNotIn(self.CDN, case["images"])
+        self.assertNotIn("image_refs", case)
+
+    async def test_deleting_legacy_local_image_touches_no_archive(self):
+        bot = await self._delete_image("img/portfolio/a.svg")
+        bot.delete_message.assert_not_awaited()
+
+    async def test_delete_case_cleans_gallery_archive_messages(self):
+        state = make_state(self.actor)
+        await state.update_data(case_id="case_gal_d")
+        bot = SimpleNamespace(delete_message=AsyncMock())
+        cb = make_callback("admindelcaseconfirm:yes", chat_id=self.actor, bot=bot)
+        with patch.object(admin.flow, "reset_state_keep_nav", new=AsyncMock()), \
+             patch.object(admin.flow, "step_from_callback", new=AsyncMock()):
+            await admin.cases_delete_do(cb, state)
+        deleted = {c.kwargs["message_id"] for c in bot.delete_message.await_args_list}
+        self.assertIn(70, deleted)
+
+    async def test_delete_case_does_not_delete_same_message_twice(self):
+        # Если галерейную картинку выбрали обложкой, её ссылка может
+        # совпасть с cover-ссылкой — одно сообщение не должно уходить в
+        # deleteMessage дважды.
+        await content_store.update_case(
+            str(self.actor), "case_gal_d",
+            source_type="upload", source_ref=self.REF, external_url=None,
+        )
+        state = make_state(self.actor)
+        await state.update_data(case_id="case_gal_d")
+        bot = SimpleNamespace(delete_message=AsyncMock())
+        cb = make_callback("admindelcaseconfirm:yes", chat_id=self.actor, bot=bot)
+        with patch.object(admin.flow, "reset_state_keep_nav", new=AsyncMock()), \
+             patch.object(admin.flow, "step_from_callback", new=AsyncMock()):
+            await admin.cases_delete_do(cb, state)
+        ids = [c.kwargs["message_id"] for c in bot.delete_message.await_args_list]
+        self.assertEqual(ids.count(70), 1)
 
 
 class CaseSectionManagementTests(unittest.IsolatedAsyncioTestCase):
@@ -12252,9 +12621,17 @@ class ArchiveUploadFlowTests(unittest.IsolatedAsyncioTestCase):
 
     # ---- gallery / non-cover media untouched ----
 
-    async def test_gallery_image_upload_still_uses_storage_not_archive(self):
-        """В архив уходят ТОЛЬКО обложки. Картинки галереи по-прежнему
-        идут через save_case_photo — второй storage не появился."""
+    async def test_gallery_image_upload_uses_archive_not_local_storage(self):
+        """Инвариант тот же, что и был, — storage ровно ОДИН, второй не
+        появился; изменилось лишь то, какой именно.
+
+        Раньше здесь проверялось обратное: галерея шла через
+        save_case_photo, а в архив уходили только обложки. Это перевёрнуто
+        сознательно: R2 в production не сконфигурирован, поэтому
+        save_case_photo писал картинку на диск Render, а он эфемерный —
+        картинка исчезала при следующем деплое, оставляя в images[] ссылку
+        на несуществующий файл. Теперь галерея использует тот же
+        Telegram-архив, что и обложки."""
         await content_store.add_case(
             self.actor, case_id="case_gal_up", title="S", type_id="site",
             cover="img/portfolio/demo_case_1.svg", task="t", related_service=None,
@@ -12263,10 +12640,16 @@ class ArchiveUploadFlowTests(unittest.IsolatedAsyncioTestCase):
         await state.set_state(AdminStates.case_image_add)
         await state.update_data(case_id="case_gal_up")
         msg = self._photo_msg()
-        with patch.object(content_store, "save_case_photo", return_value="img/portfolio/g.jpg") as save:
+        with patch.object(content_store, "save_case_photo") as save, \
+             patch.object(telegram_media, "resolve_cover_url",
+                          new=AsyncMock(return_value=GALLERY_TEST_URL)):
             await admin.case_image_add_receive(msg, state)
-        save.assert_awaited_once()
-        msg.bot.send_photo.assert_not_awaited()
+        # Локальный/R2 путь не задействован вообще...
+        save.assert_not_awaited()
+        # ...а картинка ушла в тот же архив-канал, что и обложки.
+        msg.bot.send_photo.assert_awaited_once()
+        case = next(c for c in await content_store.list_cases() if c["id"] == "case_gal_up")
+        self.assertIn(GALLERY_TEST_URL, case["images"])
 
     async def test_gallery_pick_as_cover_clears_link_and_drops_archive_ref(self):
         await self._seed_upload_case("case_gal_pick", 900)

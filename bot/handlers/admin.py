@@ -183,6 +183,42 @@ async def _cover_from_upload(bot: Any, file_id: str) -> tuple[str, dict[str, str
         if not resolved:
             await media_archive.delete_archive_message(bot, source_ref)
 
+async def _gallery_image_from_upload(bot: Any, file_id: str) -> tuple[str, str]:
+    """Загруженное фото галереи -> (cdn_url, archive_ref).
+
+    Тот же путь, что и у обложки (_cover_from_upload выше): фото уходит в
+    архив-канал по file_id, а адрес картинки берётся из веб-превью поста —
+    tokenless CDN-ссылка, ни одного байта через Render.
+
+    Почему галерея больше НЕ идёт через save_case_photo: R2 в production не
+    сконфигурирован, поэтому save_case_photo писал файл на диск Render, а
+    он эфемерный (free plan, диск не подключён) — картинка исчезала при
+    следующем деплое, оставляя в images[] ссылку на несуществующий файл.
+    Обложки эту же проблему уже решили архивом; галерея повторяет решение,
+    а не заводит второе.
+
+    Fallback'а на save_case_photo здесь нет сознательно — по той же
+    причине, что и у обложек: тихий откат означал бы две одновременно
+    живущие архитектуры хранения, часть картинок молча уезжала бы в
+    эфемерное хранилище.
+
+    Lifecycle — как у обложки: если после успешного sendPhoto картинку не
+    удалось разрезолвить, только что созданное архивное сообщение удаляется
+    здесь же, чтобы не оставить сироту в канале. try/finally с флагом, а не
+    except: убрать нужно при ЛЮБОМ незавершении, включая CancelledError
+    (она наследует BaseException) и TimeoutError."""
+    message_id, post_url = await media_archive.send_archive_photo(bot, file_id)
+    archive_ref = media_archive.build_source_ref(message_id)
+    resolved = False
+    try:
+        url = await telegram_media.resolve_cover_url(post_url)
+        resolved = True
+        return url, archive_ref
+    finally:
+        if not resolved:
+            await media_archive.delete_archive_message(bot, archive_ref)
+
+
 # Куда возвращает универсальная "❌ Отмена" (cancel_keyboard) — по значению
 # cancel_to, проставленному в state.data в момент входа в конкретный мастер
 # (см. _resolve_cancel). Раньше "Отмена" всегда вела в корень /admin, из-за
@@ -809,13 +845,30 @@ async def case_image_add_receive(message: Message, state: FSMContext) -> None:
         return
     data = await state.get_data()
     file_id = message.photo[-1].file_id if message.photo else message.document.file_id
+    # Галерея хранится в архив-канале, как и обложки (см.
+    # _gallery_image_from_upload). Порядок all-or-nothing: пока картинка не
+    # получила CDN-адрес, в кейс не пишется ничего, а созданное архивное
+    # сообщение убирается — кейс остаётся ровно таким, каким был, и
+    # дизайнер может просто прислать фото ещё раз.
     try:
-        path = await content_store.save_case_photo(message.chat.id, message.bot, file_id, f"{data['case_id']}_{uuid.uuid4().hex[:8]}")
-    except r2_storage.R2UploadError:
-        logger.exception("R2 upload failed for gallery image (case_id=%s)", data["case_id"])
-        await flow.step_from_text(message, state, "Не удалось загрузить изображение, попробуйте ещё раз 🙁", kb.cancel_keyboard())
+        path, archive_ref = await _gallery_image_from_upload(message.bot, file_id)
+    except media_archive.MediaArchiveNotConfigured:
+        logger.error("MEDIA_ARCHIVE_CHANNEL не задан — загрузка картинки галереи невозможна (case_id=%s)", data["case_id"])
+        await flow.step_from_text(message, state, _ARCHIVE_NOT_CONFIGURED_ERROR, kb.cancel_keyboard())
         return
-    await content_store.add_case_image(message.chat.id, data["case_id"], path)
+    except (media_archive.MediaArchiveError, telegram_media.TelegramMediaResolveError):
+        logger.exception("Gallery image upload failed (case_id=%s)", data["case_id"])
+        await flow.step_from_text(message, state, _COVER_UPLOAD_ERROR, kb.cancel_keyboard())
+        return
+    except Exception:
+        # Тот же осознанно широкий except, что и на обложке: zlib.error и
+        # http.client.IncompleteRead не наследуют OSError, а зависший мастер
+        # неотличим от «бот умер». logger.exception сохраняет traceback,
+        # архивное сообщение уже убрано в finally выше.
+        logger.exception("Unexpected gallery image upload failure (case_id=%s)", data["case_id"])
+        await flow.step_from_text(message, state, _COVER_UPLOAD_ERROR, kb.cancel_keyboard())
+        return
+    await content_store.add_case_image(message.chat.id, data["case_id"], path, archive_ref=archive_ref)
     case = await _current_case(data["case_id"])
     # flow.step_from_text (P1-3, Batch 3) — success-переход в case_images_menu
     # (AdminStates-активное, cancel_to="images" сохраняется) — без него
@@ -892,11 +945,14 @@ async def case_image_action(callback: CallbackQuery, state: FSMContext) -> None:
         await content_store.set_case_cover(callback.message.chat.id, case_id, image_path)
 
         if stale_external:
-            # source_ref=None, а не "архивная ссылка выбранной картинки":
-            # картинки галереи в архив-канал НЕ публикуются (туда идут
-            # только обложки, см. _cover_from_upload) — они лежат в
-            # прежнем storage через save_case_photo. Архивной ссылки у
-            # такой картинки просто не существует, и выдумывать её нельзя.
+            # source_ref=None, а не "архивная ссылка выбранной картинки".
+            # Галерейная картинка теперь тоже лежит в архиве и свою ссылку
+            # имеет (case["image_refs"], см. add_case_image), но source_ref
+            # описывает ИСТОЧНИК ОБЛОЖКИ — как она попала в кейс: upload,
+            # behance, telegram_post. Перенос сюда галерейной ссылки
+            # смешал бы два разных смысла в одном поле, а сама ссылка
+            # никуда не теряется — она остаётся в image_refs, привязанная
+            # к своей картинке.
             await content_store.update_case(
                 callback.message.chat.id, case_id, **_uploaded_cover_fields(None),
             )
@@ -922,7 +978,16 @@ async def case_image_delete_do(callback: CallbackQuery, state: FSMContext) -> No
     data = await state.get_data()
     case_id, image_path = data["case_id"], data.get("image_path")
     if answer == "yes" and image_path:
+        # Архивную ссылку читаем ДО удаления — после него её в кейсе уже
+        # нет (тот же порядок, что и у обложки в cases_delete_do). Сначала
+        # запись в portfolio.json, и только потом уборка канала: если
+        # удаление сообщения не удастся, дизайнер всё равно увидит
+        # выполненное действие, а не наполовину применённое. У неархивных
+        # картинок (демо-SVG, старые данные) ссылки нет — тогда
+        # delete_archive_message просто ничего не делает.
+        image_ref = content_store.case_image_ref(await _current_case(case_id), image_path)
         await content_store.remove_case_image(callback.message.chat.id, case_id, image_path)
+        await media_archive.delete_archive_message(callback.bot, image_ref)
     case = await _current_case(case_id)
     await callback.message.edit_text(
         "Изображения кейса — ⭐ отмечает текущую обложку:",
@@ -1369,7 +1434,19 @@ async def cases_delete_do(callback: CallbackQuery, state: FSMContext) -> None:
             if case_before and case_before.get("source_type") == "upload"
             else None
         )
+        # Галерейные картинки тоже лежат в архив-канале (см.
+        # _gallery_image_from_upload) — их сообщения принадлежат нам и
+        # уходят вместе с кейсом. dict.fromkeys, а не set: порядок удаления
+        # становится предсказуемым, а совпадение с обложкой (если её же
+        # картинку выбрали ⭐ из галереи) отсеивается, чтобы одно сообщение
+        # не удалялось дважды.
+        gallery_refs = [
+            ref for ref in dict.fromkeys(content_store.case_gallery_refs(case_before))
+            if ref != archive_ref
+        ]
         await content_store.delete_case(callback.message.chat.id, data["case_id"])
+        for ref in gallery_refs:
+            await media_archive.delete_archive_message(callback.bot, ref)
         # Уборка архива — best-effort и НЕ откатывает уже удалённый кейс
         # (delete_archive_message не бросает, а логирует). Формулировка
         # для дизайнера намеренно не обещает удаления самой картинки:

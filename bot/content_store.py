@@ -385,7 +385,33 @@ def _find_case(data: dict, case_id: str) -> dict | None:
     return next((c for c in data["cases"] if c["id"] == case_id), None)
 
 
-async def add_case_image(actor_chat_id: int | str, case_id: str, image_path: str, *, set_as_cover: bool = False) -> bool:
+async def add_case_image(
+    actor_chat_id: int | str,
+    case_id: str,
+    image_path: str,
+    *,
+    set_as_cover: bool = False,
+    archive_ref: str | None = None,
+) -> bool:
+    """archive_ref — ссылка на архивное сообщение, из которого получен
+    image_path (см. bot/media_archive.py::build_source_ref). Хранится в
+    case["image_refs"] — отдельном необязательном словаре
+    {image_path: archive_ref}, а НЕ в самом images[]: тот остаётся списком
+    строк, каким его читают Mini App, backup и все остальные операции.
+
+    Почему словарь, а не второй список параллельно images[]: порядок
+    галереи меняется reorder_case_image, и параллельный список пришлось бы
+    переставлять синхронно — любой пропущенный случай молча привязал бы
+    ссылку не к той картинке. Ключ по самому image_path такой синхронизации
+    не требует вовсе.
+
+    Почему не source_ref: то поле описывает ИСТОЧНИК ОБЛОЖКИ (upload /
+    behance / telegram_post) и остаётся cover-only. Галерейная картинка
+    обложкой не является.
+
+    Кейсы без archive_ref (демо-картинки, старые данные) поля image_refs не
+    получают вообще — оно появляется только тогда, когда действительно есть
+    что в нём хранить."""
     _require_designer(actor_chat_id)
     async with _lock("portfolio.json"):
         data = await _read("portfolio.json")
@@ -395,10 +421,39 @@ async def add_case_image(actor_chat_id: int | str, case_id: str, image_path: str
         images = case.setdefault("images", [])
         if image_path not in images:
             images.append(image_path)
+        if archive_ref:
+            case.setdefault("image_refs", {})[image_path] = archive_ref
         if set_as_cover or not case.get("cover"):
             case["cover"] = image_path
         await _write("portfolio.json", data)
         return True
+
+
+def case_image_ref(case: dict | None, image_path: str) -> str | None:
+    """Архивная ссылка галерейной картинки, если она архивная.
+
+    Единая точка чтения image_refs: хендлеры удаления должны узнать ссылку
+    ДО того, как картинка исчезнет из portfolio.json (тот же порядок, что и
+    у cover-обложки в cases_delete_do). Отсутствие поля, чужой тип и
+    неархивные значения одинаково дают None — старые кейсы и легаси-пути
+    проходят здесь без единой проверки на стороне вызывающего."""
+    if not isinstance(case, dict):
+        return None
+    refs = case.get("image_refs")
+    if not isinstance(refs, dict):
+        return None
+    ref = refs.get(image_path)
+    return ref if isinstance(ref, str) and ref else None
+
+
+def case_gallery_refs(case: dict | None) -> list[str]:
+    """Все архивные ссылки галереи кейса — для уборки при удалении кейса."""
+    if not isinstance(case, dict):
+        return []
+    refs = case.get("image_refs")
+    if not isinstance(refs, dict):
+        return []
+    return [v for v in refs.values() if isinstance(v, str) and v]
 
 
 async def remove_case_image(actor_chat_id: int | str, case_id: str, image_path: str) -> bool:
@@ -417,6 +472,15 @@ async def remove_case_image(actor_chat_id: int | str, case_id: str, image_path: 
         if case is None or image_path not in case.get("images", []):
             return False
         case["images"] = [i for i in case["images"] if i != image_path]
+        # Ссылка на архивное сообщение уходит вместе с картинкой: иначе в
+        # image_refs копились бы записи про уже несуществующие изображения.
+        # Само сообщение удаляет вызывающий хендлер — он единственный, у
+        # кого есть bot (см. case_image_delete_do).
+        refs = case.get("image_refs")
+        if isinstance(refs, dict):
+            refs.pop(image_path, None)
+            if not refs:
+                case.pop("image_refs", None)
         if case.get("cover") == image_path:
             case["cover"] = case["images"][0] if case["images"] else None
         await _write("portfolio.json", data)
