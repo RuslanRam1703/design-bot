@@ -600,7 +600,12 @@ function renderCase() {
   const c = state.currentCase;
   const hasImages = c.images && c.images.length > 0;
   const images = hasImages
-    ? c.images.map((src, i) => `<img src="${imageSrc(src)}" alt="" data-lightbox-index="${i}" />`).join("")
+    // tabindex/role/alt — минимум, нужный чтобы миниатюра была видимой
+    // точкой возврата фокуса после закрытия лайтбокса (см. closeLightbox).
+    ? c.images.map((src, i) =>
+        `<img src="${imageSrc(src)}" alt="${escapeHtml(c.title)} — изображение ${i + 1}" ` +
+        `data-lightbox-index="${i}" tabindex="0" role="button" />`
+      ).join("")
     : `<div class="case-images-empty">Пока нет изображений</div>`;
   // external_url — необязательное поле (см. bot/content_store.py -> CASE_FIELD_LABELS);
   // ссылка показывается, только если дизайнер её заполнил для этого конкретного кейса.
@@ -622,9 +627,15 @@ function renderCase() {
 function attachCaseEvents() {
   document.getElementById("back").addEventListener("click", goBack);
   const c = state.currentCase;
-  document.querySelectorAll("[data-lightbox-index]").forEach((el) =>
-    el.addEventListener("click", () => openLightbox(c.images.map(imageSrc), Number(el.dataset.lightboxIndex)))
-  );
+  document.querySelectorAll("[data-lightbox-index]").forEach((el) => {
+    const open = () => openLightbox(c.images.map(imageSrc), Number(el.dataset.lightboxIndex), el);
+    el.addEventListener("click", open);
+    // Клавиатурный эквивалент клика по миниатюре — картинка теперь в
+    // порядке табуляции (tabindex="0", см. renderCase).
+    el.addEventListener("keydown", (e) => {
+      if (e.key === "Enter" || e.key === " ") { e.preventDefault(); open(); }
+    });
+  });
   document.getElementById("want-similar").addEventListener("click", () => {
     // order_template.service_id (см. data/portfolio.json) — переносим ТОЛЬКО
     // услугу, не опции. order_template.options — статические demo-данные:
@@ -660,17 +671,56 @@ function attachCaseEvents() {
 let lightboxEl = null;
 let lightboxImages = [];
 let lightboxIndex = 0;
+let lightboxOpener = null; // элемент, с которого открыли — туда возвращаем фокус
 
-function openLightbox(images, index) {
+// Состояние зума. scale === 1 означает "как было раньше": свайп листает,
+// панорамирование выключено. Всё, что связано с зумом, живёт только внутри
+// лайтбокса и сбрасывается при смене картинки и при закрытии.
+const LIGHTBOX_MAX_SCALE = 4;
+let lbScale = 1;
+let lbTx = 0;
+let lbTy = 0;
+
+function lightboxImg() {
+  return lightboxEl.querySelector("img");
+}
+
+function applyLightboxTransform() {
+  const img = lightboxImg();
+  img.style.transform = `translate(${lbTx}px, ${lbTy}px) scale(${lbScale})`;
+  // Пока картинка не увеличена, лайтбокс ведёт себя ровно как раньше;
+  // класс нужен только чтобы курсор/выделение не мешали панорамированию.
+  lightboxEl.classList.toggle("zoomed", lbScale > 1);
+}
+
+function resetLightboxZoom() {
+  lbScale = 1;
+  lbTx = 0;
+  lbTy = 0;
+  if (lightboxEl) applyLightboxTransform();
+}
+
+// Панорамирование ограничено так, чтобы картинку нельзя было утащить за
+// пределы экрана и потерять (вместе с ней — кнопку закрытия).
+function clampLightboxPan() {
+  const img = lightboxImg();
+  const maxX = Math.max(0, (img.clientWidth * lbScale - img.clientWidth) / 2);
+  const maxY = Math.max(0, (img.clientHeight * lbScale - img.clientHeight) / 2);
+  lbTx = Math.min(maxX, Math.max(-maxX, lbTx));
+  lbTy = Math.min(maxY, Math.max(-maxY, lbTy));
+}
+
+function openLightbox(images, index, opener) {
   lightboxImages = images;
   lightboxIndex = index;
+  lightboxOpener = opener || null;
   if (!lightboxEl) {
     lightboxEl = document.createElement("div");
     lightboxEl.className = "lightbox";
     lightboxEl.innerHTML = `
       <button class="lightbox-close" aria-label="Закрыть">✕</button>
       <button class="lightbox-prev" aria-label="Предыдущее">‹</button>
-      <img alt="" />
+      <img alt="Изображение кейса" />
       <button class="lightbox-next" aria-label="Следующее">›</button>
       <div class="lightbox-counter"></div>
     `;
@@ -679,17 +729,78 @@ function openLightbox(images, index) {
     lightboxEl.querySelector(".lightbox-prev").addEventListener("click", (e) => { e.stopPropagation(); lightboxStep(-1); });
     lightboxEl.querySelector(".lightbox-next").addEventListener("click", (e) => { e.stopPropagation(); lightboxStep(1); });
     lightboxEl.addEventListener("click", (e) => { if (e.target === lightboxEl) closeLightbox(); });
+
+    // ---- Жесты ----
+    // Один палец при scale === 1 — прежний свайп-листатель (порог 40px).
+    // Один палец при увеличенной картинке — панорамирование, НЕ листание.
+    // Два пальца — только зум; свайп в это время запрещён и остаётся
+    // запрещённым до полного отрыва пальцев, иначе разведение/сведение
+    // пальцев случайно перелистывало бы кадр.
     let touchStartX = null;
-    lightboxEl.addEventListener("touchstart", (e) => { touchStartX = e.touches[0].clientX; });
+    let panStartX = 0, panStartY = 0, panOriginX = 0, panOriginY = 0;
+    let pinchStartDist = 0, pinchStartScale = 1;
+    let gestureIsPinch = false;
+
+    const dist = (t) => Math.hypot(
+      t[0].clientX - t[1].clientX,
+      t[0].clientY - t[1].clientY
+    );
+
+    lightboxEl.addEventListener("touchstart", (e) => {
+      if (e.touches.length === 2) {
+        gestureIsPinch = true;
+        touchStartX = null;               // свайп отменён на весь жест
+        pinchStartDist = dist(e.touches);
+        pinchStartScale = lbScale;
+      } else if (e.touches.length === 1 && !gestureIsPinch) {
+        if (lbScale > 1) {
+          panStartX = e.touches[0].clientX;
+          panStartY = e.touches[0].clientY;
+          panOriginX = lbTx;
+          panOriginY = lbTy;
+        } else {
+          touchStartX = e.touches[0].clientX;
+        }
+      }
+    }, { passive: true });
+
+    lightboxEl.addEventListener("touchmove", (e) => {
+      if (e.touches.length === 2 && pinchStartDist > 0) {
+        const ratio = dist(e.touches) / pinchStartDist;
+        lbScale = Math.min(LIGHTBOX_MAX_SCALE, Math.max(1, pinchStartScale * ratio));
+        if (lbScale === 1) { lbTx = 0; lbTy = 0; }
+        clampLightboxPan();
+        applyLightboxTransform();
+        e.preventDefault();               // не отдаём жест системному зуму
+      } else if (e.touches.length === 1 && lbScale > 1 && !gestureIsPinch) {
+        lbTx = panOriginX + (e.touches[0].clientX - panStartX);
+        lbTy = panOriginY + (e.touches[0].clientY - panStartY);
+        clampLightboxPan();
+        applyLightboxTransform();
+        e.preventDefault();               // панорамирование вместо прокрутки
+      }
+    }, { passive: false });
+
     lightboxEl.addEventListener("touchend", (e) => {
-      if (touchStartX === null) return;
-      const dx = e.changedTouches[0].clientX - touchStartX;
-      if (Math.abs(dx) > 40) lightboxStep(dx > 0 ? -1 : 1);
-      touchStartX = null;
+      if (e.touches.length === 0) {
+        // Жест закончился целиком — только теперь снимаем запрет свайпа.
+        if (gestureIsPinch) { gestureIsPinch = false; touchStartX = null; return; }
+        if (touchStartX !== null && lbScale === 1) {
+          const dx = e.changedTouches[0].clientX - touchStartX;
+          if (Math.abs(dx) > 40) lightboxStep(dx > 0 ? -1 : 1);
+        }
+        touchStartX = null;
+      }
     });
   }
+  resetLightboxZoom();
   renderLightboxImage();
   lightboxEl.classList.add("open");
+  // BackButton на время просмотра закрывает картинку, а не уводит с экрана
+  // кейса. TG.backButton.show() сам снимает предыдущий обработчик перед
+  // установкой нового (см. шим TG выше), поэтому дублей не возникает.
+  TG.backButton.show(closeLightbox);
+  lightboxEl.querySelector(".lightbox-close").focus();
 }
 
 function lightboxStep(delta) {
@@ -698,7 +809,8 @@ function lightboxStep(delta) {
 }
 
 function renderLightboxImage() {
-  lightboxEl.querySelector("img").src = lightboxImages[lightboxIndex];
+  resetLightboxZoom();                    // новая картинка — всегда без зума
+  lightboxImg().src = lightboxImages[lightboxIndex];
   const multi = lightboxImages.length > 1;
   lightboxEl.querySelector(".lightbox-counter").textContent = multi ? `${lightboxIndex + 1} / ${lightboxImages.length}` : "";
   lightboxEl.querySelector(".lightbox-prev").style.display = multi ? "" : "none";
@@ -706,7 +818,15 @@ function renderLightboxImage() {
 }
 
 function closeLightbox() {
-  if (lightboxEl) lightboxEl.classList.remove("open");
+  if (!lightboxEl) return;
+  lightboxEl.classList.remove("open");
+  resetLightboxZoom();
+  // Возвращаем BackButton экрану кейса — лайтбокс открывается только
+  // оттуда (см. attachCaseEvents), и там он всегда ведёт на goBack
+  // (см. render(), case "case").
+  TG.backButton.show(goBack);
+  if (lightboxOpener && document.body.contains(lightboxOpener)) lightboxOpener.focus();
+  lightboxOpener = null;
 }
 
 document.addEventListener("keydown", (e) => {
@@ -2212,3 +2332,171 @@ document.addEventListener("click", (e) => {
 });
 
 init();
+
+// ============================================================================
+// ВРЕМЕННЫЙ ДИАГНОСТИЧЕСКИЙ PROBE — FULLSCREEN API (УДАЛИТЬ ПОСЛЕ ТЕСТА)
+// ----------------------------------------------------------------------------
+// Единственная цель: выяснить на РЕАЛЬНОМ Telegram Desktop, поддерживается ли
+// Bot API 8.0 fullscreen, и что именно происходит при requestFullscreen().
+// Документация Telegram про поддержку на tdesktop молчит, проверить иначе
+// нельзя.
+//
+// Почему отдельным блоком в конце файла, а не правкой openLightbox/
+// closeLightbox: так строки самого viewer остаются нетронутыми, и удаление
+// probe = удаление одного непрерывного блока.
+//
+// БЕЗОПАСНОСТЬ (главное отличие от откаченной реализации e4728d4, где
+// exitFullscreen() звался вслепую и закрывал весь Mini App):
+//   - requestFullscreen() вызывается РОВНО ОДИН раз за сессию;
+//   - exitFullscreen() вызывается ТОЛЬКО если isFullscreen === true И
+//     fullscreen включили мы сами;
+//   - fullscreenFailed -> просто обычный лайтбокс, никаких попыток «починить»;
+//   - весь probe обёрнут в try/catch: любая его ошибка не должна ломать
+//     ни viewer, ни Mini App.
+// ============================================================================
+(function fullscreenProbe() {
+  const tg = window.Telegram && window.Telegram.WebApp;
+
+  const P = {
+    platform: "n/a",
+    version: "n/a",
+    atLeast80: "n/a",
+    hasRequest: false,
+    hasExit: false,
+    hasOnEvent: false,
+    isFullscreenBefore: "n/a",
+    requestCalled: "NO",
+    requestThrew: "",
+    changedEvent: "NOT RECEIVED",
+    isFullscreenAfter: "n/a",
+    failedEvent: "NOT RECEIVED",
+    exitTested: "NO",
+    isFullscreenAfterExit: "n/a",
+  };
+
+  const safe = (fn, fallback) => { try { return fn(); } catch (e) { return fallback + " (" + e.message + ")"; } };
+
+  try {
+    if (!tg) {
+      P.platform = "NO Telegram.WebApp (открыто вне Telegram)";
+    } else {
+      P.platform = safe(() => String(tg.platform), "err");
+      P.version = safe(() => String(tg.version), "err");
+      P.atLeast80 = safe(() => String(typeof tg.isVersionAtLeast === "function" ? tg.isVersionAtLeast("8.0") : "no isVersionAtLeast"), "err");
+      P.hasRequest = typeof tg.requestFullscreen === "function";
+      P.hasExit = typeof tg.exitFullscreen === "function";
+      P.hasOnEvent = typeof tg.onEvent === "function";
+      P.isFullscreenBefore = safe(() => String(tg.isFullscreen), "err");
+
+      if (P.hasOnEvent) {
+        tg.onEvent("fullscreenChanged", function () {
+          P.changedEvent = "RECEIVED";
+          P.isFullscreenAfter = safe(() => String(tg.isFullscreen), "err");
+          renderPanel();
+        });
+        tg.onEvent("fullscreenFailed", function (payload) {
+          // Причина выводится КАК ЕСТЬ, без интерпретации.
+          P.failedEvent = "RECEIVED: " + safe(() => JSON.stringify(payload), "unserializable");
+          P.isFullscreenAfter = safe(() => String(tg.isFullscreen), "err");
+          renderPanel();
+        });
+      }
+    }
+  } catch (e) {
+    P.platform = "probe init error: " + e.message;
+  }
+
+  // Мы сами включили fullscreen? Только в этом случае вообще можно выходить.
+  let weEnteredFullscreen = false;
+  let requestAlreadyAttempted = false;
+
+  function panelText() {
+    return [
+      "FULLSCREEN PROBE",
+      "Platform: " + P.platform,
+      "Version: " + P.version,
+      "Version >= 8.0: " + P.atLeast80,
+      "requestFullscreen available: " + P.hasRequest,
+      "exitFullscreen available: " + P.hasExit,
+      "onEvent available: " + P.hasOnEvent,
+      "isFullscreen before: " + P.isFullscreenBefore,
+      "requestFullscreen called: " + P.requestCalled + (P.requestThrew ? " " + P.requestThrew : ""),
+      "fullscreenChanged: " + P.changedEvent,
+      "isFullscreen after: " + P.isFullscreenAfter,
+      "fullscreenFailed: " + P.failedEvent,
+      "exitFullscreen tested: " + P.exitTested,
+      "isFullscreen after exit: " + P.isFullscreenAfterExit,
+    ].join("\n");
+  }
+
+  function renderPanel() {
+    try {
+      if (!lightboxEl) return;
+      let box = lightboxEl.querySelector(".fs-probe");
+      if (!box) {
+        box = document.createElement("pre");
+        box.className = "fs-probe";
+        // Инлайновые стили намеренно: style.css остаётся нетронутым, probe
+        // удаляется одним куском вместе со своим оформлением.
+        box.style.cssText =
+          "position:absolute;left:8px;top:8px;max-width:min(92%,460px);max-height:70%;overflow:auto;" +
+          "margin:0;padding:10px 12px;background:rgba(0,0,0,.85);color:#7CFC9B;" +
+          "font:11px/1.45 ui-monospace,Menlo,Consolas,monospace;white-space:pre-wrap;" +
+          "border:1px solid #7CFC9B;border-radius:8px;z-index:200;user-select:text;-webkit-user-select:text;";
+        box.addEventListener("click", (e) => e.stopPropagation());
+        lightboxEl.appendChild(box);
+      }
+      box.textContent = panelText();
+    } catch (e) { /* probe никогда не ломает viewer */ }
+  }
+
+  // ---- обёртка openLightbox: один запрос fullscreen за сессию ----
+  const origOpen = openLightbox;
+  openLightbox = function (images, index, opener) {
+    origOpen(images, index, opener);
+    try {
+      if (tg && P.hasRequest && !requestAlreadyAttempted) {
+        requestAlreadyAttempted = true;
+        P.isFullscreenBefore = safe(() => String(tg.isFullscreen), "err");
+        try {
+          tg.requestFullscreen();
+          P.requestCalled = "YES";
+          weEnteredFullscreen = true; // подтвердим/опровергнем по isFullscreen ниже
+        } catch (e) {
+          P.requestCalled = "THREW";
+          P.requestThrew = "(" + e.message + ")";
+        }
+      } else if (!P.hasRequest) {
+        P.requestCalled = "NO (API отсутствует)";
+      }
+      renderPanel();
+    } catch (e) { /* no-op */ }
+  };
+
+  // ---- обёртка closeLightbox: выход ТОЛЬКО при подтверждённом fullscreen ----
+  const origClose = closeLightbox;
+  closeLightbox = function () {
+    try {
+      const actuallyFullscreen = !!(tg && tg.isFullscreen === true);
+      if (actuallyFullscreen && weEnteredFullscreen && P.hasExit) {
+        try {
+          tg.exitFullscreen();
+          P.exitTested = "YES";
+        } catch (e) {
+          P.exitTested = "THREW (" + e.message + ")";
+        }
+        // Значение читаем сразу; фактическое подтверждение придёт
+        // отдельным fullscreenChanged (см. подписку выше).
+        P.isFullscreenAfterExit = safe(() => String(tg.isFullscreen), "err");
+      } else {
+        P.exitTested = actuallyFullscreen ? "NO (не мы включали)" : "NO (isFullscreen !== true)";
+      }
+      weEnteredFullscreen = false;
+    } catch (e) { /* no-op */ }
+    origClose();
+  };
+
+  // Доступ из консоли, если она вдруг доступна.
+  window.__fsProbe = () => panelText();
+})();
+// ============ КОНЕЦ ВРЕМЕННОГО PROBE ============
