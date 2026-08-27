@@ -15,6 +15,7 @@ import hashlib
 import hmac
 import io
 import json
+import re
 import shutil
 import tempfile
 import time
@@ -11842,6 +11843,80 @@ class TelegramPostCoexistenceTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Смотреть подробнее", app_js)
         # Кнопка не завязана на source_type — фронтенд про него не знает.
         self.assertNotIn("source_type", app_js)
+
+
+class MaterialHandoffButtonTests(unittest.TestCase):
+    """Кнопка «Отправить материалы» на экране после отправки заявки.
+
+    Материалы принимает БОТ обычным сообщением (handle_tz_file), а не Mini
+    App — прямой загрузки файлов в Mini App нет и не добавляется. Раньше
+    пользователю оставалась только текстовая подсказка «отправьте файл в
+    чат», а закрывать окно и искать чат он должен был сам."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.app_js = (Path(__file__).resolve().parent.parent / "webapp" / "js" / "app.js").read_text(encoding="utf-8")
+        # Проверки "чего в коде быть НЕ должно" считаем по исполняемому
+        # коду: комментарии здесь объясняют в том числе те самые вещи,
+        # которые мы намеренно не используют (return_back и пр.), и по
+        # полному тексту такие assert'ы срабатывали бы на объяснении.
+        no_block = re.sub(r"/\*.*?\*/", "", cls.app_js, flags=re.S)
+        cls.app_js_code = "\n".join(
+            line for line in no_block.split("\n") if not line.strip().startswith("//")
+        )
+
+    # ---- TG.close как новая (и единственная новая) возможность шима ----
+
+    def test_shim_exposes_close_that_calls_telegram_close(self):
+        self.assertIn("close()", self.app_js)
+        self.assertIn("realTG.close()", self.app_js)
+
+    def test_close_is_guarded_for_plain_browser(self):
+        """Вне Telegram метода нет — должен быть тихий no-op, а не
+        исключение: экран заявки обязан остаться рабочим."""
+        self.assertIn('typeof realTG?.close === "function"', self.app_js)
+
+    def test_close_does_not_pass_return_back(self):
+        """return_back — про Mini App, открытый deep link'ом из ДРУГОГО
+        приложения (Android-only), к запуску из чата отношения не имеет.
+        Передавать его здесь означало бы обещать поведение, которого мы не
+        проверяли."""
+        self.assertNotIn("return_back", self.app_js_code)
+
+    def test_no_other_telegram_navigation_api_added(self):
+        """Никаких openTelegramLink/openLink/внешних ссылок — возврат в чат
+        должен происходить закрытием окна, а не переходом по ссылке."""
+        for api in ("openTelegramLink", "openLink", "web_app_open_tg_link"):
+            with self.subTest(api=api):
+                self.assertNotIn(api, self.app_js_code)
+
+    # ---- Кнопка на экране «Готово» ----
+
+    def test_submit_screen_has_materials_button_wired_to_close(self):
+        self.assertIn('id="send-materials"', self.app_js)
+        self.assertIn("Отправить материалы", self.app_js)
+        self.assertIn('e.target.id === "send-materials"', self.app_js)
+
+    def test_materials_button_shown_only_when_lead_awaits_file(self):
+        """Заявка без attach_tz файла не ждёт — предлагать «отправить
+        материалы» там не за что, бот их сейчас всё равно не привяжет."""
+        self.assertIn("const materialsButton = result.attach_tz", self.app_js)
+
+    def test_existing_success_text_and_buttons_preserved(self):
+        """Кнопка добавлена, а не заменила собой существующий экран:
+        материалы остаются опциональными."""
+        self.assertIn("отправьте его следующим сообщением прямо в этот чат с ботом", self.app_js)
+        self.assertIn("Я свяжусь с вами в ближайшее время.", self.app_js)
+        self.assertIn('id="add-more-info"', self.app_js)
+        self.assertIn('id="to-my-leads"', self.app_js)
+        self.assertIn('id="to-start"', self.app_js)
+
+    def test_no_direct_file_upload_introduced(self):
+        """Инвариант: файлы в Mini App по-прежнему не загружаются — ни
+        input[type=file], ни FormData, ни multipart."""
+        for token in ('type="file"', "FormData", "multipart", "enctype"):
+            with self.subTest(token=token):
+                self.assertNotIn(token, self.app_js_code)
 
 
 class CoverSourceTransitionTests(unittest.IsolatedAsyncioTestCase):

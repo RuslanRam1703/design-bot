@@ -40,6 +40,28 @@ const realTG = window.Telegram && window.Telegram.WebApp;
 const TG = {
   ready() { realTG?.ready(); },
   expand() { realTG?.expand(); },
+  // Закрыть Mini App. Нужно ровно в одном месте — кнопка «Отправить
+  // материалы» на экране после отправки заявки: материалы принимает бот
+  // обычным сообщением (см. handle_tz_file в bot/handlers/webapp.py), и
+  // без этого пользователю приходилось закрывать окно вручную.
+  //
+  // Что именно делает close(), по документации: «A method that closes the
+  // Mini App» — закрывается WebView, и только. Возврат ИМЕННО в исходный
+  // чат с ботом документацией НЕ гарантируется, поэтому мы на него и не
+  // опираемся: без аргументов вызов ничего лишнего не обещает.
+  // Аргумент return_back тут намеренно НЕ передаётся — он про совсем
+  // другой случай (Mini App открыли deep link'ом из ДРУГОГО приложения) и
+  // к запуску из чата отношения не имеет.
+  //
+  // Вне Telegram (обычный браузер, наш локальный превью) метода нет —
+  // тогда это тихий no-op, а не исключение: экран заявки должен
+  // оставаться рабочим.
+  close() {
+    try {
+      if (typeof realTG?.close === "function") { realTG.close(); return true; }
+    } catch (e) { /* закрытие — не критичная операция, экран остаётся рабочим */ }
+    return false;
+  },
   themeParams() { return realTG?.themeParams || {}; },
   colorScheme() { return realTG?.colorScheme || "light"; },
   // initData — подписанный Telegram'ом пакет (user/auth_date/hash), сервер
@@ -2104,12 +2126,22 @@ function renderSubmitted() {
   const tzLine = result.attach_tz
     ? `<p class="hint">Вы отметили, что пришлёте файл ТЗ — отправьте его следующим сообщением прямо в этот чат с ботом (не через Mini App).</p>`
     : "";
+  // Кнопка закрывает Mini App, чтобы не заставлять искать, как вернуться в
+  // чат: материалы принимает бот обычным сообщением. Она НЕ обязательна —
+  // материалы опциональны, и текст выше остаётся на месте для тех, кто
+  // закроет окно сам. Показываем только когда заявка действительно ждёт
+  // файл: в остальных случаях предлагать «отправить материалы» не за чем,
+  // бот их сейчас всё равно не привяжет (см. awaiting_tz_file).
+  const materialsButton = result.attach_tz
+    ? `<div class="btn-row"><button class="btn btn-primary" id="send-materials">Отправить материалы</button></div>`
+    : "";
   return `
     <div class="topbar"><h1>Готово ✅</h1></div>
     <div class="case-block"><div class="label">Заявка №${result.lead_id ?? "—"}</div><p>Услуга: ${escapeHtml(p.service_name || "не указана")}</p></div>
     ${priceLine}
     ${tzLine}
     <p>Я свяжусь с вами в ближайшее время.</p>
+    ${materialsButton}
     <div class="btn-row">
       <button class="btn btn-secondary" id="add-more-info">Дополнить информацию</button>
       <button class="btn btn-primary" id="to-my-leads">Мои заявки</button>
@@ -2121,6 +2153,13 @@ function renderSubmitted() {
 }
 
 document.addEventListener("click", (e) => {
+  if (e.target && e.target.id === "send-materials") {
+    // Единственное действие — закрыть окно. Ожидание файла уже выставлено
+    // сервером при создании заявки (awaiting_tz_file, см. add_lead), и в
+    // чате пользователя уже ждёт сообщение с просьбой прислать файл —
+    // здесь ничего дополнительно слать или менять не нужно.
+    TG.close();
+  }
   if (e.target && e.target.id === "to-start") {
     // Осознанный уход "в начало" — вот здесь черновик действительно можно
     // очистить: пользователь явно закончил с этим заказом.
