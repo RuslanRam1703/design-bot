@@ -2332,3 +2332,131 @@ document.addEventListener("click", (e) => {
 });
 
 init();
+
+// ============================================================================
+// ВРЕМЕННЫЙ PROBE v2 — FULLSCREEN БЕЗ exitFullscreen() (УДАЛИТЬ ПОСЛЕ ТЕСТА)
+// ----------------------------------------------------------------------------
+// Вопрос эксперимента: можно ли получить
+//   case -> image -> fullscreen -> закрыть картинку -> тот же case
+// НЕ вызывая exitFullscreen(). Прошлый тест показал, что exitFullscreen() на
+// tdesktop 9.6 закрывает весь Mini App даже при корректной проверке
+// isFullscreen === true, поэтому здесь этого вызова НЕТ ВООБЩЕ.
+//
+// Отличия от probe v1, который не смог ответить на вопрос:
+//   - append-only журнал вместо перезаписываемых полей: каждое событие —
+//     отдельная строка со своим временем и полным снимком состояния;
+//   - снимок включает и то, что СООБЩАЕТ Telegram (isFullscreen,
+//     viewportHeight/StableHeight), и то, что реально видит документ
+//     (innerWidth/Height, visualViewport) — если они разойдутся, это будет
+//     видно, а не замаскировано;
+//   - панель живёт на document.body, а НЕ внутри лайтбокса: иначе после
+//     закрытия картинки журнал исчезал бы вместе с ней, а самое интересное
+//     происходит именно ПОСЛЕ закрытия.
+//
+// Панель намеренно внизу и не доходит до правого края: сверху справа —
+// крестик закрытия (z-index: 1 после фикса 659042ee), перекрывать его нельзя.
+// ============================================================================
+(function fullscreenProbe2() {
+  const tg = window.Telegram && window.Telegram.WebApp;
+  const LOG = [];
+  const t0 = Date.now();
+
+  function snap(event, extra) {
+    const vv = window.visualViewport;
+    const row = {
+      t: String(Date.now() - t0).padStart(5, " ") + "ms",
+      ev: event,
+      fs: tg ? String(tg.isFullscreen) : "n/a",
+      iw: window.innerWidth,
+      ih: window.innerHeight,
+      vvw: vv ? Math.round(vv.width) : "-",
+      vvh: vv ? Math.round(vv.height) : "-",
+      vvs: vv ? (Math.round(vv.scale * 100) / 100) : "-",
+      vh: tg && tg.viewportHeight != null ? Math.round(tg.viewportHeight) : "-",
+      vsh: tg && tg.viewportStableHeight != null ? Math.round(tg.viewportStableHeight) : "-",
+      note: extra || "",
+    };
+    LOG.push(row);
+    render();
+    return row;
+  }
+
+  function render() {
+    try {
+      let box = document.getElementById("fsprobe2");
+      if (!box) {
+        box = document.createElement("div");
+        box.id = "fsprobe2";
+        box.style.cssText =
+          "position:fixed;left:6px;right:70px;bottom:6px;max-height:58vh;overflow:auto;" +
+          "z-index:2147483000;background:rgba(0,0,0,.92);color:#7CFC9B;" +
+          "font:10px/1.35 ui-monospace,Menlo,Consolas,monospace;white-space:pre;" +
+          "border:1px solid #7CFC9B;border-radius:6px;padding:6px 8px;" +
+          "user-select:text;-webkit-user-select:text;";
+        box.addEventListener("click", (e) => e.stopPropagation());
+        document.body.appendChild(box);
+      }
+      const head = "PROBE2  platform=" + (tg ? tg.platform : "n/a") +
+                   "  ver=" + (tg ? tg.version : "n/a") + "\n" +
+                   "t      event            fs     iw x ih   vv(w x h @s)   vh/vsh\n";
+      box.textContent = head + LOG.map((r) =>
+        `${r.t} ${String(r.ev).padEnd(16)} ${String(r.fs).padEnd(6)} ${r.iw}x${r.ih}  ${r.vvw}x${r.vvh}@${r.vvs}  ${r.vh}/${r.vsh}${r.note ? "  " + r.note : ""}`
+      ).join("\n");
+      box.scrollTop = box.scrollHeight;
+    } catch (e) { /* журнал никогда не ломает viewer */ }
+  }
+
+  snap("load");
+
+  if (tg && typeof tg.onEvent === "function") {
+    tg.onEvent("fullscreenChanged", () => snap("fullscreenChanged"));
+    tg.onEvent("fullscreenFailed", (p) => {
+      let d = "";
+      try { d = JSON.stringify(p); } catch (e) { d = "unserializable"; }
+      snap("fullscreenFailed", d);
+    });
+    // viewportChanged покажет, менялся ли реальный размер, даже если
+    // isFullscreen об этом не сообщает.
+    tg.onEvent("viewportChanged", (p) => {
+      let st = "";
+      try { st = p && p.isStateStable != null ? "stable=" + p.isStateStable : ""; } catch (e) {}
+      snap("viewportChanged", st);
+    });
+  }
+
+  let requested = false;
+
+  const origOpen = openLightbox;
+  openLightbox = function (images, index, opener) {
+    origOpen(images, index, opener);
+    try {
+      snap("lightboxOpen");
+      if (tg && typeof tg.requestFullscreen === "function" && !requested) {
+        requested = true;
+        snap("beforeRequest");
+        try {
+          tg.requestFullscreen();
+          snap("requestCalled");
+        } catch (e) {
+          snap("requestTHREW", e && e.message ? e.message : String(e));
+        }
+        [100, 500, 1000, 2000].forEach((ms) => setTimeout(() => snap("+" + ms + "ms"), ms));
+      }
+    } catch (e) { /* no-op */ }
+  };
+
+  // ГЛАВНОЕ: exitFullscreen() НЕ вызывается. Только журналируем, что
+  // происходит с Telegram после обычного закрытия картинки.
+  const origClose = closeLightbox;
+  closeLightbox = function () {
+    try { snap("beforeClose"); } catch (e) {}
+    origClose();
+    try {
+      snap("afterClose");
+      [100, 500, 1000, 2000].forEach((ms) => setTimeout(() => snap("close+" + ms + "ms"), ms));
+    } catch (e) { /* no-op */ }
+  };
+
+  window.__fsProbe2 = () => LOG;
+})();
+// ============ КОНЕЦ ВРЕМЕННОГО PROBE v2 ============
