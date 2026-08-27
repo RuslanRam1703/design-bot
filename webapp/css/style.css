@@ -173,98 +173,13 @@ a { color: var(--link); text-decoration: none; }
 
 /* ---- Кейс ---- */
 .case-images { display: flex; flex-direction: column; gap: 8px; margin-bottom: 12px; }
-.case-images img { width: 100%; border-radius: var(--radius); display: block; cursor: zoom-in; }
+/* Курсор намеренно обычный: изображение статично и по нажатию ничего не
+   делает, курсор-лупа обещал бы несуществующее увеличение. Раскладка та
+   же, что у .case-section-gallery ниже, — обе галереи вертикальные. */
+.case-images img { width: 100%; border-radius: var(--radius); display: block; }
 .case-block { margin-bottom: 14px; }
 .case-block .label { font-size: 12px; text-transform: uppercase; color: var(--hint); margin-bottom: 4px; letter-spacing: .03em; }
 .external-case-link { display: inline-block; margin-bottom: 14px; font-size: 14px; font-weight: 600; }
-
-/* ---- Lightbox: изображение кейса крупным планом ---- */
-.lightbox {
-  position: fixed; inset: 0; background: rgba(0, 0, 0, .9);
-  display: none; align-items: center; justify-content: center;
-  z-index: 100; padding: 24px; cursor: zoom-out;
-  /* Жесты внутри лайтбокса обрабатываются вручную (pinch-зум и
-     панорамирование, см. app.js). Без touch-action: none системный зум
-     WebView перехватывал бы те же касания и конфликтовал со свайпом. */
-  touch-action: none;
-  -webkit-user-select: none; user-select: none;
-  overflow: hidden;
-}
-.lightbox.open { display: flex; }
-/* На широком экране рамка в 24px заметно съедает окно Mini App — отдаём
-   картинке почти весь viewport. На десктопе лайтбокс вдобавок просит у
-   Telegram fullscreen (см. TG.fullscreen и машину состояний в app.js). */
-@media (min-width: 700px) { .lightbox { padding: 12px; } }
-/* width/height: 100% (не max-width/max-height) — иначе картинка не
-   растягивается крупнее своего "естественного" intrinsic-размера
-   (у наших SVG-обложек он всего 600x400) и остаётся маленькой посреди
-   тёмного экрана вместо "как обычное фото на весь экран". object-fit
-   сохраняет пропорции и не даёт растянуть с искажением. */
-.lightbox img {
-  width: 100%; height: 100%; object-fit: contain; border-radius: 8px;
-  transform-origin: center center;
-  will-change: transform;
-  -webkit-user-drag: none;
-}
-/* Плавный возврат к 1:1, но БЕЗ анимации во время самого жеста — иначе
-   зум «резиновый» и отстаёт от пальцев (класс zoomed ставится в app.js,
-   пока scale > 1). */
-.lightbox:not(.zoomed) img { transition: transform .18s ease-out; }
-.lightbox.zoomed { cursor: grab; }
-.lightbox.zoomed img { border-radius: 0; }
-.lightbox-close, .lightbox-prev, .lightbox-next {
-  position: absolute; border: none; background: rgba(255, 255, 255, .12); color: #fff;
-  border-radius: 50%; width: 40px; height: 40px; font-size: 20px; cursor: pointer;
-  display: flex; align-items: center; justify-content: center;
-  /* z-index обязателен, а не косметика. Картинка получила transform и
-     will-change (нужны для zoom/pan) — любое из двух создаёт stacking
-     context, и <img>, идущий в разметке ПОСЛЕ этих кнопок, начал
-     закрашиваться поверх них. Кнопки позиционированы, но с z-index:auto,
-     поэтому в споре с таким <img> проигрывали: замерено — центр, левый и
-     нижний край крестика попадали в IMG, и нажималась только узкая
-     полоска сверху/справа. До появления transform/will-change (сборка
-     ac1247fb) те же координаты попадали в кнопку — то есть геометрия ни
-     при чём, сменился порядок отрисовки. Явный z-index возвращает
-     кнопкам приоритет, не трогая ни их размеры, ни zoom/pan. */
-  z-index: 1;
-}
-/* Отступы учитывают content safe area Telegram. В fullscreen клиент рисует
-   поверх WebView собственные контролы, и документация вводит
-   --tg-content-safe-area-inset-* именно как область, свободную от них.
-   Значения берём у клиента, а не подбираем в пикселях. Фолбэк 0px
-   обязателен: вне Telegram и на клиентах, которые эти переменные не
-   выставляют, отступы остаются прежними, то есть раскладка вне
-   fullscreen не меняется вообще. */
-/* Крестик стоит ВНИЗУ по центру, а не в правом верхнем углу. Причина не
-   косметическая: в fullscreen Telegram рисует собственный × в правом
-   верхнем углу, и наш оказывался вплотную к нему — два одинаковых
-   крестика рядом с разным смыслом (наш закрывает картинку, нативный
-   управляет Mini App). Скрыть или переназначить нативный нельзя, поэтому
-   расходимся с ним по позиции. Нижняя зона свободна: нативные контролы
-   fullscreen живут сверху.
-   58px = 20px (отступ счётчика от низа) + 26px (его высота) + 12px
-   зазор, то есть кнопка садится ровно НАД счётчиком и не пересекает его
-   ни при одном viewport. Стрелки стоят по вертикальному центру у боковых
-   краёв и с нижней зоной не пересекаются. */
-.lightbox-close {
-  bottom: calc(58px + var(--tg-content-safe-area-inset-bottom, 0px));
-  left: 50%;
-  transform: translateX(-50%);
-}
-.lightbox-prev {
-  left: calc(16px + var(--tg-content-safe-area-inset-left, 0px));
-  top: 50%; transform: translateY(-50%);
-}
-.lightbox-next {
-  right: calc(16px + var(--tg-content-safe-area-inset-right, 0px));
-  top: 50%; transform: translateY(-50%);
-}
-.lightbox-counter {
-  position: absolute;
-  bottom: calc(20px + var(--tg-content-safe-area-inset-bottom, 0px));
-  left: 50%; transform: translateX(-50%);
-  color: #fff; font-size: 13px; background: rgba(255, 255, 255, .12); padding: 4px 10px; border-radius: 999px;
-}
 
 /* ---- Пустые состояния (нет изображений) ---- */
 .case-images-empty {

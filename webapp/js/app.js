@@ -40,49 +40,6 @@ const realTG = window.Telegram && window.Telegram.WebApp;
 const TG = {
   ready() { realTG?.ready(); },
   expand() { realTG?.expand(); },
-  // Fullscreen (Bot API 8.0+). ЕДИНСТВЕННОЕ место в приложении, которое
-  // трогает fullscreen-API Telegram — остальной код ходит только сюда.
-  //
-  // История: в 2026-08 fullscreen уже пробовали и откатили — при закрытии
-  // картинки закрывался весь Mini App. Диагностическими probe на реальном
-  // tdesktop 9.6 установлено, что дело было НЕ в exitFullscreen(): та
-  // реализация звала его вслепую, а крестик лайтбокса стоял в правом
-  // верхнем углу, где в fullscreen рисует свои контролы сам Telegram, и
-  // вдобавок имел баг hit-area. Проверка из заведомо безопасной зоны
-  // экрана показала штатный цикл: 576x877 -> requestFullscreen ->
-  // 1920x1080 -> exitFullscreen -> 576x877, Mini App остаётся открытым.
-  //
-  // Всё обёрнуто в try/catch: вне Telegram и на клиентах без поддержки
-  // вызов бросает синхронно (проверено: WebAppMethodUnsupported), и это
-  // не должно ломать просмотрщик — fullscreen здесь улучшение, а не
-  // условие работы.
-  fullscreen: {
-    // Только tdesktop: именно там окно Mini App маленькое и выигрыш
-    // реальный, и только там поведение подтверждено вживую. На мобильных
-    // приложение и так занимает почти весь экран — трогать их без
-    // проверки незачем.
-    isSupported() {
-      try {
-        return !!realTG
-          && realTG.platform === "tdesktop"
-          && typeof realTG.requestFullscreen === "function"
-          && typeof realTG.exitFullscreen === "function";
-      } catch (e) { return false; }
-    },
-    isActive() {
-      try { return realTG?.isFullscreen === true; } catch (e) { return false; }
-    },
-    // true — вызов ушёл; НЕ означает, что fullscreen включился: это
-    // подтверждается только событием onChanged (см. машину состояний).
-    request() {
-      try { realTG.requestFullscreen(); return true; } catch (e) { return false; }
-    },
-    exit() {
-      try { realTG.exitFullscreen(); return true; } catch (e) { return false; }
-    },
-    onChanged(cb) { try { realTG?.onEvent("fullscreenChanged", cb); } catch (e) {} },
-    onFailed(cb) { try { realTG?.onEvent("fullscreenFailed", cb); } catch (e) {} },
-  },
   themeParams() { return realTG?.themeParams || {}; },
   colorScheme() { return realTG?.colorScheme || "light"; },
   // initData — подписанный Telegram'ом пакет (user/auth_date/hash), сервер
@@ -345,9 +302,6 @@ async function init() {
   TG.expand();
   applyTheme();
   TG.onThemeChanged(applyTheme);
-  // Подписки на fullscreen ставятся один раз за жизнь страницы (см. fsInit)
-  // — вешать их на каждое открытие картинки значило бы копить обработчики.
-  fsInit();
   const restored = restoreBriefDraft();
   if (!state.brief.draftId) state.brief.draftId = generateDraftId();
   // См. state.briefEntryPending — восстановленный черновик БЕЗ реального
@@ -640,12 +594,15 @@ function renderCaseContent(c) {
 function renderCase() {
   const c = state.currentCase;
   const hasImages = c.images && c.images.length > 0;
+  // Изображения статичны: нажатие по ним ничего не делает. Поэтому ни
+  // tabindex, ни role="button" — картинка не элемент управления и не
+  // должна быть ни в порядке табуляции, ни объявлена кнопкой. Порядок
+  // images[] сохраняется как есть: cover не обязан быть первым (см.
+  // set_case_cover в bot/content_store.py), и переставлять его здесь
+  // значило бы показывать не то, что задал дизайнер.
   const images = hasImages
-    // tabindex/role/alt — минимум, нужный чтобы миниатюра была видимой
-    // точкой возврата фокуса после закрытия лайтбокса (см. closeLightbox).
     ? c.images.map((src, i) =>
-        `<img src="${imageSrc(src)}" alt="${escapeHtml(c.title)} — изображение ${i + 1}" ` +
-        `data-lightbox-index="${i}" tabindex="0" role="button" />`
+        `<img src="${imageSrc(src)}" alt="${escapeHtml(c.title)} — изображение ${i + 1}" />`
       ).join("")
     : `<div class="case-images-empty">Пока нет изображений</div>`;
   // external_url — необязательное поле (см. bot/content_store.py -> CASE_FIELD_LABELS);
@@ -668,15 +625,7 @@ function renderCase() {
 function attachCaseEvents() {
   document.getElementById("back").addEventListener("click", goBack);
   const c = state.currentCase;
-  document.querySelectorAll("[data-lightbox-index]").forEach((el) => {
-    const open = () => openLightbox(c.images.map(imageSrc), Number(el.dataset.lightboxIndex), el);
-    el.addEventListener("click", open);
-    // Клавиатурный эквивалент клика по миниатюре — картинка теперь в
-    // порядке табуляции (tabindex="0", см. renderCase).
-    el.addEventListener("keydown", (e) => {
-      if (e.key === "Enter" || e.key === " ") { e.preventDefault(); open(); }
-    });
-  });
+  // Изображениям обработчики не вешаются: они статичны (см. renderCase).
   document.getElementById("want-similar").addEventListener("click", () => {
     // order_template.service_id (см. data/portfolio.json) — переносим ТОЛЬКО
     // услугу, не опции. order_template.options — статические demo-данные:
@@ -702,278 +651,6 @@ function attachCaseEvents() {
     navigate("brief", { resetBrief: true });
   });
 }
-
-// ---- Lightbox: просмотр изображений кейса крупным планом (несколько
-// изображений — стрелки/свайп/счётчик; одно — просто открыть/закрыть).
-// На десктопе дополнительно просит fullscreen — см. машину состояний
-// ниже и историю вопроса в комментарии к TG.fullscreen. На остальных
-// платформах и вне Telegram работает как раньше, в обычном режиме. ----
-let lightboxEl = null;
-let lightboxImages = [];
-let lightboxIndex = 0;
-let lightboxOpener = null; // элемент, с которого открыли — туда возвращаем фокус
-
-// Состояние зума. scale === 1 означает "как было раньше": свайп листает,
-// панорамирование выключено. Всё, что связано с зумом, живёт только внутри
-// лайтбокса и сбрасывается при смене картинки и при закрытии.
-const LIGHTBOX_MAX_SCALE = 4;
-let lbScale = 1;
-let lbTx = 0;
-let lbTy = 0;
-
-// ---- Fullscreen лайтбокса: машина состояний с ЯВНЫМ владением ----
-//
-// Зачем владение, а не просто isFullscreen: выйти из fullscreen можно
-// только если в него вошли МЫ и именно этим открытием картинки. Иначе
-// возможны два плохих случая — выйти из fullscreen, который пользователь
-// включил сам (Telegram отвечает fullscreenFailed: ALREADY_FULLSCREEN), и
-// зависнуть в fullscreen, если подтверждение придёт уже после закрытия
-// картинки.
-//
-//   IDLE ──request──> REQUESTED ──changed(true)──> OWNED ──close──> EXITING
-//                        │                            │               │
-//                        │ failed / throw             │ changed(false)│ changed(false)
-//                        ↓                            │  извне        ↓
-//                       IDLE <──────────────────────  IDLE  <───────  IDLE
-//                        │
-//                        │ close до подтверждения
-//                        ↓
-//                  PENDING_CANCEL ──changed(true)──> exit() ──> EXITING
-//
-const FS_IDLE = "IDLE";
-const FS_REQUESTED = "REQUESTED";
-const FS_OWNED = "OWNED";
-const FS_PENDING_CANCEL = "PENDING_CANCEL";
-const FS_EXITING = "EXITING";
-
-// Подтверждение/выход обязаны прийти событием. Если клиент промолчал —
-// не зависаем в переходном состоянии навсегда, а возвращаемся в IDLE:
-// хуже висящего REQUESTED только висящий EXITING.
-const FS_CONFIRM_TIMEOUT_MS = 3000;
-
-let fsState = FS_IDLE;
-let fsTimer = null;
-
-function fsClearTimer() {
-  if (fsTimer !== null) { clearTimeout(fsTimer); fsTimer = null; }
-}
-
-function fsSet(state) {
-  fsState = state;
-  fsClearTimer();
-  if (state === FS_REQUESTED || state === FS_PENDING_CANCEL || state === FS_EXITING) {
-    fsTimer = setTimeout(() => { fsTimer = null; fsState = FS_IDLE; }, FS_CONFIRM_TIMEOUT_MS);
-  }
-}
-
-// Подписки ставятся ОДИН раз на всё приложение, а не на каждое открытие
-// картинки — иначе обработчики копились бы с каждым просмотром.
-function fsInit() {
-  if (!TG.fullscreen.isSupported()) return;
-  TG.fullscreen.onChanged(() => {
-    const active = TG.fullscreen.isActive();
-    if (active) {
-      if (fsState === FS_REQUESTED) {
-        fsSet(FS_OWNED);                 // вошли и владеем
-      } else if (fsState === FS_PENDING_CANCEL) {
-        // Картинку закрыли раньше, чем Telegram подтвердил вход. Сразу
-        // выходим — иначе Mini App остался бы на весь экран без причины.
-        fsSet(FS_EXITING);
-        if (!TG.fullscreen.exit()) fsSet(FS_IDLE);
-      }
-    } else {
-      // Вышли — неважно, по нашему exit() или снаружи. Владение снято,
-      // автоматически возвращать fullscreen не пытаемся.
-      fsSet(FS_IDLE);
-    }
-  });
-  TG.fullscreen.onFailed(() => {
-    // Сюда попадает и ALREADY_FULLSCREEN: fullscreen включили не мы,
-    // значит владения нет и выходить из него мы не вправе.
-    if (fsState === FS_REQUESTED || fsState === FS_PENDING_CANCEL) fsSet(FS_IDLE);
-  });
-}
-
-function fsRequestForLightbox() {
-  if (!TG.fullscreen.isSupported()) return;
-  if (fsState !== FS_IDLE) return;        // без повторных запросов
-  if (TG.fullscreen.isActive()) return;   // уже полноэкранно — не наше
-  fsSet(FS_REQUESTED);
-  if (!TG.fullscreen.request()) fsSet(FS_IDLE);   // синхронный throw
-}
-
-function fsReleaseForLightbox() {
-  if (fsState === FS_OWNED) {
-    fsSet(FS_EXITING);
-    if (!TG.fullscreen.exit()) fsSet(FS_IDLE);    // синхронный throw
-  } else if (fsState === FS_REQUESTED) {
-    fsSet(FS_PENDING_CANCEL);              // подтверждение ещё в пути
-  }
-  // IDLE/PENDING_CANCEL/EXITING — выходить нечего и не из чего.
-}
-
-function lightboxImg() {
-  return lightboxEl.querySelector("img");
-}
-
-function applyLightboxTransform() {
-  const img = lightboxImg();
-  img.style.transform = `translate(${lbTx}px, ${lbTy}px) scale(${lbScale})`;
-  // Пока картинка не увеличена, лайтбокс ведёт себя ровно как раньше;
-  // класс нужен только чтобы курсор/выделение не мешали панорамированию.
-  lightboxEl.classList.toggle("zoomed", lbScale > 1);
-}
-
-function resetLightboxZoom() {
-  lbScale = 1;
-  lbTx = 0;
-  lbTy = 0;
-  if (lightboxEl) applyLightboxTransform();
-}
-
-// Панорамирование ограничено так, чтобы картинку нельзя было утащить за
-// пределы экрана и потерять (вместе с ней — кнопку закрытия).
-function clampLightboxPan() {
-  const img = lightboxImg();
-  const maxX = Math.max(0, (img.clientWidth * lbScale - img.clientWidth) / 2);
-  const maxY = Math.max(0, (img.clientHeight * lbScale - img.clientHeight) / 2);
-  lbTx = Math.min(maxX, Math.max(-maxX, lbTx));
-  lbTy = Math.min(maxY, Math.max(-maxY, lbTy));
-}
-
-function openLightbox(images, index, opener) {
-  lightboxImages = images;
-  lightboxIndex = index;
-  lightboxOpener = opener || null;
-  if (!lightboxEl) {
-    lightboxEl = document.createElement("div");
-    lightboxEl.className = "lightbox";
-    lightboxEl.innerHTML = `
-      <button class="lightbox-close" aria-label="Закрыть">✕</button>
-      <button class="lightbox-prev" aria-label="Предыдущее">‹</button>
-      <img alt="Изображение кейса" />
-      <button class="lightbox-next" aria-label="Следующее">›</button>
-      <div class="lightbox-counter"></div>
-    `;
-    document.body.appendChild(lightboxEl);
-    lightboxEl.querySelector(".lightbox-close").addEventListener("click", closeLightbox);
-    lightboxEl.querySelector(".lightbox-prev").addEventListener("click", (e) => { e.stopPropagation(); lightboxStep(-1); });
-    lightboxEl.querySelector(".lightbox-next").addEventListener("click", (e) => { e.stopPropagation(); lightboxStep(1); });
-    lightboxEl.addEventListener("click", (e) => { if (e.target === lightboxEl) closeLightbox(); });
-
-    // ---- Жесты ----
-    // Один палец при scale === 1 — прежний свайп-листатель (порог 40px).
-    // Один палец при увеличенной картинке — панорамирование, НЕ листание.
-    // Два пальца — только зум; свайп в это время запрещён и остаётся
-    // запрещённым до полного отрыва пальцев, иначе разведение/сведение
-    // пальцев случайно перелистывало бы кадр.
-    let touchStartX = null;
-    let panStartX = 0, panStartY = 0, panOriginX = 0, panOriginY = 0;
-    let pinchStartDist = 0, pinchStartScale = 1;
-    let gestureIsPinch = false;
-
-    const dist = (t) => Math.hypot(
-      t[0].clientX - t[1].clientX,
-      t[0].clientY - t[1].clientY
-    );
-
-    lightboxEl.addEventListener("touchstart", (e) => {
-      if (e.touches.length === 2) {
-        gestureIsPinch = true;
-        touchStartX = null;               // свайп отменён на весь жест
-        pinchStartDist = dist(e.touches);
-        pinchStartScale = lbScale;
-      } else if (e.touches.length === 1 && !gestureIsPinch) {
-        if (lbScale > 1) {
-          panStartX = e.touches[0].clientX;
-          panStartY = e.touches[0].clientY;
-          panOriginX = lbTx;
-          panOriginY = lbTy;
-        } else {
-          touchStartX = e.touches[0].clientX;
-        }
-      }
-    }, { passive: true });
-
-    lightboxEl.addEventListener("touchmove", (e) => {
-      if (e.touches.length === 2 && pinchStartDist > 0) {
-        const ratio = dist(e.touches) / pinchStartDist;
-        lbScale = Math.min(LIGHTBOX_MAX_SCALE, Math.max(1, pinchStartScale * ratio));
-        if (lbScale === 1) { lbTx = 0; lbTy = 0; }
-        clampLightboxPan();
-        applyLightboxTransform();
-        e.preventDefault();               // не отдаём жест системному зуму
-      } else if (e.touches.length === 1 && lbScale > 1 && !gestureIsPinch) {
-        lbTx = panOriginX + (e.touches[0].clientX - panStartX);
-        lbTy = panOriginY + (e.touches[0].clientY - panStartY);
-        clampLightboxPan();
-        applyLightboxTransform();
-        e.preventDefault();               // панорамирование вместо прокрутки
-      }
-    }, { passive: false });
-
-    lightboxEl.addEventListener("touchend", (e) => {
-      if (e.touches.length === 0) {
-        // Жест закончился целиком — только теперь снимаем запрет свайпа.
-        if (gestureIsPinch) { gestureIsPinch = false; touchStartX = null; return; }
-        if (touchStartX !== null && lbScale === 1) {
-          const dx = e.changedTouches[0].clientX - touchStartX;
-          if (Math.abs(dx) > 40) lightboxStep(dx > 0 ? -1 : 1);
-        }
-        touchStartX = null;
-      }
-    });
-  }
-  resetLightboxZoom();
-  renderLightboxImage();
-  lightboxEl.classList.add("open");
-  // BackButton на время просмотра закрывает картинку, а не уводит с экрана
-  // кейса. TG.backButton.show() сам снимает предыдущий обработчик перед
-  // установкой нового (см. шим TG выше), поэтому дублей не возникает.
-  TG.backButton.show(closeLightbox);
-  lightboxEl.querySelector(".lightbox-close").focus();
-  // Fullscreen запрашивается ПОСЛЕДНИМ и ничего не блокирует: лайтбокс уже
-  // открыт и полностью рабочий. Не получилось — останется оконным.
-  fsRequestForLightbox();
-}
-
-function lightboxStep(delta) {
-  lightboxIndex = (lightboxIndex + delta + lightboxImages.length) % lightboxImages.length;
-  renderLightboxImage();
-}
-
-function renderLightboxImage() {
-  resetLightboxZoom();                    // новая картинка — всегда без зума
-  lightboxImg().src = lightboxImages[lightboxIndex];
-  const multi = lightboxImages.length > 1;
-  lightboxEl.querySelector(".lightbox-counter").textContent = multi ? `${lightboxIndex + 1} / ${lightboxImages.length}` : "";
-  lightboxEl.querySelector(".lightbox-prev").style.display = multi ? "" : "none";
-  lightboxEl.querySelector(".lightbox-next").style.display = multi ? "" : "none";
-}
-
-function closeLightbox() {
-  if (!lightboxEl) return;
-  lightboxEl.classList.remove("open");
-  resetLightboxZoom();
-  // Порядок важен: сперва полностью возвращаем экран кейса (клавиатура,
-  // фокус, BackButton), и только потом просим Telegram выйти из
-  // fullscreen. Если выход окажется медленным или беззвучным,
-  // пользователь всё равно уже на рабочем экране кейса.
-  // Возвращаем BackButton экрану кейса — лайтбокс открывается только
-  // оттуда (см. attachCaseEvents), и там он всегда ведёт на goBack
-  // (см. render(), case "case").
-  TG.backButton.show(goBack);
-  if (lightboxOpener && document.body.contains(lightboxOpener)) lightboxOpener.focus();
-  lightboxOpener = null;
-  fsReleaseForLightbox();
-}
-
-document.addEventListener("keydown", (e) => {
-  if (!lightboxEl || !lightboxEl.classList.contains("open")) return;
-  if (e.key === "Escape") closeLightbox();
-  else if (e.key === "ArrowLeft") lightboxStep(-1);
-  else if (e.key === "ArrowRight") lightboxStep(1);
-});
 
 // ---- Экран: Обо мне ----
 function renderAbout() {
