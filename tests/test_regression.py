@@ -5004,6 +5004,23 @@ def patch_archive_upload(cover: str = UPLOAD_TEST_COVER, message_id: int = 1):
 GALLERY_TEST_URL = "https://cdn4.telesco.pe/file/GALLERYTESTIMAGE"
 
 
+
+def client_acks(fake_bot, user_id: int = 42):
+    """Подтверждения, ушедшие КЛИЕНТУ (в его личный чат).
+
+    После fix'а «acknowledge clients after lead submission» боевой HTTP-путь
+    шлёт два сообщения на одну заявку — уведомление дизайнеру и
+    подтверждение клиенту. Тесты, которые проверяют именно уведомление
+    дизайнера, обязаны считать его отдельно, иначе assert_awaited_once()
+    ловил бы сумму двух разных сообщений."""
+    return [c for c in fake_bot.send_message.await_args_list if c.kwargs.get("chat_id") == user_id]
+
+
+def designer_notifications(fake_bot, user_id: int = 42):
+    """Всё, что ушло НЕ клиенту, — то есть уведомления дизайнеру."""
+    return [c for c in fake_bot.send_message.await_args_list if c.kwargs.get("chat_id") != user_id]
+
+
 def patch_gallery_upload(url: str = GALLERY_TEST_URL, message_id: int = 2):
     """Успешная публикация КАРТИНКИ ГАЛЕРЕИ в архив — зеркало
     patch_archive_upload для тестов, чья суть архив не составляет
@@ -9352,7 +9369,10 @@ class CreateLeadHttpEndpointTests(unittest.IsolatedAsyncioTestCase):
 
         leads = await content_store.list_leads_by_user(42)
         self.assertEqual(len(leads), 1)  # заявка всё равно создана
-        fake_bot.send_message.assert_not_awaited()  # но уведомление не отправлено
+        # Уведомление дизайнеру не отправлено (некуда)...
+        self.assertEqual(designer_notifications(fake_bot), [])
+        # ...а подтверждение клиенту от этого не зависит и всё равно уходит.
+        self.assertEqual(len(client_acks(fake_bot)), 1)
         self.assertTrue(any("DESIGNER_CHAT_ID" in msg for msg in log_ctx.output))  # предупреждение залогировано
 
     async def test_missing_init_data_is_401_and_creates_no_lead(self):
@@ -9538,8 +9558,11 @@ class CreateLeadHttpEndpointTests(unittest.IsolatedAsyncioTestCase):
                     headers={"X-Telegram-Init-Data": self._init_data(), "Content-Type": "application/json"},
                     json={"service_name": "Лендинг"},
                 )
-            fake_bot.send_message.assert_awaited_once()
-            self.assertEqual(fake_bot.send_message.await_args.kwargs["chat_id"], "777")
+            # Ровно одно уведомление ДИЗАЙНЕРУ (клиент получает своё
+            # подтверждение отдельным сообщением, см. client_acks).
+            designer = designer_notifications(fake_bot)
+            self.assertEqual(len(designer), 1)
+            self.assertEqual(designer[0].kwargs["chat_id"], "777")
         finally:
             webserver.config.DESIGNER_CHAT_ID = self._orig_designer
 
@@ -9605,7 +9628,7 @@ class SubmitIdempotencyTests(unittest.IsolatedAsyncioTestCase):
             body = await resp.json()
             self.assertTrue(body["created"])
 
-        fake_bot.send_message.assert_awaited_once()
+        self.assertEqual(len(designer_notifications(fake_bot)), 1)
 
     async def test_repeat_post_same_draft_id_returns_created_false_and_no_second_notification(self):
         # Симулирует ровно баг из аудита: несколько POST одного и того же
@@ -9628,7 +9651,9 @@ class SubmitIdempotencyTests(unittest.IsolatedAsyncioTestCase):
 
         # Один lead (upsert), но ОДНО уведомление — не пять.
         self.assertEqual(len(await content_store.list_leads_by_user(42)), 1)
-        fake_bot.send_message.assert_awaited_once()
+        # Ни второго уведомления дизайнеру, ни второго подтверждения клиенту.
+        self.assertEqual(len(designer_notifications(fake_bot)), 1)
+        self.assertEqual(len(client_acks(fake_bot)), 1)
 
     async def test_different_user_same_draft_id_is_rejected(self):
         # См. production-аудит, P1-2: draft_id — обычная строка из
@@ -9665,7 +9690,219 @@ class SubmitIdempotencyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(await content_store.list_leads_by_user(42)), 1)
         # Уведомление владельцу ушло РОВНО один раз (за первую, настоящую
         # заявку) — отклонённая коллизия не притворилась новой заявкой.
-        fake_bot.send_message.assert_awaited_once()
+        self.assertEqual(len(designer_notifications(fake_bot)), 1)
+        # И подтверждение получил только настоящий владелец draft_id:
+        # user 999 не должен узнать, что коллизия вообще во что-то попала.
+        self.assertEqual(len(client_acks(fake_bot, user_id=42)), 1)
+        self.assertEqual(client_acks(fake_bot, user_id=999), [])
+
+
+class ClientAcknowledgementHttpFlowTests(unittest.IsolatedAsyncioTestCase):
+    """Подтверждение КЛИЕНТУ в боевом HTTP-пути (POST /api/leads).
+
+    Защищаемый дефект: Mini App отправляет заявку через POST /api/leads, а
+    этот путь уведомлял только дизайнера — клиенту не уходило ничего. Текст
+    с инструкцией «пришлите файл следующим сообщением» существовал, но
+    вызывался лишь из legacy-обработчика sendData(), который Mini App давно
+    не использует. Поэтому клиент, закрывший окно (в том числе кнопкой
+    «Отправить материалы»), оказывался в чате без единого сообщения о том,
+    что произошло и что делать дальше.
+
+    Тесты бьют именно по HTTP-пути, а не по legacy handle_webapp_data —
+    зелёные тесты legacy-пути и были причиной, по которой дефект дожил до
+    production."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        real_data_dir = Path(__file__).resolve().parent.parent / "data"
+        for name in ("pricing.json", "portfolio.json", "faq.json", "about.json", "ui_config.json"):
+            shutil.copy(real_data_dir / name, Path(self.tmpdir) / name)
+        self._orig_data_dir = content_store.DATA_DIR
+        self._orig_token = webserver.config.BOT_TOKEN
+        self._orig_designer = webserver.config.DESIGNER_CHAT_ID
+        content_store.DATA_DIR = Path(self.tmpdir)
+        webserver.config.BOT_TOKEN = "123456:test-token-not-real"
+        webserver.config.DESIGNER_CHAT_ID = "777"
+
+    def tearDown(self):
+        content_store.DATA_DIR = self._orig_data_dir
+        webserver.config.BOT_TOKEN = self._orig_token
+        webserver.config.DESIGNER_CHAT_ID = self._orig_designer
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def _init_data(self, user_id=42, **extra_fields):
+        fields = {
+            "auth_date": str(int(time.time())),
+            "user": json.dumps({"id": user_id, "first_name": "Клиент", "username": "client1"}),
+            **extra_fields,
+        }
+        return _sign_init_data(fields, webserver.config.BOT_TOKEN)
+
+    async def _post(self, fake_bot, payload, user_id=42):
+        from aiohttp.test_utils import TestClient, TestServer
+
+        app = webserver.create_app(fake_bot)
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.post(
+                "/api/leads",
+                headers={"X-Telegram-Init-Data": self._init_data(user_id=user_id), "Content-Type": "application/json"},
+                json=payload,
+            )
+            return resp.status, await resp.json()
+
+    # ---- Новая заявка ----
+
+    async def test_attach_tz_true_client_gets_instruction_to_send_file(self):
+        fake_bot = AsyncMock()
+        status, body = await self._post(fake_bot, {"service_name": "Лендинг", "attach_tz": True, "draft_id": "ack-1"})
+        self.assertEqual(status, 200)
+
+        # Заявка создана и ждёт файл — механика привязки не менялась.
+        lead = await content_store.find_lead_awaiting_file(42)
+        self.assertIsNotNone(lead)
+        self.assertEqual(lead["id"], body["lead_id"])
+
+        # Дизайнер по-прежнему уведомлён — ровно один раз.
+        self.assertEqual(len(designer_notifications(fake_bot)), 1)
+
+        # И КЛИЕНТ получил подтверждение с инструкцией.
+        acks = client_acks(fake_bot)
+        self.assertEqual(len(acks), 1)
+        self.assertEqual(acks[0].kwargs["chat_id"], 42)
+        text = acks[0].kwargs["text"]
+        self.assertIn(str(body["lead_id"]), text)
+        self.assertIn("следующим сообщением", text)
+
+    async def test_attach_tz_false_client_gets_plain_confirmation_without_file_ask(self):
+        fake_bot = AsyncMock()
+        status, body = await self._post(fake_bot, {"service_name": "Лендинг", "attach_tz": False, "draft_id": "ack-2"})
+        self.assertEqual(status, 200)
+        self.assertEqual(len(designer_notifications(fake_bot)), 1)
+
+        acks = client_acks(fake_bot)
+        self.assertEqual(len(acks), 1)
+        text = acks[0].kwargs["text"]
+        self.assertIn(str(body["lead_id"]), text)
+        # Ложной инструкции про файл быть не должно — заявка его не ждёт.
+        self.assertNotIn("следующим сообщением", text)
+        self.assertIsNone(await content_store.find_lead_awaiting_file(42))
+
+    async def test_client_ack_includes_service_and_price_when_calculated(self):
+        fake_bot = AsyncMock()
+        await self._post(fake_bot, {
+            "service_name": "Лендинг", "attach_tz": False, "draft_id": "ack-3",
+            "calc": {"service_id": "SITE", "options": [{"id": "SITE_1", "qty": 1}], "urgent": False, "complex": False},
+        })
+        text = client_acks(fake_bot)[0].kwargs["text"]
+        self.assertIn("Лендинг", text)
+        self.assertIn("Предварительная стоимость", text)
+
+    async def test_repeat_submit_of_same_draft_does_not_send_second_ack(self):
+        """Идемпотентность: повторный POST того же черновика обновляет ту же
+        заявку и не должен слать клиенту второе подтверждение."""
+        fake_bot = AsyncMock()
+        await self._post(fake_bot, {"service_name": "Лендинг", "attach_tz": True, "draft_id": "ack-dup"})
+        await self._post(fake_bot, {"service_name": "Лендинг", "attach_tz": True, "draft_id": "ack-dup"})
+        self.assertEqual(len(client_acks(fake_bot)), 1)
+        self.assertEqual(len(designer_notifications(fake_bot)), 1)
+
+    async def test_exactly_one_ack_per_submit_no_double_mechanism(self):
+        """В HTTP-пути не должно быть двух механизмов подтверждения: legacy
+        sendData-обработчик существует, но Mini App его не вызывает."""
+        fake_bot = AsyncMock()
+        await self._post(fake_bot, {"service_name": "Лендинг", "attach_tz": True, "draft_id": "ack-single"})
+        self.assertEqual(fake_bot.send_message.await_count, 2)  # ровно: дизайнер + клиент
+        self.assertEqual(len(client_acks(fake_bot)), 1)
+
+    async def test_ack_failure_does_not_break_lead_creation(self):
+        """Отправка подтверждения — best-effort: если Telegram недоступен,
+        заявка всё равно создана, а запрос завершается успехом."""
+        fake_bot = AsyncMock()
+        fake_bot.send_message = AsyncMock(side_effect=RuntimeError("bot blocked by user"))
+        status, body = await self._post(fake_bot, {"service_name": "Лендинг", "attach_tz": True, "draft_id": "ack-fail"})
+        self.assertEqual(status, 200)
+        self.assertIn("lead_id", body)
+        self.assertEqual(len(await content_store.list_leads_by_user(42)), 1)
+        self.assertIsNotNone(await content_store.find_lead_awaiting_file(42))
+
+    async def test_ack_goes_to_identity_from_signed_init_data_only(self):
+        """chat_id берётся из подписанного initData, а не из тела запроса —
+        подставленный user_id не может увести подтверждение в чужой чат."""
+        fake_bot = AsyncMock()
+        await self._post(fake_bot, {
+            "service_name": "Лендинг", "attach_tz": False, "draft_id": "ack-id",
+            "user_id": 999, "telegram": {"user_id": 999}, "chat_id": 999,
+        })
+        acks = client_acks(fake_bot, user_id=42)
+        self.assertEqual(len(acks), 1)
+        self.assertEqual(client_acks(fake_bot, user_id=999), [])
+
+    # ---- Дополнение (supplement) ----
+
+    async def _create_lead_for_supplement(self, fake_bot):
+        _, body = await self._post(fake_bot, {"service_name": "Лендинг", "draft_id": "sup-base"})
+        fake_bot.send_message.reset_mock()
+        return body["lead_id"]
+
+    async def test_supplement_wants_file_true_client_gets_instruction(self):
+        from aiohttp.test_utils import TestClient, TestServer
+
+        fake_bot = AsyncMock()
+        lead_id = await self._create_lead_for_supplement(fake_bot)
+        app = webserver.create_app(fake_bot)
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.post(
+                "/api/leads",
+                headers={"X-Telegram-Init-Data": self._init_data(), "Content-Type": "application/json"},
+                json={"mode": "supplement", "lead_id": lead_id, "fields": {"comment": "деталь"}, "wants_file": True},
+            )
+            self.assertEqual(resp.status, 200)
+
+        self.assertEqual(len(designer_notifications(fake_bot)), 1)
+        acks = client_acks(fake_bot)
+        self.assertEqual(len(acks), 1)
+        text = acks[0].kwargs["text"]
+        self.assertIn(str(lead_id), text)
+        self.assertIn("следующим сообщением", text)
+        # Дополнение действительно перевело заявку в ожидание файла.
+        self.assertIsNotNone(await content_store.find_lead_awaiting_file(42))
+
+    async def test_supplement_wants_file_false_client_gets_plain_confirmation(self):
+        from aiohttp.test_utils import TestClient, TestServer
+
+        fake_bot = AsyncMock()
+        lead_id = await self._create_lead_for_supplement(fake_bot)
+        app = webserver.create_app(fake_bot)
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.post(
+                "/api/leads",
+                headers={"X-Telegram-Init-Data": self._init_data(), "Content-Type": "application/json"},
+                json={"mode": "supplement", "lead_id": lead_id, "fields": {"comment": "деталь"}, "wants_file": False},
+            )
+            self.assertEqual(resp.status, 200)
+
+        acks = client_acks(fake_bot)
+        self.assertEqual(len(acks), 1)
+        text = acks[0].kwargs["text"]
+        self.assertIn(str(lead_id), text)
+        self.assertNotIn("следующим сообщением", text)
+        self.assertIsNone(await content_store.find_lead_awaiting_file(42))
+
+    async def test_rejected_supplement_sends_no_client_ack(self):
+        """Чужая/несуществующая заявка -> 404 и НИ одного сообщения:
+        подтверждение не должно подсказывать, что lead_id существует."""
+        from aiohttp.test_utils import TestClient, TestServer
+
+        fake_bot = AsyncMock()
+        app = webserver.create_app(fake_bot)
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.post(
+                "/api/leads",
+                headers={"X-Telegram-Init-Data": self._init_data(), "Content-Type": "application/json"},
+                json={"mode": "supplement", "lead_id": 999999, "fields": {"comment": "x"}, "wants_file": True},
+            )
+            self.assertEqual(resp.status, 404)
+        fake_bot.send_message.assert_not_awaited()
 
 
 class LeadSupplementTests(unittest.IsolatedAsyncioTestCase):
@@ -9837,8 +10074,9 @@ class LeadSupplementTests(unittest.IsolatedAsyncioTestCase):
                 json={"mode": "supplement", "lead_id": lead_id, "fields": {"comment": "важная деталь"}},
             )
 
-        fake_bot.send_message.assert_awaited_once()
-        text = fake_bot.send_message.await_args.kwargs["text"]
+        designer = designer_notifications(fake_bot)
+        self.assertEqual(len(designer), 1)
+        text = designer[0].kwargs["text"]
         self.assertIn(f"Дополнение к заявке #{lead_id}", text)
         self.assertNotIn("Новая заявка", text)
         self.assertIn("важная деталь", text)

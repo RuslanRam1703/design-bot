@@ -6,7 +6,7 @@ from pathlib import Path
 from aiogram import Bot
 from aiohttp import web
 
-from bot import config, content_store
+from bot import config, content_store, texts
 from bot.calculator import calculate
 from bot.data import load_pricing
 from bot.lead import format_lead_message, format_lead_supplement_message
@@ -160,6 +160,44 @@ async def handle_create_lead(request: web.Request) -> web.Response:
     return await _handle_lead_create(payload, telegram_identity, bot)
 
 
+async def _notify_client(bot: Bot, telegram_identity: dict, text: str, *, lead_id: int) -> None:
+    """Подтверждение КЛИЕНТУ в его чат с ботом — best-effort.
+
+    Зачем вообще: Mini App отправляет заявку через POST /api/leads, и до
+    этого места по боевому пути клиенту не уходило НИЧЕГО — уведомление
+    получал только дизайнер. Пользователь закрывал окно (в том числе
+    кнопкой «Отправить материалы») и оказывался в чате, где не было ни
+    подтверждения, ни инструкции прислать файл, хотя заявка уже ждала его
+    (awaiting_tz_file). Текст с инструкцией в texts.py существовал, но
+    вызывался только из legacy-обработчика sendData(), который Mini App
+    больше не использует.
+
+    chat_id берётся из telegram_identity — а он собран из подписи initData
+    (см. handle_create_lead выше), не из тела запроса. Отправить
+    подтверждение в чужой чат подставленным id поэтому невозможно.
+
+    Ошибка отправки НЕ проваливает запрос: заявка уже сохранена и
+    дизайнер уже уведомлён — тот же принцип best-effort, что и у
+    уведомления дизайнера чуть ниже. Клиент в худшем случае не увидит
+    подтверждения, но заявка не потеряется."""
+    user_id = telegram_identity.get("user_id")
+    if not user_id:
+        return
+    try:
+        await bot.send_message(chat_id=user_id, text=text)
+    except Exception:
+        logger.exception("Не удалось отправить подтверждение клиенту (lead #%s)", lead_id)
+
+
+def _price_range_text(calc_summary: dict | None) -> str | None:
+    """Та же форма строки, что и в legacy-пути (bot/handlers/webapp.py):
+    тексты подтверждений общие, значит и цена в них должна выглядеть
+    одинаково независимо от того, каким путём пришла заявка."""
+    if not calc_summary:
+        return None
+    return f"{calc_summary['price_from']:,} – {calc_summary['price_to']:,} ₽".replace(",", " ")
+
+
 async def _handle_lead_create(payload: dict, telegram_identity: dict, bot: Bot) -> web.Response:
     calc_result = None
     calc_payload = payload.get("calc")
@@ -204,6 +242,18 @@ async def _handle_lead_create(payload: dict, telegram_identity: dict, bot: Bot) 
                 logger.exception("Не удалось отправить заявку дизайнеру (lead #%s)", lead["id"])
         else:
             logger.warning("DESIGNER_CHAT_ID не задан — заявка не отправлена дизайнеру (lead #%s)", lead["id"])
+
+        # Подтверждение клиенту — под тем же `if created`, что и уведомление
+        # дизайнера: повторный POST того же draft_id обновляет ту же заявку
+        # и не должен слать вторую копию подтверждения (клиент его уже
+        # получил при первой отправке).
+        attach_tz = bool(payload.get("attach_tz"))
+        ack = texts.lead_ack_ask_file if attach_tz else texts.lead_received_ack
+        await _notify_client(
+            bot, telegram_identity,
+            ack(lead["id"], payload.get("service_name"), _price_range_text(calc_summary)),
+            lead_id=lead["id"],
+        )
 
     price_range = None
     if calc_summary:
@@ -265,6 +315,16 @@ async def _handle_lead_supplement(payload: dict, telegram_identity: dict, bot: B
             logger.exception("Не удалось отправить дополнение дизайнеру (lead #%s)", lead_id)
     else:
         logger.warning("DESIGNER_CHAT_ID не задан — дополнение не отправлено дизайнеру (lead #%s)", lead_id)
+
+    # Тот же принцип, что и при создании заявки: клиент, закрывший Mini App,
+    # должен увидеть в чате и подтверждение, и — если отметил файл —
+    # инструкцию его прислать (add_lead_supplement уже выставил
+    # awaiting_tz_file, см. wants_file выше).
+    await _notify_client(
+        bot, telegram_identity,
+        texts.supplement_ack_ask_file(lead_id) if wants_file else texts.supplement_ack(lead_id),
+        lead_id=lead_id,
+    )
 
     return web.json_response(
         {"lead_id": lead_id, "supplement_id": supplement_id},
