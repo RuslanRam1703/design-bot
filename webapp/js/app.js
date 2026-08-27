@@ -40,11 +40,49 @@ const realTG = window.Telegram && window.Telegram.WebApp;
 const TG = {
   ready() { realTG?.ready(); },
   expand() { realTG?.expand(); },
-  // requestFullscreen() пробовали для лайтбокса (Bot API 8.0+) — в реальном
-  // Telegram-клиенте exitFullscreen() при закрытии лайтбокса закрывал весь
-  // Mini App целиком, а не только лайтбокс (живой баг, воспроизвести и
-  // продиагностировать точнее без реального Telegram нельзя). Убрано —
-  // лайтбокс работает в обычном (не полноэкранном) режиме Mini App.
+  // Fullscreen (Bot API 8.0+). ЕДИНСТВЕННОЕ место в приложении, которое
+  // трогает fullscreen-API Telegram — остальной код ходит только сюда.
+  //
+  // История: в 2026-08 fullscreen уже пробовали и откатили — при закрытии
+  // картинки закрывался весь Mini App. Диагностическими probe на реальном
+  // tdesktop 9.6 установлено, что дело было НЕ в exitFullscreen(): та
+  // реализация звала его вслепую, а крестик лайтбокса стоял в правом
+  // верхнем углу, где в fullscreen рисует свои контролы сам Telegram, и
+  // вдобавок имел баг hit-area. Проверка из заведомо безопасной зоны
+  // экрана показала штатный цикл: 576x877 -> requestFullscreen ->
+  // 1920x1080 -> exitFullscreen -> 576x877, Mini App остаётся открытым.
+  //
+  // Всё обёрнуто в try/catch: вне Telegram и на клиентах без поддержки
+  // вызов бросает синхронно (проверено: WebAppMethodUnsupported), и это
+  // не должно ломать просмотрщик — fullscreen здесь улучшение, а не
+  // условие работы.
+  fullscreen: {
+    // Только tdesktop: именно там окно Mini App маленькое и выигрыш
+    // реальный, и только там поведение подтверждено вживую. На мобильных
+    // приложение и так занимает почти весь экран — трогать их без
+    // проверки незачем.
+    isSupported() {
+      try {
+        return !!realTG
+          && realTG.platform === "tdesktop"
+          && typeof realTG.requestFullscreen === "function"
+          && typeof realTG.exitFullscreen === "function";
+      } catch (e) { return false; }
+    },
+    isActive() {
+      try { return realTG?.isFullscreen === true; } catch (e) { return false; }
+    },
+    // true — вызов ушёл; НЕ означает, что fullscreen включился: это
+    // подтверждается только событием onChanged (см. машину состояний).
+    request() {
+      try { realTG.requestFullscreen(); return true; } catch (e) { return false; }
+    },
+    exit() {
+      try { realTG.exitFullscreen(); return true; } catch (e) { return false; }
+    },
+    onChanged(cb) { try { realTG?.onEvent("fullscreenChanged", cb); } catch (e) {} },
+    onFailed(cb) { try { realTG?.onEvent("fullscreenFailed", cb); } catch (e) {} },
+  },
   themeParams() { return realTG?.themeParams || {}; },
   colorScheme() { return realTG?.colorScheme || "light"; },
   // initData — подписанный Telegram'ом пакет (user/auth_date/hash), сервер
@@ -307,6 +345,9 @@ async function init() {
   TG.expand();
   applyTheme();
   TG.onThemeChanged(applyTheme);
+  // Подписки на fullscreen ставятся один раз за жизнь страницы (см. fsInit)
+  // — вешать их на каждое открытие картинки значило бы копить обработчики.
+  fsInit();
   const restored = restoreBriefDraft();
   if (!state.brief.draftId) state.brief.draftId = generateDraftId();
   // См. state.briefEntryPending — восстановленный черновик БЕЗ реального
@@ -664,10 +705,9 @@ function attachCaseEvents() {
 
 // ---- Lightbox: просмотр изображений кейса крупным планом (несколько
 // изображений — стрелки/свайп/счётчик; одно — просто открыть/закрыть).
-// Без requestFullscreen() — пробовали раньше, в реальном Telegram-клиенте
-// exitFullscreen() при закрытии закрывал весь Mini App целиком, а не
-// только картинку (живой баг, воспроизведённый пользователем). Работает
-// в обычном (не полноэкранном) режиме Mini App. ----
+// На десктопе дополнительно просит fullscreen — см. машину состояний
+// ниже и историю вопроса в комментарии к TG.fullscreen. На остальных
+// платформах и вне Telegram работает как раньше, в обычном режиме. ----
 let lightboxEl = null;
 let lightboxImages = [];
 let lightboxIndex = 0;
@@ -680,6 +720,97 @@ const LIGHTBOX_MAX_SCALE = 4;
 let lbScale = 1;
 let lbTx = 0;
 let lbTy = 0;
+
+// ---- Fullscreen лайтбокса: машина состояний с ЯВНЫМ владением ----
+//
+// Зачем владение, а не просто isFullscreen: выйти из fullscreen можно
+// только если в него вошли МЫ и именно этим открытием картинки. Иначе
+// возможны два плохих случая — выйти из fullscreen, который пользователь
+// включил сам (Telegram отвечает fullscreenFailed: ALREADY_FULLSCREEN), и
+// зависнуть в fullscreen, если подтверждение придёт уже после закрытия
+// картинки.
+//
+//   IDLE ──request──> REQUESTED ──changed(true)──> OWNED ──close──> EXITING
+//                        │                            │               │
+//                        │ failed / throw             │ changed(false)│ changed(false)
+//                        ↓                            │  извне        ↓
+//                       IDLE <──────────────────────  IDLE  <───────  IDLE
+//                        │
+//                        │ close до подтверждения
+//                        ↓
+//                  PENDING_CANCEL ──changed(true)──> exit() ──> EXITING
+//
+const FS_IDLE = "IDLE";
+const FS_REQUESTED = "REQUESTED";
+const FS_OWNED = "OWNED";
+const FS_PENDING_CANCEL = "PENDING_CANCEL";
+const FS_EXITING = "EXITING";
+
+// Подтверждение/выход обязаны прийти событием. Если клиент промолчал —
+// не зависаем в переходном состоянии навсегда, а возвращаемся в IDLE:
+// хуже висящего REQUESTED только висящий EXITING.
+const FS_CONFIRM_TIMEOUT_MS = 3000;
+
+let fsState = FS_IDLE;
+let fsTimer = null;
+
+function fsClearTimer() {
+  if (fsTimer !== null) { clearTimeout(fsTimer); fsTimer = null; }
+}
+
+function fsSet(state) {
+  fsState = state;
+  fsClearTimer();
+  if (state === FS_REQUESTED || state === FS_PENDING_CANCEL || state === FS_EXITING) {
+    fsTimer = setTimeout(() => { fsTimer = null; fsState = FS_IDLE; }, FS_CONFIRM_TIMEOUT_MS);
+  }
+}
+
+// Подписки ставятся ОДИН раз на всё приложение, а не на каждое открытие
+// картинки — иначе обработчики копились бы с каждым просмотром.
+function fsInit() {
+  if (!TG.fullscreen.isSupported()) return;
+  TG.fullscreen.onChanged(() => {
+    const active = TG.fullscreen.isActive();
+    if (active) {
+      if (fsState === FS_REQUESTED) {
+        fsSet(FS_OWNED);                 // вошли и владеем
+      } else if (fsState === FS_PENDING_CANCEL) {
+        // Картинку закрыли раньше, чем Telegram подтвердил вход. Сразу
+        // выходим — иначе Mini App остался бы на весь экран без причины.
+        fsSet(FS_EXITING);
+        if (!TG.fullscreen.exit()) fsSet(FS_IDLE);
+      }
+    } else {
+      // Вышли — неважно, по нашему exit() или снаружи. Владение снято,
+      // автоматически возвращать fullscreen не пытаемся.
+      fsSet(FS_IDLE);
+    }
+  });
+  TG.fullscreen.onFailed(() => {
+    // Сюда попадает и ALREADY_FULLSCREEN: fullscreen включили не мы,
+    // значит владения нет и выходить из него мы не вправе.
+    if (fsState === FS_REQUESTED || fsState === FS_PENDING_CANCEL) fsSet(FS_IDLE);
+  });
+}
+
+function fsRequestForLightbox() {
+  if (!TG.fullscreen.isSupported()) return;
+  if (fsState !== FS_IDLE) return;        // без повторных запросов
+  if (TG.fullscreen.isActive()) return;   // уже полноэкранно — не наше
+  fsSet(FS_REQUESTED);
+  if (!TG.fullscreen.request()) fsSet(FS_IDLE);   // синхронный throw
+}
+
+function fsReleaseForLightbox() {
+  if (fsState === FS_OWNED) {
+    fsSet(FS_EXITING);
+    if (!TG.fullscreen.exit()) fsSet(FS_IDLE);    // синхронный throw
+  } else if (fsState === FS_REQUESTED) {
+    fsSet(FS_PENDING_CANCEL);              // подтверждение ещё в пути
+  }
+  // IDLE/PENDING_CANCEL/EXITING — выходить нечего и не из чего.
+}
 
 function lightboxImg() {
   return lightboxEl.querySelector("img");
@@ -801,6 +932,9 @@ function openLightbox(images, index, opener) {
   // установкой нового (см. шим TG выше), поэтому дублей не возникает.
   TG.backButton.show(closeLightbox);
   lightboxEl.querySelector(".lightbox-close").focus();
+  // Fullscreen запрашивается ПОСЛЕДНИМ и ничего не блокирует: лайтбокс уже
+  // открыт и полностью рабочий. Не получилось — останется оконным.
+  fsRequestForLightbox();
 }
 
 function lightboxStep(delta) {
@@ -821,12 +955,17 @@ function closeLightbox() {
   if (!lightboxEl) return;
   lightboxEl.classList.remove("open");
   resetLightboxZoom();
+  // Порядок важен: сперва полностью возвращаем экран кейса (клавиатура,
+  // фокус, BackButton), и только потом просим Telegram выйти из
+  // fullscreen. Если выход окажется медленным или беззвучным,
+  // пользователь всё равно уже на рабочем экране кейса.
   // Возвращаем BackButton экрану кейса — лайтбокс открывается только
   // оттуда (см. attachCaseEvents), и там он всегда ведёт на goBack
   // (см. render(), case "case").
   TG.backButton.show(goBack);
   if (lightboxOpener && document.body.contains(lightboxOpener)) lightboxOpener.focus();
   lightboxOpener = null;
+  fsReleaseForLightbox();
 }
 
 document.addEventListener("keydown", (e) => {
@@ -2332,164 +2471,3 @@ document.addEventListener("click", (e) => {
 });
 
 init();
-
-// ============================================================================
-// ВРЕМЕННЫЙ PROBE v3 — ПРОВЕРКА exitFullscreen() (УДАЛИТЬ ПОСЛЕ ТЕСТА)
-// ----------------------------------------------------------------------------
-// Устанавливает РОВНО ОДИН факт: закрывает ли tg.exitFullscreen() весь Mini App
-// на tdesktop 9.6, если вызвать его из заведомо безопасной области экрана.
-//
-// Зачем перепроверять. Прежний вывод «exitFullscreen() убивает Mini App» не
-// доказан: в том тесте панель probe не была видна, то есть вызова никто не
-// зафиксировал, а нажимали крестик в правом верхнем углу — там же, где в
-// fullscreen рисует свои контролы сам Telegram (документация вводит
-// contentSafeAreaInset именно как область, свободную от «overlapping Telegram
-// UI elements»). Вдобавок у крестика тогда был баг hit-area. Поэтому равно
-// вероятно, что закрылось приложение от нативной кнопки Telegram, а не от
-// нашего вызова.
-//
-// Здесь этот confound исключён: кнопка теста — крупная, в НИЖНЕЙ ЛЕВОЙ части,
-// далеко от правого верхнего угла, от крестика лайтбокса и от стрелок
-// (.lightbox-prev/.lightbox-next стоят по вертикальному центру).
-//
-// Строго один запуск = один requestFullscreen() + один exitFullscreen().
-// Никаких повторов, никаких Telegram.WebApp.close(), никаких программных
-// закрытий лайтбокса и никаких манипуляций BackButton.
-// ============================================================================
-(function exitFullscreenProbe3() {
-  const tg = window.Telegram && window.Telegram.WebApp;
-  const LOG = [];
-  const t0 = Date.now();
-  let requested = false;   // один requestFullscreen() за сессию
-  let exited = false;      // один exitFullscreen() за сессию
-
-  function snap(event, note) {
-    const vv = window.visualViewport;
-    LOG.push({
-      t: String(Date.now() - t0).padStart(6, " ") + "ms",
-      ev: event,
-      fs: tg ? String(tg.isFullscreen) : "n/a",
-      iw: window.innerWidth, ih: window.innerHeight,
-      vvw: vv ? Math.round(vv.width) : "-", vvh: vv ? Math.round(vv.height) : "-",
-      vvs: vv ? Math.round(vv.scale * 100) / 100 : "-",
-      vh: tg && tg.viewportHeight != null ? Math.round(tg.viewportHeight) : "-",
-      vsh: tg && tg.viewportStableHeight != null ? Math.round(tg.viewportStableHeight) : "-",
-      note: note || "",
-    });
-    render();
-  }
-
-  function render() {
-    try {
-      let box = document.getElementById("fsprobe3");
-      if (!box) {
-        box = document.createElement("div");
-        box.id = "fsprobe3";
-        // Внизу, не доходя до правого края: сверху справа — и наш крестик
-        // (z-index: 1), и нативные контролы Telegram в fullscreen.
-        box.style.cssText =
-          "position:fixed;left:6px;right:70px;bottom:6px;max-height:30vh;overflow:auto;" +
-          "z-index:2147483000;background:rgba(0,0,0,.92);color:#7CFC9B;" +
-          "font:10px/1.35 ui-monospace,Menlo,Consolas,monospace;white-space:pre;" +
-          "border:1px solid #7CFC9B;border-radius:6px;padding:6px 8px;" +
-          "user-select:text;-webkit-user-select:text;";
-        box.addEventListener("click", (e) => e.stopPropagation());
-        document.body.appendChild(box);
-      }
-      box.textContent =
-        "PROBE3 exitFullscreen  platform=" + (tg ? tg.platform : "n/a") +
-        "  ver=" + (tg ? tg.version : "n/a") + "\n" +
-        "t        event          fs     iw x ih     vv(w x h @s)    vh/vsh\n" +
-        LOG.map((r) =>
-          `${r.t} ${String(r.ev).padEnd(14)} ${String(r.fs).padEnd(6)} ${r.iw}x${r.ih}  ${r.vvw}x${r.vvh}@${r.vvs}  ${r.vh}/${r.vsh}${r.note ? "  " + r.note : ""}`
-        ).join("\n");
-      box.scrollTop = box.scrollHeight;
-    } catch (e) { /* журнал не должен ломать viewer */ }
-  }
-
-  // Кнопка появляется ТОЛЬКО после подтверждённого fullscreen и живёт на
-  // document.body — она и журнал должны пережить закрытие лайтбокса.
-  function showExitButton() {
-    try {
-      if (document.getElementById("fsprobe3btn")) return;
-      const b = document.createElement("button");
-      b.id = "fsprobe3btn";
-      b.textContent = "TEST EXIT FULLSCREEN";
-      b.style.cssText =
-        "position:fixed;left:16px;bottom:32vh;z-index:2147483001;" +
-        "width:270px;height:68px;font:700 15px/1.2 system-ui,sans-serif;" +
-        "background:#ff3b30;color:#fff;border:3px solid #fff;border-radius:12px;" +
-        "cursor:pointer;box-shadow:0 4px 18px rgba(0,0,0,.6);";
-      b.addEventListener("click", (e) => {
-        e.stopPropagation();
-        if (exited) { snap("ignoredRepeat", "уже вызывали один раз"); return; }
-        exited = true;
-        b.disabled = true;
-        b.textContent = "exitFullscreen() ВЫЗВАН";
-        b.style.background = "#555";
-        snap("beforeExit");
-        try {
-          tg.exitFullscreen();
-          snap("exitCalled");
-        } catch (err) {
-          snap("exitTHREW", err && err.message ? err.message : String(err));
-        }
-        [100, 500, 1000, 2000, 3000].forEach((ms) =>
-          setTimeout(() => snap("exit+" + ms + "ms"), ms)
-        );
-      });
-      document.body.appendChild(b);
-      snap("exitButtonShown");
-    } catch (e) { /* no-op */ }
-  }
-
-  snap("load");
-
-  if (tg && typeof tg.onEvent === "function") {
-    tg.onEvent("fullscreenChanged", () => {
-      snap("fullscreenChanged");
-      if (tg.isFullscreen === true) showExitButton();
-    });
-    tg.onEvent("fullscreenFailed", (p) => {
-      let d = "";
-      try { d = JSON.stringify(p); } catch (e) { d = "unserializable"; }
-      snap("fullscreenFailed", d);
-    });
-    tg.onEvent("viewportChanged", (p) => {
-      let st = "";
-      try { st = p && p.isStateStable != null ? "stable=" + p.isStateStable : ""; } catch (e) {}
-      snap("viewportChanged", st);
-    });
-  }
-
-  const origOpen = openLightbox;
-  openLightbox = function (images, index, opener) {
-    origOpen(images, index, opener);
-    try {
-      snap("lightboxOpen");
-      if (tg && typeof tg.requestFullscreen === "function" && !requested) {
-        requested = true;
-        snap("beforeRequest");
-        try {
-          tg.requestFullscreen();
-          snap("requestCalled");
-        } catch (e) {
-          snap("requestTHREW", e && e.message ? e.message : String(e));
-        }
-        [100, 500, 1000, 2000].forEach((ms) => setTimeout(() => snap("req+" + ms + "ms"), ms));
-      }
-    } catch (e) { /* no-op */ }
-  };
-
-  // Закрытие лайтбокса только журналируется. exitFullscreen() отсюда НЕ
-  // вызывается — он вызывается исключительно по нажатию кнопки теста.
-  const origClose = closeLightbox;
-  closeLightbox = function () {
-    try { snap("beforeClose"); } catch (e) {}
-    origClose();
-    try { snap("afterClose"); } catch (e) {}
-  };
-
-  window.__fsProbe3 = () => LOG;
-})();
-// ============ КОНЕЦ ВРЕМЕННОГО PROBE v3 ============

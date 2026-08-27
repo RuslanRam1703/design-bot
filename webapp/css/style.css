@@ -228,11 +228,30 @@ a { color: var(--link); text-decoration: none; }
      кнопкам приоритет, не трогая ни их размеры, ни zoom/pan. */
   z-index: 1;
 }
-.lightbox-close { top: 16px; right: 16px; }
-.lightbox-prev { left: 16px; top: 50%; transform: translateY(-50%); }
-.lightbox-next { right: 16px; top: 50%; transform: translateY(-50%); }
+/* Отступы учитывают content safe area Telegram. В fullscreen клиент рисует
+   поверх WebView собственные контролы, и документация вводит
+   --tg-content-safe-area-inset-* именно как область, свободную от них —
+   ровно та зона, куда раньше попадал крестик и где нажатия уходили в
+   интерфейс Telegram. Значения берём у клиента, а не подбираем в пикселях.
+   Фолбэк 0px обязателен: вне Telegram и на клиентах, которые эти
+   переменные не выставляют, отступы остаются прежними (16px), то есть
+   раскладка вне fullscreen не меняется вообще. */
+.lightbox-close {
+  top: calc(16px + var(--tg-content-safe-area-inset-top, 0px));
+  right: calc(16px + var(--tg-content-safe-area-inset-right, 0px));
+}
+.lightbox-prev {
+  left: calc(16px + var(--tg-content-safe-area-inset-left, 0px));
+  top: 50%; transform: translateY(-50%);
+}
+.lightbox-next {
+  right: calc(16px + var(--tg-content-safe-area-inset-right, 0px));
+  top: 50%; transform: translateY(-50%);
+}
 .lightbox-counter {
-  position: absolute; bottom: 20px; left: 50%; transform: translateX(-50%);
+  position: absolute;
+  bottom: calc(20px + var(--tg-content-safe-area-inset-bottom, 0px));
+  left: 50%; transform: translateX(-50%);
   color: #fff; font-size: 13px; background: rgba(255, 255, 255, .12); padding: 4px 10px; border-radius: 999px;
 }
 
