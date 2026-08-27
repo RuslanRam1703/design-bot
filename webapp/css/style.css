@@ -216,6 +216,17 @@ a { color: var(--link); text-decoration: none; }
   position: absolute; border: none; background: rgba(255, 255, 255, .12); color: #fff;
   border-radius: 50%; width: 40px; height: 40px; font-size: 20px; cursor: pointer;
   display: flex; align-items: center; justify-content: center;
+  /* z-index обязателен, а не косметика. Картинка получила transform и
+     will-change (нужны для zoom/pan) — любое из двух создаёт stacking
+     context, и <img>, идущий в разметке ПОСЛЕ этих кнопок, начал
+     закрашиваться поверх них. Кнопки позиционированы, но с z-index:auto,
+     поэтому в споре с таким <img> проигрывали: замерено — центр, левый и
+     нижний край крестика попадали в IMG, и нажималась только узкая
+     полоска сверху/справа. До появления transform/will-change (сборка
+     ac1247fb) те же координаты попадали в кнопку — то есть геометрия ни
+     при чём, сменился порядок отрисовки. Явный z-index возвращает
+     кнопкам приоритет, не трогая ни их размеры, ни zoom/pan. */
+  z-index: 1;
 }
 .lightbox-close { top: 16px; right: 16px; }
 .lightbox-prev { left: 16px; top: 50%; transform: translateY(-50%); }
