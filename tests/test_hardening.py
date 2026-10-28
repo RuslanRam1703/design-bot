@@ -139,6 +139,44 @@ class HardeningTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(fake.store[content_store._LOCK_NAMESPACE + "leads.json"], "other-instance")
 
 
+    async def test_remote_mutex_excludes_another_instance(self):
+        import asyncio
+        from bot import content_store
+        from test_regression import FakeUpstash
+        fake = FakeUpstash()
+        with patch.object(content_store.config, "UPSTASH_REDIS_REST_URL", "https://fake/"), \
+             patch.object(content_store.config, "UPSTASH_REDIS_REST_TOKEN", "fake"), \
+             patch("bot.content_store.urllib.request.urlopen", side_effect=fake.urlopen):
+            mutex = content_store._LOCK_NAMESPACE + "leads.json"
+            async with content_store._lock("leads.json"):
+                self.assertIsNone(await asyncio.to_thread(
+                    content_store._upstash_command, "SET", mutex, "second-instance", "NX", "PX", 120000,
+                ))
+                self.assertEqual(fake.store[mutex], content_store._active_redis_tokens.get()["leads.json"])
+            self.assertEqual(await asyncio.to_thread(
+                content_store._upstash_command, "SET", mutex, "second-instance", "NX", "PX", 120000,
+            ), "OK")
+
+    async def test_expired_delivery_claim_can_be_recovered(self):
+        import tempfile
+        from pathlib import Path
+        from bot import content_store
+        with tempfile.TemporaryDirectory() as tmp, patch.object(content_store, "DATA_DIR", Path(tmp)):
+            lead = await content_store.add_lead({"service_name": "A"}, {"user_id": 42})
+            claimed = await content_store.claim_designer_notification(lead["id"], 1)
+            old_token = claimed["designer_notification"]["claim_token"]
+            async with content_store._lock("leads.json"):
+                data = await content_store._read("leads.json")
+                data["leads"][0]["designer_notification"]["claim_until"] = "2020-01-01T00:00:00+00:00"
+                await content_store._write("leads.json", data)
+            due = await content_store.pending_designer_notifications()
+            self.assertEqual(len(due), 1)
+            recovered = await content_store.claim_designer_notification(lead["id"], 1)
+            new_token = recovered["designer_notification"]["claim_token"]
+            self.assertNotEqual(old_token, new_token)
+            self.assertFalse(await content_store.finish_designer_notification(lead["id"], 1, old_token, "sent"))
+            self.assertTrue(await content_store.finish_designer_notification(lead["id"], 1, new_token, "sent"))
+
 
 if __name__ == "__main__":
     unittest.main()
