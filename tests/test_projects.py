@@ -60,6 +60,21 @@ class ProjectLedgerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([p["id"] for p in projects], [demo["id"]])
         self.assertEqual((await content_store.get_lead(lead["id"]))["status"], "VIEWED")
 
+    async def test_upstash_lead_mutation_preserves_project_ledger(self):
+        from test_regression import FakeUpstash
+        fake = FakeUpstash()
+        fake.store[content_store.MARKER_KEY] = "1"
+        fake.store["leads.json"] = json.dumps({"leads": []})
+        with patch.object(config, "UPSTASH_REDIS_REST_URL", "https://fake/"), \
+             patch.object(config, "UPSTASH_REDIS_REST_TOKEN", "fake"), \
+             patch("bot.content_store.urllib.request.urlopen", side_effect=fake.urlopen):
+            demo = await project_store.create_demo(777)
+            lead = await self.new_lead()
+            self.assertTrue(await content_store.update_lead_status(777, lead["id"], "IN_PROGRESS"))
+            preserved = await project_store.list_projects(777)
+            self.assertEqual([p["id"] for p in preserved], [demo["id"]])
+            self.assertEqual(json.loads(fake.store["leads.json"])["projects"][0]["id"], demo["id"])
+
     async def test_private_ledger_is_not_in_client_lead_record(self):
         lead = await self.new_lead()
         project = await project_store.create_from_lead(777, lead["id"])
