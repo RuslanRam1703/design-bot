@@ -295,6 +295,8 @@ async def _handle_lead_create(payload: dict, telegram_identity: dict, bot: Bot) 
     # обновляет ту же заявку через add_lead(), но не должен слать вторую
     # копию "Новая заявка" в чат дизайнеру.
     if created or lead.get("changed") or (lead.get("designer_notification") or {}).get("state") != "sent":
+        if not config.DESIGNER_CHAT_ID:
+            logger.warning("DESIGNER_CHAT_ID не задан — уведомление о заявке #%s ожидает отправки", lead["id"])
         await notify_designer_lead(bot, lead)
 
     if created:
