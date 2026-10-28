@@ -9,7 +9,7 @@ import uuid
 from html import escape
 
 from aiogram import F, Router
-from aiogram.filters import Command
+from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, Message
@@ -233,6 +233,6 @@ async def intake_cancel(callback: CallbackQuery, state: FSMContext):
 
 
 @router.message(QuestionStates.awaiting_question, Command("cancel"))
-@router.message(QuickLeadStates, Command("cancel"))
+@router.message(StateFilter(QuickLeadStates), Command("cancel"))
 async def intake_cancel_command(message: Message, state: FSMContext):
     await flow.open_root(message, state, texts.CLIENT_HOME, client_home_keyboard(config.WEBAPP_URL))
