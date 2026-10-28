@@ -171,10 +171,10 @@ class ProjectLedgerTests(unittest.IsolatedAsyncioTestCase):
     async def test_native_keyboard_actions_and_escape_output(self):
         project = await self.new_project()
         project["title"] = "Лендинг <b>&"
-        card = admin_projects._project_text(demo)
+        card = admin_projects._project_text(project)
         self.assertIn("&lt;b&gt;&amp;", card)
         self.assertNotIn("Лендинг <b>&", card)
-        keys = [b.callback_data for row in project_keyboards.project_detail(demo).inline_keyboard for b in row]
+        keys = [b.callback_data for row in project_keyboards.project_detail(project).inline_keyboard for b in row]
         self.assertIn("pj:price", keys)
         self.assertIn("pj:deadline", keys)
         self.assertIn("pj:stage", keys)
