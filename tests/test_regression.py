@@ -3281,7 +3281,7 @@ class AdminRemainingAnchorGapsTests(unittest.IsolatedAsyncioTestCase):
         await state.set_state(AdminStates.edit_about_field_pick)
         cb = make_callback("admineditabout:done", chat_id=self.actor, message_id=msg_id)
         await admin.about_edit_field(cb, state)
-        cb.message.edit_text.assert_awaited_once_with("Админ-меню:", reply_markup=kb.admin_root_keyboard())
+        cb.message.edit_text.assert_awaited_once_with("Контент — что хотите изменить?", reply_markup=kb.admin_content_keyboard())
         await self._assert_main_menu_cleans_current_screen(state, msg_id, 12500)
 
     # ---- Categories: add ----
