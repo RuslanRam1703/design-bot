@@ -111,3 +111,15 @@ class AdminStates(StatesGroup):
     backup_menu = State()
     backup_restore_wait_file = State()
     backup_restore_confirm = State()
+
+
+class ProjectStates(StatesGroup):
+    """Owner-only finance/project screens in Telegram, not client-facing."""
+    list = State()
+    detail = State()
+    price_input = State()
+    deadline_input = State()
+    payment_input = State()
+    payment_confirm = State()
+    void_confirm = State()
+    delete_demo_confirm = State()
