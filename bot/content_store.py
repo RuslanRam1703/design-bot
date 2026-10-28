@@ -321,7 +321,16 @@ async def _read(filename: str) -> Any:
         # инициализации, что и в ensure_storage_initialized, безопасно
         # досеять именно этот файл.
         data = _read_local(filename)
-        await asyncio.to_thread(_upstash_command, "SET", filename, json.dumps(data, ensure_ascii=False), "NX")
+        inserted = await asyncio.to_thread(
+            _upstash_command, "SET", filename, json.dumps(data, ensure_ascii=False), "NX",
+        )
+        if inserted != "OK":
+            # Another instance won the concurrent first-seed race: use its
+            # authoritative value instead of returning the stale local seed.
+            current = await asyncio.to_thread(_upstash_command, "GET", filename)
+            if current is None:
+                raise UpstashKeyMissingError(filename)
+            return json.loads(current)
         return data
     return json.loads(raw)
 
