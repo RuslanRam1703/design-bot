@@ -93,6 +93,17 @@ class NativeIntakeTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(await state.get_state())
         self.assertEqual(await content_store.list_leads_by_user(31), [])
 
+    async def test_relay_preserves_literal_angle_brackets_and_ampersands(self):
+        from test_regression import make_message
+        msg = make_message(chat_id=1)
+        msg.text = "Можно дизайн <сайта> & фирменного стиля?"
+        with patch("bot.handlers.start.config.DESIGNER_CHAT_ID", "777"):
+            await start.relay_client_text_to_designer(msg, make_state(1))
+        msg.bot.send_message.assert_awaited_once()
+        kwargs = msg.bot.send_message.await_args.kwargs
+        self.assertIn("<сайта> & фирменного стиля", kwargs["text"])
+        self.assertIsNone(kwargs["parse_mode"])
+
     async def test_preview_escapes_user_html(self):
         text = client_intake._preview("Лендинг <b> & дизайн", "name<broken")
         self.assertIn("&lt;b&gt; &amp;", text)
