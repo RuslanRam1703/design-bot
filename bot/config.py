@@ -9,6 +9,11 @@ DESIGNER_CHAT_ID = os.getenv("DESIGNER_CHAT_ID", "")
 WEBAPP_URL = os.getenv("WEBAPP_URL", "").rstrip("/")
 PORT = int(os.getenv("PORT", "8080"))
 
+# True: require signed Telegram Mini App identity to read all /data/*.json.
+# False (default): anonymous web portfolio preview stays public; blocked
+# Telegram IDs are denied on authenticated requests, but may browse anonymously.
+PRIVATE_MINIAPP_CONTENT = os.getenv("PRIVATE_MINIAPP_CONTENT", "0").strip().lower() in ("1", "true", "yes")
+
 # Опционально: Upstash Redis (REST API) как персистентное хранилище для
 # data/*.json — на Render (и большинстве бесплатных PaaS) файловая система
 # эфемерна и сбрасывается на каждый redeploy/restart, теряя и заявки, и

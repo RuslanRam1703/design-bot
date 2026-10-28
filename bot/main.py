@@ -15,7 +15,7 @@ from aiogram.types import (
 from aiohttp import web
 
 from bot import config, content_store, texts
-from bot.handlers import admin, admin_projects, client_intake, faq, start, webapp
+from bot.handlers import admin, admin_access, admin_projects, client_intake, faq, start, webapp
 from bot.webserver import create_app
 from bot.notifications import retry_designer_notifications
 
@@ -105,6 +105,10 @@ async def main() -> None:
     # admin — первым: /admin не должен перехватываться catch-all из start.
     # webapp — тоже раньше faq/start, т.к. должен первым перехватывать
     # web_app_data и ответы в состоянии "ждём файл ТЗ".
+    from bot.access_control import AccessMiddleware
+    dp.message.outer_middleware(AccessMiddleware())
+    dp.callback_query.outer_middleware(AccessMiddleware())
+    dp.include_router(admin_access.router)
     dp.include_router(admin_projects.router)
     dp.include_router(admin.router)
     dp.include_router(webapp.router)

@@ -113,6 +113,10 @@ class AdminStates(StatesGroup):
     backup_restore_confirm = State()
 
 
+class AccessStates(StatesGroup):
+    target_input = State()
+
+
 class ProjectStates(StatesGroup):
     """Owner-only finance/project screens in Telegram, not client-facing."""
     list = State()

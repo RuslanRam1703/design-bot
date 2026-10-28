@@ -81,6 +81,7 @@ def admin_root_keyboard() -> InlineKeyboardMarkup:
          InlineKeyboardButton(text="📂 Проекты", callback_data="adminmenu:projects")],
         [InlineKeyboardButton(text="📁 Контент", callback_data="adminmenu:content"),
          InlineKeyboardButton(text="💰 Услуги и цены", callback_data="adminmenu:pricing")],
+        [InlineKeyboardButton(text="👥 Пользователи и доступ", callback_data="access:root")],
         [InlineKeyboardButton(text="⚙️ Настройки и данные", callback_data="adminmenu:settings")],
     ])
 
