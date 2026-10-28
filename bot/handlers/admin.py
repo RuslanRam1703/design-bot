@@ -405,6 +405,20 @@ async def menu_root(callback: CallbackQuery, state: FSMContext) -> None:
     await callback.answer()
 
 
+@router.callback_query(F.data == "adminmenu:content")
+async def menu_content(callback: CallbackQuery, state: FSMContext) -> None:
+    await flow.reset_state_keep_nav(state)
+    await flow.step_from_callback(callback, state, "Контент — что хотите изменить?", kb.admin_content_keyboard())
+    await callback.answer()
+
+
+@router.callback_query(F.data == "adminmenu:settings")
+async def menu_settings(callback: CallbackQuery, state: FSMContext) -> None:
+    await flow.reset_state_keep_nav(state)
+    await flow.step_from_callback(callback, state, "Настройки и данные:", kb.admin_settings_keyboard())
+    await callback.answer()
+
+
 @router.callback_query(F.data == "adminmenu:cases")
 async def menu_cases(callback: CallbackQuery, state: FSMContext) -> None:
     await flow.reset_state_keep_nav(state)
@@ -1598,7 +1612,7 @@ async def about_edit_field(callback: CallbackQuery, state: FSMContext) -> None:
     if field == "done":
         # flow.step_from_callback (P1-3, Batch 4).
         await flow.reset_state_keep_nav(state)
-        await flow.step_from_callback(callback, state, "Админ-меню:", kb.admin_root_keyboard())
+        await flow.step_from_callback(callback, state, "Контент — что хотите изменить?", kb.admin_content_keyboard())
         await callback.answer()
         return
     if field == "experience":

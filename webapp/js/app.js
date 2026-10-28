@@ -251,6 +251,8 @@ function restoreBriefDraft() {
     const saved = localStorage.getItem(BRIEF_DRAFT_STORAGE_KEY);
     if (saved) {
       state.brief = { ...state.brief, ...JSON.parse(saved) };
+      state.brief.complex = false;
+      if (state.brief.calc) state.brief.calc.complex = false;
       parseOk = true;
     }
   } catch (e) {
@@ -305,7 +307,7 @@ function resetBriefState({ hardReset = false } = {}) {
     sourceCaseTitle: hardReset ? null : (state.brief.sourceCaseTitle || null),
     orderOptions: hardReset ? {} : (state.brief.orderOptions || {}),
     urgent: hardReset ? false : (state.brief.urgent || false),
-    complex: hardReset ? false : (state.brief.complex || false),
+    complex: false,
     // resetBriefState всегда означает осознанный новый заход в заявку
     // (кейс/калькулятор/about) — новый draftId, чтобы не перезаписать
     // предыдущую, уже отправленную заявку при следующем submit.
@@ -871,15 +873,11 @@ function attachCalculatorEvents() {
     state.calc.urgent = urgentToggle.checked;
     render();
   });
-  const complexToggle = document.getElementById("complex-toggle");
-  if (complexToggle) complexToggle.addEventListener("change", () => {
-    state.calc.complex = complexToggle.checked;
-    render();
-  });
+  // Professional complexity is confirmed by the designer, not selected by a client.
 
   const submitBtn = document.getElementById("submit-with-calc");
   if (submitBtn) submitBtn.addEventListener("click", () => {
-    const result = calculatePrice(state.pricing, state.calc.serviceId, state.calc.options, state.calc.urgent, state.calc.complex);
+    const result = calculatePrice(state.pricing, state.calc.serviceId, state.calc.options, state.calc.urgent, false);
     state.brief.serviceId = result.service.id;
     state.brief.serviceName = result.service.name;
     // orderOptions/urgent/complex — рабочее состояние для шага 1 брифа
@@ -887,12 +885,12 @@ function attachCalculatorEvents() {
     // при выходе с шага 1 (см. order-next), храним здесь только для полноты.
     state.brief.orderOptions = { ...state.calc.options };
     state.brief.urgent = state.calc.urgent;
-    state.brief.complex = state.calc.complex;
+    state.brief.complex = false;
     state.brief.calc = {
       service_id: state.calc.serviceId,
       options: Object.entries(state.calc.options).map(([id, qty]) => ({ id, qty })),
       urgent: state.calc.urgent,
-      complex: state.calc.complex,
+      complex: false,
     };
     state.brief.source = "calculator";
     state.brief.sourceCaseId = null;
@@ -964,7 +962,7 @@ function renderCalculator() {
 
   const service = state.pricing.services.find((s) => s.id === state.calc.serviceId);
   const options = calcServiceOptions(pricing, service.id);
-  const result = calculatePrice(pricing, service.id, state.calc.options, state.calc.urgent, state.calc.complex);
+  const result = calculatePrice(pricing, service.id, state.calc.options, state.calc.urgent, false);
 
   const optionRows = options
     .map((o) => {
@@ -1008,10 +1006,7 @@ function renderCalculator() {
       <span>Срочный проект (+25%)</span>
       <label class="switch"><input type="checkbox" id="urgent-toggle" ${state.calc.urgent ? "checked" : ""} /><span class="track"></span></label>
     </div>
-    <div class="toggle-row">
-      <span>Высокая сложность (+20%)</span>
-      <label class="switch"><input type="checkbox" id="complex-toggle" ${state.calc.complex ? "checked" : ""} /><span class="track"></span></label>
-    </div>
+    <p class="hint">Сложность проекта и окончательную стоимость дизайнер уточнит после обсуждения задачи.</p>
 
     <div class="result-box">
       <div class="price">${formatMoney(result.priceFrom)} – ${formatMoney(result.priceTo)}</div>
@@ -1127,11 +1122,7 @@ function attachBriefEvents() {
     state.brief.urgent = orderUrgentToggle.checked;
     render();
   });
-  const orderComplexToggle = document.getElementById("order-complex-toggle");
-  if (orderComplexToggle) orderComplexToggle.addEventListener("change", () => {
-    state.brief.complex = orderComplexToggle.checked;
-    render();
-  });
+  // No customer-facing complexity control; its calculation flag stays false.
   const orderChangeService = document.getElementById("order-change-service");
   if (orderChangeService) orderChangeService.addEventListener("click", (e) => {
     e.preventDefault();
@@ -1155,7 +1146,7 @@ function attachBriefEvents() {
       service_id: state.brief.serviceId,
       options: Object.entries(state.brief.orderOptions).map(([id, qty]) => ({ id, qty })),
       urgent: state.brief.urgent,
-      complex: state.brief.complex,
+      complex: false,
     };
     briefNext();
   });
@@ -1200,6 +1191,16 @@ function attachBriefEvents() {
     })
   );
 
+  const tgContact = document.getElementById("use-telegram-contact");
+  if (tgContact) tgContact.addEventListener("click", () => {
+    const user = realTG?.initDataUnsafe?.user;
+    if (!user?.id) return;
+    const suggestedName = [user.first_name, user.last_name].filter(Boolean).join(" ");
+    state.brief.name = state.brief.name.trim() || suggestedName;
+    state.brief.contactValue = user.username ? `@${user.username}` : `Telegram ID: ${user.id}`;
+    persistBriefDraftDebounced();
+    render();
+  });
   const nameInput = document.getElementById("contact-name");
   const contactInput = document.getElementById("contact-value");
   if (nameInput) nameInput.addEventListener("input", () => {
@@ -1269,7 +1270,7 @@ function inferBudgetFromCalc(calc) {
   if (!calc || !calc.service_id || !state.pricing) return null;
   const selected = {};
   for (const o of calc.options || []) selected[o.id] = o.qty;
-  const result = calculatePrice(state.pricing, calc.service_id, selected, calc.urgent, calc.complex);
+  const result = calculatePrice(state.pricing, calc.service_id, selected, calc.urgent, false);
   if (!result) return null;
   const price = result.priceFrom;
   if (price < 20000) return "lt20";
@@ -1433,7 +1434,7 @@ function renderBrief() {
     // часть заявки, с предзаполнением из кейса/калькулятора, если пришли оттуда.
     const service = state.pricing.services.find((s) => s.id === b.serviceId);
     const options = calcServiceOptions(state.pricing, service.id);
-    const result = calculatePrice(state.pricing, service.id, b.orderOptions, b.urgent, b.complex);
+    const result = calculatePrice(state.pricing, service.id, b.orderOptions, b.urgent, false);
     const optionRows = options
       .map((o) => {
         const checked = Boolean(b.orderOptions[o.id]);
@@ -1467,10 +1468,7 @@ function renderBrief() {
         <span>Срочный проект (+25%)</span>
         <label class="switch"><input type="checkbox" id="order-urgent-toggle" ${b.urgent ? "checked" : ""} /><span class="track"></span></label>
       </div>
-      <div class="toggle-row">
-        <span>Высокая сложность (+20%)</span>
-        <label class="switch"><input type="checkbox" id="order-complex-toggle" ${b.complex ? "checked" : ""} /><span class="track"></span></label>
-      </div>
+      <p class="hint">Сложность проекта оценит дизайнер после изучения задачи.</p>
       <div class="result-box">
         <div class="price">${formatMoney(result.priceFrom)} – ${formatMoney(result.priceTo)}</div>
         <div class="term">${formatDays(result.termFrom)}–${formatDays(result.termTo)} рабочих дней</div>
@@ -1521,12 +1519,12 @@ function renderBrief() {
       (o) => `<button class="pick ${b.have.includes(o.id) ? "selected" : ""}" data-have-toggle="${o.id}">${o.label}${b.have.includes(o.id) ? " ✓" : ""}</button>`
     ).join("");
     body = `
-      <h2>Что уже есть?</h2>
-      <p class="hint">Можно выбрать несколько</p>
+      <h2>Что уже подготовлено?</h2>
+      <p class="hint">Необязательный шаг. Можно выбрать несколько пунктов или продолжить без ответа.</p>
       <div class="option-buttons">${items}</div>
       <div class="btn-row">
         <button class="btn btn-secondary" id="brief-prev">Назад</button>
-        <button class="btn btn-primary" id="brief-next" ${b.have.length === 0 ? "disabled" : ""}>Далее</button>
+        <button class="btn btn-primary" id="brief-next">${b.have.length === 0 ? "Пропустить" : "Далее"}</button>
       </div>
     `;
     return wrapBrief(body, step);
@@ -1553,7 +1551,9 @@ function renderBrief() {
     `;
   } else if (step === 6) {
     body = `
-      <h2>Контакты</h2>
+      <h2>Как с вами связаться?</h2>
+      <p class="hint">Telegram уже знает ваш аккаунт. Можно подставить контакт автоматически или указать другой.</p>
+      ${realTG?.initDataUnsafe?.user?.id ? '<button type="button" class="btn btn-secondary" id="use-telegram-contact">Использовать мой Telegram</button>' : ""}
       <div class="field">
         <label>Имя</label>
         <input type="text" id="contact-name" value="${escapeHtml(b.name)}" placeholder="Как к вам обращаться" />
@@ -1594,6 +1594,15 @@ function renderBrief() {
         <input type="text" id="tz-references" value="${escapeHtml(b.tzDetails.references)}" placeholder="Ссылки на примеры, которые нравятся" />
       </div>
       ` : ""}
+      <div class="case-block">
+        <div class="label">Проверка перед отправкой</div>
+        <p><b>Услуга:</b> ${escapeHtml(b.serviceName || "Для уточнения")}</p>
+        <p><b>Задача:</b> ${escapeHtml(b.task)}</p>
+        <p><b>Срок:</b> ${escapeHtml(DEADLINE_OPTIONS.find(o => o.id === b.deadline)?.label || "Не определён")}</p>
+        <p><b>Бюджет:</b> ${escapeHtml(BUDGET_OPTIONS.find(o => o.id === b.budget)?.label || "Не определён")}</p>
+        <p><b>Контакт:</b> ${escapeHtml([b.name, b.contactValue].filter(Boolean).join(" — "))}</p>
+        <p class="hint">Это запрос на оценку, а не обязательство оплатить заказ. Стоимость и сроки согласовываются отдельно.</p>
+      </div>
       ${state.briefSubmitError ? `<p class="error-text">${escapeHtml(state.briefSubmitError)}</p>` : ""}
       <div class="btn-row">
         <button class="btn btn-secondary" id="brief-prev" ${state.submitting ? "disabled" : ""}>Назад</button>

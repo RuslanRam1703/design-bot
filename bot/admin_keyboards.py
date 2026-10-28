@@ -75,21 +75,31 @@ MENU_ITEM_LABELS = {
 # ---- Навигация: 2 уровня — раздел -> действие ----
 
 def admin_root_keyboard() -> InlineKeyboardMarkup:
-    # "Меню и навигация" убрана из корня — это техническая настройка
-    # видимости экранов, не основной рабочий пункт для владельца бота;
-    # сам механизм (adminmenu:nav и связанные хендлеры) не удалён, просто
-    # больше не предлагается как равноценный пункт наравне с Заявками/Кейсами.
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="📋 Заявки", callback_data="adminmenu:leads")],
-            [InlineKeyboardButton(text="📁 Кейсы", callback_data="adminmenu:cases")],
-            [InlineKeyboardButton(text="❓ FAQ", callback_data="adminmenu:faq")],
-            [InlineKeyboardButton(text="👤 Обо мне", callback_data="adminmenu:about")],
-            [InlineKeyboardButton(text="💰 Услуги и цены", callback_data="adminmenu:pricing")],
-            [InlineKeyboardButton(text="🏷 Категории портфолио", callback_data="adminmenu:categories")],
-            [InlineKeyboardButton(text="💾 Бэкап", callback_data="adminmenu:backup")],
-        ]
-    )
+    """Three clear responsibilities; all actions remain native inline buttons."""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📋 Заявки", callback_data="adminmenu:leads")],
+        [InlineKeyboardButton(text="📁 Контент", callback_data="adminmenu:content"),
+         InlineKeyboardButton(text="💰 Услуги и цены", callback_data="adminmenu:pricing")],
+        [InlineKeyboardButton(text="⚙️ Настройки и данные", callback_data="adminmenu:settings")],
+    ])
+
+
+def admin_content_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📁 Кейсы", callback_data="adminmenu:cases"),
+         InlineKeyboardButton(text="👤 Обо мне", callback_data="adminmenu:about")],
+        [InlineKeyboardButton(text="❓ FAQ", callback_data="adminmenu:faq"),
+         InlineKeyboardButton(text="🏷 Категории", callback_data="adminmenu:categories")],
+        [InlineKeyboardButton(text="◀️ В админ-меню", callback_data="adminmenu:root")],
+    ])
+
+
+def admin_settings_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🧭 Меню Mini App", callback_data="adminmenu:nav")],
+        [InlineKeyboardButton(text="💾 Экспорт и восстановление", callback_data="adminmenu:backup")],
+        [InlineKeyboardButton(text="◀️ В админ-меню", callback_data="adminmenu:root")],
+    ])
 
 
 def backup_menu_keyboard() -> InlineKeyboardMarkup:
@@ -97,7 +107,7 @@ def backup_menu_keyboard() -> InlineKeyboardMarkup:
         inline_keyboard=[
             [InlineKeyboardButton(text="📤 Экспортировать", callback_data="adminbackupaction:export")],
             [InlineKeyboardButton(text="📥 Восстановить из файла", callback_data="adminbackupaction:import")],
-            [InlineKeyboardButton(text="◀️ Назад", callback_data="adminmenu:root")],
+            [InlineKeyboardButton(text="◀️ Назад", callback_data="adminmenu:settings")],
         ]
     )
 
@@ -108,7 +118,7 @@ def admin_cases_menu_keyboard() -> InlineKeyboardMarkup:
             [InlineKeyboardButton(text="➕ Добавить", callback_data="admincasesaction:add")],
             [InlineKeyboardButton(text="✏️ Редактировать", callback_data="admincasesaction:edit")],
             [InlineKeyboardButton(text="🗑 Удалить", callback_data="admincasesaction:delete")],
-            [InlineKeyboardButton(text="◀️ Назад", callback_data="adminmenu:root")],
+            [InlineKeyboardButton(text="◀️ Назад", callback_data="adminmenu:content")],
         ]
     )
 
@@ -119,7 +129,7 @@ def admin_faq_menu_keyboard() -> InlineKeyboardMarkup:
             [InlineKeyboardButton(text="➕ Добавить", callback_data="adminfaqaction:add")],
             [InlineKeyboardButton(text="✏️ Редактировать", callback_data="adminfaqaction:edit")],
             [InlineKeyboardButton(text="🗑 Удалить", callback_data="adminfaqaction:delete")],
-            [InlineKeyboardButton(text="◀️ Назад", callback_data="adminmenu:root")],
+            [InlineKeyboardButton(text="◀️ Назад", callback_data="adminmenu:content")],
         ]
     )
 
@@ -348,7 +358,7 @@ def categories_menu_keyboard() -> InlineKeyboardMarkup:
             [InlineKeyboardButton(text="✏️ Переименовать", callback_data="admincataction:rename")],
             [InlineKeyboardButton(text="🔗 Похожая услуга", callback_data="admincataction:relservice")],
             [InlineKeyboardButton(text="🗑 Удалить", callback_data="admincataction:delete")],
-            [InlineKeyboardButton(text="◀️ Назад", callback_data="adminmenu:root")],
+            [InlineKeyboardButton(text="◀️ Назад", callback_data="adminmenu:content")],
         ]
     )
 
@@ -365,7 +375,7 @@ def nav_menu_keyboard(ui_config: dict) -> InlineKeyboardMarkup:
         enabled = ui_config["menu"].get(key, True)
         mark = "✅" if enabled else "⬜"
         rows.append([InlineKeyboardButton(text=f"{mark} {label}", callback_data=f"adminnavtoggle:{key}")])
-    rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data="adminmenu:root")])
+    rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data="adminmenu:settings")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
