@@ -43,7 +43,7 @@ class HardeningTests(unittest.IsolatedAsyncioTestCase):
             selected_options = [{"name": "<unclosed", "qty": 1}]
             urgent = False
             complex_ = False
-        rendered = format_lead_message({"service_name": "Лендинг"}, Calc(), lead_id=7, from_user_id=42)
+        rendered = format_lead_message({"service_name": "Лендинг"}, Calc(), lead_id=7, from_user_id=42, username=None)
         self.assertIn("&lt;unclosed", rendered)
         self.assertNotIn("— опции: <unclosed", rendered)
 

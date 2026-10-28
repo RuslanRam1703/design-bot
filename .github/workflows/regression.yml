@@ -8,6 +8,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       BOT_TOKEN: '123456:test-token-not-real'
+      DESIGNER_CHAT_ID: '777'
       WEBAPP_URL: 'https://example.invalid'
     steps:
       - uses: actions/checkout@v4
