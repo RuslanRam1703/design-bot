@@ -7,7 +7,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, Message
 
 from bot import config, content_store, flow, texts
-from bot.keyboards import main_menu_confirm_keyboard, webapp_open_keyboard
+from bot.keyboards import client_home_keyboard, main_menu_confirm_keyboard, webapp_open_keyboard
 
 router = Router(name="start")
 logger = logging.getLogger(__name__)
@@ -21,6 +21,9 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
     # либо создаёт NAV anchor с этим текстом (первое взаимодействие в
     # чате), либо просто редактирует уже существующий обратно в WELCOME.
     await flow.reset_nav_screen(message, state)
+    # NAV anchor keeps the persistent reply keyboard; this separate
+    # TRANSIENT screen contains the native inline entry points.
+    await flow.open_flow(message, state, texts.CLIENT_HOME, client_home_keyboard(config.WEBAPP_URL))
 
 
 @router.message(Command("id"))
@@ -99,7 +102,11 @@ async def main_menu_or_confirm(message: Message, state: FSMContext) -> None:
     долгоживущего state под саму confirmation, см.
     bot/keyboards.py::main_menu_confirm_keyboard)."""
     if await state.get_state() is None:
-        await flow.main_menu_cleanup(message, state)
+        # Keep the designer's existing /admin navigation behaviour intact.
+        if config.DESIGNER_CHAT_ID and str(message.chat.id) == str(config.DESIGNER_CHAT_ID):
+            await flow.main_menu_cleanup(message, state)
+        else:
+            await flow.open_root(message, state, texts.CLIENT_HOME, client_home_keyboard(config.WEBAPP_URL))
         return
     await flow.delete_trigger(message)
     # NAV anchor не затронут этим экраном — освежать нечего (см. bot/flow.py).
@@ -117,6 +124,8 @@ async def main_menu_confirm(callback: CallbackQuery, state: FSMContext) -> None:
     # сам удалит его как "триггер" (RULE 1). NAV anchor не трогаем — это
     # "Главное меню", не /start (см. bot/flow.py::main_menu_cleanup).
     await flow.main_menu_cleanup(callback.message, state)
+    if not (config.DESIGNER_CHAT_ID and str(callback.message.chat.id) == str(config.DESIGNER_CHAT_ID)):
+        await flow.open_flow(callback.message, state, texts.CLIENT_HOME, client_home_keyboard(config.WEBAPP_URL))
     await callback.answer()
 
 
@@ -238,7 +247,7 @@ async def relay_client_text_to_designer(message: Message, state: FSMContext) -> 
     text = _enforce_telegram_hard_limit("\n".join(lines))
 
     try:
-        await message.bot.send_message(chat_id=config.DESIGNER_CHAT_ID, text=text)
+        await message.bot.send_message(chat_id=config.DESIGNER_CHAT_ID, text=text, parse_mode=None)
     except Exception:
         logger.exception("Не удалось передать сообщение клиента дизайнеру (user_id=%s)", message.from_user.id)
         await message.answer("Не получилось отправить сообщение дизайнеру. Попробуйте ещё раз чуть позже.")
@@ -289,7 +298,7 @@ async def relay_client_media_to_designer(message: Message) -> None:
 
     try:
         await message.bot.send_message(
-            chat_id=config.DESIGNER_CHAT_ID, text=_enforce_telegram_hard_limit("\n".join(lines)),
+            chat_id=config.DESIGNER_CHAT_ID, text=_enforce_telegram_hard_limit("\n".join(lines)), parse_mode=None,
         )
         # forward, а не скачивание: файл остаётся у Telegram, ни одного
         # байта через Render — тот же принцип, что и у handle_tz_file.

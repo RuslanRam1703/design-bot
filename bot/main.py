@@ -15,7 +15,7 @@ from aiogram.types import (
 from aiohttp import web
 
 from bot import config, content_store, texts
-from bot.handlers import admin, faq, start, webapp
+from bot.handlers import admin, client_intake, faq, start, webapp
 from bot.webserver import create_app
 from bot.notifications import retry_designer_notifications
 
@@ -107,6 +107,7 @@ async def main() -> None:
     # web_app_data и ответы в состоянии "ждём файл ТЗ".
     dp.include_router(admin.router)
     dp.include_router(webapp.router)
+    dp.include_router(client_intake.router)
     dp.include_router(faq.router)
     dp.include_router(start.router)  # start — последним: содержит catch-all для текста
 

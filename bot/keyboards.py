@@ -75,6 +75,40 @@ def webapp_open_keyboard(webapp_url: str, path: str, label: str) -> InlineKeyboa
     )
 
 
+def client_home_keyboard(webapp_url: str) -> InlineKeyboardMarkup:
+    """Native Telegram menu; WebApp buttons preserve signed initData."""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📁 Портфолио", web_app=WebAppInfo(url=f"{webapp_url}/portfolio")),
+         InlineKeyboardButton(text="💰 Рассчитать", web_app=WebAppInfo(url=f"{webapp_url}/calculator"))],
+        [InlineKeyboardButton(text="💬 Задать вопрос", callback_data="intake:question"),
+         InlineKeyboardButton(text="⚡ Быстрая заявка", callback_data="intake:quick")],
+        [InlineKeyboardButton(text="✍️ Подробная заявка", web_app=WebAppInfo(url=f"{webapp_url}/brief"))],
+        [InlineKeyboardButton(text="📋 Мои заявки", web_app=WebAppInfo(url=f"{webapp_url}/myleads"))],
+    ])
+
+
+def intake_cancel_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="◀️ К выбору действий", callback_data="intake:cancel")],
+    ])
+
+
+def quick_lead_confirm_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Отправить заявку", callback_data="intake:submit")],
+        [InlineKeyboardButton(text="✏️ Другой контакт", callback_data="intake:contact"),
+         InlineKeyboardButton(text="↩️ Изменить задачу", callback_data="intake:task")],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="intake:cancel")],
+    ])
+
+
+def quick_contact_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Использовать мой Telegram", callback_data="intake:use_telegram")],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="intake:cancel")],
+    ])
+
+
 def main_menu_confirm_keyboard() -> InlineKeyboardMarkup:
     """Подтверждение "Главное меню" (см. bot/handlers/start.py::
     main_menu_or_confirm) — показывается только когда есть активное bot/FSM-
