@@ -1612,7 +1612,7 @@ async def about_edit_field(callback: CallbackQuery, state: FSMContext) -> None:
     if field == "done":
         # flow.step_from_callback (P1-3, Batch 4).
         await flow.reset_state_keep_nav(state)
-        await flow.step_from_callback(callback, state, "Админ-меню:", kb.admin_root_keyboard())
+        await flow.step_from_callback(callback, state, "Контент — что хотите изменить?", kb.admin_content_keyboard())
         await callback.answer()
         return
     if field == "experience":
