@@ -104,6 +104,11 @@ class NativeIntakeTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("<сайта> & фирменного стиля", kwargs["text"])
         self.assertIsNone(kwargs["parse_mode"])
 
+    async def test_maximal_escaped_input_stays_under_telegram_limit(self):
+        from bot.handlers.client_intake import _TASK_MAX, _CONTACT_MAX
+        text = client_intake._preview("'" * _TASK_MAX, "'" * _CONTACT_MAX)
+        self.assertLess(len(text), 4096)
+
     async def test_preview_escapes_user_html(self):
         text = client_intake._preview("Лендинг <b> & дизайн", "name<broken")
         self.assertIn("&lt;b&gt; &amp;", text)

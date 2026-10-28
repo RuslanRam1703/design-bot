@@ -24,8 +24,8 @@ from bot.notifications import notify_designer_lead
 logger = logging.getLogger(__name__)
 router = Router(name="client_intake")
 _TASK_MIN = 10
-_TASK_MAX = 1500
-_CONTACT_MAX = 180
+_TASK_MAX = 500
+_CONTACT_MAX = 120
 
 
 class QuestionStates(StatesGroup):
@@ -113,7 +113,7 @@ async def quick_task_receive(message: Message, state: FSMContext):
     task = message.text.strip()
     if not _TASK_MIN <= len(task) <= _TASK_MAX:
         await flow.step_from_text(
-            message, state, "Описание должно содержать от 10 до 1500 символов. Попробуйте ещё раз.",
+            message, state, "Описание должно содержать от 10 до 500 символов. Попробуйте ещё раз.",
             intake_cancel_keyboard(),
         )
         return
@@ -149,7 +149,7 @@ async def quick_contact_receive(message: Message, state: FSMContext):
     contact = message.text.strip()
     if not 3 <= len(contact) <= _CONTACT_MAX:
         await flow.step_from_text(
-            message, state, "Контакт должен содержать от 3 до 180 символов.",
+            message, state, "Контакт должен содержать от 3 до 120 символов.",
             quick_contact_keyboard(),
         )
         return
