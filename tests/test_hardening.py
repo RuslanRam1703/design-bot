@@ -62,6 +62,12 @@ class HardeningTests(unittest.IsolatedAsyncioTestCase):
                 failed = await content_store.get_lead(lead["id"])
                 self.assertEqual(failed["designer_notification"]["state"], "failed")
                 bot.send_message.side_effect = None
+                # Exponential backoff must prevent an immediate retry.
+                self.assertFalse(await notify_designer_lead(bot, failed))
+                async with content_store._lock("leads.json"):
+                    data = await content_store._read("leads.json")
+                    data["leads"][0]["designer_notification"]["retry_after"] = None
+                    await content_store._write("leads.json", data)
                 self.assertTrue(await notify_designer_lead(bot, failed))
                 stored = await content_store.get_lead(lead["id"])
                 self.assertEqual(stored["designer_notification"]["state"], "sent")
@@ -79,6 +85,59 @@ class HardeningTests(unittest.IsolatedAsyncioTestCase):
                 changed = await content_store.add_lead({"service_name": "B"}, user, draft_id="dup-test")
                 self.assertTrue(changed["changed"])
                 self.assertEqual(changed["designer_notification"]["revision"], 2)
+
+    async def test_claim_prevents_two_concurrent_telegram_sends(self):
+        import asyncio
+        import tempfile
+        from pathlib import Path
+        from bot import content_store
+        from bot.notifications import notify_designer_lead
+        with tempfile.TemporaryDirectory() as tmp, patch.object(content_store, "DATA_DIR", Path(tmp)), \
+             patch("bot.notifications.config.DESIGNER_CHAT_ID", "777"):
+            lead = await content_store.add_lead({"service_name": "A"}, {"user_id": 2})
+            bot = AsyncMock()
+            started, resume = asyncio.Event(), asyncio.Event()
+
+            async def pause_send(**kwargs):
+                started.set()
+                await resume.wait()
+
+            bot.send_message.side_effect = pause_send
+            task = asyncio.create_task(notify_designer_lead(bot, lead))
+            await asyncio.wait_for(started.wait(), timeout=2)
+            self.assertFalse(await notify_designer_lead(bot, lead))
+            resume.set()
+            self.assertTrue(await task)
+            self.assertEqual(bot.send_message.await_count, 1)
+            self.assertEqual((await content_store.get_lead(lead["id"]))["designer_notification"]["state"], "sent")
+
+    async def test_claim_token_prevents_stale_delivery_ack(self):
+        import tempfile
+        from pathlib import Path
+        from bot import content_store
+        with tempfile.TemporaryDirectory() as tmp, patch.object(content_store, "DATA_DIR", Path(tmp)):
+            lead = await content_store.add_lead({"service_name": "A"}, {"user_id": 42})
+            claimed = await content_store.claim_designer_notification(lead["id"], 1)
+            token = claimed["designer_notification"]["claim_token"]
+            self.assertIsNone(await content_store.claim_designer_notification(lead["id"], 1))
+            self.assertFalse(await content_store.finish_designer_notification(lead["id"], 1, "wrong", "sent"))
+            self.assertTrue(await content_store.finish_designer_notification(lead["id"], 1, token, "sent"))
+            self.assertIsNone(await content_store.claim_designer_notification(lead["id"], 1))
+
+    async def test_fenced_write_rejects_stale_redis_owner(self):
+        from bot import content_store
+        from test_regression import FakeUpstash
+        fake = FakeUpstash()
+        with patch.object(content_store.config, "UPSTASH_REDIS_REST_URL", "https://fake/"), \
+             patch.object(content_store.config, "UPSTASH_REDIS_REST_TOKEN", "fake"), \
+             patch("bot.content_store.urllib.request.urlopen", side_effect=fake.urlopen):
+            async with content_store._lock("leads.json"):
+                fake.store[content_store._LOCK_NAMESPACE + "leads.json"] = "other-instance"
+                with self.assertRaises(content_store.StorageLeaseLostError):
+                    await content_store._write("leads.json", {"leads": [{"id": 77}]})
+                self.assertNotIn("leads.json", fake.store)
+            self.assertEqual(fake.store[content_store._LOCK_NAMESPACE + "leads.json"], "other-instance")
+
 
 
 if __name__ == "__main__":
