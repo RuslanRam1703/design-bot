@@ -14,6 +14,63 @@ from bot.telegram_auth import diagnose_init_data, validate_init_data
 
 SUPPLEMENT_FIELD_KEYS = ("comment", "additional_requirements", "references", "contact")
 
+
+async def _pricing_for_calculation() -> dict:
+    # /admin writes to Upstash when configured. Never calculate against
+    # stale deployment-time pricing.json.
+    if content_store.is_redis_backed():
+        return await content_store.read_async("pricing.json")
+    return load_pricing()
+
+
+def _valid_new_lead_payload(payload: dict) -> bool:
+    """Reject malformed external input before persisting or formatting it."""
+    if payload.get("mode", "new") != "new":
+        return False
+    text_fields = (
+        "service_id", "service_name", "task_description", "deadline",
+        "budget", "contact", "source", "source_case_id",
+        "source_case_title", "draft_id",
+    )
+    for key in text_fields:
+        value = payload.get(key)
+        if value is not None and (not isinstance(value, str) or len(value) > 5000):
+            return False
+    if "attach_tz" in payload and not isinstance(payload["attach_tz"], bool):
+        return False
+    have = payload.get("have", [])
+    if not isinstance(have, list) or len(have) > 30 or any(
+        not isinstance(value, str) or len(value) > 200 for value in have
+    ):
+        return False
+    tz = payload.get("tz_details")
+    if tz is not None and (
+        not isinstance(tz, dict) or
+        any(not isinstance(value, str) or len(value) > 5000 for value in tz.values())
+    ):
+        return False
+    calc = payload.get("calc")
+    if calc is None:
+        return True
+    if not isinstance(calc, dict) or not isinstance(calc.get("service_id"), str):
+        return False
+    if len(calc["service_id"]) > 150:
+        return False
+    selected = calc.get("options", [])
+    if not isinstance(selected, list) or len(selected) > 100:
+        return False
+    for item in selected:
+        if not isinstance(item, dict) or not isinstance(item.get("id"), str):
+            return False
+        qty = item.get("qty", 1)
+        if not isinstance(qty, int) or isinstance(qty, bool) or not 1 <= qty <= 100:
+            return False
+    for name in ("urgent", "complex"):
+        if name in calc and not isinstance(calc[name], bool):
+            return False
+    return True
+
+
 WEBAPP_DIR = Path(__file__).resolve().parent.parent / "webapp"
 logger = logging.getLogger(__name__)
 
@@ -142,6 +199,8 @@ async def handle_create_lead(request: web.Request) -> web.Response:
         return web.json_response({"error": "invalid_json"}, status=400)
     if not isinstance(payload, dict):
         return web.json_response({"error": "invalid_payload"}, status=400)
+    if payload.get("mode") != "supplement" and not _valid_new_lead_payload(payload):
+        return web.json_response({"error": "invalid_payload"}, status=400)
 
     # user — уже провалидированный dict из validate_init_data ({"id":...,
     # "username":..., "first_name":..., "last_name":...}), а не aiogram
@@ -202,7 +261,7 @@ async def _handle_lead_create(payload: dict, telegram_identity: dict, bot: Bot) 
     calc_result = None
     calc_payload = payload.get("calc")
     if isinstance(calc_payload, dict) and calc_payload.get("service_id"):
-        pricing = load_pricing()
+        pricing = await _pricing_for_calculation()
         calc_result = calculate(
             pricing=pricing,
             service_id=calc_payload["service_id"],
@@ -352,7 +411,7 @@ def create_app(bot: Bot) -> web.Application:
     минимально необходимый способ дать handle_create_lead возможность
     уведомить DESIGNER_CHAT_ID (aiohttp-приложение раньше не имело доступа
     ни к Bot, ни к Dispatcher вообще — см. аудит перед этим изменением)."""
-    app = web.Application()
+    app = web.Application(client_max_size=64 * 1024)
     app["bot"] = bot
     app.on_response_prepare.append(_no_cache)
     for path in ("/", "/portfolio", "/about", "/calculator", "/brief", "/myleads"):

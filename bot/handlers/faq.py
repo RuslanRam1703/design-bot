@@ -5,7 +5,7 @@ from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, Message
 
-from bot import flow, texts
+from bot import content_store, flow, texts
 from bot.data import get_service, load_faq, load_pricing, load_ui_config
 from bot.keyboards import (
     faq_back_keyboard,
@@ -15,6 +15,19 @@ from bot.keyboards import (
 )
 
 router = Router(name="faq")
+
+
+async def _runtime_data(filename: str, local_loader):
+    # /admin writes Redis when configured; local development still reads files.
+    if content_store.is_redis_backed():
+        return await content_store.read_async(filename)
+    return local_loader()
+
+
+async def _client_faq_items_live() -> list[dict]:
+    data = await _runtime_data("faq.json", load_faq)
+    return [item for item in data["faq"] if not item.get("needs_review")]
+
 
 
 def _client_faq_items() -> list[dict]:
@@ -37,7 +50,7 @@ async def _send_faq_list(message: Message, state: FSMContext) -> None:
     # сознательно не ретроактивны (то же принятое поведение, что и у
     # needs_review-фильтра выше — устаревшее открытое сообщение продолжает
     # работать, пока клиент не уйдёт с него).
-    if not load_ui_config()["menu"].get("faq", True):
+    if not (await _runtime_data("ui_config.json", load_ui_config))["menu"].get("faq", True):
         await flow.open_root(message, state, texts.FAQ_DISABLED, None)
         return
     # flow.open_root (не голый message.answer) — FAQ-список сам по себе
@@ -53,7 +66,7 @@ async def _send_faq_list(message: Message, state: FSMContext) -> None:
     # "освежается" автоматически внутри open_flow (см. bot/flow.py) —
     # отдельный вызов здесь больше не нужен (и раньше выполнялся уже ПОСЛЕ
     # удаления предыдущего anchor — источник отдельного regression, см. аудит).
-    await flow.open_root(message, state, texts.FAQ_INTRO, faq_list_keyboard(_client_faq_items()))
+    await flow.open_root(message, state, texts.FAQ_INTRO, faq_list_keyboard(await _client_faq_items_live()))
 
 
 @router.message(F.text == texts.MENU_FAQ)
@@ -68,7 +81,7 @@ async def cmd_faq(message: Message, state: FSMContext) -> None:
 
 @router.callback_query(F.data == "faq:back")
 async def faq_back(callback: CallbackQuery) -> None:
-    await callback.message.edit_text(texts.FAQ_INTRO, reply_markup=faq_list_keyboard(_client_faq_items()))
+    await callback.message.edit_text(texts.FAQ_INTRO, reply_markup=faq_list_keyboard(await _client_faq_items_live()))
     await callback.answer()
 
 
@@ -77,13 +90,13 @@ async def faq_answer(callback: CallbackQuery) -> None:
     item_id = int(callback.data.split(":", 1)[1])
     # needs_review исключены и здесь — не только из списка выше — на случай
     # устаревшей клавиатуры в старом сообщении, которое клиент мог не закрыть.
-    item = next((i for i in _client_faq_items() if i["id"] == item_id), None)
+    item = next((i for i in await _client_faq_items_live() if i["id"] == item_id), None)
     if item is None:
         await callback.answer("Вопрос не найден", show_alert=True)
         return
 
     if item["type"] == "service_price":
-        pricing = load_pricing()
+        pricing = await _runtime_data("pricing.json", load_pricing)
         await callback.message.edit_text(texts.FAQ_PICK_SERVICE, reply_markup=faq_service_picker_keyboard(pricing["services"]))
     else:
         await callback.message.edit_text(item["answer"], reply_markup=faq_back_keyboard())
@@ -93,13 +106,13 @@ async def faq_answer(callback: CallbackQuery) -> None:
 @router.callback_query(F.data.regexp(re.compile(r"^faqprice:(.+)$")))
 async def faq_price_answer(callback: CallbackQuery) -> None:
     service_id = callback.data.split(":", 1)[1]
-    pricing = load_pricing()
+    pricing = await _runtime_data("pricing.json", load_pricing)
     service = get_service(pricing, service_id)
     if service is None:
         await callback.answer("Услуга не найдена", show_alert=True)
         return
 
-    faq_items = load_faq()["faq"]
+    faq_items = (await _runtime_data("faq.json", load_faq))["faq"]
     # next(..., None) — тот же graceful-паттерн, что и в faq_answer выше
     # (P1-3, Batch 12): шаблонный вопрос service_price мог быть удалён из
     # /admin -> FAQ между показом пикера услуг и нажатием клиента (TOCTOU) —

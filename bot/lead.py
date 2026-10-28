@@ -152,7 +152,7 @@ def format_lead_message(payload: dict, calc: CalcResult | None, lead_id: int, fr
         lines.append(f"— срок: {_fmt_days(calc.term_from)}–{_fmt_days(calc.term_to)} дн.")
         if calc.selected_options:
             opts = ", ".join(
-                f"{o['name']}" + (f" ×{o['qty']}" if o["qty"] > 1 else "") for o in calc.selected_options
+                f"{_esc(o['name'])}" + (f" ×{o['qty']}" if o["qty"] > 1 else "") for o in calc.selected_options
             )
             lines.append(f"— опции: {opts}")
         flags = []
@@ -295,7 +295,7 @@ def format_lead_admin_detail(lead: dict) -> str:
     if calc:
         lines.append(f"— Расчёт: {calc['price_from']:,} – {calc['price_to']:,} ₽".replace(",", " ") + f", срок {_fmt_days(calc['term_from'])}–{_fmt_days(calc['term_to'])} дн.")
         if calc.get("selected_options"):
-            opts = ", ".join(f"{o['name']}" + (f" ×{o['qty']}" if o["qty"] > 1 else "") for o in calc["selected_options"])
+            opts = ", ".join(f"{_esc(o['name'])}" + (f" ×{o['qty']}" if o["qty"] > 1 else "") for o in calc["selected_options"])
             lines.append(f"— Опции: {opts}")
         flags = [f for f, v in (("срочно", calc.get("urgent")), ("высокая сложность", calc.get("complex_"))) if v]
         if flags:

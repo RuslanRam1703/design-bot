@@ -43,7 +43,7 @@ async def _handle_brief_submission(message: Message, payload: dict) -> None:
     calc_result = None
     calc_payload = payload.get("calc")
     if calc_payload and calc_payload.get("service_id"):
-        pricing = load_pricing()
+        pricing = await content_store.read_async("pricing.json") if content_store.is_redis_backed() else load_pricing()
         calc_result = calculate(
             pricing=pricing,
             service_id=calc_payload["service_id"],
@@ -141,7 +141,10 @@ async def handle_tz_file(message: Message) -> None:
     # Материал сохраняем ДО пересылки — если пересылка упадёт (Telegram API
     # недоступен и т.п.), связь "файл ↔ заявка" всё равно не теряется, её
     # можно будет восстановить вручную через file_id из /admin.
-    await content_store.record_lead_material(lead["id"], file_id, file_unique_id, kind, source)
+    stored = await content_store.record_lead_material(lead["id"], file_id, file_unique_id, kind, source)
+    if not stored:
+        await message.answer("Заявка больше не принимает материалы. Файл не прикреплён.")
+        return
 
     if config.DESIGNER_CHAT_ID:
         try:
