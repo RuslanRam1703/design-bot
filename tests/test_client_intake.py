@@ -47,6 +47,22 @@ class NativeIntakeTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(flow._NAV_ANCHOR_MSG_KEY, data)
         self.assertIn(flow._ANCHOR_MSG_KEY, data)
 
+    async def test_quick_cancel_filters_do_not_break_start_or_faq(self):
+        # Regression: passing the StatesGroup class directly as a filter
+        # raises TypeError on every unrelated Telegram message.
+        cancel_handlers = [
+            h for h in client_intake.router.message.handlers
+            if h.callback is client_intake.intake_cancel_command
+        ]
+        self.assertEqual(len(cancel_handlers), 2)
+        for text in ("/start", "/faq", texts.MENU_FAQ):
+            for handler in cancel_handlers:
+                with self.subTest(text=text, handler=handler):
+                    matched, _ = await handler.check(
+                        make_flow_message(chat_id=31, text=text), raw_state=None,
+                    )
+                    self.assertFalse(matched)
+
     async def test_question_reuses_relay_without_creating_lead(self):
         state = make_state(31)
         with patch("bot.handlers.client_intake.config.DESIGNER_CHAT_ID", "777"), \
