@@ -158,6 +158,15 @@ class ProjectLedgerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await state.get_state(), ProjectStates.detail.state)
         self.assertEqual(len((await project_store.get_project(777, demo["id"]))["payments"]), 1)
 
+    async def test_old_backup_cannot_silently_erase_ledger(self):
+        demo = await project_store.create_demo(777)
+        legacy = io.BytesIO()
+        with zipfile.ZipFile(legacy, "w") as zf:
+            zf.writestr("data/leads.json", json.dumps({"leads": []}))
+        with self.assertRaises(content_store.BackupValidationError):
+            await content_store.import_backup_bytes(777, legacy.getvalue())
+        self.assertEqual((await project_store.list_projects(777))[0]["id"], demo["id"])
+
     async def test_backup_contains_ledger_without_new_files(self):
         demo = await project_store.create_demo(777)
         # The existing archive only knows six files; projects share leads.json.

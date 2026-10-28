@@ -2083,6 +2083,24 @@ async def import_backup_bytes(actor_chat_id: int | str, zip_bytes: bytes) -> Bac
                 logger.exception("Storage: backup snapshot failed for %s — restore aborted before any write", filename)
                 raise BackupSnapshotError(filename) from e
 
+        # A legacy archive with leads but no "projects" would otherwise
+        # silently erase commercial accounting records. Reject it while a
+        # ledger exists. Old archives remain restorable before any project
+        # is created; archives made by this version include the ledger.
+        previous_leads = snapshot.get("leads.json")
+        incoming_leads = json_plan.get("leads.json")
+        if (
+            isinstance(previous_leads, dict)
+            and previous_leads.get("projects")
+            and isinstance(incoming_leads, dict)
+            and "projects" not in incoming_leads
+        ):
+            raise BackupValidationError(
+                "leads.json",
+                "старый бэкап не содержит проекты и финансовую историю; восстановление отменено",
+                found_json_filenames,
+            )
+
         # ---- Phase 2: запись JSON. Ошибка -> откат уже записанных к снапшоту.
         written: list[str] = []
         failed_filename: str | None = None
