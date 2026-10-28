@@ -195,7 +195,7 @@ async def handle_create_lead(request: web.Request) -> web.Response:
 
     try:
         payload = await request.json()
-    except json.JSONDecodeError:
+    except (json.JSONDecodeError, web.HTTPBadRequest, UnicodeDecodeError):
         return web.json_response({"error": "invalid_json"}, status=400)
     if not isinstance(payload, dict):
         return web.json_response({"error": "invalid_payload"}, status=400)
@@ -215,6 +215,10 @@ async def handle_create_lead(request: web.Request) -> web.Response:
     bot: Bot = request.app["bot"]
 
     if payload.get("mode") == "supplement":
+        if not isinstance(payload.get("fields"), dict) or any(not isinstance(v, str) or len(v) > 5000 for v in payload["fields"].values()):
+            return web.json_response({"error": "invalid_fields"}, status=400)
+        if "wants_file" in payload and not isinstance(payload["wants_file"], bool):
+            return web.json_response({"error": "invalid_payload"}, status=400)
         return await _handle_lead_supplement(payload, telegram_identity, bot)
     return await _handle_lead_create(payload, telegram_identity, bot)
 

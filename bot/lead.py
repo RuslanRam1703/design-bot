@@ -164,7 +164,7 @@ def format_lead_message(payload: dict, calc: CalcResult | None, lead_id: int, fr
             lines.append(f"— отметки: {', '.join(flags)}")
 
     lines.append("")
-    username_part = f"@{username}" if username else "нет username"
+    username_part = f"@{_esc(username)}" if username else "нет username"
     lines.append(f"<i>От пользователя {username_part}, id {from_user_id}</i>")
 
     # Финальная сетка поверх пофайловых потолков: сами по себе _clip выше
