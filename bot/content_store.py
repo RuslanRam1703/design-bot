@@ -2101,6 +2101,21 @@ async def import_backup_bytes(actor_chat_id: int | str, zip_bytes: bytes) -> Bac
                 found_json_filenames,
             )
 
+        # Legacy archives without current access controls cannot silently
+        # unblock users. Restore requires the active blocklist if nonempty.
+        if (
+            isinstance(previous_leads, dict)
+            and isinstance(incoming_leads, dict)
+            and any((previous_leads.get("access_control") or {}).get(k) for k in
+                    ("blocked_ids", "watch_usernames"))
+            and "access_control" not in incoming_leads
+        ):
+            raise BackupValidationError(
+                "leads.json",
+                "старый бэкап не содержит список заблокированных пользователей",
+                found_json_filenames,
+            )
+
         # ---- Phase 2: запись JSON. Ошибка -> откат уже записанных к снапшоту.
         written: list[str] = []
         failed_filename: str | None = None

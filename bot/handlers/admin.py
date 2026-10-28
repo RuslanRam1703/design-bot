@@ -25,7 +25,7 @@ from aiogram.fsm.state import State
 from aiogram.types import BufferedInputFile, CallbackQuery, InlineKeyboardMarkup, Message
 
 from bot import admin_keyboards as kb
-from bot import behance, config, content_store, flow, media_archive, telegram_media, texts
+from bot import access_control, behance, config, content_store, flow, media_archive, telegram_media, texts
 from bot import lead as lead_format
 from bot.handlers.start import main_menu_or_confirm
 from bot.states import AdminStates
@@ -2461,7 +2461,10 @@ async def lead_change_status(callback: CallbackQuery, state: FSMContext) -> None
     # персистентный лог статус-уведомлений — сам lead["status"] уже
     # источник правды, Mini App покажет его корректно независимо от того,
     # дошло ли сейчас сообщение в Telegram.
-    if old_status != status and lead.get("telegram", {}).get("user_id"):
+    if (old_status != status and lead.get("telegram", {}).get("user_id")
+            and not await access_control.is_blocked(
+                lead["telegram"]["user_id"], lead["telegram"].get("username")
+            )):
         try:
             await callback.bot.send_message(
                 chat_id=lead["telegram"]["user_id"],
@@ -2480,6 +2483,9 @@ async def lead_reply_start(callback: CallbackQuery, state: FSMContext) -> None:
     lead = await content_store.get_lead(data["lead_id"])
     if lead is None or not lead.get("telegram", {}).get("user_id"):
         await callback.answer("Нет Telegram ID клиента — ответить через бота нельзя", show_alert=True)
+        return
+    if await access_control.is_blocked(lead["telegram"]["user_id"], lead["telegram"].get("username")):
+        await callback.answer("Пользователь заблокирован; ответы отключены", show_alert=True)
         return
     await callback.message.edit_text("Текст сообщения клиенту:", reply_markup=kb.cancel_keyboard())
     # cancel_to="leads", не "root" (P1-3, Batch 7) — раньше "❌ Отмена"/
@@ -2501,6 +2507,10 @@ async def lead_reply_send(message: Message, state: FSMContext) -> None:
         await flow.finish_flow(state)
         return
     text = message.text.strip()
+    if await access_control.is_blocked(lead["telegram"]["user_id"], lead["telegram"].get("username")):
+        await flow.step_from_text(message, state, "Пользователь заблокирован: отправка отменена.", kb.lead_detail_keyboard(lead))
+        await state.set_state(AdminStates.lead_detail)
+        return
     try:
         # "Ответ по заявке #N" — контекст только в исходящем клиенту
         # сообщении (сам клиент мог получать от бота что угодно ещё); в

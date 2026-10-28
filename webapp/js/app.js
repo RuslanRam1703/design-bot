@@ -333,12 +333,32 @@ async function init() {
   // спрашивать там нечего.
   state.briefEntryPending = restored && briefDraftHasProgress(state.brief);
 
-  const [pricing, portfolio, about, uiConfig] = await Promise.all([
-    fetch("/data/pricing.json").then((r) => r.json()),
-    fetch("/data/portfolio.json").then((r) => r.json()),
-    fetch("/data/about.json").then((r) => r.json()),
-    fetch("/data/ui_config.json").then((r) => r.json()),
-  ]);
+  // Send signed Telegram identity to every content endpoint so the
+  // server can deny blocked accounts. In public preview mode an empty
+  // initData is still accepted, but strict mode requires real Telegram.
+  const publicHeaders = { "X-Telegram-Init-Data": TG.initData() };
+  const getContent = async (name) => {
+    const response = await fetch(`/data/${name}`, { headers: publicHeaders });
+    if (response.status === 403) throw new Error("ACCESS_DENIED");
+    if (response.status === 401) throw new Error("TELEGRAM_REQUIRED");
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    return response.json();
+  };
+  let pricing, portfolio, about, uiConfig;
+  try {
+    [pricing, portfolio, about, uiConfig] = await Promise.all([
+      getContent("pricing.json"), getContent("portfolio.json"),
+      getContent("about.json"), getContent("ui_config.json"),
+    ]);
+  } catch (err) {
+    const element = document.getElementById("app");
+    if (element) element.textContent = err.message === "ACCESS_DENIED"
+      ? "Доступ к этому приложению ограничен."
+      : err.message === "TELEGRAM_REQUIRED"
+        ? "Откройте приложение из Telegram, чтобы просмотреть портфолио."
+        : "Не удалось загрузить данные. Попробуйте позже.";
+    return;
+  }
   state.pricing = pricing;
   state.portfolio = portfolio;
   state.about = about;

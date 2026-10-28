@@ -6,7 +6,7 @@ from pathlib import Path
 from aiogram import Bot
 from aiohttp import web
 
-from bot import config, content_store, texts
+from bot import access_control, config, content_store, texts
 from bot.calculator import calculate
 from bot.data import load_pricing
 from bot.lead import format_lead_message, format_lead_supplement_message
@@ -116,6 +116,16 @@ async def handle_public_data(request: web.Request) -> web.Response:
     filename = request.match_info["filename"]
     if filename not in PUBLIC_DATA_FILES:
         raise web.HTTPNotFound()
+    # With PRIVATE_MINIAPP_CONTENT=1, only signed Telegram users may
+    # obtain portfolio/about/pricing; anonymous browser preview is disabled.
+    # In public mode, authenticated blocked users are denied too, but an
+    # anonymous direct request remains possible (documented limitation).
+    raw_init = request.headers.get("X-Telegram-Init-Data", "")
+    user = validate_init_data(raw_init, config.BOT_TOKEN) if raw_init else None
+    if config.PRIVATE_MINIAPP_CONTENT and user is None:
+        return web.json_response({"error": "telegram_required"}, status=401)
+    if user and await access_control.is_blocked(user["id"], user.get("username")):
+        return web.json_response({"error": "access_denied"}, status=403)
     try:
         data = await content_store.read_async(filename)
     except FileNotFoundError:
@@ -168,6 +178,8 @@ async def handle_my_leads(request: web.Request) -> web.Response:
             request.headers.get("User-Agent", "")[:120],
         )
         return web.json_response({"error": "unauthorized"}, status=401)
+    if await access_control.is_blocked(user["id"], user.get("username")):
+        return web.json_response({"error": "access_denied"}, status=403)
     leads = await content_store.list_leads_by_user(user["id"])
     return web.json_response(leads, dumps=lambda d: json.dumps(d, ensure_ascii=False))
 
@@ -193,6 +205,9 @@ async def handle_create_lead(request: web.Request) -> web.Response:
             diag.auth_date_present, diag.auth_date_valid, diag.user_present, diag.user_json_ok,
         )
         return web.json_response({"error": "unauthorized"}, status=401)
+
+    if await access_control.is_blocked(user["id"], user.get("username")):
+        return web.json_response({"error": "access_denied"}, status=403)
 
     try:
         payload = await request.json()
