@@ -6,6 +6,7 @@ Full briefs and calculations remain in Mini App unchanged.
 """
 import logging
 import uuid
+from html import escape
 
 from aiogram import F, Router
 from aiogram.filters import Command
@@ -44,8 +45,8 @@ def _telegram_contact(user) -> str:
 def _preview(task: str, contact: str) -> str:
     return (
         "⚡ Быстрая заявка\n\n"
-        f"Задача: {task}\n\n"
-        f"Как связаться: {contact}\n\n"
+        f"Задача: {escape(task)}\n\n"
+        f"Как связаться: {escape(contact)}\n\n"
         "Проверьте данные перед отправкой. Стоимость и сроки "
         "согласуем после обсуждения."
     )

@@ -4043,13 +4043,15 @@ class MainMenuConfirmationTests(unittest.IsolatedAsyncioTestCase):
 
         await start.main_menu_button(msg, state)
 
-        msg.answer.assert_not_awaited()
+        # A client now receives a transient native menu, not a new NAV anchor.
+        msg.answer.assert_awaited_once()
+        self.assertEqual(msg.answer.await_args.args[0], texts.CLIENT_HOME)
         msg.bot.edit_message_text.assert_not_awaited()
         msg.bot.delete_message.assert_awaited_once_with(chat_id=999, message_id=222)
         self.assertTrue(deleted["trigger"])
         self.assertIsNone(await state.get_state())
         data = await state.get_data()
-        self.assertIsNone(data.get(flow._ANCHOR_MSG_KEY))
+        self.assertIsNotNone(data.get(flow._ANCHOR_MSG_KEY))
         self.assertEqual(data.get(flow._NAV_ANCHOR_MSG_KEY), 111)
 
     async def test_active_state_shows_confirmation_without_resetting_it(self):
@@ -4091,7 +4093,7 @@ class MainMenuConfirmationTests(unittest.IsolatedAsyncioTestCase):
             await start.main_menu_button(msg, state)
             total_answer += msg.answer.await_count
             total_edit += msg.bot.edit_message_text.await_count
-        self.assertEqual(total_answer, 0)
+        self.assertEqual(total_answer, 3)  # transient menus, no extra NAV
         self.assertEqual(total_edit, 0)
         data = await state.get_data()
         self.assertEqual(data.get(flow._NAV_ANCHOR_MSG_KEY), 111)
