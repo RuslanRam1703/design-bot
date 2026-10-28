@@ -759,9 +759,10 @@ class StartHandlerCleanupTests(unittest.IsolatedAsyncioTestCase):
         state = make_state()
         msg = make_flow_message(text="/start")
         await start.cmd_start(msg, state)
-        msg.answer.assert_awaited_once()
+        self.assertEqual(msg.answer.await_count, 2)  # NAV + native inline home
         data = await state.get_data()
         self.assertEqual(data[flow._NAV_ANCHOR_MSG_KEY], 555)
+        self.assertEqual(data[flow._ANCHOR_MSG_KEY], 555)
 
     async def test_second_root_command_deletes_first_root_screen(self):
         # /start больше не создаёт TRANSIENT-экран (он ушёл в NAV anchor,
@@ -880,7 +881,9 @@ class EntryPointArchitectureTests(unittest.IsolatedAsyncioTestCase):
         state = make_state()
         msg = make_flow_message(text="/start")
         await start.cmd_start(msg, state)
-        sent_markup = msg.answer.await_args.kwargs.get("reply_markup") or msg.answer.await_args.args[1]
+        # First call is the persistent NAV keyboard; second is inline menu.
+        nav_call = msg.answer.await_args_list[0]
+        sent_markup = nav_call.kwargs.get("reply_markup") or nav_call.args[1]
         self.assertIsInstance(sent_markup, ReplyKeyboardMarkup)
         for row in sent_markup.keyboard:
             for btn in row:
@@ -889,13 +892,15 @@ class EntryPointArchitectureTests(unittest.IsolatedAsyncioTestCase):
     async def test_cmd_start_shows_admin_button_only_to_owner(self):
         owner_msg = make_flow_message(chat_id=888, text="/start")
         await start.cmd_start(owner_msg, make_state(888))
-        owner_markup = owner_msg.answer.await_args.kwargs.get("reply_markup") or owner_msg.answer.await_args.args[1]
+        owner_call = owner_msg.answer.await_args_list[0]
+        owner_markup = owner_call.kwargs.get("reply_markup") or owner_call.args[1]
         owner_texts_seen = {btn.text for row in owner_markup.keyboard for btn in row}
         self.assertIn(texts.ADMIN_BUTTON, owner_texts_seen)
 
         client_msg = make_flow_message(chat_id=999, text="/start")
         await start.cmd_start(client_msg, make_state(999))
-        client_markup = client_msg.answer.await_args.kwargs.get("reply_markup") or client_msg.answer.await_args.args[1]
+        client_call = client_msg.answer.await_args_list[0]
+        client_markup = client_call.kwargs.get("reply_markup") or client_call.args[1]
         client_texts_seen = {btn.text for row in client_markup.keyboard for btn in row}
         self.assertNotIn(texts.ADMIN_BUTTON, client_texts_seen)
 
@@ -1089,12 +1094,12 @@ class EntryPointArchitectureTests(unittest.IsolatedAsyncioTestCase):
     async def test_start_sends_persistent_keyboard_client_and_owner(self):
         client_msg = make_flow_message(chat_id=999, text="/start")
         await start.cmd_start(client_msg, make_state(999))
-        client_markup = client_msg.answer.await_args.kwargs.get("reply_markup") or client_msg.answer.await_args.args[1]
+        client_markup = client_msg.answer.await_args_list[0].kwargs["reply_markup"]
         self.assertTrue(client_markup.is_persistent)
 
         owner_msg = make_flow_message(chat_id=888, text="/start")
         await start.cmd_start(owner_msg, make_state(888))
-        owner_markup = owner_msg.answer.await_args.kwargs.get("reply_markup") or owner_msg.answer.await_args.args[1]
+        owner_markup = owner_msg.answer.await_args_list[0].kwargs["reply_markup"]
         self.assertTrue(owner_markup.is_persistent)
 
     async def test_cancel_sends_persistent_reply_keyboard(self):
@@ -4638,9 +4643,9 @@ class FaqCleanupRegressionTests(unittest.IsolatedAsyncioTestCase):
         state = make_state(999)
         msg = make_flow_message(chat_id=999, text="/start")
         await start.cmd_start(msg, state)
-        self.assertEqual(msg.answer.await_count, 1)
-        sent_markup = msg.answer.await_args.kwargs.get("reply_markup") or msg.answer.await_args.args[1]
-        button_texts = {btn.text for row in sent_markup.keyboard for btn in row}
+        self.assertEqual(msg.answer.await_count, 2)
+        nav_markup = msg.answer.await_args_list[0].kwargs["reply_markup"]
+        button_texts = {btn.text for row in nav_markup.keyboard for btn in row}
         self.assertEqual(button_texts, {texts.MAIN_MENU_BUTTON, texts.MENU_FAQ})
 
     async def test_cold_state_faq_creates_nav_anchor_separately_from_transient(self):
