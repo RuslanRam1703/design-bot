@@ -10,6 +10,7 @@ from bot.calculator import calculate
 from bot.data import load_pricing
 from bot.handlers.start import relay_client_media_to_designer
 from bot.lead import format_lead_message, format_material_message
+from bot.notifications import notify_designer_lead
 
 router = Router(name="webapp")
 logger = logging.getLogger(__name__)
@@ -43,7 +44,7 @@ async def _handle_brief_submission(message: Message, payload: dict) -> None:
     calc_result = None
     calc_payload = payload.get("calc")
     if calc_payload and calc_payload.get("service_id"):
-        pricing = load_pricing()
+        pricing = await content_store.read_async("pricing.json") if content_store.is_redis_backed() else load_pricing()
         calc_result = calculate(
             pricing=pricing,
             service_id=calc_payload["service_id"],
@@ -72,17 +73,9 @@ async def _handle_brief_submission(message: Message, payload: dict) -> None:
     # (handle_tz_file ниже не различает, откуда взялась заявка).
     lead = await content_store.add_lead(payload, telegram_identity, calc_summary, draft_id=payload.get("draft_id"))
 
-    # Уведомляем владельца только при реальном создании — та же логика
-    # idempotency, что и в bot/webserver.py::_handle_lead_create (см. аудит).
-    if lead["created"]:
-        text = format_lead_message(payload, calc_result, lead_id=lead["id"], from_user_id=user.id, username=user.username)
-        if config.DESIGNER_CHAT_ID:
-            try:
-                await message.bot.send_message(chat_id=config.DESIGNER_CHAT_ID, text=text, parse_mode="HTML")
-            except Exception:
-                logger.exception("Не удалось отправить заявку дизайнеру (DESIGNER_CHAT_ID=%s)", config.DESIGNER_CHAT_ID)
-        else:
-            logger.warning("DESIGNER_CHAT_ID не задан — заявка не отправлена дизайнеру:\n%s", text)
+    # Both legacy and HTTP submission use the same persisted delivery state.
+    if lead["created"] or lead.get("changed") or (lead.get("designer_notification") or {}).get("state") != "sent":
+        await notify_designer_lead(message.bot, lead)
 
     price_range = None
     if calc_summary:
@@ -141,7 +134,10 @@ async def handle_tz_file(message: Message) -> None:
     # Материал сохраняем ДО пересылки — если пересылка упадёт (Telegram API
     # недоступен и т.п.), связь "файл ↔ заявка" всё равно не теряется, её
     # можно будет восстановить вручную через file_id из /admin.
-    await content_store.record_lead_material(lead["id"], file_id, file_unique_id, kind, source)
+    stored = await content_store.record_lead_material(lead["id"], file_id, file_unique_id, kind, source)
+    if not stored:
+        await message.answer("Заявка больше не принимает материалы. Файл не прикреплён.")
+        return
 
     if config.DESIGNER_CHAT_ID:
         try:

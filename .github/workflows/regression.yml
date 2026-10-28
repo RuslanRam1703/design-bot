@@ -1,0 +1,19 @@
+name: Regression tests
+on:
+  pull_request:
+  push:
+    branches: [main]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    env:
+      BOT_TOKEN: '123456:test-token-not-real'
+      DESIGNER_CHAT_ID: '777'
+      WEBAPP_URL: 'https://example.invalid'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt
+      - run: python -m unittest discover -s tests -p 'test_*.py'

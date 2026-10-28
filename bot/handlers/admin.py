@@ -12,6 +12,7 @@
 """
 
 import logging
+import math
 import zipfile
 from datetime import datetime, timezone
 from typing import Any, Callable
@@ -304,7 +305,7 @@ def _parse_number(text: str, *, min_value: float = 0) -> float | None:
         value = float(text.strip().replace(",", "."))
     except ValueError:
         return None
-    if value < min_value:
+    if not math.isfinite(value) or value > 1_000_000_000_000 or value < min_value:
         return None
     return value
 
