@@ -7,6 +7,7 @@ from aiogram import Bot
 from aiohttp import web
 
 from bot import access_control, config, content_store, texts
+from bot.burst_guard import BurstLimiter
 from bot.calculator import calculate
 from bot.data import load_pricing
 from bot.lead import format_lead_message, format_lead_supplement_message
@@ -27,6 +28,10 @@ async def _pricing_for_calculation() -> dict:
 def _valid_new_lead_payload(payload: dict) -> bool:
     """Reject malformed external input before persisting or formatting it."""
     if payload.get("mode", "new") != "new":
+        return False
+    # A valid signed initData must not permit empty leads using new draft IDs.
+    if not any(isinstance(payload.get(k), str) and payload[k].strip()
+               for k in ("service_name", "task_description")):
         return False
     text_fields = (
         "service_id", "service_name", "task_description", "deadline",
@@ -194,6 +199,14 @@ async def handle_create_lead(request: web.Request) -> web.Response:
     Тот же принцип identity, что и в handle_my_leads: user_id ТОЛЬКО из
     validate_init_data, из body не принимается и не читается вообще —
     подменить чужой user_id через body физически невозможно."""
+    # Fast best-effort abuse protection before HMAC/Redis/notifications.
+    # Render forwards the client address in X-Forwarded-For. This is an
+    # in-process guard, not a substitute for Render's edge DDoS protection.
+    remote = request.headers.get("X-Forwarded-For", "").split(",")[0].strip()
+    remote = remote or request.remote or "unknown"
+    if not request.app["lead_burst"].allow(remote):
+        return web.json_response({"error": "too_many_requests"}, status=429,
+                                 headers={"Retry-After": "10"})
     init_data = request.headers.get("X-Telegram-Init-Data", "")
     user = validate_init_data(init_data, config.BOT_TOKEN)
     if user is None:
@@ -419,6 +432,8 @@ def create_app(bot: Bot) -> web.Application:
     ни к Bot, ни к Dispatcher вообще — см. аудит перед этим изменением)."""
     app = web.Application(client_max_size=64 * 1024)
     app["bot"] = bot
+    # Per-worker, per-client-IP short-burst limit; no daily lead quota.
+    app["lead_burst"] = BurstLimiter(limit=20, window_seconds=10)
     app.on_response_prepare.append(_no_cache)
     for path in ("/", "/portfolio", "/about", "/calculator", "/brief", "/myleads"):
         app.router.add_get(path, handle_index)

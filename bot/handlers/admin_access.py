@@ -124,9 +124,12 @@ async def block(cb: CallbackQuery, state: FSMContext):
     except ValueError as exc:
         await cb.answer(str(exc), show_alert=True)
         return
+    menu_updated = await access_control.sync_menu_button(cb.bot, user_id, blocked=True)
+    menu_note = "" if menu_updated else "\nКнопку Telegram скрыть не удалось; блокировка действий всё равно действует."
     await flow.step_from_callback(cb, state,
         f"{'Заблокирован' if added else 'Уже заблокирован'} ID {user_id}. "
-        "Его заявки, сообщения и нажатия кнопок больше не обрабатываются.",
+        "Его заявки, сообщения и нажатия кнопок больше не обрабатываются."
+        + menu_note,
         back_keyboard())
     await cb.answer()
 
@@ -175,8 +178,11 @@ async def unblock(cb: CallbackQuery, state: FSMContext):
     except ValueError:
         await cb.answer("Некорректный ID", show_alert=True)
         return
+    restored = await access_control.sync_menu_button(cb.bot, uid, blocked=False)
+    menu_note = "" if restored else "\nНе удалось обновить кнопку Telegram: повторите действие позже."
     await flow.step_from_callback(cb, state,
-        f"ID {uid}: {'доступ восстановлен' if removed else 'запись уже отсутствует'}.", back_keyboard())
+        f"ID {uid}: {'доступ восстановлен' if removed else 'запись уже отсутствует'}."
+        + menu_note, back_keyboard())
     await cb.answer()
 
 

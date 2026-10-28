@@ -69,3 +69,30 @@ test('customer cannot choose professional complexity in either public surface', 
   assert.doesNotMatch(source, /id="order-complex-toggle"/);
   assert.match(source, /complex: false/);
 });
+
+test('blocked Telegram account closes Mini App before content is rendered', async () => {
+  let closed = 0;
+  const element = { textContent: '' };
+  const fakeTG = {
+    initData: 'signed-data',
+    ready() {}, expand() {}, themeParams: {}, colorScheme: 'light',
+    onEvent() {}, close() { closed += 1; },
+  };
+  const context = {
+    window: { Telegram: { WebApp: fakeTG } },
+    document: {
+      addEventListener() {},
+      documentElement: { style: { setProperty() {} }, dataset: {} },
+      getElementById() { return element; },
+    },
+    localStorage: { getItem() { return null; }, setItem() {}, removeItem() {} },
+    fetch: async () => ({ status: 403, ok: false }),
+    console, setTimeout, clearTimeout,
+  };
+  vm.createContext(context);
+  const sourceWithoutBootstrap = source.replace(/\ninit\(\);\s*$/, '\n');
+  vm.runInContext(sourceWithoutBootstrap + '\nglobalThis.__initApp = init;', context);
+  await context.__initApp();
+  assert.equal(closed, 1);
+  assert.match(element.textContent, /Доступ к этому приложению ограничен/);
+});
