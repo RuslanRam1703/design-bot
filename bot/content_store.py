@@ -1390,7 +1390,16 @@ async def _read_leads() -> list[dict]:
 
 
 async def _write_leads(leads: list[dict]) -> None:
-    await _write("leads.json", {"leads": leads})
+    # Both leads and owner-only projects live under one existing Redis key.
+    # Preserve project ledger on ALL legacy lead writes (and restores).
+    # Callers already hold _lock("leads.json"); the same fenced write
+    # protects both arrays from multi-instance lost updates.
+    try:
+        document = await _read("leads.json")
+    except FileNotFoundError:
+        document = {}
+    document["leads"] = leads
+    await _write("leads.json", document)
 
 
 def _clear_other_awaiting(leads: list[dict], user_id: int, keep_lead_id: int) -> None:
@@ -1828,6 +1837,10 @@ async def delete_lead(actor_chat_id: int | str, lead_id: int) -> bool:
         leads = [l for l in leads if l["id"] != lead_id]
         if len(leads) == before:
             return False
+        # Never silently erase a commercial project's accounting history.
+        document = await _read("leads.json")
+        if any(p.get("lead_id") == lead_id for p in document.get("projects", [])):
+            return False
         await _write_leads(leads)
         return True
 
@@ -2069,6 +2082,24 @@ async def import_backup_bytes(actor_chat_id: int | str, zip_bytes: bytes) -> Bac
             except Exception as e:
                 logger.exception("Storage: backup snapshot failed for %s — restore aborted before any write", filename)
                 raise BackupSnapshotError(filename) from e
+
+        # A legacy archive with leads but no "projects" would otherwise
+        # silently erase commercial accounting records. Reject it while a
+        # ledger exists. Old archives remain restorable before any project
+        # is created; archives made by this version include the ledger.
+        previous_leads = snapshot.get("leads.json")
+        incoming_leads = json_plan.get("leads.json")
+        if (
+            isinstance(previous_leads, dict)
+            and previous_leads.get("projects")
+            and isinstance(incoming_leads, dict)
+            and "projects" not in incoming_leads
+        ):
+            raise BackupValidationError(
+                "leads.json",
+                "старый бэкап не содержит проекты и финансовую историю; восстановление отменено",
+                found_json_filenames,
+            )
 
         # ---- Phase 2: запись JSON. Ошибка -> откат уже записанных к снапшоту.
         written: list[str] = []

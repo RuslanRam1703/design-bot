@@ -2623,10 +2623,14 @@ async def lead_delete_do(callback: CallbackQuery, state: FSMContext) -> None:
     answer = callback.data.split(":", 1)[1]
     data = await state.get_data()
     status = data.get("lead_filter", "ALL")
+    deleted = False
     if answer == "yes":
-        await content_store.delete_lead(callback.message.chat.id, data["lead_id"])
+        deleted = await content_store.delete_lead(callback.message.chat.id, data["lead_id"])
     leads = await content_store.list_leads(status)
-    text = f"Заявка удалена ✅\n\nЗаявки ({len(leads)}):" if answer == "yes" else f"Отменено.\n\nЗаявки ({len(leads)}):"
+    if answer == "yes" and not deleted:
+        text = f"Заявка привязана к проекту либо уже удалена. Финансовая история сохранена.\\n\\nЗаявки ({len(leads)}):"
+    else:
+        text = f"Заявка удалена ✅\\n\\nЗаявки ({len(leads)}):" if deleted else f"Отменено.\\n\\nЗаявки ({len(leads)}):"
     await callback.message.edit_text(text, reply_markup=kb.leads_list_keyboard(leads, status))
     await state.set_state(AdminStates.leads_list)
     await callback.answer()
@@ -2647,13 +2651,13 @@ async def lead_delete_do(callback: CallbackQuery, state: FSMContext) -> None:
 def _backup_menu_text() -> str:
     if content_store.is_redis_backed():
         return (
-            "Бэкап данных (заявки, кейсы, «Обо мне», услуги, FAQ, фото) — "
+            "Бэкап данных (заявки, проекты и оплаты, кейсы, «Обо мне», услуги, FAQ, фото) — "
             "данные хранятся в Redis и переживают деплой автоматически. "
             "Бэкап нужен как дополнительная копия на всякий случай, "
             "восстанавливать его после каждого деплоя не требуется:"
         )
     return (
-        "Бэкап данных (заявки, кейсы, «Обо мне», услуги, FAQ, фото) — "
+        "Бэкап данных (заявки, проекты и оплаты, кейсы, «Обо мне», услуги, FAQ, фото) — "
         "переживает деплой, только если вы его восстановите после каждого обновления бота:"
     )
 

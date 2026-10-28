@@ -77,7 +77,8 @@ MENU_ITEM_LABELS = {
 def admin_root_keyboard() -> InlineKeyboardMarkup:
     """Three clear responsibilities; all actions remain native inline buttons."""
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📋 Заявки", callback_data="adminmenu:leads")],
+        [InlineKeyboardButton(text="📋 Заявки", callback_data="adminmenu:leads"),
+         InlineKeyboardButton(text="📂 Проекты", callback_data="adminmenu:projects")],
         [InlineKeyboardButton(text="📁 Контент", callback_data="adminmenu:content"),
          InlineKeyboardButton(text="💰 Услуги и цены", callback_data="adminmenu:pricing")],
         [InlineKeyboardButton(text="⚙️ Настройки и данные", callback_data="adminmenu:settings")],
@@ -430,6 +431,7 @@ def lead_detail_keyboard(lead: dict) -> InlineKeyboardMarkup:
     rows = [[
         InlineKeyboardButton(text=("▶ " if lead["status"] == key else "") + label, callback_data=f"adminleadstatus:{key}")
     ] for key, label in LEAD_STATUS_LABELS.items()]
+    rows.append([InlineKeyboardButton(text="📂 Открыть / создать проект", callback_data="adminleadaction:project")])
     rows.append([InlineKeyboardButton(text="💬 Ответить через бота", callback_data="adminleadaction:reply")])
     materials = lead.get("materials") or []
     if materials:

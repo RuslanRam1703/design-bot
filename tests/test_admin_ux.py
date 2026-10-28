@@ -10,7 +10,7 @@ class AdminNavigationUXTests(unittest.IsolatedAsyncioTestCase):
     def test_root_prioritizes_inbox_and_groups_content(self):
         root = kb.admin_root_keyboard()
         callbacks = [[button.callback_data for button in row] for row in root.inline_keyboard]
-        self.assertEqual(callbacks[0], ["adminmenu:leads"])
+        self.assertEqual(callbacks[0], ["adminmenu:leads", "adminmenu:projects"])
         self.assertIn("adminmenu:content", callbacks[1])
         self.assertIn("adminmenu:pricing", callbacks[1])
         self.assertEqual(callbacks[-1], ["adminmenu:settings"])
