@@ -1,7 +1,8 @@
-"""Persisted at-least-once designer notification delivery.
+"""Persisted at-least-once Telegram notifications with exclusive delivery claims.
 
-Telegram timeouts are ambiguous, so an occasional duplicate is possible;
-losing a lead notification silently is worse.
+Telegram does not supply sendMessage idempotency keys. A timeout may occur
+after acceptance, so exactly-once is impossible; per-message claims prevent
+parallel sends, and backoff limits retries after ambiguous failures.
 """
 import asyncio
 import logging
@@ -20,21 +21,26 @@ async def notify_designer_lead(bot, lead: dict) -> bool:
     notice = lead.get("designer_notification")
     if not notice or notice.get("state") == "sent":
         return True
-    calc = lead.get("calc_summary")
-    try:
-        text = format_lead_message(
-            lead["payload"], CalcResult(**calc) if calc else None,
-            lead_id=lead["id"], from_user_id=lead["telegram"]["user_id"],
-            username=lead["telegram"].get("username"),
-        )
-        if notice["revision"] > 1:
-            text = text.replace("Новая заявка", "Обновление заявки", 1)
-        await bot.send_message(chat_id=config.DESIGNER_CHAT_ID, text=text, parse_mode="HTML")
-    except Exception:
-        logger.exception("Designer notification failed for lead #%s", lead["id"])
-        await content_store.update_designer_notification(lead["id"], notice["revision"], "failed")
+    claimed = await content_store.claim_designer_notification(lead["id"], notice["revision"])
+    if claimed is None:
         return False
-    await content_store.update_designer_notification(lead["id"], notice["revision"], "sent")
+    record = claimed["designer_notification"]
+    token = record["claim_token"]
+    calc = claimed.get("calc_summary")
+    try:
+        message = format_lead_message(
+            claimed["payload"], CalcResult(**calc) if calc else None,
+            lead_id=claimed["id"], from_user_id=claimed["telegram"]["user_id"],
+            username=claimed["telegram"].get("username"),
+        )
+        if record["revision"] > 1:
+            message = message.replace("Новая заявка", "Обновление заявки", 1)
+        await bot.send_message(chat_id=config.DESIGNER_CHAT_ID, text=message, parse_mode="HTML")
+    except Exception:
+        logger.exception("Designer notification failed for lead #%s", claimed["id"])
+        await content_store.finish_designer_notification(claimed["id"], record["revision"], token, "failed")
+        return False
+    await content_store.finish_designer_notification(claimed["id"], record["revision"], token, "sent")
     return True
 
 
@@ -48,14 +54,19 @@ async def notify_designer_supplement(bot, lead: dict, supplement_id: int) -> boo
     notice = supplement.get("designer_notification")
     if not notice or notice.get("state") == "sent":
         return True
-    try:
-        text = format_lead_supplement_message(lead["id"], supplement["fields"])
-        await bot.send_message(chat_id=config.DESIGNER_CHAT_ID, text=text, parse_mode="HTML")
-    except Exception:
-        logger.exception("Designer supplement notification failed for lead #%s", lead["id"])
-        await content_store.update_designer_notification(lead["id"], notice["revision"], "failed", supplement_id)
+    claimed = await content_store.claim_designer_notification(lead["id"], notice["revision"], supplement_id)
+    if claimed is None:
         return False
-    await content_store.update_designer_notification(lead["id"], notice["revision"], "sent", supplement_id)
+    current = next(s for s in claimed.get("supplements", []) if s["id"] == supplement_id)
+    token = current["designer_notification"]["claim_token"]
+    try:
+        message = format_lead_supplement_message(claimed["id"], current["fields"])
+        await bot.send_message(chat_id=config.DESIGNER_CHAT_ID, text=message, parse_mode="HTML")
+    except Exception:
+        logger.exception("Designer supplement notification failed for lead #%s", claimed["id"])
+        await content_store.finish_designer_notification(claimed["id"], notice["revision"], token, "failed", supplement_id)
+        return False
+    await content_store.finish_designer_notification(claimed["id"], notice["revision"], token, "sent", supplement_id)
     return True
 
 
@@ -71,4 +82,4 @@ async def retry_designer_notifications(bot) -> None:
                 else:
                     await notify_designer_supplement(bot, lead, supplement_id)
         except Exception:
-            logger.exception("Designer delivery retry worker failed")
+            logger.exception("Designer notification retry failed")

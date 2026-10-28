@@ -5930,8 +5930,27 @@ class FakeUpstash:
         if cmd == "GET":
             result = self.store.get(args[1])
         elif cmd == "SET":
-            self.store[args[1]] = args[2]
-            result = "OK"
+            if "NX" in args[3:] and args[1] in self.store:
+                result = None
+            else:
+                self.store[args[1]] = args[2]
+                result = "OK"
+        elif cmd == "EVAL":
+            script = args[1]
+            keys = args[3:3 + int(args[2])]
+            argv = args[3 + int(args[2]):]
+            if "PEXPIRE" in script:
+                result = 1 if self.store.get(keys[0]) == argv[0] else 0
+            elif "DEL" in script:
+                result = 1 if self.store.get(keys[0]) == argv[0] else 0
+                if result:
+                    del self.store[keys[0]]
+            elif len(keys) == 2 and "SET" in script:
+                result = 1 if self.store.get(keys[0]) == argv[0] else 0
+                if result:
+                    self.store[keys[1]] = argv[1]
+            else:
+                raise AssertionError("Unrecognized test Lua script")
         else:
             raise AssertionError(f"unexpected command in test double: {args}")
         body = json.dumps({"result": result}).encode("utf-8")
