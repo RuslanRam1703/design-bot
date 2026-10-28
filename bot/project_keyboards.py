@@ -1,4 +1,4 @@
-"""Native, owner-only inline controls for demo and commercial projects."""
+"""Native, owner-only inline controls for projects created from leads."""
 from aiogram.types import InlineKeyboardButton as B, InlineKeyboardMarkup as K
 from bot import project_store
 
@@ -8,7 +8,7 @@ def project_list(items: list[dict], page: int = 0, page_size: int = 8) -> K:
     page = min(max(page, 0), pages - 1)
     rows = []
     for project in items[page * page_size:(page + 1) * page_size]:
-        label = ("🧪 " if project["is_demo"] else "📂 ") + project["id"] + " · " + project["title"][:34]
+        label = "📂 " + project["id"] + " · " + project["title"][:34]
         rows.append([B(text=label[:64], callback_data=f"pj:open:{project['id']}")])
     if pages > 1:
         nav = []
@@ -18,10 +18,7 @@ def project_list(items: list[dict], page: int = 0, page_size: int = 8) -> K:
         if page + 1 < pages:
             nav.append(B(text="▶️", callback_data=f"pj:page:{page+1}"))
         rows.append(nav)
-    rows += [
-        [B(text="🧪 Создать тестовый проект", callback_data="pj:newdemo")],
-        [B(text="◀️ Админ-меню", callback_data="pj:root")],
-    ]
+    rows.append([B(text="◀️ Админ-меню", callback_data="pj:root")])
     return K(inline_keyboard=rows)
 
 
@@ -35,8 +32,6 @@ def project_detail(project: dict) -> K:
          B(text="🧾 Платежи", callback_data="pj:payments")],
         [B(text="🕘 История изменений", callback_data="pj:history")],
     ]
-    if project["is_demo"]:
-        rows.append([B(text="🗑 Удалить тестовый проект", callback_data="pj:delete")])
     rows.append([B(text="◀️ К проектам", callback_data="adminmenu:projects")])
     return K(inline_keyboard=rows)
 

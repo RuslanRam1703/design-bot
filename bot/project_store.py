@@ -2,8 +2,8 @@
 
 No migration, new Redis key, or change to the public My Leads API.
 All writes use the existing per-key distributed _lock and fenced _write.
-A demo project has no lead_id and can be deleted; real projects are
-non-destructive and keep append-only history (void payments, do not erase).
+Projects are created from customer leads. Previously stored project records
+remain intact; payments stay append-only (void, do not erase).
 Payments are MANUAL RECORDS, never proof of a bank transaction.
 """
 from datetime import date, datetime, timezone
@@ -44,16 +44,16 @@ def _history(project: dict, kind: str, detail: str) -> None:
     project["updated_at"] = _now()
 
 
-def _new_project(project_id: str, lead_id: int | None, title: str, client: str, is_demo: bool) -> dict:
+def _new_project(project_id: str, lead_id: int, title: str, client: str) -> dict:
     stamp = _now()
     result = {
-        "id": project_id, "lead_id": lead_id, "is_demo": is_demo,
+        "id": project_id, "lead_id": lead_id,
         "title": title[:160], "client": client[:120],
         "status": "PLANNED", "stage_index": 0,
         "stages": list(STAGES), "price_rub": None, "deadline": None,
         "payments": [], "history": [], "created_at": stamp, "updated_at": stamp,
     }
-    _history(result, "created", "Демонстрационный проект" if is_demo else "Создан из заявки")
+    _history(result, "created", "Создан из заявки")
     return result
 
 
@@ -89,20 +89,7 @@ async def create_from_lead(actor, lead_id: int) -> dict:
             f"P{lead_id}", lead_id,
             lead.get("payload", {}).get("service_name") or "Проект для оценки",
             lead.get("telegram", {}).get("first_name") or "Клиент",
-            False,
         )
-        projects.append(project)
-        await content_store._write("leads.json", doc)
-        return project
-
-
-async def create_demo(actor) -> dict:
-    _require(actor)
-    async with content_store._lock("leads.json"):
-        doc = await _read_document()
-        projects = doc.setdefault("projects", [])
-        next_id = max((int(p["id"][1:]) for p in projects if p["id"].startswith("D") and p["id"][1:].isdigit()), default=0) + 1
-        project = _new_project(f"D{next_id}", None, "Тестовый дизайн-проект", "Демо-клиент", True)
         projects.append(project)
         await content_store._write("leads.json", doc)
         return project
@@ -177,16 +164,3 @@ async def mutate(actor, project_id: str, operation: str, value=None) -> dict:
         _history(project, operation, detail)
         await content_store._write("leads.json", doc)
         return project
-
-
-async def delete_demo(actor, project_id: str) -> bool:
-    _require(actor)
-    async with content_store._lock("leads.json"):
-        doc = await _read_document()
-        projects = doc.get("projects", [])
-        target = next((p for p in projects if p["id"] == project_id), None)
-        if target is None or not target.get("is_demo") or target.get("lead_id") is not None:
-            return False
-        doc["projects"] = [p for p in projects if p["id"] != project_id]
-        await content_store._write("leads.json", doc)
-        return True

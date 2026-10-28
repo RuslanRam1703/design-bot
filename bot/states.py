@@ -126,4 +126,3 @@ class ProjectStates(StatesGroup):
     payment_input = State()
     payment_confirm = State()
     void_confirm = State()
-    delete_demo_confirm = State()

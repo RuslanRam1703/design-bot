@@ -47,7 +47,7 @@ def _project_text(project: dict) -> str:
     paid = project_store.total_paid(project)
     agreed = project.get("price_rub")
     balance = agreed - paid if agreed is not None else None
-    tag = "🧪 ТЕСТ — не реальный клиент" if project["is_demo"] else "📂 Коммерческий проект"
+    tag = "📂 Проект"
     current_stage = project["stages"][project["stage_index"]]
     return (
         f"<b>{tag} #{escape(project['id'])}</b>\n"
@@ -71,8 +71,8 @@ async def _show_list(callback: CallbackQuery, state: FSMContext, page: int = 0) 
     page = min(max(page, 0), pages - 1)
     await flow.step_from_callback(
         callback, state, f"📂 Проекты ({len(projects)})\n\n"
-        "Здесь только учёт заказов. Тестовые записи отмечены 🧪.\n"
-        "Чтобы перевести реальную заявку в проект, откройте её в разделе «Заявки».",
+        "Чтобы создать проект, откройте заявку в разделе «Заявки»"
+        " и выберите «Открыть / создать проект».",
         kb.project_list(projects, page),
     )
     await state.update_data(project_page=page)
@@ -116,13 +116,6 @@ async def projects_page(callback: CallbackQuery, state: FSMContext) -> None:
 @router.callback_query(F.data == "pj:noop")
 async def page_noop(callback: CallbackQuery) -> None:
     await callback.answer()
-
-
-@router.callback_query(ProjectStates.list, F.data == "pj:newdemo")
-async def create_demo(callback: CallbackQuery, state: FSMContext) -> None:
-    project = await project_store.create_demo(callback.message.chat.id)
-    await _show_project(callback, state, project)
-    await callback.answer("Тестовый проект создан")
 
 
 @router.callback_query(AdminStates.lead_detail, F.data == "adminleadaction:project")
@@ -397,34 +390,6 @@ async def history_menu(callback: CallbackQuery, state: FSMContext) -> None:
         lines.append(f"{event['at'][:16].replace('T', ' ')} — {escape(event['detail'])}")
     await flow.step_from_callback(callback, state, "\n".join(lines), kb.cancel_keyboard())
     await callback.answer()
-
-
-@router.callback_query(ProjectStates.detail, F.data == "pj:delete")
-async def delete_demo_start(callback: CallbackQuery, state: FSMContext) -> None:
-    project = await _current_project(callback, state)
-    if project is None:
-        return
-    if not project["is_demo"]:
-        await callback.answer("Рабочие проекты нельзя удалить через демо-режим", show_alert=True)
-        return
-    await flow.step_from_callback(callback, state, "Удалить тестовый проект и его демо-платежи?",
-                                  kb.confirm_keyboard("delete", destructive=True))
-    await state.set_state(ProjectStates.delete_demo_confirm)
-    await callback.answer()
-
-
-@router.callback_query(ProjectStates.delete_demo_confirm, F.data.startswith("pj:delete:"))
-async def delete_demo_confirm(callback: CallbackQuery, state: FSMContext) -> None:
-    if callback.data.endswith(":no"):
-        await go_project_back(callback, state)
-        return
-    project_id = (await state.get_data()).get("project_id")
-    success = await project_store.delete_demo(callback.message.chat.id, project_id)
-    if not success:
-        await callback.answer("Нельзя удалить рабочий проект", show_alert=True)
-        return
-    await _show_list(callback, state)
-    await callback.answer("Тестовый проект удалён")
 
 
 @router.message(StateFilter(ProjectStates), Command("cancel"))
