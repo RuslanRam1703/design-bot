@@ -47,6 +47,39 @@ class HardeningTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("&lt;unclosed", rendered)
         self.assertNotIn("— опции: <unclosed", rendered)
 
+    async def test_notification_failure_then_success_is_persistent(self):
+        import tempfile
+        from pathlib import Path
+        from bot import content_store
+        from bot.notifications import notify_designer_lead
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.object(content_store, "DATA_DIR", Path(tmp)), \
+                 patch("bot.notifications.config.DESIGNER_CHAT_ID", "777"):
+                lead = await content_store.add_lead({"service_name": "Лендинг"}, {"user_id": 42}, draft_id="retry-test")
+                bot = AsyncMock()
+                bot.send_message.side_effect = RuntimeError("temporary")
+                self.assertFalse(await notify_designer_lead(bot, lead))
+                failed = await content_store.get_lead(lead["id"])
+                self.assertEqual(failed["designer_notification"]["state"], "failed")
+                bot.send_message.side_effect = None
+                self.assertTrue(await notify_designer_lead(bot, failed))
+                stored = await content_store.get_lead(lead["id"])
+                self.assertEqual(stored["designer_notification"]["state"], "sent")
+
+    async def test_changed_draft_creates_new_pending_revision(self):
+        import tempfile
+        from pathlib import Path
+        from bot import content_store
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.object(content_store, "DATA_DIR", Path(tmp)):
+                user = {"user_id": 42}
+                await content_store.add_lead({"service_name": "A"}, user, draft_id="dup-test")
+                same = await content_store.add_lead({"service_name": "A"}, user, draft_id="dup-test")
+                self.assertFalse(same["changed"])
+                changed = await content_store.add_lead({"service_name": "B"}, user, draft_id="dup-test")
+                self.assertTrue(changed["changed"])
+                self.assertEqual(changed["designer_notification"]["revision"], 2)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -10,6 +10,7 @@ from bot.calculator import calculate
 from bot.data import load_pricing
 from bot.handlers.start import relay_client_media_to_designer
 from bot.lead import format_lead_message, format_material_message
+from bot.notifications import notify_designer_lead
 
 router = Router(name="webapp")
 logger = logging.getLogger(__name__)
@@ -72,17 +73,9 @@ async def _handle_brief_submission(message: Message, payload: dict) -> None:
     # (handle_tz_file ниже не различает, откуда взялась заявка).
     lead = await content_store.add_lead(payload, telegram_identity, calc_summary, draft_id=payload.get("draft_id"))
 
-    # Уведомляем владельца только при реальном создании — та же логика
-    # idempotency, что и в bot/webserver.py::_handle_lead_create (см. аудит).
-    if lead["created"]:
-        text = format_lead_message(payload, calc_result, lead_id=lead["id"], from_user_id=user.id, username=user.username)
-        if config.DESIGNER_CHAT_ID:
-            try:
-                await message.bot.send_message(chat_id=config.DESIGNER_CHAT_ID, text=text, parse_mode="HTML")
-            except Exception:
-                logger.exception("Не удалось отправить заявку дизайнеру (DESIGNER_CHAT_ID=%s)", config.DESIGNER_CHAT_ID)
-        else:
-            logger.warning("DESIGNER_CHAT_ID не задан — заявка не отправлена дизайнеру:\n%s", text)
+    # Both legacy and HTTP submission use the same persisted delivery state.
+    if lead["created"] or lead.get("changed") or (lead.get("designer_notification") or {}).get("state") != "sent":
+        await notify_designer_lead(message.bot, lead)
 
     price_range = None
     if calc_summary:

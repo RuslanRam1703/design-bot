@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import logging
 
 from aiogram import Bot, Dispatcher
@@ -16,6 +17,7 @@ from aiohttp import web
 from bot import config, content_store, texts
 from bot.handlers import admin, faq, start, webapp
 from bot.webserver import create_app
+from bot.notifications import retry_designer_notifications
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger(__name__)
@@ -136,9 +138,13 @@ async def main() -> None:
     await _setup_bot_description(bot)
     logger.info("Бот запущен в режиме polling")
 
+    delivery_task = asyncio.create_task(retry_designer_notifications(bot))
     try:
         await dp.start_polling(bot)
     finally:
+        delivery_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await delivery_task
         await runner.cleanup()
 
 

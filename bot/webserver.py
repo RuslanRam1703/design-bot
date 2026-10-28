@@ -10,6 +10,7 @@ from bot import config, content_store, texts
 from bot.calculator import calculate
 from bot.data import load_pricing
 from bot.lead import format_lead_message, format_lead_supplement_message
+from bot.notifications import notify_designer_lead, notify_designer_supplement
 from bot.telegram_auth import diagnose_init_data, validate_init_data
 
 SUPPLEMENT_FIELD_KEYS = ("comment", "additional_requirements", "references", "contact")
@@ -293,19 +294,10 @@ async def _handle_lead_create(payload: dict, telegram_identity: dict, bot: Bot) 
     # заявку" могла до фикса срабатывать несколько раз на один клик)
     # обновляет ту же заявку через add_lead(), но не должен слать вторую
     # копию "Новая заявка" в чат дизайнеру.
-    if created:
-        text = format_lead_message(
-            payload, calc_result, lead_id=lead["id"],
-            from_user_id=telegram_identity["user_id"], username=telegram_identity.get("username"),
-        )
-        if config.DESIGNER_CHAT_ID:
-            try:
-                await bot.send_message(chat_id=config.DESIGNER_CHAT_ID, text=text, parse_mode="HTML")
-            except Exception:
-                logger.exception("Не удалось отправить заявку дизайнеру (lead #%s)", lead["id"])
-        else:
-            logger.warning("DESIGNER_CHAT_ID не задан — заявка не отправлена дизайнеру (lead #%s)", lead["id"])
+    if created or lead.get("changed") or (lead.get("designer_notification") or {}).get("state") != "sent":
+        await notify_designer_lead(bot, lead)
 
+    if created:
         # Подтверждение клиенту — под тем же `if created`, что и уведомление
         # дизайнера: повторный POST того же draft_id обновляет ту же заявку
         # и не должен слать вторую копию подтверждения (клиент его уже
@@ -370,14 +362,7 @@ async def _handle_lead_supplement(payload: dict, telegram_identity: dict, bot: B
         # относится).
         return web.json_response({"error": "lead_closed"}, status=409)
 
-    text = format_lead_supplement_message(lead_id, fields)
-    if config.DESIGNER_CHAT_ID:
-        try:
-            await bot.send_message(chat_id=config.DESIGNER_CHAT_ID, text=text, parse_mode="HTML")
-        except Exception:
-            logger.exception("Не удалось отправить дополнение дизайнеру (lead #%s)", lead_id)
-    else:
-        logger.warning("DESIGNER_CHAT_ID не задан — дополнение не отправлено дизайнеру (lead #%s)", lead_id)
+    await notify_designer_supplement(bot, lead, supplement_id)
 
     # Тот же принцип, что и при создании заявки: клиент, закрывший Mini App,
     # должен увидеть в чате и подтверждение, и — если отметил файл —

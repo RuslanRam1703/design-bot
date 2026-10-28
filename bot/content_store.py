@@ -1363,6 +1363,13 @@ async def add_lead(payload: dict, telegram: dict, calc_summary: dict | None = No
                     # меняем и не пишем, вызывающий код (bot/webserver.py)
                     # покажет клиенту понятную ошибку вместо тихой перезаписи.
                     raise LeadClosedError(existing["id"])
+                changed = existing.get("payload") != payload or existing.get("calc_summary") != calc_summary
+                if changed:
+                    previous = existing.get("designer_notification") or {}
+                    existing["designer_notification"] = {
+                        "revision": previous.get("revision", 0) + 1,
+                        "state": "pending", "attempts": 0, "retry_after": None,
+                    }
                 existing.update(
                     payload=payload,
                     telegram=telegram,
@@ -1374,7 +1381,7 @@ async def add_lead(payload: dict, telegram: dict, calc_summary: dict | None = No
                 if awaiting_tz_file:
                     _clear_other_awaiting(leads, telegram["user_id"], existing["id"])
                 await _write_leads(leads)
-                return {**existing, "created": False}
+                return {**existing, "created": False, "changed": changed}
 
         next_id = max((l["id"] for l in leads), default=0) + 1
         lead = {
@@ -1386,6 +1393,7 @@ async def add_lead(payload: dict, telegram: dict, calc_summary: dict | None = No
             "telegram": telegram,
             "payload": payload,
             "calc_summary": calc_summary,
+            "designer_notification": {"revision": 1, "state": "pending", "attempts": 0, "retry_after": None},
             "awaiting_tz_file": awaiting_tz_file,
             "awaiting_tz_file_source": "new" if awaiting_tz_file else None,
             "supplements": [],
@@ -1396,6 +1404,55 @@ async def add_lead(payload: dict, telegram: dict, calc_summary: dict | None = No
             _clear_other_awaiting(leads, telegram["user_id"], lead["id"])
         await _write_leads(leads)
         return {**lead, "created": True}
+
+
+async def update_designer_notification(lead_id: int, revision: int, state: str, supplement_id: int | None = None) -> bool:
+    """Persist delivery, conditional on event revision to avoid stale acknowledgments."""
+    if state not in ("sent", "failed"):
+        raise ValueError("invalid delivery state")
+    async with _lock("leads.json"):
+        leads = await _read_leads()
+        lead = next((v for v in leads if v["id"] == lead_id), None)
+        if lead is None:
+            return False
+        if supplement_id is None:
+            notice = lead.get("designer_notification")
+        else:
+            supplement = next((v for v in lead.get("supplements", []) if v["id"] == supplement_id), None)
+            notice = supplement.get("designer_notification") if supplement else None
+        if notice is None or notice["revision"] != revision:
+            return False
+        notice["attempts"] = notice.get("attempts", 0) + 1
+        notice["state"] = state
+        if state == "failed":
+            from datetime import timedelta
+            delay = min(3600, 60 * 2 ** min(notice["attempts"] - 1, 6))
+            notice["retry_after"] = (datetime.now(timezone.utc) + timedelta(seconds=delay)).isoformat()
+        else:
+            notice["retry_after"] = None
+        await _write_leads(leads)
+        return True
+
+
+async def pending_designer_notifications(limit: int = 20) -> list[tuple[dict, int | None]]:
+    """Only new persisted notifications; never re-send historical leads."""
+    now = datetime.now(timezone.utc).isoformat()
+    due = []
+    for lead in await _read_leads():
+        notice = lead.get("designer_notification")
+        if notice and notice["state"] in ("pending", "failed") and (
+            not notice.get("retry_after") or notice["retry_after"] <= now
+        ):
+            due.append((lead, None))
+        for supplement in lead.get("supplements", []):
+            notice = supplement.get("designer_notification")
+            if notice and notice["state"] in ("pending", "failed") and (
+                not notice.get("retry_after") or notice["retry_after"] <= now
+            ):
+                due.append((lead, supplement["id"]))
+        if len(due) >= limit:
+            break
+    return due[:limit]
 
 
 async def add_lead_supplement(lead_id: int, telegram: dict, fields: dict, wants_file: bool = False) -> tuple[dict, int]:
@@ -1435,6 +1492,7 @@ async def add_lead_supplement(lead_id: int, telegram: dict, fields: dict, wants_
             "id": next_supplement_id,
             "created_at": datetime.now(timezone.utc).isoformat(),
             "fields": fields,
+            "designer_notification": {"revision": 1, "state": "pending", "attempts": 0, "retry_after": None},
         })
         lead["updated_at"] = datetime.now(timezone.utc).isoformat()
         if wants_file:
