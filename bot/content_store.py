@@ -49,6 +49,7 @@ Backup (export/import) держит все 6 локов на всю операц
 """
 
 import asyncio
+import contextvars
 import io
 import json
 import logging
@@ -56,11 +57,12 @@ import mimetypes
 import os
 import re
 import tempfile
+import uuid
 import urllib.error
 import urllib.request
 import zipfile
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -116,27 +118,110 @@ _LOCK_ORDER: tuple[str, ...] = DATA_FILENAMES
 _locks: dict[str, asyncio.Lock] = {name: asyncio.Lock() for name in _LOCK_ORDER}
 
 
-class _StorageLock:
-    """Context manager: приобретает per-key asyncio.Lock для одного или
-    нескольких DATA_FILENAMES-ключей строго в каноническом порядке
-    _LOCK_ORDER, независимо от порядка, в котором имена переданы вызывающим
-    кодом — единственная точка приобретения locks в этом модуле. Держится
-    ДО первого storage I/O операции и отпускается только после её полного
-    завершения (см. докстринг модуля, Tier 1/Tier 2)."""
 
-    __slots__ = ("_filenames",)
+_LOCK_TTL_MS = 120_000
+_LOCK_WAIT_SECONDS = 25
+_LOCK_NAMESPACE = "design_assistant:lock:"
+_active_redis_tokens = contextvars.ContextVar("storage_redis_tokens", default={})
+_RELEASE_LOCK_LUA = "if redis.call('GET', KEYS[1]) == ARGV[1] then return redis.call('DEL', KEYS[1]) else return 0 end"
+_RENEW_LOCK_LUA = "if redis.call('GET', KEYS[1]) == ARGV[1] then return redis.call('PEXPIRE', KEYS[1], ARGV[2]) else return 0 end"
+_FENCED_WRITE_LUA = "if redis.call('GET', KEYS[1]) == ARGV[1] then redis.call('SET', KEYS[2], ARGV[2]); return 1 else return 0 end"
+
+
+class StorageLeaseLostError(RuntimeError):
+    """Refuse stale Redis writes after losing a distributed lease."""
+
+
+class StorageLockTimeoutError(TimeoutError):
+    """An existing Redis writer holds the key too long."""
+
+
+class _StorageLock:
+    """Canonical local locks plus Redis per-key leases for multi-instance safety.
+
+    Acquires locks in DATA_FILENAMES order; fenced writes check ownership
+    *atomically* inside Redis. TTL permits recovery after process failure.
+    """
+
+    __slots__ = ("_filenames", "_local", "_remote", "_ctx", "_heartbeat")
 
     def __init__(self, *filenames: str):
         self._filenames = tuple(sorted(set(filenames), key=_LOCK_ORDER.index))
+        self._local = []
+        self._remote = {}
+        self._ctx = None
+        self._heartbeat = None
 
-    async def __aenter__(self) -> "_StorageLock":
-        for name in self._filenames:
-            await _locks[name].acquire()
-        return self
+    async def __aenter__(self):
+        try:
+            for name in self._filenames:
+                await _locks[name].acquire()
+                self._local.append(name)
+            if _upstash_enabled():
+                loop = asyncio.get_running_loop()
+                for name in self._filenames:
+                    token = uuid.uuid4().hex
+                    deadline = loop.time() + _LOCK_WAIT_SECONDS
+                    while True:
+                        result = await asyncio.to_thread(
+                            _upstash_command, "SET", _LOCK_NAMESPACE + name,
+                            token, "NX", "PX", _LOCK_TTL_MS,
+                        )
+                        if result == "OK":
+                            self._remote[name] = token
+                            break
+                        if loop.time() >= deadline:
+                            raise StorageLockTimeoutError("Redis lock busy: " + name)
+                        await asyncio.sleep(0.1)
+                self._ctx = _active_redis_tokens.set({**_active_redis_tokens.get(), **self._remote})
+                self._heartbeat = asyncio.create_task(self._renew())
+            return self
+        except BaseException:
+            await self._cleanup()
+            raise
 
-    async def __aexit__(self, exc_type, exc, tb) -> None:
-        for name in reversed(self._filenames):
+    async def _renew(self):
+        while True:
+            await asyncio.sleep(15)
+            for name, token in self._remote.items():
+                try:
+                    result = await asyncio.to_thread(
+                        _upstash_command, "EVAL", _RENEW_LOCK_LUA, 1,
+                        _LOCK_NAMESPACE + name, token, _LOCK_TTL_MS,
+                    )
+                    if result != 1:
+                        logger.error("Redis lease lost: %s", name)
+                        return
+                except Exception:
+                    # Any eventual write is still guarded by the Lua fence.
+                    logger.exception("Redis lease renewal failed for %s", name)
+
+    async def _cleanup(self):
+        if self._heartbeat is not None:
+            self._heartbeat.cancel()
+            try:
+                await self._heartbeat
+            except asyncio.CancelledError:
+                pass
+            self._heartbeat = None
+        if self._ctx is not None:
+            _active_redis_tokens.reset(self._ctx)
+            self._ctx = None
+        for name, token in reversed(list(self._remote.items())):
+            try:
+                await asyncio.to_thread(
+                    _upstash_command, "EVAL", _RELEASE_LOCK_LUA, 1,
+                    _LOCK_NAMESPACE + name, token,
+                )
+            except Exception:
+                logger.exception("Redis lease release failed: %s", name)
+        self._remote.clear()
+        for name in reversed(self._local):
             _locks[name].release()
+        self._local.clear()
+
+    async def __aexit__(self, exc_type, exc, tb):
+        await self._cleanup()
         return False
 
 
@@ -177,7 +262,7 @@ def _upstash_command(*args: Any) -> Any:
     # каждый вызов, ничего не переиспользуется между вызовами) — вызывать её
     # из worker-треда asyncio.to_thread безопасно без дополнительных мер.
     command = args[0]
-    key = args[1] if len(args) > 1 else None
+    key = args[3] if command == "EVAL" and len(args) > 3 else (args[1] if len(args) > 1 else None)
     req = urllib.request.Request(
         config.UPSTASH_REDIS_REST_URL,
         data=json.dumps(list(args)).encode("utf-8"),
@@ -236,7 +321,7 @@ async def _read(filename: str) -> Any:
         # инициализации, что и в ensure_storage_initialized, безопасно
         # досеять именно этот файл.
         data = _read_local(filename)
-        await asyncio.to_thread(_upstash_command, "SET", filename, json.dumps(data, ensure_ascii=False))
+        await asyncio.to_thread(_upstash_command, "SET", filename, json.dumps(data, ensure_ascii=False), "NX")
         return data
     return json.loads(raw)
 
@@ -245,7 +330,21 @@ async def _write(filename: str, data: Any) -> None:
     if not _upstash_enabled():
         _write_local(filename, data)
         return
-    await asyncio.to_thread(_upstash_command, "SET", filename, json.dumps(data, ensure_ascii=False))
+    serialized = json.dumps(data, ensure_ascii=False)
+    token = _active_redis_tokens.get().get(filename)
+    if token is not None:
+        ok = await asyncio.to_thread(
+            _upstash_command, "EVAL", _FENCED_WRITE_LUA, 2,
+            _LOCK_NAMESPACE + filename, filename, token, serialized,
+        )
+        if ok != 1:
+            raise StorageLeaseLostError("Refusing stale write for " + filename)
+    else:
+        # Startup seeding and low-level diagnostics use the unguarded API.
+        # All normal production read-modify-write paths use _lock(filename).
+        await asyncio.to_thread(_upstash_command, "SET", filename, serialized)
+
+
 
 
 async def read_async(filename: str) -> Any:
@@ -294,7 +393,7 @@ async def ensure_storage_initialized() -> None:
         for filename in DATA_FILENAMES:
             if await asyncio.to_thread(_upstash_command, "GET", filename) is None:
                 data = _read_local(filename)
-                await asyncio.to_thread(_upstash_command, "SET", filename, json.dumps(data, ensure_ascii=False))
+                await asyncio.to_thread(_upstash_command, "SET", filename, json.dumps(data, ensure_ascii=False), "NX")
                 seeded.append(filename)
         await asyncio.to_thread(_upstash_command, "SET", MARKER_KEY, datetime.now(timezone.utc).isoformat())
     except Exception:
@@ -1406,26 +1505,50 @@ async def add_lead(payload: dict, telegram: dict, calc_summary: dict | None = No
         return {**lead, "created": True}
 
 
-async def update_designer_notification(lead_id: int, revision: int, state: str, supplement_id: int | None = None) -> bool:
-    """Persist delivery, conditional on event revision to avoid stale acknowledgments."""
-    if state not in ("sent", "failed"):
-        raise ValueError("invalid delivery state")
+def _notification_record(lead: dict, supplement_id: int | None):
+    if supplement_id is None:
+        return lead.get("designer_notification")
+    supplement = next((s for s in lead.get("supplements", []) if s["id"] == supplement_id), None)
+    return supplement.get("designer_notification") if supplement else None
+
+
+async def claim_designer_notification(lead_id: int, revision: int, supplement_id: int | None = None) -> dict | None:
+    """Atomic claim across instances; "sending" leases expire after crashes."""
     async with _lock("leads.json"):
         leads = await _read_leads()
-        lead = next((v for v in leads if v["id"] == lead_id), None)
-        if lead is None:
-            return False
-        if supplement_id is None:
-            notice = lead.get("designer_notification")
-        else:
-            supplement = next((v for v in lead.get("supplements", []) if v["id"] == supplement_id), None)
-            notice = supplement.get("designer_notification") if supplement else None
-        if notice is None or notice["revision"] != revision:
+        lead = next((item for item in leads if item["id"] == lead_id), None)
+        notice = _notification_record(lead, supplement_id) if lead else None
+        if not notice or notice.get("revision") != revision or notice["state"] == "sent":
+            return None
+        now = datetime.now(timezone.utc)
+        now_text = now.isoformat()
+        if notice["state"] == "sending" and (notice.get("claim_until") or "") > now_text:
+            return None
+        if notice["state"] == "failed" and (notice.get("retry_after") or "") > now_text:
+            return None
+        notice["state"] = "sending"
+        notice["claim_token"] = uuid.uuid4().hex
+        notice["claim_until"] = (now + timedelta(seconds=120)).isoformat()
+        await _write_leads(leads)
+        return lead
+
+
+async def finish_designer_notification(
+    lead_id: int, revision: int, claim_token: str, state: str, supplement_id: int | None = None,
+) -> bool:
+    if state not in ("sent", "failed"):
+        raise ValueError("Invalid notification status")
+    async with _lock("leads.json"):
+        leads = await _read_leads()
+        lead = next((item for item in leads if item["id"] == lead_id), None)
+        notice = _notification_record(lead, supplement_id) if lead else None
+        if not notice or notice.get("revision") != revision or notice.get("claim_token") != claim_token:
             return False
         notice["attempts"] = notice.get("attempts", 0) + 1
         notice["state"] = state
+        notice.pop("claim_token", None)
+        notice.pop("claim_until", None)
         if state == "failed":
-            from datetime import timedelta
             delay = min(3600, 60 * 2 ** min(notice["attempts"] - 1, 6))
             notice["retry_after"] = (datetime.now(timezone.utc) + timedelta(seconds=delay)).isoformat()
         else:
@@ -1435,24 +1558,31 @@ async def update_designer_notification(lead_id: int, revision: int, state: str, 
 
 
 async def pending_designer_notifications(limit: int = 20) -> list[tuple[dict, int | None]]:
-    """Only new persisted notifications; never re-send historical leads."""
+    """Retry failed deliveries after backoff and crashed claims after expiry."""
     now = datetime.now(timezone.utc).isoformat()
-    due = []
+
+    def due(notice):
+        if not notice:
+            return False
+        state = notice.get("state")
+        if state == "pending":
+            return True
+        if state == "failed":
+            return not notice.get("retry_after") or notice["retry_after"] <= now
+        if state == "sending":
+            return not notice.get("claim_until") or notice["claim_until"] <= now
+        return False
+
+    pending = []
     for lead in await _read_leads():
-        notice = lead.get("designer_notification")
-        if notice and notice["state"] in ("pending", "failed") and (
-            not notice.get("retry_after") or notice["retry_after"] <= now
-        ):
-            due.append((lead, None))
+        if due(lead.get("designer_notification")):
+            pending.append((lead, None))
         for supplement in lead.get("supplements", []):
-            notice = supplement.get("designer_notification")
-            if notice and notice["state"] in ("pending", "failed") and (
-                not notice.get("retry_after") or notice["retry_after"] <= now
-            ):
-                due.append((lead, supplement["id"]))
-        if len(due) >= limit:
+            if due(supplement.get("designer_notification")):
+                pending.append((lead, supplement["id"]))
+        if len(pending) >= limit:
             break
-    return due[:limit]
+    return pending[:limit]
 
 
 async def add_lead_supplement(lead_id: int, telegram: dict, fields: dict, wants_file: bool = False) -> tuple[dict, int]:
