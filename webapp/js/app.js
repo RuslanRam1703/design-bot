@@ -357,6 +357,11 @@ async function init() {
       : err.message === "TELEGRAM_REQUIRED"
         ? "Откройте приложение из Telegram, чтобы просмотреть портфолио."
         : "Не удалось загрузить данные. Попробуйте позже.";
+    if (err.message === "ACCESS_DENIED" && realTG) {
+      // Telegram WebView may briefly open first; close() is best-effort.
+      // Never render portfolio/about/pricing before successful authorization.
+      TG.close();
+    }
     return;
   }
   state.pricing = pricing;

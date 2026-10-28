@@ -6,14 +6,37 @@ currently presented by Telegram, which may have changed/reassigned.
 The first matching interaction is pinned to a numeric ID; watchers then
 disappear. No global customer quotas or automatic bans.
 """
+import logging
 import re
 from datetime import datetime, timezone
+
+from aiogram.types import MenuButtonCommands, MenuButtonDefault
+from bot.burst_guard import BurstLimiter
 
 from aiogram import BaseMiddleware
 
 from bot import config, content_store
 
 _USERNAME = re.compile(r"^[a-zA-Z0-9_]{5,32}$")
+logger = logging.getLogger(__name__)
+
+
+async def sync_menu_button(bot, user_id: int, *, blocked: bool) -> bool:
+    """Best-effort cosmetic menu change: callbacks and API remain authoritative.
+
+    Telegram may reject chat-specific menu changes for accounts which have
+    never started the bot. Never revert the saved block because of this.
+    """
+    try:
+        await bot.set_chat_menu_button(
+            chat_id=user_id,
+            menu_button=MenuButtonCommands() if blocked else MenuButtonDefault(),
+        )
+    except Exception:
+        logger.warning("Cannot update personal Menu button for user %s", user_id)
+        return False
+    return True
+
 
 
 def normalize_username(value: str) -> str | None:
@@ -110,7 +133,7 @@ async def remove_watch(actor: int | str, username: str) -> bool:
         return True
 
 
-async def is_blocked(user_id: int, username: str | None = None) -> bool:
+async def is_blocked(user_id: int, username: str | None = None, *, bot=None) -> bool:
     if str(user_id) == config.DESIGNER_CHAT_ID:
         return False
     access = await view()
@@ -130,16 +153,27 @@ async def is_blocked(user_id: int, username: str | None = None) -> bool:
         blocked = access.setdefault("blocked_ids", {})
         blocked[str(user_id)] = {"at": _now(), "username": handle, "from_watch": True}
         await content_store._write("leads.json", document)
+    # A provisional username is now pinned to the Telegram numeric ID.
+    # Only once per resolved watch (not on every blocked update).
+    if bot is not None:
+        await sync_menu_button(bot, user_id, blocked=True)
     return True
 
 
 class AccessMiddleware(BaseMiddleware):
-    """Runs before FSM handlers and all Telegram client callbacks."""
+    """Reject aggressive bursts before any Redis reads or Telegram replies."""
+
+    def __init__(self):
+        self._bursts = BurstLimiter(limit=30, window_seconds=10)
+
     async def __call__(self, handler, event, data):
         sender = getattr(event, "from_user", None)
-        if sender and await is_blocked(sender.id, sender.username):
-            # Acknowledge callback so Telegram stops the loading spinner.
-            if hasattr(event, "answer") and hasattr(event, "data"):
-                await event.answer("Доступ к боту ограничен", show_alert=True)
-            return None
+        if sender and str(sender.id) != config.DESIGNER_CHAT_ID:
+            if not self._bursts.allow(sender.id):
+                # Deliberately no reply: flood should not induce Bot API output.
+                return None
+            if await is_blocked(sender.id, sender.username, bot=data.get("bot")):
+                if hasattr(event, "answer") and hasattr(event, "data"):
+                    await event.answer("Доступ к боту ограничен", show_alert=True)
+                return None
         return await handler(event, data)
