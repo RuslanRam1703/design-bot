@@ -2623,10 +2623,14 @@ async def lead_delete_do(callback: CallbackQuery, state: FSMContext) -> None:
     answer = callback.data.split(":", 1)[1]
     data = await state.get_data()
     status = data.get("lead_filter", "ALL")
+    deleted = False
     if answer == "yes":
-        await content_store.delete_lead(callback.message.chat.id, data["lead_id"])
+        deleted = await content_store.delete_lead(callback.message.chat.id, data["lead_id"])
     leads = await content_store.list_leads(status)
-    text = f"Заявка удалена ✅\n\nЗаявки ({len(leads)}):" if answer == "yes" else f"Отменено.\n\nЗаявки ({len(leads)}):"
+    if answer == "yes" and not deleted:
+        text = f"Заявка привязана к проекту либо уже удалена. Финансовая история сохранена.\\n\\nЗаявки ({len(leads)}):"
+    else:
+        text = f"Заявка удалена ✅\\n\\nЗаявки ({len(leads)}):" if deleted else f"Отменено.\\n\\nЗаявки ({len(leads)}):"
     await callback.message.edit_text(text, reply_markup=kb.leads_list_keyboard(leads, status))
     await state.set_state(AdminStates.leads_list)
     await callback.answer()

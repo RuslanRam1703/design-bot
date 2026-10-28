@@ -226,7 +226,7 @@ async def price_prompt(callback: CallbackQuery, state: FSMContext) -> None:
     await callback.answer()
 
 
-@router.message(ProjectStates.price_input, F.text)
+@router.message(ProjectStates.price_input, F.text, ~F.text.startswith("/"), F.text != texts.MAIN_MENU_BUTTON)
 async def price_input(message: Message, state: FSMContext) -> None:
     amount = _parse_rub(message.text)
     if amount is None:
@@ -253,7 +253,7 @@ async def deadline_prompt(callback: CallbackQuery, state: FSMContext) -> None:
     await callback.answer()
 
 
-@router.message(ProjectStates.deadline_input, F.text)
+@router.message(ProjectStates.deadline_input, F.text, ~F.text.startswith("/"), F.text != texts.MAIN_MENU_BUTTON)
 async def deadline_input(message: Message, state: FSMContext) -> None:
     raw = message.text.strip()
     value = None if raw.lower() in ("нет", "снять", "-") else raw
@@ -286,7 +286,7 @@ async def payment_prompt(callback: CallbackQuery, state: FSMContext) -> None:
     await callback.answer()
 
 
-@router.message(ProjectStates.payment_input, F.text)
+@router.message(ProjectStates.payment_input, F.text, ~F.text.startswith("/"), F.text != texts.MAIN_MENU_BUTTON)
 async def payment_input(message: Message, state: FSMContext) -> None:
     amount = _parse_rub(message.text)
     if amount is None:
