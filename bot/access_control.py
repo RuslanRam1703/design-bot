@@ -26,7 +26,13 @@ def _now() -> str:
 
 
 async def view() -> dict:
-    document = await content_store._read("leads.json")
+    try:
+        document = await content_store._read("leads.json")
+    except FileNotFoundError:
+        # Fresh local/test storage: no users or blacklist exist yet.
+        # UpstashKeyMissingError remains fatal: never bypass a missing
+        # production Redis key after its initialization marker exists.
+        return {"blocked_ids": {}, "watch_usernames": {}}
     return document.get("access_control") or {"blocked_ids": {}, "watch_usernames": {}}
 
 
