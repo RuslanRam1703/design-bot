@@ -247,7 +247,7 @@ async def relay_client_text_to_designer(message: Message, state: FSMContext) -> 
     text = _enforce_telegram_hard_limit("\n".join(lines))
 
     try:
-        await message.bot.send_message(chat_id=config.DESIGNER_CHAT_ID, text=text)
+        await message.bot.send_message(chat_id=config.DESIGNER_CHAT_ID, text=text, parse_mode=None)
     except Exception:
         logger.exception("Не удалось передать сообщение клиента дизайнеру (user_id=%s)", message.from_user.id)
         await message.answer("Не получилось отправить сообщение дизайнеру. Попробуйте ещё раз чуть позже.")
@@ -298,7 +298,7 @@ async def relay_client_media_to_designer(message: Message) -> None:
 
     try:
         await message.bot.send_message(
-            chat_id=config.DESIGNER_CHAT_ID, text=_enforce_telegram_hard_limit("\n".join(lines)),
+            chat_id=config.DESIGNER_CHAT_ID, text=_enforce_telegram_hard_limit("\n".join(lines)), parse_mode=None,
         )
         # forward, а не скачивание: файл остаётся у Telegram, ни одного
         # байта через Render — тот же принцип, что и у handle_tz_file.
