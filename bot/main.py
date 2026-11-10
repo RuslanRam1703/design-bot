@@ -6,7 +6,7 @@ import logging
 
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
-from aiogram.fsm.storage.memory import MemoryStorage, SimpleEventIsolation
+from aiogram.fsm.storage.memory import SimpleEventIsolation
 from aiogram.types import (
     Update,
     BotCommand,
@@ -20,6 +20,7 @@ from aiohttp import web
 from bot import config, content_store, texts
 from bot.handlers import admin, admin_access, admin_projects, client_intake, faq, portfolio_channel, start, webapp
 from bot.webserver import create_app
+from bot.fsm_storage import create_fsm_storage
 from bot.notifications import retry_designer_notifications
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -103,7 +104,7 @@ async def main() -> None:
     # обе гонки проходили check "nav anchor отсутствует" до того, как
     # первая успевала записать результат (см. UX-аудит: race condition,
     # приводивший к дублированию NAV anchor при повторных "Главное меню").
-    dp = Dispatcher(storage=MemoryStorage(), events_isolation=SimpleEventIsolation())
+    dp = Dispatcher(storage=create_fsm_storage(), events_isolation=SimpleEventIsolation())
 
     # admin — первым: /admin не должен перехватываться catch-all из start.
     # webapp — тоже раньше faq/start, т.к. должен первым перехватывать
