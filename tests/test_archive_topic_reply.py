@@ -16,7 +16,7 @@ class ArchiveTopicReplyTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_non_owner_cannot_reply(self):
         message = self.make_message(user_id=18)
-        with patch.object(archive_setup.config, "DESIGNER_CHAT_ID", "17"), patch.object(
+        with patch.object(archive_setup.config, "UPSTASH_REDIS_REST_URL", "https://redis.example"), patch.object(archive_setup.config, "UPSTASH_REDIS_REST_TOKEN", "test"), patch.object(archive_setup.config, "DESIGNER_CHAT_ID", "17"), patch.object(
             archive_setup.config, "CLIENT_MATERIALS_CHANNEL", "-100123"
         ):
             await archive_setup.reply_from_archive_topic(message)
