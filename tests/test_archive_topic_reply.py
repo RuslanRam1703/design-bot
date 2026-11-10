@@ -32,7 +32,7 @@ class ArchiveTopicReplyTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_valid_topic_delivers_and_records(self):
         message = self.make_message()
-        with patch.object(archive_setup.config, "DESIGNER_CHAT_ID", "17"), patch.object(
+        with patch.object(archive_setup.config, "UPSTASH_REDIS_REST_URL", "https://redis.example"), patch.object(archive_setup.config, "UPSTASH_REDIS_REST_TOKEN", "test"), patch.object(archive_setup.config, "DESIGNER_CHAT_ID", "17"), patch.object(
             archive_setup.config, "CLIENT_MATERIALS_CHANNEL", "-100123"
         ), patch("bot.content_store.list_leads", new_callable=AsyncMock, return_value=[
             {"id": 7, "telegram": {"user_id": 55, "username": None}}
