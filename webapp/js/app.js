@@ -2164,7 +2164,9 @@ function renderSubmitted() {
   // закроет окно сам. Показываем только когда заявка действительно ждёт
   // файл: в остальных случаях предлагать «отправить материалы» не за чем,
   // бот их сейчас всё равно не привяжет (см. awaiting_tz_file).
-  const materialsButton = `<div class="btn-row"><button class="btn btn-primary" id="send-materials">Добавить материалы в боте</button></div>`;
+  const materialsButton = result.attach_tz
+    ? `<div class="btn-row"><button class="btn btn-primary" id="send-materials">Добавить материалы в боте</button></div>`
+    : "";
   return `
     <div class="topbar"><h1>Готово ✅</h1></div>
     <div class="case-block"><div class="label">Заявка №${result.lead_id ?? "—"}</div><p>Услуга: ${escapeHtml(p.service_name || "не указана")}</p></div>
