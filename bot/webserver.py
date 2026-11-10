@@ -1,6 +1,7 @@
 import dataclasses
 import json
 import logging
+import os
 from pathlib import Path
 
 from aiogram import Bot
@@ -103,7 +104,11 @@ async def handle_index(request: web.Request) -> web.Response:
 
 
 async def handle_health(request: web.Request) -> web.Response:
-    return web.Response(text="ok")
+    headers = {"Cache-Control": "no-store"}
+    revision = os.getenv("RENDER_GIT_COMMIT", "")
+    if len(revision) == 40 and all(char in "0123456789abcdef" for char in revision.lower()):
+        headers["X-App-Revision"] = revision.lower()
+    return web.Response(text="ok", headers=headers)
 
 
 async def handle_public_data(request: web.Request) -> web.Response:
