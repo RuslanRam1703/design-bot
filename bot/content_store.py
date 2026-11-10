@@ -467,11 +467,12 @@ async def upsert_channel_case(
         data = await _read("portfolio.json")
         for case in data["cases"]:
             if case.get("source_post_url") == post_url:
-                if case.get("cover") != cover:
-                    case["cover"] = cover
-                    case["images"] = [cover]
-                case["title"] = title
-                await _write("portfolio.json", data)
+                # Telegram edits must never overwrite curated or rejected work.
+                # Keep the original imported material for reference only.
+                if case.get("status", "published") == "draft":
+                    case["source_title"] = title
+                    case["source_cover"] = cover
+                    await _write("portfolio.json", data)
                 return case, False
         case_id = f"tg_{channel_username.lower()}_{message_id}"
         case = {
@@ -487,6 +488,8 @@ async def upsert_channel_case(
             "result": "",
             "related_service": None,
             "source_post_url": post_url,
+            "source_title": title,
+            "source_cover": cover,
         }
         data["cases"].append(case)
         await _write("portfolio.json", data)
