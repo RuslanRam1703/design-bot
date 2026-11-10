@@ -1,0 +1,19 @@
+name: Portfolio channel tests
+on:
+  push:
+    branches: [feature/portfolio-channel-integration]
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    env:
+      BOT_TOKEN: "123456:TEST_TOKEN"
+      WEBAPP_URL: "https://example.org"
+      DESIGNER_CHAT_ID: "123"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements.txt pytest pytest-asyncio
+      - run: python -m pytest -q tests/test_portfolio_channel.py

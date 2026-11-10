@@ -44,6 +44,9 @@ UPSTASH_REDIS_REST_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN", "")
 # прежний storage-путь (см. bot/handlers/admin.py), ничего не ломается.
 MEDIA_ARCHIVE_CHANNEL = os.getenv("MEDIA_ARCHIVE_CHANNEL", "").strip()
 
+# Public channel used only as a source for curated portfolio posts.
+PORTFOLIO_CHANNEL = os.getenv("PORTFOLIO_CHANNEL", "@portfolio_rrr17").strip()
+
 R2_ACCOUNT_ID = os.getenv("R2_ACCOUNT_ID", "")
 R2_ACCESS_KEY_ID = os.getenv("R2_ACCESS_KEY_ID", "")
 R2_SECRET_ACCESS_KEY = os.getenv("R2_SECRET_ACCESS_KEY", "")

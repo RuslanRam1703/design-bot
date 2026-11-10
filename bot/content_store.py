@@ -453,6 +453,44 @@ async def add_case(actor_chat_id: int | str, *, case_id: str, title: str, type_i
         return case
 
 
+
+async def upsert_channel_case(
+    *, channel_username: str, message_id: int, title: str, cover: str
+) -> tuple[dict, bool]:
+    """Atomically create or update a demo case for a Telegram channel post.
+
+    Identity is the channel post URL, not an auto-incremented case number.
+    Duplicate updates are safe across restarts and concurrent polling.
+    """
+    post_url = f"https://t.me/{channel_username}/{message_id}"
+    async with _lock("portfolio.json"):
+        data = await _read("portfolio.json")
+        for case in data["cases"]:
+            if case.get("source_post_url") == post_url:
+                if case.get("cover") != cover:
+                    case["cover"] = cover
+                    case["images"] = [cover]
+                case["title"] = title
+                await _write("portfolio.json", data)
+                return case, False
+        case_id = f"tg_{channel_username.lower()}_{message_id}"
+        case = {
+            "id": case_id,
+            "title": title,
+            "type": "graphics",
+            "featured": False,
+            "cover": cover,
+            "images": [cover],
+            "task": "Демонстрационная публикация из Telegram-канала.",
+            "solution": "",
+            "result": "",
+            "related_service": None,
+            "source_post_url": post_url,
+        }
+        data["cases"].append(case)
+        await _write("portfolio.json", data)
+        return case, True
+
 async def update_case(actor_chat_id: int | str, case_id: str, **fields: Any) -> bool:
     """"cover" через это поле — быстрый путь "загрузить новую обложку":
     новое фото ДОБАВЛЯЕТСЯ в галерею (images) и становится cover, но не
