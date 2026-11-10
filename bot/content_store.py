@@ -492,6 +492,24 @@ async def upsert_channel_case(
         await _write("portfolio.json", data)
         return case, True
 
+PORTFOLIO_STATUSES = frozenset({"draft", "published", "unpublished", "rejected", "trashed"})
+
+
+async def set_case_status(actor_chat_id: int | str, case_id: str, status: str) -> bool:
+    """Change visibility without destroying case data or associated images."""
+    _require_designer(actor_chat_id)
+    if status not in PORTFOLIO_STATUSES:
+        raise ValueError("Invalid portfolio status")
+    async with _lock("portfolio.json"):
+        data = await _read("portfolio.json")
+        case = _find_case(data, case_id)
+        if case is None:
+            return False
+        case["status"] = status
+        await _write("portfolio.json", data)
+        return True
+
+
 async def update_case(actor_chat_id: int | str, case_id: str, **fields: Any) -> bool:
     """"cover" через это поле — быстрый путь "загрузить новую обложку":
     новое фото ДОБАВЛЯЕТСЯ в галерею (images) и становится cover, но не
