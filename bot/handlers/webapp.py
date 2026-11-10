@@ -3,7 +3,7 @@ import json
 import logging
 
 from aiogram import F, Router
-from aiogram.types import Message
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 
 from bot import config, content_store, texts
 from bot.calculator import calculate
@@ -85,6 +85,130 @@ async def _handle_brief_submission(message: Message, payload: dict) -> None:
         await message.answer(texts.lead_ack_ask_file(lead["id"], payload.get("service_name"), price_range))
     else:
         await message.answer(texts.lead_received_ack(lead["id"], payload.get("service_name"), price_range))
+
+
+
+# Native client lead navigation: callbacks are resolved from the authenticated
+# Telegram sender, never from a user_id supplied by a client.
+def _lead_nav(rows):
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@router.callback_query(F.data == "clientleads:list")
+async def client_leads_list(callback: CallbackQuery) -> None:
+    leads = await content_store.list_leads_by_user(callback.from_user.id)
+    rows = [
+        [InlineKeyboardButton(
+            text=f"{(lead.get('payload') or {}).get('service_name') or 'Заявка'} · {lead.get('status', 'NEW')}",
+            callback_data=f"clientleads:open:{lead['id']}",
+        )]
+        for lead in leads[:20]
+    ]
+    rows.append([InlineKeyboardButton(text="◀️ Главное меню", callback_data="clientleads:home")])
+    await callback.message.edit_text(
+        "Ваши заявки. Выберите заявку:" if leads else "У вас пока нет заявок.",
+        reply_markup=_lead_nav(rows),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "clientleads:home")
+async def client_leads_home(callback: CallbackQuery) -> None:
+    from bot.keyboards import client_home_keyboard
+    await callback.message.edit_text(texts.CLIENT_HOME, reply_markup=client_home_keyboard(config.WEBAPP_URL))
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("clientleads:open:"))
+async def client_leads_open(callback: CallbackQuery) -> None:
+    try:
+        lead_id = int(callback.data.rsplit(":", 1)[1])
+    except (ValueError, IndexError):
+        await callback.answer("Некорректная заявка", show_alert=True)
+        return
+    lead = next((item for item in await content_store.list_leads_by_user(callback.from_user.id) if item["id"] == lead_id), None)
+    if lead is None:
+        await callback.answer("Заявка не найдена", show_alert=True)
+        return
+    payload = lead.get("payload") or {}
+    materials = lead.get("materials") or []
+    description = (payload.get("task_description") or "Не указано").strip()
+    if len(description) > 900:
+        description = description[:897] + "..."
+    price = lead.get("calc_summary") or {}
+    price_text = ""
+    if isinstance(price, dict) and price.get("price_from") is not None:
+        price_text = f"\\nРасчёт: {price['price_from']}–{price.get('price_to', price['price_from'])} ₽"
+    text = (
+        f"Заявка №{lead_id}\\n"
+        f"Услуга: {payload.get('service_name') or 'Не указана'}\\n"
+        f"Статус: {lead.get('status', 'NEW')}\\n"
+        f"Задача: {description}{price_text}\\n"
+        f"Материалы: {len(materials)}"
+    ).replace("\\n", "\n")
+    rows = []
+    if lead.get("status") not in content_store.TERMINAL_LEAD_STATUSES:
+        rows.append([InlineKeyboardButton(text="📎 Добавить материалы", callback_data=f"clientleads:attach:{lead_id}")])
+    if materials:
+        rows.append([InlineKeyboardButton(text="📁 Посмотреть материалы", callback_data=f"clientleads:files:{lead_id}")])
+    rows.append([InlineKeyboardButton(text="◀️ Мои заявки", callback_data="clientleads:list")])
+    await callback.message.edit_text(text, reply_markup=_lead_nav(rows))
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("clientleads:attach:"))
+async def client_leads_attach(callback: CallbackQuery) -> None:
+    try:
+        lead_id = int(callback.data.rsplit(":", 1)[1])
+    except (ValueError, IndexError):
+        await callback.answer("Некорректная заявка", show_alert=True)
+        return
+    lead = next((item for item in await content_store.list_leads_by_user(callback.from_user.id) if item["id"] == lead_id), None)
+    if lead is None or lead.get("status") in content_store.TERMINAL_LEAD_STATUSES:
+        await callback.answer("Заявка недоступна для загрузки", show_alert=True)
+        return
+    await content_store.begin_lead_material_upload(callback.from_user.id, lead_id)
+    await callback.message.edit_text(
+        f"Отправьте фото, видео или документ к заявке №{lead_id} следующим сообщением. "
+        "После получения файла вы сможете добавить следующий.",
+        reply_markup=_lead_nav([[InlineKeyboardButton(text="Отмена", callback_data=f"clientleads:stop:{lead_id}")]]),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("clientleads:stop:"))
+async def client_leads_stop(callback: CallbackQuery) -> None:
+    lead_id = int(callback.data.rsplit(":", 1)[1])
+    await content_store.stop_lead_material_upload(callback.from_user.id, lead_id)
+    callback.data = f"clientleads:open:{lead_id}"
+    await client_leads_open(callback)
+
+
+@router.callback_query(F.data.startswith("clientleads:files:"))
+async def client_leads_files(callback: CallbackQuery) -> None:
+    lead_id = int(callback.data.rsplit(":", 1)[1])
+    lead = next((item for item in await content_store.list_leads_by_user(callback.from_user.id) if item["id"] == lead_id), None)
+    if lead is None:
+        await callback.answer("Заявка не найдена", show_alert=True)
+        return
+    materials = lead.get("materials") or []
+    for material in materials[:20]:
+        file_id = material.get("file_id")
+        if not file_id:
+            continue
+        kind = material.get("kind")
+        try:
+            if kind == "photo":
+                await callback.bot.send_photo(callback.from_user.id, file_id)
+            elif kind == "video":
+                await callback.bot.send_video(callback.from_user.id, file_id)
+            elif kind == "animation":
+                await callback.bot.send_animation(callback.from_user.id, file_id)
+            else:
+                await callback.bot.send_document(callback.from_user.id, file_id)
+        except Exception:
+            logger.exception("Не удалось показать материал заявки %s", lead_id)
+    await callback.answer("Материалы отправлены в этот чат" if materials else "Материалов пока нет")
 
 
 @router.message(F.document | F.photo | F.video | F.animation)
