@@ -1891,7 +1891,7 @@ async def add_client_message(user_id: int, lead_id: int, message_id: int, kind: 
     async with _lock("leads.json"):
         leads = await _read_leads()
         lead = next((item for item in leads if item["id"] == lead_id
-                     and item.get("telegram", {}).get("user_id") == user_id), None)
+                     and str(item.get("telegram", {}).get("user_id")) == str(user_id)), None)
         if lead is None or lead["status"] not in ACTIVE_LEAD_STATUSES:
             return None
         messages = lead.setdefault("client_messages", [])
