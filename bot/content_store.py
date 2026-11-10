@@ -508,7 +508,26 @@ async def set_case_status(actor_chat_id: int | str, case_id: str, status: str) -
         case = _find_case(data, case_id)
         if case is None:
             return False
+        current = case.get("status", "published")
+        if status == "trashed" and current != "trashed":
+            case["status_before_trash"] = current
+        elif current == "trashed" and status != "trashed":
+            case.pop("status_before_trash", None)
         case["status"] = status
+        await _write("portfolio.json", data)
+        return True
+
+
+async def restore_trashed_case(actor_chat_id: int | str, case_id: str) -> bool:
+    """Restore a trashed case to its previous visibility state."""
+    _require_designer(actor_chat_id)
+    async with _lock("portfolio.json"):
+        data = await _read("portfolio.json")
+        case = _find_case(data, case_id)
+        if case is None or case.get("status") != "trashed":
+            return False
+        previous = case.pop("status_before_trash", "draft")
+        case["status"] = previous if previous in PORTFOLIO_STATUSES - {"trashed"} else "draft"
         await _write("portfolio.json", data)
         return True
 
