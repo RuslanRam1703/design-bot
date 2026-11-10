@@ -21,6 +21,7 @@ from bot import config, content_store, texts
 from bot.handlers import archive_setup, admin, admin_access, admin_projects, client_intake, faq, portfolio_channel, start, webapp
 from bot.webserver import create_app
 from bot.fsm_storage import create_fsm_storage
+from bot.archive_smoke import run_archive_smoke
 from bot.notifications import retry_designer_notifications
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -166,6 +167,7 @@ async def main() -> None:
         allowed_updates=dp.resolve_used_update_types(),
     )
     logger.info("Telegram webhook registered")
+    await run_archive_smoke(bot)
     # Render may suspend this web service. Telegram retries updates when it wakes.
     # Do not delete webhook on shutdown: there must be no polling dependency.
     delivery_task = asyncio.create_task(retry_designer_notifications(bot))
