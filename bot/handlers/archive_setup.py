@@ -39,6 +39,9 @@ async def reply_from_archive_topic(message: Message) -> None:
         await message.answer("Напишите /reply и текст сообщения для клиента.")
         return
     from bot import content_store, access_control
+    if not config.UPSTASH_REDIS_REST_URL or not config.UPSTASH_REDIS_REST_TOKEN:
+        await message.answer("Архив не подключён к постоянному хранилищу.")
+        return
     import asyncio
     import logging
     logger = logging.getLogger(__name__)
