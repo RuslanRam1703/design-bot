@@ -2157,18 +2157,14 @@ function renderSubmitted() {
   const priceLine = result.price_range
     ? `<div class="result-box"><div class="price">${formatMoney(result.price_range.from)} – ${formatMoney(result.price_range.to)}</div><div class="hint">Точная сумма — предварительная, дизайнер подтвердит в чате</div></div>`
     : "";
-  const tzLine = result.attach_tz
-    ? `<p class="hint">Вы отметили, что пришлёте файл ТЗ — отправьте его следующим сообщением прямо в этот чат с ботом (не через Mini App).</p>`
-    : "";
+  const tzLine = `<p class="hint">При необходимости приложите файлы через Telegram-бота сейчас или позже. Заявка уже отправлена.</p>`;
   // Кнопка закрывает Mini App, чтобы не заставлять искать, как вернуться в
   // чат: материалы принимает бот обычным сообщением. Она НЕ обязательна —
   // материалы опциональны, и текст выше остаётся на месте для тех, кто
   // закроет окно сам. Показываем только когда заявка действительно ждёт
   // файл: в остальных случаях предлагать «отправить материалы» не за чем,
   // бот их сейчас всё равно не привяжет (см. awaiting_tz_file).
-  const materialsButton = result.attach_tz
-    ? `<div class="btn-row"><button class="btn btn-primary" id="send-materials">Отправить материалы</button></div>`
-    : "";
+  const materialsButton = `<div class="btn-row"><button class="btn btn-primary" id="send-materials">Добавить материалы в боте</button></div>`;
   return `
     <div class="topbar"><h1>Готово ✅</h1></div>
     <div class="case-block"><div class="label">Заявка №${result.lead_id ?? "—"}</div><p>Услуга: ${escapeHtml(p.service_name || "не указана")}</p></div>
