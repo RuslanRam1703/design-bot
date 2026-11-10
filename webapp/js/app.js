@@ -2157,9 +2157,7 @@ function renderSubmitted() {
   const priceLine = result.price_range
     ? `<div class="result-box"><div class="price">${formatMoney(result.price_range.from)} – ${formatMoney(result.price_range.to)}</div><div class="hint">Точная сумма — предварительная, дизайнер подтвердит в чате</div></div>`
     : "";
-  const tzLine = result.attach_tz
-    ? `<p class="hint">Вы отметили, что пришлёте файл ТЗ — отправьте его следующим сообщением прямо в этот чат с ботом (не через Mini App).</p>`
-    : "";
+  const tzLine = `<p class="hint">При необходимости приложите файлы через Telegram-бота сейчас или позже. Заявка уже отправлена.</p>`;
   // Кнопка закрывает Mini App, чтобы не заставлять искать, как вернуться в
   // чат: материалы принимает бот обычным сообщением. Она НЕ обязательна —
   // материалы опциональны, и текст выше остаётся на месте для тех, кто

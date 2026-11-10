@@ -1719,6 +1719,9 @@ async def add_lead_supplement(lead_id: int, telegram: dict, fields: dict, wants_
             "id": next_supplement_id,
             "created_at": datetime.now(timezone.utc).isoformat(),
             "fields": fields,
+            "review_status": "pending",
+            "reviewed_at": None,
+            "review_comment": None,
             "designer_notification": {"revision": 1, "state": "pending", "attempts": 0, "retry_after": None},
         })
         lead["updated_at"] = datetime.now(timezone.utc).isoformat()
@@ -1730,7 +1733,54 @@ async def add_lead_supplement(lead_id: int, telegram: dict, fields: dict, wants_
         return lead, next_supplement_id
 
 
-async def record_lead_material(lead_id: int, file_id: str, file_unique_id: str, kind: str, source: str) -> bool:
+
+async def review_lead_supplement(actor_chat_id: int | str, lead_id: int, supplement_id: int, decision: str) -> dict | None:
+    """Designer-only review. Never mutate the original brief or accepted price."""
+    _require_designer(actor_chat_id)
+    if decision not in ("approved", "needs_clarification", "not_agreed"):
+        raise ValueError("Unsupported review decision")
+    async with _lock("leads.json"):
+        leads = await _read_leads()
+        lead = next((item for item in leads if item["id"] == lead_id), None)
+        if lead is None:
+            return None
+        supplement = next((item for item in lead.get("supplements", []) if item["id"] == supplement_id), None)
+        if supplement is None or supplement.get("review_status", "pending") != "pending":
+            return None
+        supplement["review_status"] = decision
+        supplement["reviewed_at"] = datetime.now(timezone.utc).isoformat()
+        lead["updated_at"] = supplement["reviewed_at"]
+        await _write_leads(leads)
+        return {"user_id": lead.get("telegram", {}).get("user_id"), "lead_id": lead_id, "supplement_id": supplement_id, "decision": decision}
+
+
+async def begin_lead_material_upload(user_id: int, lead_id: int) -> None:
+    """Persist an explicit, owner-scoped upload target across bot restarts."""
+    async with _lock("leads.json"):
+        leads = await _read_leads()
+        target = next((lead for lead in leads if lead["id"] == lead_id and lead.get("telegram", {}).get("user_id") == user_id), None)
+        if target is None:
+            raise LeadNotFoundError()
+        if target.get("status") in TERMINAL_LEAD_STATUSES:
+            raise LeadClosedError(lead_id)
+        for lead in leads:
+            if lead.get("telegram", {}).get("user_id") == user_id:
+                lead["awaiting_tz_file"] = lead["id"] == lead_id
+                lead["awaiting_tz_file_source"] = "supplement" if lead["id"] == lead_id else None
+        await _write_leads(leads)
+
+
+async def stop_lead_material_upload(user_id: int, lead_id: int) -> None:
+    async with _lock("leads.json"):
+        leads = await _read_leads()
+        target = next((lead for lead in leads if lead["id"] == lead_id and lead.get("telegram", {}).get("user_id") == user_id), None)
+        if target is not None:
+            target["awaiting_tz_file"] = False
+            target["awaiting_tz_file_source"] = None
+            await _write_leads(leads)
+
+
+async def record_lead_material(lead_id: int, file_id: str, file_unique_id: str, kind: str, source: str, *, user_id: int | None = None, archive_ref: dict | None = None) -> bool:
     """Сохраняет метаданные присланного клиентом файла (document/photo) НА
     заявке — раньше файл только пересылался владельцу через message.forward()
     и нигде не сохранялся, связь "файл ↔ заявка" существовала лишь на
@@ -1742,6 +1792,8 @@ async def record_lead_material(lead_id: int, file_id: str, file_unique_id: str, 
         leads = await _read_leads()
         lead = next((l for l in leads if l["id"] == lead_id), None)
         if lead is None:
+            return False
+        if user_id is not None and lead.get("telegram", {}).get("user_id") != user_id:
             return False
         if lead["status"] in TERMINAL_LEAD_STATUSES:
             # Batch 2 — последний рубеж на случай гонки (find_lead_awaiting_file
@@ -1757,6 +1809,7 @@ async def record_lead_material(lead_id: int, file_id: str, file_unique_id: str, 
             "kind": kind,
             "source": source,
             "received_at": datetime.now(timezone.utc).isoformat(),
+            "archive_ref": archive_ref,
         })
         lead["awaiting_tz_file"] = False
         lead["awaiting_tz_file_source"] = None

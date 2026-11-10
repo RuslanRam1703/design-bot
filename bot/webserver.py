@@ -4,6 +4,7 @@ import logging
 from pathlib import Path
 
 from aiogram import Bot
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from aiohttp import web
 
 from bot import access_control, config, content_store, texts
@@ -283,7 +284,13 @@ async def _notify_client(bot: Bot, telegram_identity: dict, text: str, *, lead_i
     if not user_id:
         return
     try:
-        await bot.send_message(chat_id=user_id, text=text)
+        await bot.send_message(
+            chat_id=user_id, text=text,
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="📎 Добавить материалы", callback_data=f"clientleads:attach:{lead_id}")],
+                [InlineKeyboardButton(text="📋 Открыть заявку", callback_data=f"clientleads:open:{lead_id}")],
+            ]),
+        )
     except Exception:
         logger.exception("Не удалось отправить подтверждение клиенту (lead #%s)", lead_id)
 

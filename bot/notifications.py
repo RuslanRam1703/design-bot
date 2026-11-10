@@ -8,6 +8,7 @@ import asyncio
 import logging
 
 from bot import config, content_store
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from bot.calculator import CalcResult
 from bot.lead import format_lead_message, format_lead_supplement_message
 
@@ -61,7 +62,12 @@ async def notify_designer_supplement(bot, lead: dict, supplement_id: int) -> boo
     token = current["designer_notification"]["claim_token"]
     try:
         message = format_lead_supplement_message(claimed["id"], current["fields"])
-        await bot.send_message(chat_id=config.DESIGNER_CHAT_ID, text=message, parse_mode="HTML")
+        await bot.send_message(
+            chat_id=config.DESIGNER_CHAT_ID, text=message, parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="Рассмотреть изменение", callback_data=f"leadreview:show:{claimed['id']}:{supplement_id}"),
+            ]]),
+        )
     except Exception:
         logger.exception("Designer supplement notification failed for lead #%s", claimed["id"])
         await content_store.finish_designer_notification(claimed["id"], notice["revision"], token, "failed", supplement_id)

@@ -84,6 +84,7 @@ def client_home_keyboard(webapp_url: str) -> InlineKeyboardMarkup:
          InlineKeyboardButton(text="⚡ Быстрая заявка", callback_data="intake:quick")],
         [InlineKeyboardButton(text="✍️ Подробная заявка", web_app=WebAppInfo(url=f"{webapp_url}/brief"))],
         [InlineKeyboardButton(text="📋 Мои заявки", web_app=WebAppInfo(url=f"{webapp_url}/myleads"))],
+        [InlineKeyboardButton(text="📋 Заявки в чате", callback_data="clientleads:list")],
     ])
 
 

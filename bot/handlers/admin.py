@@ -31,6 +31,57 @@ from bot.handlers.start import main_menu_or_confirm
 from bot.states import AdminStates
 
 router = Router(name="admin")
+
+@router.callback_query(F.data.startswith("leadreview:"))
+async def lead_supplement_review(callback: CallbackQuery) -> None:
+    """Review a pending customer change; callback is owner-only via router filter."""
+    from aiogram.types import InlineKeyboardButton
+    try:
+        _, action, lead_str, supplement_str = callback.data.split(":")
+        lead_id, supplement_id = int(lead_str), int(supplement_str)
+    except (ValueError, TypeError):
+        await callback.answer("Некорректное действие", show_alert=True)
+        return
+    if action == "show":
+        lead = await content_store.get_lead(lead_id)
+        supplement = next((item for item in (lead or {}).get("supplements", []) if item["id"] == supplement_id), None)
+        if supplement is None:
+            await callback.answer("Дополнение не найдено", show_alert=True)
+            return
+        status = supplement.get("review_status", "pending")
+        fields = supplement.get("fields") or {}
+        description = "\\n".join(f"{key}: {value}" for key, value in fields.items())[:2000]
+        rows = []
+        if status == "pending":
+            rows = [
+                [InlineKeyboardButton(text="Согласовать", callback_data=f"leadreview:approved:{lead_id}:{supplement_id}")],
+                [InlineKeyboardButton(text="Требует уточнения", callback_data=f"leadreview:needs_clarification:{lead_id}:{supplement_id}")],
+                [InlineKeyboardButton(text="Не согласовано", callback_data=f"leadreview:not_agreed:{lead_id}:{supplement_id}")],
+            ]
+        await callback.message.answer(
+            f"Дополнение №{supplement_id} к заявке №{lead_id}\\nСтатус: {status}\\n{description}".replace("\\n", "\n"),
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=rows) if rows else None,
+        )
+        await callback.answer()
+        return
+    if action not in ("approved", "needs_clarification", "not_agreed"):
+        await callback.answer("Неизвестное решение", show_alert=True)
+        return
+    result = await content_store.review_lead_supplement(callback.message.chat.id, lead_id, supplement_id, action)
+    if result is None:
+        await callback.answer("Уже рассмотрено или не найдено", show_alert=True)
+        return
+    labels = {"approved": "Согласовано", "needs_clarification": "Требует уточнения", "not_agreed": "Не согласовано"}
+    await callback.message.edit_text(f"Дополнение №{supplement_id} к заявке №{lead_id}: {labels[action]}")
+    if result.get("user_id"):
+        try:
+            await callback.bot.send_message(result["user_id"], f"Дополнение №{supplement_id} к вашей заявке: {labels[action]}.")
+        except Exception:
+            logger.exception("Не удалось уведомить клиента о рассмотрении дополнения %s", supplement_id)
+    await callback.answer("Решение сохранено")
+
+
+
 logger = logging.getLogger(__name__)
 
 # Единая формулировка на оба места, где резолвится обложка из Telegram
