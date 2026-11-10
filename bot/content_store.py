@@ -1880,6 +1880,35 @@ async def update_lead_status(actor_chat_id: int | str, lead_id: int, status: str
         return True
 
 
+async def add_client_message(user_id: int, lead_id: int, message_id: int, kind: str, text: str | None = None) -> dict | None:
+    """Persist inbound client activity with ownership checks and message-ID deduplication.
+
+    The original Telegram media remains in Telegram; only a reference and
+    optional caption/text are stored. Repeated callback delivery is idempotent.
+    """
+    if not isinstance(message_id, int) or message_id <= 0 or kind not in {"text", "media"}:
+        return None
+    async with _lock("leads.json"):
+        leads = await _read_leads()
+        lead = next((item for item in leads if item["id"] == lead_id
+                     and item.get("telegram", {}).get("user_id") == user_id), None)
+        if lead is None or lead["status"] not in ACTIVE_LEAD_STATUSES:
+            return None
+        messages = lead.setdefault("client_messages", [])
+        if any(item.get("telegram_message_id") == message_id for item in messages):
+            return lead
+        messages.append({
+            "id": max((item["id"] for item in messages), default=0) + 1,
+            "telegram_message_id": message_id,
+            "kind": kind,
+            "text": text,
+            "received_at": datetime.now(timezone.utc).isoformat(),
+        })
+        lead["updated_at"] = datetime.now(timezone.utc).isoformat()
+        await _write_leads(leads)
+        return lead
+
+
 async def add_owner_message(actor_chat_id: int | str, lead_id: int, text: str, delivery_status: str) -> dict | None:
     """Ответ дизайнера клиенту (bot/handlers/admin.py::lead_reply_send) —
     append-only, тот же паттерн, что и add_lead_supplement/record_lead_material
