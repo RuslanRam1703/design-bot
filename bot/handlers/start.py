@@ -206,7 +206,7 @@ def _enforce_telegram_hard_limit(text: str) -> str:
 def _lead_choice_keyboard(leads, source_message_id, kind="text"):
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=f"Заявка #{lead['id']}",
-            callback_data=f"clientleadroute:{source_message_id}:{lead['id']}:{kind}")]
+            callback_data=(f"clientleadroute:{source_message_id}:{lead['id']}:media" if kind == "media" else f"clientleadroute:{source_message_id}:{lead['id']}"))]
         for lead in leads[:20]
     ])
 
