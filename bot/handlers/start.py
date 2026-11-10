@@ -203,10 +203,10 @@ def _enforce_telegram_hard_limit(text: str) -> str:
 # самого relay обрабатывается отдельно, своим текстом, см. except ниже, а
 # не падением в generic fallback).
 
-def _lead_choice_keyboard(leads, source_message_id):
+def _lead_choice_keyboard(leads, source_message_id, kind="text"):
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=f"Заявка #{lead['id']}",
-            callback_data=f"clientleadroute:{source_message_id}:{lead['id']}")]
+            callback_data=(f"clientleadroute:{source_message_id}:{lead['id']}:media" if kind == "media" else f"clientleadroute:{source_message_id}:{lead['id']}"))]
         for lead in leads[:20]
     ])
 
@@ -214,7 +214,11 @@ def _lead_choice_keyboard(leads, source_message_id):
 @router.callback_query(F.data.startswith("clientleadroute:"))
 async def route_client_message_to_lead(callback: CallbackQuery) -> None:
     try:
-        _, source_id, lead_id = callback.data.split(":", 2)
+        parts = callback.data.split(":")
+        _, source_id, lead_id = parts[:3]
+        kind = parts[3] if len(parts) == 4 else "text"
+        if kind not in {"text", "media"}:
+            raise ValueError("invalid kind")
         source_id, lead_id = int(source_id), int(lead_id)
         if source_id <= 0 or callback.message.chat.type != "private":
             raise ValueError("invalid source")
@@ -228,6 +232,7 @@ async def route_client_message_to_lead(callback: CallbackQuery) -> None:
     source = type("ClientArchiveSource", (), {})()
     source.bot, source.chat, source.message_id = callback.bot, callback.message.chat, source_id
     if await client_materials_archive.archive_lead_material(source, lead_id):
+        await content_store.add_client_message(callback.from_user.id, lead_id, source_id, kind)
         await callback.message.edit_text(f"Сообщение привязано к заявке #{lead_id}.")
         await callback.answer("Сохранено в архиве")
     else:
@@ -291,6 +296,11 @@ async def relay_client_text_to_designer(message: Message, state: FSMContext) -> 
     # best-effort and must not misroute messages when multiple leads exist.
     if len(active_leads) == 1:
         await client_materials_archive.archive_lead_material(message, active_leads[0]["id"])
+        if getattr(message, "message_id", None):
+            await content_store.add_client_message(
+                message.from_user.id, active_leads[0]["id"], message.message_id,
+                "text", message.text,
+            )
     if len(active_leads) > 1 and getattr(message.chat, "type", "private") == "private" and getattr(message, "message_id", None) is not None:
         await message.answer(
             "Сообщение отправлено дизайнеру. К какой заявке его прикрепить?",
@@ -356,10 +366,15 @@ async def relay_client_media_to_designer(message: Message) -> None:
     # archive topic. It remains an informal message, not a lead attachment.
     if len(active_leads) == 1:
         await client_materials_archive.archive_lead_material(message, active_leads[0]["id"])
+        if getattr(message, "message_id", None):
+            await content_store.add_client_message(
+                message.from_user.id, active_leads[0]["id"], message.message_id,
+                "media", getattr(message, "caption", None),
+            )
     if len(active_leads) > 1 and getattr(message.chat, "type", "private") == "private" and getattr(message, "message_id", None) is not None:
         await message.answer(
-            "Файл отправлено дизайнеру. К какой заявке его прикрепить?",
-            reply_markup=_lead_choice_keyboard(active_leads, message.message_id),
+            "Файл отправлен дизайнеру. К какой заявке его прикрепить?",
+            reply_markup=_lead_choice_keyboard(active_leads, message.message_id, "media"),
         )
     else:
         await message.answer("Файл отправлен дизайнеру ✅")
