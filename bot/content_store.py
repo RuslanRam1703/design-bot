@@ -1780,7 +1780,7 @@ async def stop_lead_material_upload(user_id: int, lead_id: int) -> None:
             await _write_leads(leads)
 
 
-async def record_lead_material(lead_id: int, file_id: str, file_unique_id: str, kind: str, source: str) -> bool:
+async def record_lead_material(lead_id: int, file_id: str, file_unique_id: str, kind: str, source: str, *, user_id: int | None = None) -> bool:
     """Сохраняет метаданные присланного клиентом файла (document/photo) НА
     заявке — раньше файл только пересылался владельцу через message.forward()
     и нигде не сохранялся, связь "файл ↔ заявка" существовала лишь на
@@ -1792,6 +1792,8 @@ async def record_lead_material(lead_id: int, file_id: str, file_unique_id: str, 
         leads = await _read_leads()
         lead = next((l for l in leads if l["id"] == lead_id), None)
         if lead is None:
+            return False
+        if user_id is not None and lead.get("telegram", {}).get("user_id") != user_id:
             return False
         if lead["status"] in TERMINAL_LEAD_STATUSES:
             # Batch 2 — последний рубеж на случай гонки (find_lead_awaiting_file
