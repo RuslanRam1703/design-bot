@@ -180,8 +180,8 @@ async def client_leads_attach(callback: CallbackQuery) -> None:
 async def client_leads_stop(callback: CallbackQuery) -> None:
     lead_id = int(callback.data.rsplit(":", 1)[1])
     await content_store.stop_lead_material_upload(callback.from_user.id, lead_id)
-    callback.data = f"clientleads:open:{lead_id}"
-    await client_leads_open(callback)
+    await callback.message.edit_text("Добавление файлов отменено.", reply_markup=_lead_nav([[InlineKeyboardButton(text="◀️ К заявке", callback_data=f"clientleads:open:{lead_id}")]]))
+    await callback.answer()
 
 
 @router.callback_query(F.data.startswith("clientleads:files:"))
@@ -275,7 +275,13 @@ async def handle_tz_file(message: Message) -> None:
             await message.forward(chat_id=config.DESIGNER_CHAT_ID)
         except Exception:
             logger.exception("Не удалось переслать материал дизайнеру (lead #%s)", lead["id"])
-    await message.answer(texts.TZ_FILE_FORWARDED)
+    await message.answer(
+        f"Файл добавлен к заявке №{lead['id']}. Вы можете добавить ещё один файл.",
+        reply_markup=_lead_nav([
+            [InlineKeyboardButton(text="📎 Добавить ещё", callback_data=f"clientleads:attach:{lead['id']}")],
+            [InlineKeyboardButton(text="✅ Готово · К заявке", callback_data=f"clientleads:open:{lead['id']}")],
+        ]),
+    )
 
 
 @router.message(F.voice | F.video_note | F.sticker)
