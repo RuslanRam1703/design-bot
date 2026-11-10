@@ -757,12 +757,44 @@ async def cases_moderate_pick(callback: CallbackQuery) -> None:
         [InlineKeyboardButton(text=label, callback_data=f"adminsetcasestatus:{status}:{case_id}")]
         for status, label in _PORTFOLIO_STATUS_LABELS.items() if status != current
     ]
+    rows.append([InlineKeyboardButton(text="Выбрать тип работы", callback_data=f"adminmoderatecategory:{case_id}")])
     rows.append([InlineKeyboardButton(text="◀️ К списку", callback_data="admincasesaction:moderate")])
     await callback.message.edit_text(
         f"Кейс: {case['title']}\\nСтатус: {_PORTFOLIO_STATUS_LABELS.get(current, current)}\\n\\nВыбери действие:",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
     )
     await callback.answer()
+
+
+@router.callback_query(F.data.startswith("adminmoderatecategory:"))
+async def cases_moderate_category(callback: CallbackQuery) -> None:
+    from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+
+    case_id = callback.data.split(":", 1)[1]
+    case = next((item for item in await content_store.list_cases() if item["id"] == case_id), None)
+    if case is None:
+        await callback.answer("Кейс не найден", show_alert=True)
+        return
+    types = await content_store.list_portfolio_types()
+    rows = [[InlineKeyboardButton(text=item["label"], callback_data=f"adminmoderatesettype:{case_id}:{item['id']}")] for item in types]
+    rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data=f"adminmoderatecase:{case_id}")])
+    await callback.message.edit_text("Выбери тип работы:", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("adminmoderatesettype:"))
+async def cases_moderate_set_category(callback: CallbackQuery) -> None:
+    _, case_id, type_id = callback.data.split(":", 2)
+    types = {item["id"] for item in await content_store.list_portfolio_types()}
+    if type_id not in types:
+        await callback.answer("Тип работы не найден", show_alert=True)
+        return
+    updated = await content_store.update_case_category(callback.message.chat.id, case_id, type_id)
+    if not updated:
+        await callback.answer("Кейс не найден", show_alert=True)
+        return
+    await callback.answer("Тип работы обновлён")
+    await cases_moderate_pick_for_id(callback, case_id)
 
 
 @router.callback_query(F.data.startswith("adminsetcasestatus:"))
@@ -796,6 +828,7 @@ async def cases_moderate_pick_for_id(callback: CallbackQuery, case_id: str) -> N
         [InlineKeyboardButton(text=label, callback_data=f"adminsetcasestatus:{status}:{case_id}")]
         for status, label in _PORTFOLIO_STATUS_LABELS.items() if status != current
     ]
+    rows.append([InlineKeyboardButton(text="Выбрать тип работы", callback_data=f"adminmoderatecategory:{case_id}")])
     rows.append([InlineKeyboardButton(text="◀️ К списку", callback_data="admincasesaction:moderate")])
     await callback.message.edit_text(
         f"Кейс: {case['title']}\\nСтатус: {_PORTFOLIO_STATUS_LABELS[current]}\\n\\nВыбери действие:",
