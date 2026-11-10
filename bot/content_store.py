@@ -467,18 +467,20 @@ async def upsert_channel_case(
         data = await _read("portfolio.json")
         for case in data["cases"]:
             if case.get("source_post_url") == post_url:
-                if case.get("cover") != cover:
-                    case["cover"] = cover
-                    case["images"] = [cover]
-                case["title"] = title
-                await _write("portfolio.json", data)
+                # Telegram edits must never overwrite curated or rejected work.
+                # Keep the original imported material for reference only.
+                if case.get("status", "published") == "draft":
+                    case["source_title"] = title
+                    case["source_cover"] = cover
+                    await _write("portfolio.json", data)
                 return case, False
         case_id = f"tg_{channel_username.lower()}_{message_id}"
         case = {
             "id": case_id,
             "title": title,
-            "type": "graphics",
+            "type": None,
             "featured": False,
+            "status": "draft",
             "cover": cover,
             "images": [cover],
             "task": "Демонстрационная публикация из Telegram-канала.",
@@ -486,10 +488,49 @@ async def upsert_channel_case(
             "result": "",
             "related_service": None,
             "source_post_url": post_url,
+            "source_title": title,
+            "source_cover": cover,
         }
         data["cases"].append(case)
         await _write("portfolio.json", data)
         return case, True
+
+PORTFOLIO_STATUSES = frozenset({"draft", "published", "unpublished", "rejected", "trashed"})
+
+
+async def set_case_status(actor_chat_id: int | str, case_id: str, status: str) -> bool:
+    """Change visibility without destroying case data or associated images."""
+    _require_designer(actor_chat_id)
+    if status not in PORTFOLIO_STATUSES:
+        raise ValueError("Invalid portfolio status")
+    async with _lock("portfolio.json"):
+        data = await _read("portfolio.json")
+        case = _find_case(data, case_id)
+        if case is None:
+            return False
+        current = case.get("status", "published")
+        if status == "trashed" and current != "trashed":
+            case["status_before_trash"] = current
+        elif current == "trashed" and status != "trashed":
+            case.pop("status_before_trash", None)
+        case["status"] = status
+        await _write("portfolio.json", data)
+        return True
+
+
+async def restore_trashed_case(actor_chat_id: int | str, case_id: str) -> bool:
+    """Restore a trashed case to its previous visibility state."""
+    _require_designer(actor_chat_id)
+    async with _lock("portfolio.json"):
+        data = await _read("portfolio.json")
+        case = _find_case(data, case_id)
+        if case is None or case.get("status") != "trashed":
+            return False
+        previous = case.pop("status_before_trash", "draft")
+        case["status"] = previous if previous in PORTFOLIO_STATUSES - {"trashed"} else "draft"
+        await _write("portfolio.json", data)
+        return True
+
 
 async def update_case(actor_chat_id: int | str, case_id: str, **fields: Any) -> bool:
     """"cover" через это поле — быстрый путь "загрузить новую обложку":

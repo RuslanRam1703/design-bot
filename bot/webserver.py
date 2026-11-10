@@ -138,6 +138,13 @@ async def handle_public_data(request: web.Request) -> web.Response:
     except Exception:
         logger.exception("Не удалось прочитать публичный /data/%s", filename)
         return web.json_response({"error": "internal"}, status=500)
+    if filename == "portfolio.json":
+        # Public visitors must never receive drafts, rejected or trashed cases.
+        # Legacy cases have no status and remain published for compatibility.
+        data = {**data, "cases": [
+            case for case in data.get("cases", [])
+            if case.get("status", "published") == "published"
+        ]}
     return web.json_response(data, dumps=lambda d: json.dumps(d, ensure_ascii=False))
 
 
