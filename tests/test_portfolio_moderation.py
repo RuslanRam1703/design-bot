@@ -42,8 +42,11 @@ class PortfolioModerationTests(unittest.IsolatedAsyncioTestCase):
              patch.object(content_store, "_write", side_effect=write):
             self.assertTrue(await content_store.set_case_status(1, "case_1", "trashed"))
             self.assertEqual(data["cases"][0]["cover"], "image.jpg")
-            self.assertTrue(await content_store.set_case_status(1, "case_1", "published"))
+            self.assertEqual(data["cases"][0]["status_before_trash"], "published")
+            self.assertTrue(await content_store.restore_trashed_case(1, "case_1"))
             self.assertEqual(data["cases"][0]["status"], "published")
+            self.assertNotIn("status_before_trash", data["cases"][0])
+            self.assertFalse(await content_store.restore_trashed_case(1, "case_1"))
             with self.assertRaises(ValueError):
                 await content_store.set_case_status(1, "case_1", "unknown")
 
