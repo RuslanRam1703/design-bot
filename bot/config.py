@@ -43,6 +43,8 @@ UPSTASH_REDIS_REST_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN", "")
 # Если не задан — прямая загрузка обложки продолжает работать через
 # прежний storage-путь (см. bot/handlers/admin.py), ничего не ломается.
 MEDIA_ARCHIVE_CHANNEL = os.getenv("MEDIA_ARCHIVE_CHANNEL", "").strip()
+# Separate PRIVATE archive for client briefs and documents; never reuse public portfolio archive.
+CLIENT_MATERIALS_CHANNEL = os.getenv("CLIENT_MATERIALS_CHANNEL", "").strip()
 
 # Public channel used only as a source for curated portfolio posts.
 PORTFOLIO_CHANNEL = os.getenv("PORTFOLIO_CHANNEL", "@portfolio_rrr17").strip()
