@@ -305,7 +305,7 @@ async def handle_tz_file(message: Message) -> None:
         except Exception:
             logger.exception("Не удалось переслать материал дизайнеру (lead #%s)", lead["id"])
     await message.answer(
-        f"Файл добавлен к заявке №{lead['id']}. Вы можете добавить ещё один файл.",
+        texts.TZ_FILE_FORWARDED,
         reply_markup=_lead_nav([
             [InlineKeyboardButton(text="📎 Добавить ещё", callback_data=f"clientleads:attach:{lead['id']}")],
             [InlineKeyboardButton(text="✅ Готово · К заявке", callback_data=f"clientleads:open:{lead['id']}")],
