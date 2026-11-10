@@ -757,6 +757,8 @@ async def cases_moderate_pick(callback: CallbackQuery) -> None:
         [InlineKeyboardButton(text=label, callback_data=f"adminsetcasestatus:{status}:{case_id}")]
         for status, label in _PORTFOLIO_STATUS_LABELS.items() if status != current
     ]
+    if current == "trashed":
+        rows.insert(0, [InlineKeyboardButton(text="Восстановить прежний статус", callback_data=f"adminrestorecase:{case_id}")])
     rows.append([InlineKeyboardButton(text="Выбрать тип работы", callback_data=f"adminmoderatecategory:{case_id}")])
     rows.append([InlineKeyboardButton(text="◀️ К списку", callback_data="admincasesaction:moderate")])
     await callback.message.edit_text(
@@ -764,6 +766,17 @@ async def cases_moderate_pick(callback: CallbackQuery) -> None:
         reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
     )
     await callback.answer()
+
+
+@router.callback_query(F.data.startswith("adminrestorecase:"))
+async def cases_restore_from_trash(callback: CallbackQuery) -> None:
+    case_id = callback.data.split(":", 1)[1]
+    restored = await content_store.restore_trashed_case(callback.message.chat.id, case_id)
+    if not restored:
+        await callback.answer("Кейс не найден в корзине", show_alert=True)
+        return
+    await callback.answer("Кейс восстановлен")
+    await cases_moderate_pick_for_id(callback, case_id)
 
 
 @router.callback_query(F.data.startswith("adminmoderatecategory:"))
@@ -828,6 +841,8 @@ async def cases_moderate_pick_for_id(callback: CallbackQuery, case_id: str) -> N
         [InlineKeyboardButton(text=label, callback_data=f"adminsetcasestatus:{status}:{case_id}")]
         for status, label in _PORTFOLIO_STATUS_LABELS.items() if status != current
     ]
+    if current == "trashed":
+        rows.insert(0, [InlineKeyboardButton(text="Восстановить прежний статус", callback_data=f"adminrestorecase:{case_id}")])
     rows.append([InlineKeyboardButton(text="Выбрать тип работы", callback_data=f"adminmoderatecategory:{case_id}")])
     rows.append([InlineKeyboardButton(text="◀️ К списку", callback_data="admincasesaction:moderate")])
     await callback.message.edit_text(
