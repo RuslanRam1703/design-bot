@@ -20,6 +20,7 @@ class PortfolioModerationTests(unittest.IsolatedAsyncioTestCase):
             case, created = await content_store.upsert_channel_case(channel_username="portfolio_rrr17", message_id=6, title="Original", cover="old.jpg")
             self.assertTrue(created)
             self.assertEqual(case["status"], "draft")
+            self.assertIsNone(case["type"])
             data["cases"][0]["title"] = "Manually edited"
             data["cases"][0]["status"] = "rejected"
             case, created = await content_store.upsert_channel_case(channel_username="portfolio_rrr17", message_id=6, title="Telegram edit", cover="new.jpg")
