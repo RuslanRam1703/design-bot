@@ -5,7 +5,7 @@ import logging
 from aiogram import F, Router
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 
-from bot import config, content_store, texts
+from bot import config, content_store, texts, client_materials_archive
 from bot.calculator import calculate
 from bot.data import load_pricing
 from bot.handlers.start import relay_client_media_to_designer
@@ -287,7 +287,19 @@ async def handle_tz_file(message: Message) -> None:
     # Материал сохраняем ДО пересылки — если пересылка упадёт (Telegram API
     # недоступен и т.п.), связь "файл ↔ заявка" всё равно не теряется, её
     # можно будет восстановить вручную через file_id из /admin.
-    stored = await content_store.record_lead_material(lead["id"], file_id, file_unique_id, kind, source, user_id=message.from_user.id)
+    archive_ref = None
+    if config.CLIENT_MATERIALS_CHANNEL:
+        try:
+            archive_ref = await client_materials_archive.archive_client_material(
+                message.bot, file_id=file_id, kind=kind, lead_id=lead["id"],
+            )
+        except client_materials_archive.ClientArchiveUnavailable:
+            # Do not discard the original Telegram file_id when archive delivery fails.
+            logger.exception("Материал заявки %s не удалось скопировать в архив", lead["id"])
+    stored = await content_store.record_lead_material(
+        lead["id"], file_id, file_unique_id, kind, source,
+        user_id=message.from_user.id, archive_ref=archive_ref,
+    )
     if not stored:
         await message.answer("Заявка больше не принимает материалы. Файл не прикреплён.")
         return
