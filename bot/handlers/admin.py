@@ -720,6 +720,89 @@ async def cases_add_description(message: Message, state: FSMContext) -> None:
     await flow.finish_flow(state)
 
 
+# Portfolio moderation: all transitions are reversible and do not delete assets.
+_PORTFOLIO_STATUS_LABELS = {
+    "draft": "Черновик",
+    "published": "Опубликован",
+    "unpublished": "Снят с публикации",
+    "rejected": "Отклонён",
+    "trashed": "Корзина",
+}
+
+
+@router.callback_query(F.data == "admincasesaction:moderate")
+async def cases_moderate_start(callback: CallbackQuery) -> None:
+    cases = await content_store.list_cases()
+    if not cases:
+        await callback.message.edit_text("Кейсов пока нет.", reply_markup=kb.admin_cases_menu_keyboard())
+    else:
+        await callback.message.edit_text(
+            "Выбери кейс для управления публикацией:",
+            reply_markup=kb.case_pick_keyboard(cases, "adminmoderatecase"),
+        )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("adminmoderatecase:"))
+async def cases_moderate_pick(callback: CallbackQuery) -> None:
+    from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+
+    case_id = callback.data.split(":", 1)[1]
+    case = next((item for item in await content_store.list_cases() if item["id"] == case_id), None)
+    if case is None:
+        await callback.answer("Кейс не найден", show_alert=True)
+        return
+    current = case.get("status", "published")
+    rows = [
+        [InlineKeyboardButton(text=label, callback_data=f"adminsetcasestatus:{status}:{case_id}")]
+        for status, label in _PORTFOLIO_STATUS_LABELS.items() if status != current
+    ]
+    rows.append([InlineKeyboardButton(text="◀️ К списку", callback_data="admincasesaction:moderate")])
+    await callback.message.edit_text(
+        f"Кейс: {case['title']}\\nСтатус: {_PORTFOLIO_STATUS_LABELS.get(current, current)}\\n\\nВыбери действие:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("adminsetcasestatus:"))
+async def cases_moderate_apply(callback: CallbackQuery) -> None:
+    _, status, case_id = callback.data.split(":", 2)
+    if status not in _PORTFOLIO_STATUS_LABELS:
+        await callback.answer("Недопустимый статус", show_alert=True)
+        return
+    if status == "published":
+        case = next((item for item in await content_store.list_cases() if item["id"] == case_id), None)
+        types = {item["id"] for item in await content_store.list_portfolio_types()}
+        if case is None or case.get("type") not in types:
+            await callback.answer("Сначала выбери действующий тип работы в редактировании кейса", show_alert=True)
+            return
+    updated = await content_store.set_case_status(callback.message.chat.id, case_id, status)
+    if not updated:
+        await callback.answer("Кейс не найден", show_alert=True)
+        return
+    await callback.answer("Статус обновлён")
+    await cases_moderate_pick_for_id(callback, case_id)
+
+
+async def cases_moderate_pick_for_id(callback: CallbackQuery, case_id: str) -> None:
+    from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+
+    case = next((item for item in await content_store.list_cases() if item["id"] == case_id), None)
+    if case is None:
+        return
+    current = case.get("status", "published")
+    rows = [
+        [InlineKeyboardButton(text=label, callback_data=f"adminsetcasestatus:{status}:{case_id}")]
+        for status, label in _PORTFOLIO_STATUS_LABELS.items() if status != current
+    ]
+    rows.append([InlineKeyboardButton(text="◀️ К списку", callback_data="admincasesaction:moderate")])
+    await callback.message.edit_text(
+        f"Кейс: {case['title']}\\nСтатус: {_PORTFOLIO_STATUS_LABELS[current]}\\n\\nВыбери действие:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+    )
+
+
 @router.callback_query(F.data == "admincasesaction:edit")
 async def cases_edit_start(callback: CallbackQuery, state: FSMContext) -> None:
     cases = await content_store.list_cases()
