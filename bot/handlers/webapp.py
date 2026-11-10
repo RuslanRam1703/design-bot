@@ -287,7 +287,7 @@ async def handle_tz_file(message: Message) -> None:
     # Материал сохраняем ДО пересылки — если пересылка упадёт (Telegram API
     # недоступен и т.п.), связь "файл ↔ заявка" всё равно не теряется, её
     # можно будет восстановить вручную через file_id из /admin.
-    stored = await content_store.record_lead_material(lead["id"], file_id, file_unique_id, kind, source)
+    stored = await content_store.record_lead_material(lead["id"], file_id, file_unique_id, kind, source, user_id=message.from_user.id)
     if not stored:
         await message.answer("Заявка больше не принимает материалы. Файл не прикреплён.")
         return
