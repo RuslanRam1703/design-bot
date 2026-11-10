@@ -7,6 +7,15 @@ from bot import client_materials_archive as archive
 
 
 class ArchiveDeliveryTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        prepare = patch.object(archive.content_store, 'prepare_archive_copy', AsyncMock(
+            return_value={'key': 'synthetic', 'claim_token': 'test', 'claimed': True, 'state': 'sending'}))
+        finish = patch.object(archive.content_store, 'finish_archive_copy', AsyncMock())
+        prepare.start()
+        finish.start()
+        self.addCleanup(prepare.stop)
+        self.addCleanup(finish.stop)
+
     async def test_copy_failure_keeps_canonical_mapping_for_retry(self):
         db = {}
         def redis(*args):

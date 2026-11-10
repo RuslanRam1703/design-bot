@@ -2,7 +2,7 @@
 import asyncio
 import logging
 
-from aiogram.exceptions import TelegramAPIError, TelegramNetworkError
+from aiogram.exceptions import TelegramAPIError, TelegramNetworkError, TelegramServerError
 from bot import access_control, content_store
 
 logger = logging.getLogger(__name__)
@@ -44,7 +44,7 @@ async def deliver_owner_reply(message, lead: dict, text: str) -> str:
             parse_mode=None,
         )
         status = "sent"
-    except (TelegramNetworkError, asyncio.TimeoutError):
+    except (TelegramNetworkError, TelegramServerError, asyncio.TimeoutError):
         status = "unknown"
     except TelegramAPIError:
         logger.exception("Reply delivery rejected")

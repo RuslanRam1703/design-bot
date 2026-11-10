@@ -438,6 +438,8 @@ def lead_detail_keyboard(lead: dict) -> InlineKeyboardMarkup:
     rows.append([InlineKeyboardButton(text="📂 Открыть / создать проект", callback_data="adminleadaction:project")])
     if lead.get("owner_messages") or lead.get("client_messages"):
         rows.append([InlineKeyboardButton(text="💬 Переписка", callback_data="adminleadhistory:0")])
+    if any(c.get("state") == "failed" for c in lead.get("archive_deliveries", [])):
+        rows.append([InlineKeyboardButton(text="🔄 Повторить копирование в архив", callback_data="adminleadarchive:retry")])
     materials = lead_material_items(lead)
     if materials:
         rows.append([InlineKeyboardButton(text=f"📎 Материалы ({len(materials)})", callback_data="adminleadaction:materials")])

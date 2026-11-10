@@ -6,6 +6,15 @@ from bot import client_materials_archive as archive
 
 
 class ArchiveTopicTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        prepare = patch.object(archive.content_store, 'prepare_archive_copy', AsyncMock(
+            return_value={'key': 'synthetic', 'claim_token': 'test', 'claimed': True, 'state': 'sending'}))
+        finish = patch.object(archive.content_store, 'finish_archive_copy', AsyncMock())
+        prepare.start()
+        finish.start()
+        self.addCleanup(prepare.stop)
+        self.addCleanup(finish.stop)
+
     async def test_one_topic_for_multiple_files_of_same_lead(self):
         db = {}
         def redis(*args):

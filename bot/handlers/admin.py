@@ -2581,6 +2581,20 @@ async def lead_change_status(callback: CallbackQuery, state: FSMContext) -> None
     await callback.answer("Статус обновлён")
 
 
+@router.callback_query(AdminStates.lead_detail, F.data == "adminleadarchive:retry")
+async def lead_archive_retry(callback: CallbackQuery, state: FSMContext) -> None:
+    data = await state.get_data()
+    lead = await content_store.get_lead(data["lead_id"])
+    if lead is None:
+        await callback.answer("Заявка не найдена", show_alert=True)
+        return
+    await callback.answer("Повторяем неудачные копирования")
+    from bot.client_materials_archive import retry_archive_copies
+    await retry_archive_copies(callback.bot, lead_id=lead["id"], manual=True)
+    lead = await content_store.get_lead(lead["id"])
+    await callback.message.edit_text(lead_format.format_lead_admin_detail(lead), reply_markup=kb.lead_detail_keyboard(lead))
+
+
 @router.callback_query(AdminStates.lead_detail, F.data.startswith("adminleadhistory:"))
 async def lead_history(callback: CallbackQuery, state: FSMContext) -> None:
     data = await state.get_data()
