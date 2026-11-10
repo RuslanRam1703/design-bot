@@ -1730,6 +1730,33 @@ async def add_lead_supplement(lead_id: int, telegram: dict, fields: dict, wants_
         return lead, next_supplement_id
 
 
+
+async def begin_lead_material_upload(user_id: int, lead_id: int) -> None:
+    """Persist an explicit, owner-scoped upload target across bot restarts."""
+    async with _lock("leads.json"):
+        leads = await _read_leads()
+        target = next((lead for lead in leads if lead["id"] == lead_id and lead.get("telegram", {}).get("user_id") == user_id), None)
+        if target is None:
+            raise LeadNotFoundError()
+        if target.get("status") in TERMINAL_LEAD_STATUSES:
+            raise LeadClosedError(lead_id)
+        for lead in leads:
+            if lead.get("telegram", {}).get("user_id") == user_id:
+                lead["awaiting_tz_file"] = lead["id"] == lead_id
+                lead["awaiting_tz_file_source"] = "supplement" if lead["id"] == lead_id else None
+        await _write_leads(leads)
+
+
+async def stop_lead_material_upload(user_id: int, lead_id: int) -> None:
+    async with _lock("leads.json"):
+        leads = await _read_leads()
+        target = next((lead for lead in leads if lead["id"] == lead_id and lead.get("telegram", {}).get("user_id") == user_id), None)
+        if target is not None:
+            target["awaiting_tz_file"] = False
+            target["awaiting_tz_file_source"] = None
+            await _write_leads(leads)
+
+
 async def record_lead_material(lead_id: int, file_id: str, file_unique_id: str, kind: str, source: str) -> bool:
     """Сохраняет метаданные присланного клиентом файла (document/photo) НА
     заявке — раньше файл только пересылался владельцу через message.forward()
