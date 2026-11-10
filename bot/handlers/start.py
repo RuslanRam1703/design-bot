@@ -228,6 +228,7 @@ async def route_client_message_to_lead(callback: CallbackQuery) -> None:
     source = type("ClientArchiveSource", (), {})()
     source.bot, source.chat, source.message_id = callback.bot, callback.message.chat, source_id
     if await client_materials_archive.archive_lead_material(source, lead_id):
+        await content_store.add_client_message(callback.from_user.id, lead_id, source_id, "media")
         await callback.message.edit_text(f"Сообщение привязано к заявке #{lead_id}.")
         await callback.answer("Сохранено в архиве")
     else:
@@ -291,6 +292,16 @@ async def relay_client_text_to_designer(message: Message, state: FSMContext) -> 
     # best-effort and must not misroute messages when multiple leads exist.
     if len(active_leads) == 1:
         await client_materials_archive.archive_lead_material(message, active_leads[0]["id"])
+        if getattr(message, "message_id", None):
+            await content_store.add_client_message(
+                message.from_user.id, active_leads[0]["id"], message.message_id,
+                "media", getattr(message, "caption", None),
+            )
+        if getattr(message, "message_id", None):
+            await content_store.add_client_message(
+                message.from_user.id, active_leads[0]["id"], message.message_id,
+                "text", message.text,
+            )
     if len(active_leads) > 1 and getattr(message.chat, "type", "private") == "private" and getattr(message, "message_id", None) is not None:
         await message.answer(
             "Сообщение отправлено дизайнеру. К какой заявке его прикрепить?",
