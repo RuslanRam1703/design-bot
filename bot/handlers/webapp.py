@@ -222,6 +222,17 @@ async def client_leads_files(callback: CallbackQuery) -> None:
         return
     materials = lead.get("materials") or []
     for material in materials[:20]:
+        archive_ref = material.get("archive_ref")
+        if isinstance(archive_ref, dict) and archive_ref.get("chat_id") and archive_ref.get("message_id"):
+            try:
+                await callback.bot.copy_message(
+                    chat_id=callback.from_user.id,
+                    from_chat_id=archive_ref["chat_id"],
+                    message_id=archive_ref["message_id"],
+                )
+                continue
+            except Exception:
+                logger.exception("Не удалось восстановить файл из приватного архива заявки %s", lead_id)
         file_id = material.get("file_id")
         if not file_id:
             continue
