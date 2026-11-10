@@ -1780,7 +1780,7 @@ async def stop_lead_material_upload(user_id: int, lead_id: int) -> None:
             await _write_leads(leads)
 
 
-async def record_lead_material(lead_id: int, file_id: str, file_unique_id: str, kind: str, source: str, *, user_id: int | None = None) -> bool:
+async def record_lead_material(lead_id: int, file_id: str, file_unique_id: str, kind: str, source: str, *, user_id: int | None = None, archive_ref: dict | None = None) -> bool:
     """Сохраняет метаданные присланного клиентом файла (document/photo) НА
     заявке — раньше файл только пересылался владельцу через message.forward()
     и нигде не сохранялся, связь "файл ↔ заявка" существовала лишь на
@@ -1809,6 +1809,7 @@ async def record_lead_material(lead_id: int, file_id: str, file_unique_id: str, 
             "kind": kind,
             "source": source,
             "received_at": datetime.now(timezone.utc).isoformat(),
+            "archive_ref": archive_ref,
         })
         lead["awaiting_tz_file"] = False
         lead["awaiting_tz_file_source"] = None
