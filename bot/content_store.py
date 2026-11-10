@@ -478,7 +478,7 @@ async def upsert_channel_case(
         case = {
             "id": case_id,
             "title": title,
-            "type": "graphics",
+            "type": None,
             "featured": False,
             "status": "draft",
             "cover": cover,
