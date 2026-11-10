@@ -299,12 +299,7 @@ async def relay_client_text_to_designer(message: Message, state: FSMContext) -> 
         if getattr(message, "message_id", None):
             await content_store.add_client_message(
                 message.from_user.id, active_leads[0]["id"], message.message_id,
-                "media", getattr(message, "caption", None),
-            )
-        if getattr(message, "message_id", None):
-            await content_store.add_client_message(
-                message.from_user.id, active_leads[0]["id"], message.message_id,
-                "media", getattr(message, "caption", None),
+                "text", message.text,
             )
     if len(active_leads) > 1 and getattr(message.chat, "type", "private") == "private" and getattr(message, "message_id", None) is not None:
         await message.answer(
@@ -371,9 +366,14 @@ async def relay_client_media_to_designer(message: Message) -> None:
     # archive topic. It remains an informal message, not a lead attachment.
     if len(active_leads) == 1:
         await client_materials_archive.archive_lead_material(message, active_leads[0]["id"])
+        if getattr(message, "message_id", None):
+            await content_store.add_client_message(
+                message.from_user.id, active_leads[0]["id"], message.message_id,
+                "media", getattr(message, "caption", None),
+            )
     if len(active_leads) > 1 and getattr(message.chat, "type", "private") == "private" and getattr(message, "message_id", None) is not None:
         await message.answer(
-            "Файл отправлено дизайнеру. К какой заявке его прикрепить?",
+            "Файл отправлен дизайнеру. К какой заявке его прикрепить?",
             reply_markup=_lead_choice_keyboard(active_leads, message.message_id, "media"),
         )
     else:
