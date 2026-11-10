@@ -12,6 +12,7 @@
 """
 
 import logging
+from html import escape
 import math
 import zipfile
 from datetime import datetime, timezone
@@ -713,7 +714,7 @@ async def cases_add_description(message: Message, state: FSMContext) -> None:
     # не трогая data, поэтому anchor переживает этот шаг.
     await flow.step_from_text(
         message, state,
-        f"Кейс «{case['title']}» добавлен и уже виден в Mini App ✅\n\n"
+        f"Кейс «{escape(case['title'])}» добавлен и уже виден в Mini App ✅\n\n"
         "Поля «Решение» и «Результат» пока пустые — заполнить можно через «✏️ Редактировать».",
         kb.admin_cases_menu_keyboard(),
     )
@@ -762,7 +763,7 @@ async def cases_moderate_pick(callback: CallbackQuery) -> None:
     rows.append([InlineKeyboardButton(text="Выбрать тип работы", callback_data=f"adminmoderatecategory:{case_id}")])
     rows.append([InlineKeyboardButton(text="◀️ К списку", callback_data="admincasesaction:moderate")])
     await callback.message.edit_text(
-        f"Кейс: {case['title']}\nСтатус: {_PORTFOLIO_STATUS_LABELS.get(current, current)}\n\nВыбери действие:",
+        f"Кейс: {escape(case['title'])}\nСтатус: {_PORTFOLIO_STATUS_LABELS.get(current, current)}\n\nВыбери действие:",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
     )
     await callback.answer()
@@ -846,7 +847,7 @@ async def cases_moderate_pick_for_id(callback: CallbackQuery, case_id: str) -> N
     rows.append([InlineKeyboardButton(text="Выбрать тип работы", callback_data=f"adminmoderatecategory:{case_id}")])
     rows.append([InlineKeyboardButton(text="◀️ К списку", callback_data="admincasesaction:moderate")])
     await callback.message.edit_text(
-        f"Кейс: {case['title']}\nСтатус: {_PORTFOLIO_STATUS_LABELS[current]}\n\nВыбери действие:",
+        f"Кейс: {escape(case['title'])}\nСтатус: {_PORTFOLIO_STATUS_LABELS[current]}\n\nВыбери действие:",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
     )
 
@@ -1575,7 +1576,7 @@ async def cases_delete_confirm(callback: CallbackQuery, state: FSMContext) -> No
     case = next((c for c in await content_store.list_cases() if c["id"] == case_id), None)
     await state.update_data(case_id=case_id)
     title = case["title"] if case else case_id
-    await callback.message.edit_text(f"Переместить кейс «{title}» в корзину? Его можно будет восстановить.", reply_markup=kb.confirm_keyboard("admindelcaseconfirm"))
+    await callback.message.edit_text(f"Переместить кейс «{escape(title)}» в корзину? Его можно будет восстановить.", reply_markup=kb.confirm_keyboard("admindelcaseconfirm"))
     await state.set_state(AdminStates.delete_case_confirm)
     await callback.answer()
 
