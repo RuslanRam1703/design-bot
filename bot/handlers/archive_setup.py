@@ -38,7 +38,7 @@ async def reply_from_archive_topic(message: Message) -> None:
     if not text:
         await message.answer("Напишите /reply и текст сообщения для клиента.")
         return
-    from bot import content_store, access_control
+    from bot import content_store
     if not config.UPSTASH_REDIS_REST_URL or not config.UPSTASH_REDIS_REST_TOKEN:
         await message.answer("Архив не подключён к постоянному хранилищу.")
         return
@@ -57,20 +57,9 @@ async def reply_from_archive_topic(message: Message) -> None:
             await message.answer("Не удалось однозначно определить заявку для этой темы.")
             return
         lead = matched[0]
-        if await access_control.is_blocked(lead["telegram"]["user_id"], lead["telegram"].get("username")):
-            await message.answer("Клиент заблокирован. Отправка отменена.")
-            return
-        try:
-            await message.bot.send_message(
-                chat_id=lead["telegram"]["user_id"],
-                text=f"Ответ по заявке #{lead['id']}\\n\\n{text}",
-            )
-            status = "sent"
-        except Exception:
-            logger.exception("Archive topic reply delivery failed for lead #%s", lead["id"])
-            status = "failed"
-        await content_store.add_owner_message(message.from_user.id, lead["id"], text, status)
-        await message.answer("Ответ отправлен клиенту." if status == "sent" else "Отправить не удалось. Ответ сохранён в истории.")
+        from bot.owner_replies import deliver_owner_reply, RESULT_TEXT
+        status = await deliver_owner_reply(message, lead, text)
+        await message.answer(RESULT_TEXT[status])
     except Exception:
         logger.exception("Archive topic reply failed")
         await message.answer("Ошибка обработки ответа. Повторите позже.")

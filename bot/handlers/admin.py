@@ -2611,29 +2611,10 @@ async def lead_reply_send(message: Message, state: FSMContext) -> None:
         await flow.finish_flow(state)
         return
     text = message.text.strip()
-    if await access_control.is_blocked(lead["telegram"]["user_id"], lead["telegram"].get("username")):
-        await flow.step_from_text(message, state, "Пользователь заблокирован: отправка отменена.", kb.lead_detail_keyboard(lead))
-        await state.set_state(AdminStates.lead_detail)
-        return
-    try:
-        # "Ответ по заявке #N" — контекст только в исходящем клиенту
-        # сообщении (сам клиент мог получать от бота что угодно ещё); в
-        # owner_messages сохраняется чистый текст без этой обёртки — внутри
-        # detail конкретной заявки номер и так очевиден.
-        await message.bot.send_message(
-            chat_id=lead["telegram"]["user_id"],
-            text=f"Ответ по заявке #{lead['id']}\n\n{text}",
-        )
-        delivery_status = "sent"
-        result_text = "Сообщение отправлено клиенту ✅"
-    except Exception:
-        logger.exception("Не удалось отправить сообщение клиенту по заявке #%s", lead["id"])
-        delivery_status = "failed"
-        result_text = "⚠️ Не получилось отправить — клиент мог заблокировать бота. Ответ всё равно сохранён в истории заявки."
-    # Сохраняем независимо от результата отправки — иначе неудачная
-    # доставка (клиент заблокировал бота) стирала бы сам факт, что дизайнер
-    # вообще отвечал, см. аудит.
-    lead = await content_store.add_owner_message(message.chat.id, lead["id"], text, delivery_status) or lead
+    from bot.owner_replies import deliver_owner_reply, RESULT_TEXT
+    status = await deliver_owner_reply(message, lead, text)
+    result_text = RESULT_TEXT[status]
+    lead = await content_store.get_lead(lead["id"]) or lead
     # flow.step_from_text (P1-3, Batch 3) — success-переход в lead_detail
     # (cancel_to="root" сохраняется). "Заявка не найдена" веткой выше НЕ
     # мигрирована сознательно — reset_state_keep_nav сразу после неё
