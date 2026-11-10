@@ -32,8 +32,8 @@ async def archive_lead_material(message, lead_id: int | str) -> bool:
         if not config.UPSTASH_REDIS_REST_URL or not config.UPSTASH_REDIS_REST_TOKEN:
             logger.warning("Client archive requires persistent Upstash mapping")
             return False
-        key = f"design-bot:client-materials:topic:{lead_id}"
-        lock = _local_locks.setdefault(str(lead_id), asyncio.Lock())
+        key = f"design-bot:client-materials:topic:{chat_id}:{lead_id}"
+        lock = _local_locks.setdefault((chat_id, str(lead_id)), asyncio.Lock())
         async with lock:
             raw = await asyncio.to_thread(content_store._upstash_command, "GET", key)
             if raw is None:
