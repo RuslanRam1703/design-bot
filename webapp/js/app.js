@@ -2165,7 +2165,7 @@ function renderSubmitted() {
   // файл: в остальных случаях предлагать «отправить материалы» не за чем,
   // бот их сейчас всё равно не привяжет (см. awaiting_tz_file).
   const materialsButton = result.attach_tz
-    ? `<div class="btn-row"><button class="btn btn-primary" id="send-materials">Добавить материалы в боте</button></div>`
+    ? `<div class="btn-row"><button class="btn btn-primary" id="send-materials">Отправить материалы</button></div>`
     : "";
   return `
     <div class="topbar"><h1>Готово ✅</h1></div>
