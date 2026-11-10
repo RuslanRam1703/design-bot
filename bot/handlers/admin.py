@@ -1562,7 +1562,7 @@ async def cases_delete_start(callback: CallbackQuery, state: FSMContext) -> None
         await callback.message.edit_text("Кейсов пока нет.", reply_markup=kb.admin_cases_menu_keyboard())
         await callback.answer()
         return
-    await callback.message.edit_text("Какой кейс удалить?", reply_markup=kb.case_pick_keyboard(cases, "admindelcase"))
+    await callback.message.edit_text("Какой кейс переместить в корзину?", reply_markup=kb.case_pick_keyboard([c for c in cases if c.get("status") != "trashed"], "admindelcase"))
     await state.update_data(cancel_to="cases")
     await state.set_state(AdminStates.delete_case_pick)
     await callback.answer()
@@ -1574,7 +1574,7 @@ async def cases_delete_confirm(callback: CallbackQuery, state: FSMContext) -> No
     case = next((c for c in await content_store.list_cases() if c["id"] == case_id), None)
     await state.update_data(case_id=case_id)
     title = case["title"] if case else case_id
-    await callback.message.edit_text(f"Удалить кейс «{title}»? Это необратимо.", reply_markup=kb.confirm_keyboard("admindelcaseconfirm"))
+    await callback.message.edit_text(f"Переместить кейс «{title}» в корзину? Его можно будет восстановить.", reply_markup=kb.confirm_keyboard("admindelcaseconfirm"))
     await state.set_state(AdminStates.delete_case_confirm)
     await callback.answer()
 
@@ -1584,36 +1584,8 @@ async def cases_delete_do(callback: CallbackQuery, state: FSMContext) -> None:
     answer = callback.data.split(":", 1)[1]
     data = await state.get_data()
     if answer == "yes":
-        # source_ref читаем ДО удаления — после него кейса уже нет.
-        # Удаляем только СВОЁ архивное сообщение (source_type == upload):
-        # Behance-проект и чужой Telegram-пост нам не принадлежат, трогать
-        # их нельзя в принципе.
-        case_before = await _current_case(data["case_id"])
-        archive_ref = (
-            case_before.get("source_ref")
-            if case_before and case_before.get("source_type") == "upload"
-            else None
-        )
-        # Галерейные картинки тоже лежат в архив-канале (см.
-        # _gallery_image_from_upload) — их сообщения принадлежат нам и
-        # уходят вместе с кейсом. dict.fromkeys, а не set: порядок удаления
-        # становится предсказуемым, а совпадение с обложкой (если её же
-        # картинку выбрали ⭐ из галереи) отсеивается, чтобы одно сообщение
-        # не удалялось дважды.
-        gallery_refs = [
-            ref for ref in dict.fromkeys(content_store.case_gallery_refs(case_before))
-            if ref != archive_ref
-        ]
-        await content_store.delete_case(callback.message.chat.id, data["case_id"])
-        for ref in gallery_refs:
-            await media_archive.delete_archive_message(callback.bot, ref)
-        # Уборка архива — best-effort и НЕ откатывает уже удалённый кейс
-        # (delete_archive_message не бросает, а логирует). Формулировка
-        # для дизайнера намеренно не обещает удаления самой картинки:
-        # проверено вживую, что выданный ранее cdn*.telesco.pe URL
-        # продолжает отдавать изображение и после deleteMessage.
-        await media_archive.delete_archive_message(callback.bot, archive_ref)
-        text = "Кейс удалён ✅"
+        moved = await content_store.set_case_status(callback.message.chat.id, data["case_id"], "trashed")
+        text = "Кейс перемещён в корзину. Его можно восстановить через «Статусы и публикация»." if moved else "Кейс не найден."
     else:
         text = "Отменено."
     # flow.step_from_callback (P1-3, Batch 4) — тот же паттерн, что
