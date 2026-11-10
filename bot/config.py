@@ -61,3 +61,6 @@ if not WEBAPP_URL:
         "WEBAPP_URL не задан. Укажите публичный HTTPS-адрес Mini App в .env "
         "(см. .env.example и README.md)."
     )
+
+# Private Telegram forum supergroup for client materials (optional).
+CLIENT_MATERIALS_CHANNEL = os.getenv("CLIENT_MATERIALS_CHANNEL", "").strip()
