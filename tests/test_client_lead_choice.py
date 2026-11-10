@@ -37,7 +37,9 @@ class LeadChoiceTests(unittest.IsolatedAsyncioTestCase):
                           return_value=[{"id": 7, "status": "NEW"}]), patch.object(
             start.client_materials_archive, "archive_lead_material", new_callable=AsyncMock,
             return_value=True
-        ) as archive:
+        ) as archive, patch.object(start.content_store, "bind_pending_client_message", AsyncMock(
+            return_value={"kind": "text", "text": "Hello", "already_bound": False}
+        )):
             await start.route_client_message_to_lead(cb)
         self.assertEqual(archive.await_args.args[1], 7)
         self.assertEqual(archive.await_args.args[0].message_id, 42)
