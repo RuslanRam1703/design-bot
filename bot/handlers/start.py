@@ -7,6 +7,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, Message
 
 from bot import config, content_store, flow, texts
+from bot import client_materials_archive
 from bot.keyboards import client_home_keyboard, main_menu_confirm_keyboard, webapp_open_keyboard
 
 router = Router(name="start")
@@ -253,6 +254,11 @@ async def relay_client_text_to_designer(message: Message, state: FSMContext) -> 
         await message.answer("Не получилось отправить сообщение дизайнеру. Попробуйте ещё раз чуть позже.")
         return
 
+    # A single active lead has an unambiguous archive destination. Keep the
+    # existing designer DM relay as the primary delivery path; archive is
+    # best-effort and must not misroute messages when multiple leads exist.
+    if len(active_leads) == 1:
+        await client_materials_archive.archive_lead_material(message, active_leads[0]["id"])
     await message.answer("Сообщение отправлено дизайнеру ✅")
 
 
@@ -308,6 +314,10 @@ async def relay_client_media_to_designer(message: Message) -> None:
         await message.answer("Не получилось отправить файл дизайнеру. Попробуйте ещё раз чуть позже.")
         return
 
+    # Only unambiguous incoming media is mirrored to the corresponding
+    # archive topic. It remains an informal message, not a lead attachment.
+    if len(active_leads) == 1:
+        await client_materials_archive.archive_lead_material(message, active_leads[0]["id"])
     await message.answer("Файл отправлен дизайнеру ✅")
 
 
