@@ -479,6 +479,7 @@ async def upsert_channel_case(
             "title": title,
             "type": "graphics",
             "featured": False,
+            "status": "draft",
             "cover": cover,
             "images": [cover],
             "task": "Демонстрационная публикация из Telegram-канала.",
