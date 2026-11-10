@@ -151,6 +151,8 @@ async def client_leads_open(callback: CallbackQuery) -> None:
         rows.append([InlineKeyboardButton(text="📎 Добавить материалы", callback_data=f"clientleads:attach:{lead_id}")])
     if materials:
         rows.append([InlineKeyboardButton(text="📁 Посмотреть материалы", callback_data=f"clientleads:files:{lead_id}")])
+    if lead.get("supplements"):
+        rows.append([InlineKeyboardButton(text="📝 История дополнений", callback_data=f"clientleads:changes:{lead_id}")])
     rows.append([InlineKeyboardButton(text="◀️ Мои заявки", callback_data="clientleads:list")])
     await callback.message.edit_text(text, reply_markup=_lead_nav(rows))
     await callback.answer()
@@ -181,6 +183,33 @@ async def client_leads_stop(callback: CallbackQuery) -> None:
     lead_id = int(callback.data.rsplit(":", 1)[1])
     await content_store.stop_lead_material_upload(callback.from_user.id, lead_id)
     await callback.message.edit_text("Добавление файлов отменено.", reply_markup=_lead_nav([[InlineKeyboardButton(text="◀️ К заявке", callback_data=f"clientleads:open:{lead_id}")]]))
+    await callback.answer()
+
+
+
+@router.callback_query(F.data.startswith("clientleads:changes:"))
+async def client_leads_changes(callback: CallbackQuery) -> None:
+    try:
+        lead_id = int(callback.data.rsplit(":", 1)[1])
+    except (ValueError, IndexError):
+        await callback.answer("Некорректная заявка", show_alert=True)
+        return
+    lead = next((item for item in await content_store.list_leads_by_user(callback.from_user.id) if item["id"] == lead_id), None)
+    if lead is None:
+        await callback.answer("Заявка не найдена", show_alert=True)
+        return
+    labels = {"pending": "На рассмотрении", "approved": "Согласовано", "needs_clarification": "Требует уточнения", "not_agreed": "Не согласовано"}
+    supplements = lead.get("supplements") or []
+    lines = [f"Дополнения к заявке №{lead_id}"]
+    for supplement in supplements[-10:]:
+        status = labels.get(supplement.get("review_status", "pending"), "На рассмотрении")
+        fields = supplement.get("fields") or {}
+        preview = " · ".join(str(value)[:110] for value in fields.values() if value)[:240]
+        lines.append(f"№{supplement['id']} · {status}\\n{preview or 'Дополнение с материалами'}")
+    await callback.message.edit_text(
+        "\\n\\n".join(lines).replace("\\n", "\n"),
+        reply_markup=_lead_nav([[InlineKeyboardButton(text="◀️ К заявке", callback_data=f"clientleads:open:{lead_id}")]]),
+    )
     await callback.answer()
 
 
