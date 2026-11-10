@@ -1,11 +1,14 @@
 import asyncio
 import contextlib
+import hashlib
+import hmac
 import logging
 
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.fsm.storage.memory import MemoryStorage, SimpleEventIsolation
 from aiogram.types import (
+    Update,
     BotCommand,
     BotCommandScopeChat,
     BotCommandScopeDefault,
@@ -124,35 +127,50 @@ async def main() -> None:
     await content_store.ensure_storage_initialized()
 
     app = create_app(bot)
+    webhook_secret = hashlib.sha256(config.BOT_TOKEN.encode("utf-8")).hexdigest()
+
+    async def telegram_webhook(request: web.Request) -> web.Response:
+        supplied = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+        if not hmac.compare_digest(supplied, webhook_secret):
+            return web.Response(status=403)
+        try:
+            payload = await request.json()
+            update = Update.model_validate(payload, context={"bot": bot})
+        except (ValueError, TypeError):
+            logger.warning("Invalid Telegram webhook payload")
+            return web.Response(status=400)
+        await dp.feed_update(bot, update)
+        return web.Response(text="OK")
+
+    app.router.add_post("/telegram/webhook", telegram_webhook)
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, host="0.0.0.0", port=config.PORT)
     await site.start()
     logger.info("Mini App сервер запущен: http://0.0.0.0:%s (снаружи — %s)", config.PORT, config.WEBAPP_URL)
 
-    # drop_pending_updates=False — на free-plan Render rolling-деплой новый
-    # инстанс на короткое время перекрывается со старым (TelegramConflictError
-    # в этом окне — ожидаемое, безопасное поведение, Telegram сам разруливает
-    # конфликт polling-запросов). Но drop_pending_updates=True безусловно
-    # отбрасывал бы любые апдейты, накопившиеся именно в этом окне — реальные
-    # сообщения/файлы/callback-и клиентов, а не мусор (см. production-hardening
-    # аудит). Оставляем их дожидаться нового инстанса вместо потери: повторная
-    # обработка уже сущ. апдейта — не проблема (draft_id upsert/append-only/
-    # status-idempotency уже переживают повтор без дублей).
-    await bot.delete_webhook(drop_pending_updates=False)
     await _setup_bot_commands(bot)
     await _setup_menu_button(bot)
     await _setup_bot_description(bot)
-    logger.info("Бот запущен в режиме polling")
-
+    webhook_url = config.WEBAPP_URL + "/telegram/webhook"
+    await bot.set_webhook(
+        url=webhook_url,
+        secret_token=webhook_secret,
+        drop_pending_updates=False,
+        allowed_updates=dp.resolve_used_update_types(),
+    )
+    logger.info("Telegram webhook registered")
+    # Render may suspend this web service. Telegram retries updates when it wakes.
+    # Do not delete webhook on shutdown: there must be no polling dependency.
     delivery_task = asyncio.create_task(retry_designer_notifications(bot))
     try:
-        await dp.start_polling(bot)
+        await asyncio.Event().wait()
     finally:
         delivery_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await delivery_task
         await runner.cleanup()
+        await bot.session.close()
 
 
 if __name__ == "__main__":
