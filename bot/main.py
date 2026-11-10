@@ -139,7 +139,11 @@ async def main() -> None:
         except (ValueError, TypeError):
             logger.warning("Invalid Telegram webhook payload")
             return web.Response(status=400)
-        await dp.feed_update(bot, update)
+        try:
+            await dp.feed_update(bot, update)
+        except Exception:
+            logger.exception("Telegram webhook update processing failed: %s", update.update_id)
+            return web.Response(status=503)
         return web.Response(text="OK")
 
     app.router.add_post("/telegram/webhook", telegram_webhook)
