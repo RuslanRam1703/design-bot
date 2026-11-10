@@ -1719,6 +1719,9 @@ async def add_lead_supplement(lead_id: int, telegram: dict, fields: dict, wants_
             "id": next_supplement_id,
             "created_at": datetime.now(timezone.utc).isoformat(),
             "fields": fields,
+            "review_status": "pending",
+            "reviewed_at": None,
+            "review_comment": None,
             "designer_notification": {"revision": 1, "state": "pending", "attempts": 0, "retry_after": None},
         })
         lead["updated_at"] = datetime.now(timezone.utc).isoformat()
@@ -1729,6 +1732,26 @@ async def add_lead_supplement(lead_id: int, telegram: dict, fields: dict, wants_
         await _write_leads(leads)
         return lead, next_supplement_id
 
+
+
+async def review_lead_supplement(actor_chat_id: int | str, lead_id: int, supplement_id: int, decision: str) -> dict | None:
+    """Designer-only review. Never mutate the original brief or accepted price."""
+    _require_designer(actor_chat_id)
+    if decision not in ("approved", "needs_clarification", "not_agreed"):
+        raise ValueError("Unsupported review decision")
+    async with _lock("leads.json"):
+        leads = await _read_leads()
+        lead = next((item for item in leads if item["id"] == lead_id), None)
+        if lead is None:
+            return None
+        supplement = next((item for item in lead.get("supplements", []) if item["id"] == supplement_id), None)
+        if supplement is None or supplement.get("review_status", "pending") != "pending":
+            return None
+        supplement["review_status"] = decision
+        supplement["reviewed_at"] = datetime.now(timezone.utc).isoformat()
+        lead["updated_at"] = supplement["reviewed_at"]
+        await _write_leads(leads)
+        return {"user_id": lead.get("telegram", {}).get("user_id"), "lead_id": lead_id, "supplement_id": supplement_id, "decision": decision}
 
 
 async def begin_lead_material_upload(user_id: int, lead_id: int) -> None:
