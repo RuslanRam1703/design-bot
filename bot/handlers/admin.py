@@ -762,7 +762,7 @@ async def cases_moderate_pick(callback: CallbackQuery) -> None:
     rows.append([InlineKeyboardButton(text="Выбрать тип работы", callback_data=f"adminmoderatecategory:{case_id}")])
     rows.append([InlineKeyboardButton(text="◀️ К списку", callback_data="admincasesaction:moderate")])
     await callback.message.edit_text(
-        f"Кейс: {case['title']}\\nСтатус: {_PORTFOLIO_STATUS_LABELS.get(current, current)}\\n\\nВыбери действие:",
+        f"Кейс: {case['title']}\nСтатус: {_PORTFOLIO_STATUS_LABELS.get(current, current)}\n\nВыбери действие:",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
     )
     await callback.answer()
@@ -846,7 +846,7 @@ async def cases_moderate_pick_for_id(callback: CallbackQuery, case_id: str) -> N
     rows.append([InlineKeyboardButton(text="Выбрать тип работы", callback_data=f"adminmoderatecategory:{case_id}")])
     rows.append([InlineKeyboardButton(text="◀️ К списку", callback_data="admincasesaction:moderate")])
     await callback.message.edit_text(
-        f"Кейс: {case['title']}\\nСтатус: {_PORTFOLIO_STATUS_LABELS[current]}\\n\\nВыбери действие:",
+        f"Кейс: {case['title']}\nСтатус: {_PORTFOLIO_STATUS_LABELS[current]}\n\nВыбери действие:",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
     )
 
