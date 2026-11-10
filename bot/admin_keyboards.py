@@ -119,6 +119,7 @@ def admin_cases_menu_keyboard() -> InlineKeyboardMarkup:
         inline_keyboard=[
             [InlineKeyboardButton(text="➕ Добавить", callback_data="admincasesaction:add")],
             [InlineKeyboardButton(text="✏️ Редактировать", callback_data="admincasesaction:edit")],
+            [InlineKeyboardButton(text="📂 Статусы и публикация", callback_data="admincasesaction:moderate")],
             [InlineKeyboardButton(text="🗑 Удалить", callback_data="admincasesaction:delete")],
             [InlineKeyboardButton(text="◀️ Назад", callback_data="adminmenu:content")],
         ]
