@@ -1017,8 +1017,10 @@ class EntryPointArchitectureTests(unittest.IsolatedAsyncioTestCase):
         import bot.main as bot_main
 
         source = inspect.getsource(bot_main.main)
-        self.assertIn("delete_webhook(drop_pending_updates=False)", source)
-        self.assertNotIn("delete_webhook(drop_pending_updates=True)", source)
+        self.assertIn("drop_pending_updates=False", source)
+        self.assertIn("set_webhook(", source)
+        self.assertNotIn("delete_webhook(", source)
+        self.assertNotIn("drop_pending_updates=True", source)
 
     def test_dispatcher_uses_simple_event_isolation(self):
         # См. UX-аудит race condition: Dispatcher по умолчанию (без
