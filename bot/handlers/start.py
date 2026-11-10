@@ -291,7 +291,7 @@ async def relay_client_text_to_designer(message: Message, state: FSMContext) -> 
     # best-effort and must not misroute messages when multiple leads exist.
     if len(active_leads) == 1:
         await client_materials_archive.archive_lead_material(message, active_leads[0]["id"])
-    if len(active_leads) > 1 and message.chat.type == "private":
+    if len(active_leads) > 1 and getattr(message.chat, "type", "private") == "private":
         await message.answer(
             "Сообщение отправлено дизайнеру. К какой заявке его прикрепить?",
             reply_markup=_lead_choice_keyboard(active_leads, message.message_id),
@@ -356,7 +356,7 @@ async def relay_client_media_to_designer(message: Message) -> None:
     # archive topic. It remains an informal message, not a lead attachment.
     if len(active_leads) == 1:
         await client_materials_archive.archive_lead_material(message, active_leads[0]["id"])
-    if len(active_leads) > 1 and message.chat.type == "private":
+    if len(active_leads) > 1 and getattr(message.chat, "type", "private") == "private":
         await message.answer(
             "Файл отправлено дизайнеру. К какой заявке его прикрепить?",
             reply_markup=_lead_choice_keyboard(active_leads, message.message_id),
