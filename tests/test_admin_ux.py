@@ -20,6 +20,11 @@ class AdminNavigationUXTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("adminmenu:nav", settings)
         self.assertIn("adminmenu:backup", settings)
 
+    def test_lead_card_primary_action_is_write_to_customer(self):
+        keyboard = kb.lead_detail_keyboard({"id": 1, "status": "NEW", "telegram": {"user_id": 55}})
+        self.assertEqual(keyboard.inline_keyboard[0][0].text, "💬 Написать заказчику")
+        self.assertEqual(keyboard.inline_keyboard[0][0].callback_data, "adminleadaction:reply")
+
     def test_section_back_buttons_return_to_parent(self):
         for keyboard, expected in (
             (kb.admin_cases_menu_keyboard(), "adminmenu:content"),

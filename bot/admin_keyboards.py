@@ -430,11 +430,12 @@ def leads_list_keyboard(leads: list[dict], status_filter: str) -> InlineKeyboard
 
 
 def lead_detail_keyboard(lead: dict) -> InlineKeyboardMarkup:
-    rows = [[
-        InlineKeyboardButton(text=("▶ " if lead["status"] == key else "") + label, callback_data=f"adminleadstatus:{key}")
-    ] for key, label in LEAD_STATUS_LABELS.items()]
+    rows = [[InlineKeyboardButton(text="💬 Написать заказчику", callback_data="adminleadaction:reply")]]
+    rows.extend([
+        [InlineKeyboardButton(text=("▶ " if lead["status"] == key else "") + label, callback_data=f"adminleadstatus:{key}")]
+        for key, label in LEAD_STATUS_LABELS.items()
+    ])
     rows.append([InlineKeyboardButton(text="📂 Открыть / создать проект", callback_data="adminleadaction:project")])
-    rows.append([InlineKeyboardButton(text="💬 Ответить через бота", callback_data="adminleadaction:reply")])
     materials = lead.get("materials") or []
     if materials:
         rows.append([InlineKeyboardButton(text=f"📎 Материалы ({len(materials)})", callback_data="adminleadaction:materials")])
