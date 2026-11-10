@@ -83,3 +83,9 @@ async def retry_designer_notifications(bot) -> None:
                     await notify_designer_supplement(bot, lead, supplement_id)
         except Exception:
             logger.exception("Designer notification retry failed")
+
+        try:
+            from bot.client_materials_archive import retry_archive_copies
+            await retry_archive_copies(bot)
+        except Exception:
+            logger.exception("Archive copy retry failed")

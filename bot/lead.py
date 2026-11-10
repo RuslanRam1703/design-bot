@@ -340,6 +340,13 @@ def format_lead_admin_detail(lead: dict) -> str:
             source = source_labels.get(m.get("source"), m.get("source"))
             lines.append(f"— {kind}, {ts} ({source})")
 
+    copies = lead.get("archive_deliveries") or []
+    if copies:
+        sent = sum(c["state"] == "sent" for c in copies)
+        failed = sum(c["state"] == "failed" for c in copies)
+        uncertain = len(copies) - sent - failed
+        lines.append(f"Копии в архиве: {sent}/{len(copies)}. Ошибки: {failed}. Не подтверждены: {uncertain}.")
+
     client_messages = lead.get("client_messages") or []
     if client_messages:
         lines.append("")

@@ -1997,6 +1997,62 @@ async def add_owner_message(actor_chat_id: int | str, lead_id: int, text: str, d
         return lead
 
 
+async def prepare_archive_copy(lead_id: int, source_chat_id: int, message_id: int, archive_chat_id: int,
+                               *, retry: bool = False, manual: bool = False) -> dict | None:
+    """Persist a fenced copy claim. Uncertain attempts are never automatically repeated."""
+    async with _lock("leads.json"):
+        leads = await _read_leads()
+        lead = next((l for l in leads if l["id"] == lead_id and
+                     str(l.get("telegram", {}).get("user_id")) == str(source_chat_id)), None)
+        if lead is None or message_id <= 0:
+            return None
+        key = f"{archive_chat_id}:{source_chat_id}:{message_id}"
+        copies = lead.setdefault("archive_deliveries", [])
+        record = next((c for c in copies if c["key"] == key), None)
+        now = datetime.now(timezone.utc).isoformat()
+        if record:
+            if (record["state"] != "failed" or not retry or
+                (not manual and (record["attempts"] >= 5 or record.get("retry_after", "") > now))):
+                return dict(record, claimed=False)
+        else:
+            record = {"key": key, "source_chat_id": source_chat_id, "message_id": message_id,
+                      "archive_chat_id": archive_chat_id, "attempts": 0}
+            copies.append(record)
+        record.update(state="sending", attempts=record["attempts"] + 1, updated_at=now,
+                      claim_token=uuid.uuid4().hex)
+        await _write_leads(leads)
+        return dict(record, claimed=True)
+
+
+async def finish_archive_copy(lead_id: int, key: str, claim_token: str, state: str) -> None:
+    if state not in {"sent", "failed", "unknown"}:
+        raise ValueError("Invalid archive delivery status")
+    async with _lock("leads.json"):
+        leads = await _read_leads()
+        lead = next(l for l in leads if l["id"] == lead_id)
+        record = next(c for c in lead["archive_deliveries"] if c["key"] == key)
+        if record.get("claim_token") != claim_token or record.get("state") != "sending":
+            raise StorageLeaseLostError("Stale archive delivery result")
+        now = datetime.now(timezone.utc)
+        record.update(state=state, updated_at=now.isoformat())
+        record["retry_after"] = (now + timedelta(seconds=min(3600, 60 * 2 ** min(record["attempts"] - 1, 6)))).isoformat()
+        await _write_leads(leads)
+
+
+async def pending_archive_copies(*, lead_id: int | None = None, manual: bool = False, limit: int = 20) -> list[tuple[int, dict]]:
+    now = datetime.now(timezone.utc).isoformat()
+    result = []
+    for lead in await _read_leads():
+        if lead_id is not None and lead["id"] != lead_id:
+            continue
+        for record in lead.get("archive_deliveries", []):
+            if record["state"] == "failed" and (manual or (record["attempts"] < 5 and record.get("retry_after", "") <= now)):
+                result.append((lead["id"], dict(record)))
+                if len(result) >= limit:
+                    return result
+    return result
+
+
 async def prepare_owner_reply(actor_chat_id: int | str, lead_id: int, source_key: str, text: str) -> dict | None:
     """Persist intent before Telegram I/O. A source update can send at most once.
 

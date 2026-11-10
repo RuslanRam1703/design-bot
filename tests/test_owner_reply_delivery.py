@@ -89,3 +89,8 @@ class DurableOwnerReplyTests(unittest.IsolatedAsyncioTestCase):
         stale = dict(self.disk[0], telegram={"user_id": 99})
         self.assertEqual(await owner_replies.deliver_owner_reply(self.message, stale, 'Hello'), 'sent')
         self.assertEqual(self.message.bot.send_message.await_args.kwargs['chat_id'], 55)
+
+    async def test_server_error_does_not_claim_definitive_rejection(self):
+        from aiogram.exceptions import TelegramServerError
+        self.message.bot.send_message.side_effect = TelegramServerError(method=None, message='server error')
+        self.assertEqual(await owner_replies.deliver_owner_reply(self.message, self.disk[0], 'Hello'), 'unknown')

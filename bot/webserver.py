@@ -200,7 +200,7 @@ async def handle_my_leads(request: web.Request) -> web.Response:
     leads = await content_store.list_leads_by_user(user["id"])
     # Delivery deduplication keys include private admin/archive chat IDs.
     # Keep those server-side; the client only needs the message and status.
-    leads = [dict(lead, owner_messages=[
+    leads = [dict({key: value for key, value in lead.items() if key != "archive_deliveries"}, owner_messages=[
         {key: message[key] for key in ("id", "text", "sent_at", "delivery_status") if key in message}
         for message in lead.get("owner_messages", [])
     ]) for lead in leads]
