@@ -5,7 +5,7 @@ import logging
 from aiogram import F, Router
 from aiogram.types import Message
 
-from bot import config, content_store, texts
+from bot import config, content_store, texts, client_materials_archive
 from bot.calculator import calculate
 from bot.data import load_pricing
 from bot.handlers.start import relay_client_media_to_designer
@@ -138,6 +138,9 @@ async def handle_tz_file(message: Message) -> None:
     if not stored:
         await message.answer("Заявка больше не принимает материалы. Файл не прикреплён.")
         return
+
+    # Archive is secondary: the canonical attachment was already recorded.
+    await client_materials_archive.archive_lead_material(message, lead["id"])
 
     if config.DESIGNER_CHAT_ID:
         try:
