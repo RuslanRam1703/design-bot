@@ -300,7 +300,7 @@ async def relay_client_text_to_designer(message: Message, state: FSMContext) -> 
         if getattr(message, "message_id", None):
             await content_store.add_client_message(
                 message.from_user.id, active_leads[0]["id"], message.message_id,
-                "text", message.text,
+                "media", getattr(message, "caption", None),
             )
     if len(active_leads) > 1 and getattr(message.chat, "type", "private") == "private" and getattr(message, "message_id", None) is not None:
         await message.answer(
