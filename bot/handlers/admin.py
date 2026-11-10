@@ -1558,11 +1558,12 @@ async def cases_edit_value(message: Message, state: FSMContext) -> None:
 @router.callback_query(F.data == "admincasesaction:delete")
 async def cases_delete_start(callback: CallbackQuery, state: FSMContext) -> None:
     cases = await content_store.list_cases()
+    cases = [case for case in cases if case.get("status") != "trashed"]
     if not cases:
-        await callback.message.edit_text("Кейсов пока нет.", reply_markup=kb.admin_cases_menu_keyboard())
+        await callback.message.edit_text("Нет кейсов для перемещения в корзину.", reply_markup=kb.admin_cases_menu_keyboard())
         await callback.answer()
         return
-    await callback.message.edit_text("Какой кейс переместить в корзину?", reply_markup=kb.case_pick_keyboard([c for c in cases if c.get("status") != "trashed"], "admindelcase"))
+    await callback.message.edit_text("Какой кейс переместить в корзину?", reply_markup=kb.case_pick_keyboard(cases, "admindelcase"))
     await state.update_data(cancel_to="cases")
     await state.set_state(AdminStates.delete_case_pick)
     await callback.answer()
