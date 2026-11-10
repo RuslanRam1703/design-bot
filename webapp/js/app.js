@@ -322,6 +322,8 @@ function resetBriefState({ hardReset = false } = {}) {
 
 // ---- Загрузка данных и старт ----
 async function init() {
+  const root = document.getElementById("app");
+  if (root) root.innerHTML = '<div class="empty-state" role="status">Загружаем приложение…</div>';
   TG.ready();
   TG.expand();
   applyTheme();
@@ -338,7 +340,7 @@ async function init() {
   // initData is still accepted, but strict mode requires real Telegram.
   const publicHeaders = { "X-Telegram-Init-Data": TG.initData() };
   const getContent = async (name) => {
-    const response = await fetch(`/data/${name}`, { headers: publicHeaders });
+    const response = await fetch(`/data/${name}`, { headers: publicHeaders, signal: AbortSignal.timeout(20000) });
     if (response.status === 403) throw new Error("ACCESS_DENIED");
     if (response.status === 401) throw new Error("TELEGRAM_REQUIRED");
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
@@ -357,6 +359,13 @@ async function init() {
       : err.message === "TELEGRAM_REQUIRED"
         ? "Откройте приложение из Telegram, чтобы просмотреть портфолио."
         : "Не удалось загрузить данные. Попробуйте позже.";
+    if (element && !["ACCESS_DENIED", "TELEGRAM_REQUIRED"].includes(err.message)) {
+      const retry = document.createElement("button");
+      retry.className = "btn btn-primary";
+      retry.textContent = "Повторить загрузку";
+      retry.addEventListener("click", () => window.location.reload());
+      element.appendChild(retry);
+    }
     if (err.message === "ACCESS_DENIED" && realTG) {
       // Telegram WebView may briefly open first; close() is best-effort.
       // Never render portfolio/about/pricing before successful authorization.
@@ -1776,7 +1785,7 @@ function renderMyLeads() {
     return header + `<div class="empty-state">Раздел «Мои заявки» доступен только внутри Telegram — здесь бот не может подтвердить, кто вы.</div>`;
   }
   if (m.status === "error") {
-    return header + `<div class="empty-state">Не получилось загрузить заявки. Попробуйте открыть раздел ещё раз.</div>`;
+    return header + `<div class="empty-state">Не получилось загрузить заявки.</div><button class="btn btn-primary" id="my-leads-retry">Повторить загрузку</button>`;
   }
   if (!m.items.length) {
     return header + `<div class="empty-state">Заявок пока нет — оформите заявку на вкладке «Заказать».</div>`;
@@ -1846,6 +1855,13 @@ function renderMyLeadDetail(lead) {
     `;
   }
 
+  const clientMessages = lead.client_messages || [];
+  const clientMessagesBlock = clientMessages.length
+    ? `<div class="case-block"><div class="label">Ваши сообщения (${clientMessages.length})</div>${clientMessages.slice().reverse().map((m) =>
+        `<p><span class="hint">${escapeHtml((m.received_at || "").slice(0, 10))}</span> — ${m.kind === "media" ? "Медиа: " : ""}${escapeHtml(m.text || "Без подписи")}</p>`
+      ).join("")}</div>`
+    : "";
+
   // supplements[] — append-only дополнения САМОГО клиента (bot/webserver.py::
   // _handle_lead_supplement), не путать с owner_messages (ответы дизайнера) —
   // отдельная секция, показываем только заполненные поля каждого дополнения.
@@ -1888,6 +1904,7 @@ function renderMyLeadDetail(lead) {
     ${p.budget ? `<div class="case-block"><div class="label">Бюджет</div><p>${escapeHtml(BUDGET_OPTIONS.find((b) => b.id === p.budget)?.label || p.budget)}</p></div>` : ""}
     ${p.contact ? `<div class="case-block"><div class="label">Контакты</div><p>${escapeHtml(p.contact)}</p></div>` : ""}
     ${ownerCommentBlock}
+    ${clientMessagesBlock}
     ${supplementsBlock}
     ${materialsBlock}
     ${isLeadClosed(lead.status)
@@ -1911,6 +1928,8 @@ function closeMyLeadDetail() {
 }
 
 function attachMyLeadsEvents() {
+  const retryBtn = document.getElementById("my-leads-retry");
+  if (retryBtn) retryBtn.addEventListener("click", fetchMyLeads);
   document.querySelectorAll("[data-lead-id]").forEach((el) =>
     el.addEventListener("click", () => {
       const lead = state.myLeads.items.find((l) => l.id === Number(el.dataset.leadId));

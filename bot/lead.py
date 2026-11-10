@@ -340,6 +340,15 @@ def format_lead_admin_detail(lead: dict) -> str:
             source = source_labels.get(m.get("source"), m.get("source"))
             lines.append(f"— {kind}, {ts} ({source})")
 
+    client_messages = lead.get("client_messages") or []
+    if client_messages:
+        lines.append("")
+        lines.append(f"<b>Сообщения клиента ({len(client_messages)})</b>")
+        for m in reversed(client_messages):
+            ts = (m.get("received_at") or "")[:16].replace("T", " ")
+            label = "Медиа" if m.get("kind") == "media" else "Сообщение"
+            lines.append(f"— {label} ({ts}): {_esc(m.get('text') or 'Без подписи')}")
+
     owner_messages = lead.get("owner_messages") or []
     if owner_messages:
         lines.append("")
@@ -384,3 +393,42 @@ def _clamp_to_telegram_limit(lines: list[str]) -> str:
     while truncated and len("\n".join(truncated)) + len(notice) > _MAX_DETAIL_LENGTH:
         truncated.pop()
     return "\n".join(truncated) + notice
+
+
+def conversation_pages(lead: dict) -> list[str]:
+    """Newest messages first, split without losing text or exceeding Telegram limits."""
+    messages = [dict(m, speaker="Клиент", stamp=m.get("received_at", ""))
+                for m in lead.get("client_messages", [])]
+    messages += [dict(m, speaker="Дизайнер", stamp=m.get("sent_at", ""))
+                 for m in lead.get("owner_messages", [])]
+    messages.sort(key=lambda m: m["stamp"], reverse=True)
+    statuses = {"failed": "Не доставлено", "unknown": "Доставка не подтверждена",
+                "sending": "Доставка не подтверждена", "sent": "Отправлено в Telegram"}
+    pages = []
+    for message in messages:
+        text = message.get("text") or ("Медиа без подписи" if message.get("kind") == "media" else "Без текста")
+        chunks, chunk, units = [], [], 0
+        for char in text:
+            width = 2 if ord(char) > 0xFFFF else 1
+            if units + width > 3000:
+                chunks.append("".join(chunk))
+                chunk, units = [], 0
+            chunk.append(char)
+            units += width
+        chunks.append("".join(chunk))
+        for index, body in enumerate(chunks):
+            header = f"{message['speaker']} · {message['stamp'][:16].replace('T', ' ')}"
+            if message.get("delivery_status") in statuses:
+                header += "\n" + statuses[message["delivery_status"]]
+            if len(chunks) > 1:
+                header += f"\nЧасть {index + 1} из {len(chunks)}"
+            pages.append(f"{header}\n\n{body}")
+    return pages
+
+
+def lead_material_items(lead: dict) -> list[dict]:
+    """One existing materials screen also opens media from the conversation."""
+    return list(lead.get("materials") or []) + [
+        dict(message["media"], received_at=message.get("received_at"), source="message")
+        for message in lead.get("client_messages", []) if message.get("media")
+    ]

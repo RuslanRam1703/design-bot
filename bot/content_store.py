@@ -1894,7 +1894,51 @@ async def update_lead_status(actor_chat_id: int | str, lead_id: int, status: str
         return True
 
 
-async def add_client_message(user_id: int, lead_id: int, message_id: int, kind: str, text: str | None = None) -> dict | None:
+async def save_pending_client_message(user_id: int, message_id: int, kind: str, text: str | None, *, media: dict | None = None) -> None:
+    """Keep ambiguous inbound content in the existing persistent document."""
+    if message_id <= 0 or kind not in {"text", "media"}:
+        raise ValueError("Invalid pending client message")
+    async with _lock("leads.json"):
+        document = await _read("leads.json")
+        pending = document.setdefault("pending_client_messages", [])
+        if any(item["user_id"] == user_id and item["telegram_message_id"] == message_id for item in pending):
+            return
+        pending.append({"user_id": user_id, "telegram_message_id": message_id,
+                        "kind": kind, "text": text, "media": media, "received_at": datetime.now(timezone.utc).isoformat()})
+        await _write("leads.json", document)
+
+
+async def bind_pending_client_message(user_id: int, lead_id: int, message_id: int) -> dict | None:
+    """Only an actually received message can be bound, once, to its owner's lead."""
+    async with _lock("leads.json"):
+        document = await _read("leads.json")
+        source = next((item for item in document.get("pending_client_messages", [])
+                       if item["user_id"] == user_id and item["telegram_message_id"] == message_id), None)
+        lead = next((item for item in document["leads"] if item["id"] == lead_id
+                     and str(item.get("telegram", {}).get("user_id")) == str(user_id)
+                     and item["status"] in ACTIVE_LEAD_STATUSES), None)
+        if source is None or lead is None:
+            return None
+        if source.get("lead_id") is not None:
+            return dict(source, already_bound=True) if source["lead_id"] == lead_id else None
+        # Guard against a single-lead message being attached elsewhere by a replay.
+        for item in document["leads"]:
+            if str(item.get("telegram", {}).get("user_id")) == str(user_id) and any(
+                m.get("telegram_message_id") == message_id for m in item.get("client_messages", [])
+            ):
+                return None
+        messages = lead.setdefault("client_messages", [])
+        messages.append({key: source[key] for key in ("telegram_message_id", "kind", "text", "received_at")})
+        if source.get("media"):
+            messages[-1]["media"] = source["media"]
+        messages[-1]["id"] = max((m.get("id", 0) for m in messages), default=0) + 1
+        lead["updated_at"] = datetime.now(timezone.utc).isoformat()
+        source["lead_id"] = lead_id
+        await _write("leads.json", document)
+        return dict(source, already_bound=False)
+
+
+async def add_client_message(user_id: int, lead_id: int, message_id: int, kind: str, text: str | None = None, *, media: dict | None = None) -> dict | None:
     """Persist inbound client activity with ownership checks and message-ID deduplication.
 
     The original Telegram media remains in Telegram; only a reference and
@@ -1918,6 +1962,8 @@ async def add_client_message(user_id: int, lead_id: int, message_id: int, kind: 
             "text": text,
             "received_at": datetime.now(timezone.utc).isoformat(),
         })
+        if media:
+            messages[-1]["media"] = media
         lead["updated_at"] = datetime.now(timezone.utc).isoformat()
         await _write_leads(leads)
         return lead

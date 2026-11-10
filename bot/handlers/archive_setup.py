@@ -34,7 +34,8 @@ async def reply_from_archive_topic(message: Message) -> None:
     if not thread_id or not getattr(message, "is_topic_message", False):
         await message.answer("Откройте тему заявки и отправьте /reply текст ответа.")
         return
-    text = (message.text or "").partition(" ")[2].strip()
+    parts = (message.text or "").split(maxsplit=1)
+    text = parts[1].strip() if len(parts) > 1 else ""
     if not text:
         await message.answer("Напишите /reply и текст сообщения для клиента.")
         return

@@ -229,14 +229,23 @@ async def route_client_message_to_lead(callback: CallbackQuery) -> None:
     if not any(int(item["id"]) == lead_id and item["status"] in content_store.ACTIVE_LEAD_STATUSES for item in leads):
         await callback.answer("Заявка недоступна.", show_alert=True)
         return
+    try:
+        bound = await content_store.bind_pending_client_message(callback.from_user.id, lead_id, source_id)
+    except Exception:
+        logger.exception("Could not bind pending client message")
+        await callback.answer("Не удалось сохранить сообщение. Попробуйте позже.", show_alert=True)
+        return
+    if bound is None:
+        await callback.answer("Сообщение недоступно или уже прикреплено к другой заявке.", show_alert=True)
+        return
+    if bound["already_bound"]:
+        await callback.answer("Сообщение уже прикреплено к этой заявке.")
+        return
     source = type("ClientArchiveSource", (), {})()
     source.bot, source.chat, source.message_id = callback.bot, callback.message.chat, source_id
-    if await client_materials_archive.archive_lead_material(source, lead_id):
-        await content_store.add_client_message(callback.from_user.id, lead_id, source_id, kind)
-        await callback.message.edit_text(f"Сообщение привязано к заявке #{lead_id}.")
-        await callback.answer("Сохранено в архиве")
-    else:
-        await callback.answer("Не удалось сохранить в архиве. Попробуйте позже.", show_alert=True)
+    archived = await client_materials_archive.archive_lead_material(source, lead_id)
+    await callback.message.edit_text(f"Сообщение прикреплено к заявке #{lead_id}.")
+    await callback.answer("Сохранено в заявке" if not archived else "Сохранено в заявке и архиве")
 
 
 @router.message(F.text)
@@ -271,6 +280,21 @@ async def relay_client_text_to_designer(message: Message, state: FSMContext) -> 
         lead for lead in await content_store.list_leads_by_user(message.from_user.id)
         if lead["status"] in content_store.ACTIVE_LEAD_STATUSES
     ]
+    history_saved = True
+    if getattr(message, "message_id", None):
+        try:
+            if len(active_leads) == 1:
+                await content_store.add_client_message(
+                    message.from_user.id, active_leads[0]["id"], message.message_id,
+                    "text", message.text,
+                )
+            elif len(active_leads) > 1:
+                await content_store.save_pending_client_message(
+                    message.from_user.id, message.message_id, "text", message.text,
+                )
+        except Exception:
+            history_saved = False
+            logger.exception("Could not persist inbound client message")
     identity_line = _client_identity_line(message)
 
     if len(active_leads) == 1:
@@ -296,11 +320,9 @@ async def relay_client_text_to_designer(message: Message, state: FSMContext) -> 
     # best-effort and must not misroute messages when multiple leads exist.
     if len(active_leads) == 1:
         await client_materials_archive.archive_lead_material(message, active_leads[0]["id"])
-        if getattr(message, "message_id", None):
-            await content_store.add_client_message(
-                message.from_user.id, active_leads[0]["id"], message.message_id,
-                "text", message.text,
-            )
+    if not history_saved:
+        await message.answer("Сообщение передано дизайнеру, но сохранить историю не удалось. Попробуйте позже.")
+        return
     if len(active_leads) > 1 and getattr(message.chat, "type", "private") == "private" and getattr(message, "message_id", None) is not None:
         await message.answer(
             "Сообщение отправлено дизайнеру. К какой заявке его прикрепить?",
@@ -308,6 +330,18 @@ async def relay_client_text_to_designer(message: Message, state: FSMContext) -> 
         )
     else:
         await message.answer("Сообщение отправлено дизайнеру ✅")
+
+
+def _message_media_ref(message) -> dict:
+    for kind in ("document", "video", "animation", "photo"):
+        item = getattr(message, kind, None)
+        if kind == "photo" and item:
+            item = item[-1]
+        file_id = getattr(item, "file_id", None)
+        if isinstance(file_id, str) and file_id:
+            return {"media": {"kind": kind, "file_id": file_id,
+                              "file_unique_id": getattr(item, "file_unique_id", None)}}
+    return {}
 
 
 async def relay_client_media_to_designer(message: Message) -> None:
@@ -338,6 +372,21 @@ async def relay_client_media_to_designer(message: Message) -> None:
         lead for lead in await content_store.list_leads_by_user(message.from_user.id)
         if lead["status"] in content_store.ACTIVE_LEAD_STATUSES
     ]
+    history_saved = True
+    if getattr(message, "message_id", None):
+        try:
+            if len(active_leads) == 1:
+                await content_store.add_client_message(
+                    message.from_user.id, active_leads[0]["id"], message.message_id,
+                    "media", getattr(message, "caption", None), **_message_media_ref(message),
+                )
+            elif len(active_leads) > 1:
+                await content_store.save_pending_client_message(
+                    message.from_user.id, message.message_id, "media", getattr(message, "caption", None), **_message_media_ref(message),
+                )
+        except Exception:
+            history_saved = False
+            logger.exception("Could not persist inbound client message")
     identity_line = _client_identity_line(message)
     if len(active_leads) == 1:
         lines = [f"📎 Материал по заявке #{active_leads[0]['id']}", "", identity_line]
@@ -366,11 +415,9 @@ async def relay_client_media_to_designer(message: Message) -> None:
     # archive topic. It remains an informal message, not a lead attachment.
     if len(active_leads) == 1:
         await client_materials_archive.archive_lead_material(message, active_leads[0]["id"])
-        if getattr(message, "message_id", None):
-            await content_store.add_client_message(
-                message.from_user.id, active_leads[0]["id"], message.message_id,
-                "media", getattr(message, "caption", None),
-            )
+    if not history_saved:
+        await message.answer("Сообщение передано дизайнеру, но сохранить историю не удалось. Попробуйте позже.")
+        return
     if len(active_leads) > 1 and getattr(message.chat, "type", "private") == "private" and getattr(message, "message_id", None) is not None:
         await message.answer(
             "Файл отправлен дизайнеру. К какой заявке его прикрепить?",

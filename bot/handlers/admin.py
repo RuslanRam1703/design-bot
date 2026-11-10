@@ -2581,6 +2581,33 @@ async def lead_change_status(callback: CallbackQuery, state: FSMContext) -> None
     await callback.answer("Статус обновлён")
 
 
+@router.callback_query(AdminStates.lead_detail, F.data.startswith("adminleadhistory:"))
+async def lead_history(callback: CallbackQuery, state: FSMContext) -> None:
+    data = await state.get_data()
+    lead = await content_store.get_lead(data["lead_id"])
+    if lead is None:
+        await callback.answer("Заявка не найдена", show_alert=True)
+        return
+    requested = callback.data.split(":", 1)[1]
+    if requested == "back":
+        await callback.message.edit_text(lead_format.format_lead_admin_detail(lead), reply_markup=kb.lead_detail_keyboard(lead))
+    else:
+        pages = lead_format.conversation_pages(lead)
+        try:
+            page = int(requested)
+        except ValueError:
+            await callback.answer("Страница недоступна", show_alert=True)
+            return
+        if not 0 <= page < len(pages):
+            await callback.answer("Переписка пока пуста", show_alert=True)
+            return
+        await callback.message.edit_text(
+            f"Переписка по заявке #{lead['id']} · {page + 1}/{len(pages)}\n\n{pages[page]}",
+            parse_mode=None, reply_markup=kb.lead_history_keyboard(page, len(pages)),
+        )
+    await callback.answer()
+
+
 @router.callback_query(AdminStates.lead_detail, F.data == "adminleadaction:reply")
 async def lead_reply_start(callback: CallbackQuery, state: FSMContext) -> None:
     data = await state.get_data()
@@ -2640,7 +2667,7 @@ async def lead_materials_open(callback: CallbackQuery, state: FSMContext) -> Non
     if lead is None:
         await callback.answer("Заявка не найдена", show_alert=True)
         return
-    materials = lead.get("materials") or []
+    materials = lead_format.lead_material_items(lead)
     await callback.message.edit_text(
         f"Материалы заявки #{lead['id']} ({len(materials)}):", reply_markup=kb.lead_materials_keyboard(lead)
     )
@@ -2664,7 +2691,7 @@ async def lead_material_resend(callback: CallbackQuery, state: FSMContext) -> No
     if lead is None:
         await callback.answer("Заявка не найдена", show_alert=True)
         return
-    materials = lead.get("materials") or []
+    materials = lead_format.lead_material_items(lead)
     if not (0 <= index < len(materials)):
         await callback.answer("Материал не найден", show_alert=True)
         return

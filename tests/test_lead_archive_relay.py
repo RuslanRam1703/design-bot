@@ -11,6 +11,14 @@ def lead(lead_id):
 
 
 class LeadArchiveRelayTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.pending_patch = patch.object(start.content_store, "save_pending_client_message", AsyncMock())
+        self.pending_patch.start()
+        self.addAsyncCleanup(self._stop_pending)
+
+    async def _stop_pending(self):
+        self.pending_patch.stop()
+
     def make_message(self, text="Client reply"):
         bot = SimpleNamespace(send_message=AsyncMock())
         return SimpleNamespace(

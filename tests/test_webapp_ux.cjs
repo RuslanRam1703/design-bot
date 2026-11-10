@@ -19,7 +19,7 @@ function appWithDraft(saved = null) {
   vm.createContext(sandbox);
   const stripped = source.replace(/\ninit\(\);\s*$/, '\n');
   assert.notEqual(stripped, source, 'must skip only the final Mini App bootstrap');
-  vm.runInContext(stripped + '\nglobalThis.__ui = { state, restoreBriefDraft, renderBrief };', sandbox);
+  vm.runInContext(stripped + '\nglobalThis.__ui = { state, restoreBriefDraft, renderBrief, renderMyLeadDetail, renderMyLeads };', sandbox);
   return sandbox.__ui;
 }
 
@@ -87,7 +87,7 @@ test('blocked Telegram account closes Mini App before content is rendered', asyn
     },
     localStorage: { getItem() { return null; }, setItem() {}, removeItem() {} },
     fetch: async () => ({ status: 403, ok: false }),
-    console, setTimeout, clearTimeout,
+    console, setTimeout, clearTimeout, AbortSignal,
   };
   vm.createContext(context);
   const sourceWithoutBootstrap = source.replace(/\ninit\(\);\s*$/, '\n');
@@ -95,4 +95,21 @@ test('blocked Telegram account closes Mini App before content is rendered', asyn
   await context.__initApp();
   assert.equal(closed, 1);
   assert.match(element.textContent, /Доступ к этому приложению ограничен/);
+});
+
+
+test('my lead detail renders saved incoming messages without injecting HTML', () => {
+  const { renderMyLeadDetail } = appWithDraft();
+  const html = renderMyLeadDetail({ id: 7, status: 'NEW', created_at: '2026-11-11T01:00:00',
+    payload: {}, client_messages: [{ kind: 'text', text: '<script>alert(1)</script>', received_at: '2026-11-11' }] });
+  assert.match(html, /Ваши сообщения \(1\)/);
+  assert.ok(html.includes('&lt;script&gt;alert(1)&lt;\/script&gt;'));
+  assert.ok(!html.includes('<script>'));
+});
+
+
+test('my leads loading failures have a direct retry action', () => {
+  const { state, renderMyLeads } = appWithDraft();
+  state.myLeads.status = 'error';
+  assert.match(renderMyLeads(), /id="my-leads-retry"/);
 });

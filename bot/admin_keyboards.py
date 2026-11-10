@@ -1,6 +1,6 @@
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
-from bot.lead import MATERIAL_KIND_LABELS
+from bot.lead import MATERIAL_KIND_LABELS, lead_material_items
 
 CASE_FIELD_LABELS = {
     "title": "Название",
@@ -436,7 +436,9 @@ def lead_detail_keyboard(lead: dict) -> InlineKeyboardMarkup:
         for key, label in LEAD_STATUS_LABELS.items()
     ])
     rows.append([InlineKeyboardButton(text="📂 Открыть / создать проект", callback_data="adminleadaction:project")])
-    materials = lead.get("materials") or []
+    if lead.get("owner_messages") or lead.get("client_messages"):
+        rows.append([InlineKeyboardButton(text="💬 Переписка", callback_data="adminleadhistory:0")])
+    materials = lead_material_items(lead)
     if materials:
         rows.append([InlineKeyboardButton(text=f"📎 Материалы ({len(materials)})", callback_data="adminleadaction:materials")])
     username = lead["telegram"].get("username")
@@ -461,7 +463,7 @@ def lead_materials_keyboard(lead: dict) -> InlineKeyboardMarkup:
     всё время жизни заявки, отдельный id не нужен, см. content_store.
     record_lead_material)."""
     rows = []
-    for i, m in enumerate(lead.get("materials") or []):
+    for i, m in enumerate(lead_material_items(lead)):
         kind = MATERIAL_KIND_LABELS.get(m.get("kind"), m.get("kind"))
         ts = (m.get("received_at") or "")[:16].replace("T", " ")
         rows.append([InlineKeyboardButton(text=f"▶️ Отправить: {kind} ({ts})", callback_data=f"adminmaterialsend:{i}")])
@@ -485,3 +487,15 @@ def confirm_keyboard(prefix: str) -> InlineKeyboardMarkup:
             ]
         ]
     )
+
+
+def lead_history_keyboard(page: int, total: int) -> InlineKeyboardMarkup:
+    pager = []
+    if page > 0:
+        pager.append(InlineKeyboardButton(text="← Новее", callback_data=f"adminleadhistory:{page - 1}"))
+    if page + 1 < total:
+        pager.append(InlineKeyboardButton(text="Ранее →", callback_data=f"adminleadhistory:{page + 1}"))
+    rows = [pager] if pager else []
+    rows.append([InlineKeyboardButton(text="💬 Написать заказчику", callback_data="adminleadaction:reply")])
+    rows.append([InlineKeyboardButton(text="◀️ Карточка заявки", callback_data="adminleadhistory:back")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
