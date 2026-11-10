@@ -18,7 +18,7 @@ from aiogram.types import (
 from aiohttp import web
 
 from bot import config, content_store, texts
-from bot.handlers import admin, admin_access, admin_projects, client_intake, faq, portfolio_channel, start, webapp
+from bot.handlers import archive_setup, admin, admin_access, admin_projects, client_intake, faq, portfolio_channel, start, webapp
 from bot.webserver import create_app
 from bot.fsm_storage import create_fsm_storage
 from bot.notifications import retry_designer_notifications
@@ -112,6 +112,7 @@ async def main() -> None:
     from bot.access_control import AccessMiddleware
     dp.message.outer_middleware(AccessMiddleware())
     dp.callback_query.outer_middleware(AccessMiddleware())
+    dp.include_router(archive_setup.router)
     dp.include_router(portfolio_channel.router)
     dp.include_router(admin_access.router)
     dp.include_router(admin_projects.router)
