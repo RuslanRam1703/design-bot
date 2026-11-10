@@ -4,7 +4,7 @@ from aiogram import F, Router
 from aiogram.exceptions import TelegramAPIError
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
-from aiogram.types import CallbackQuery, Message
+from aiogram.types import CallbackQuery, Message, InlineKeyboardButton, InlineKeyboardMarkup
 
 from bot import config, content_store, flow, texts
 from bot import client_materials_archive
@@ -202,6 +202,38 @@ def _enforce_telegram_hard_limit(text: str) -> str:
 # явный прямой вызов ниже, только для сообщений из DESIGNER_CHAT_ID (сбой
 # самого relay обрабатывается отдельно, своим текстом, см. except ниже, а
 # не падением в generic fallback).
+
+def _lead_choice_keyboard(leads, source_message_id):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"Заявка #{lead['id']}",
+            callback_data=f"clientleadroute:{source_message_id}:{lead['id']}")]
+        for lead in leads[:20]
+    ])
+
+
+@router.callback_query(F.data.startswith("clientleadroute:"))
+async def route_client_message_to_lead(callback: CallbackQuery) -> None:
+    try:
+        _, source_id, lead_id = callback.data.split(":", 2)
+        source_id, lead_id = int(source_id), int(lead_id)
+        if source_id <= 0 or callback.message.chat.type != "private":
+            raise ValueError("invalid source")
+    except (ValueError, AttributeError):
+        await callback.answer("Не удалось определить сообщение.", show_alert=True)
+        return
+    leads = await content_store.list_leads_by_user(callback.from_user.id)
+    if not any(int(item["id"]) == lead_id and item["status"] in content_store.ACTIVE_LEAD_STATUSES for item in leads):
+        await callback.answer("Заявка недоступна.", show_alert=True)
+        return
+    source = type("ClientArchiveSource", (), {})()
+    source.bot, source.chat, source.message_id = callback.bot, callback.message.chat, source_id
+    if await client_materials_archive.archive_lead_material(source, lead_id):
+        await callback.message.edit_text(f"Сообщение привязано к заявке #{lead_id}.")
+        await callback.answer("Сохранено в архиве")
+    else:
+        await callback.answer("Не удалось сохранить в архиве. Попробуйте позже.", show_alert=True)
+
+
 @router.message(F.text)
 async def relay_client_text_to_designer(message: Message, state: FSMContext) -> None:
     """Свободный текст клиента -> рабочий чат дизайнера (Stage B) — раньше
@@ -259,7 +291,13 @@ async def relay_client_text_to_designer(message: Message, state: FSMContext) -> 
     # best-effort and must not misroute messages when multiple leads exist.
     if len(active_leads) == 1:
         await client_materials_archive.archive_lead_material(message, active_leads[0]["id"])
-    await message.answer("Сообщение отправлено дизайнеру ✅")
+    if len(active_leads) > 1 and getattr(message.chat, "type", "private") == "private" and getattr(message, "message_id", None) is not None:
+        await message.answer(
+            "Сообщение отправлено дизайнеру. К какой заявке его прикрепить?",
+            reply_markup=_lead_choice_keyboard(active_leads, message.message_id),
+        )
+    else:
+        await message.answer("Сообщение отправлено дизайнеру ✅")
 
 
 async def relay_client_media_to_designer(message: Message) -> None:
@@ -318,7 +356,13 @@ async def relay_client_media_to_designer(message: Message) -> None:
     # archive topic. It remains an informal message, not a lead attachment.
     if len(active_leads) == 1:
         await client_materials_archive.archive_lead_material(message, active_leads[0]["id"])
-    await message.answer("Файл отправлен дизайнеру ✅")
+    if len(active_leads) > 1 and getattr(message.chat, "type", "private") == "private" and getattr(message, "message_id", None) is not None:
+        await message.answer(
+            "Файл отправлено дизайнеру. К какой заявке его прикрепить?",
+            reply_markup=_lead_choice_keyboard(active_leads, message.message_id),
+        )
+    else:
+        await message.answer("Файл отправлен дизайнеру ✅")
 
 
 # Держим последним в этом роутере (тот же catch-all F.text, что и раньше —
