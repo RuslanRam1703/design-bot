@@ -409,3 +409,28 @@ async def resolve_cover_url(post_url: str, *, prefer_full_resolution: bool = Tru
     if not await _is_accessible_image(post_image):
         raise TelegramMediaResolveError(f"изображение недоступно: {post_image}")
     return post_image
+
+
+async def resolve_album_urls(post_url: str) -> list[str]:
+    """Read the complete ordered photo gallery from a public post's embed.
+
+    Fail visibly when a gallery cannot be verified; falling back to a single
+    cover would silently discard the rest of the album. Never expose Bot URLs.
+    """
+    normalized = normalize_post_url(post_url)
+    if not normalized:
+        raise TelegramMediaResolveError("Invalid public Telegram post")
+    try:
+        status, body = await asyncio.to_thread(_http_get, normalized + _EMBED_SUFFIX)
+    except OSError as exc:
+        raise TelegramMediaResolveError("Album preview unavailable") from exc
+    candidates = list(dict.fromkeys(extract_embed_media_urls(body.decode("utf-8", errors="replace"))))
+    if status != 200 or not candidates or len(candidates) > 10:
+        raise TelegramMediaResolveError("Album preview has no supported gallery")
+    semaphore = asyncio.Semaphore(4)
+    async def valid(url):
+        async with semaphore:
+            return is_valid_cdn_url(url) and await _is_accessible_image(url)
+    if not all(await asyncio.gather(*(valid(url) for url in candidates))):
+        raise TelegramMediaResolveError("Album contains inaccessible images")
+    return candidates

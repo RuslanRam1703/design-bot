@@ -455,42 +455,56 @@ async def add_case(actor_chat_id: int | str, *, case_id: str, title: str, type_i
 
 
 async def upsert_channel_case(
-    *, channel_username: str, message_id: int, title: str, cover: str
+    *, channel_username: str, message_id: int, title: str, cover: str,
+    media_group_id: str | None = None, images: list[str] | None = None,
+    caption: str | None = None,
 ) -> tuple[dict, bool]:
-    """Atomically create or update a demo case for a Telegram channel post.
-
-    Identity is the channel post URL, not an auto-incremented case number.
-    Duplicate updates are safe across restarts and concurrent polling.
-    """
+    """One moderated draft per post/album; imports never erase curated fields."""
+    channel_username = channel_username.lower()
     post_url = f"https://t.me/{channel_username}/{message_id}"
+    group_key = f"{channel_username}:{media_group_id}" if media_group_id else None
+    gallery = list(dict.fromkeys(images or [cover]))
     async with _lock("portfolio.json"):
         data = await _read("portfolio.json")
         for case in data["cases"]:
-            if case.get("source_post_url") == post_url:
-                # Telegram edits must never overwrite curated or rejected work.
-                # Keep the original imported material for reference only.
-                if case.get("status", "published") == "draft":
+            if (group_key and case.get("source_group_key") == group_key) or case.get("source_post_url", "").lower() == post_url:
+                if case.get("status", "published") != "draft":
+                    return case, False
+                old_cover = case.get("source_cover", case.get("cover"))
+                old_images = case.get("source_images", [old_cover])
+                # Only replace imported defaults. The designer's edits win.
+                if case.get("cover") == old_cover:
+                    case["cover"] = cover
+                if case.get("images") == old_images:
+                    case["images"] = gallery
+                if caption:
+                    if case.get("title") == case.get("source_title"):
+                        case["title"] = title
+                    if case.get("task") == case.get("source_caption", "Демонстрационная публикация из Telegram-канала."):
+                        case["task"] = caption
                     case["source_title"] = title
-                    case["source_cover"] = cover
-                    await _write("portfolio.json", data)
+                    case["source_caption"] = caption
+                case["source_cover"] = cover
+                case["source_images"] = gallery
+                if group_key:
+                    case["source_group_key"] = group_key
+                    # Canonical source stays on the first post, even if updates arrive out of order.
+                    previous_id = int(case["source_post_url"].rsplit("/", 1)[1])
+                    case["source_post_url"] = f"https://t.me/{channel_username}/{min(previous_id, message_id)}"
+                await _write("portfolio.json", data)
                 return case, False
-        case_id = f"tg_{channel_username.lower()}_{message_id}"
+        case_id = f"tg_{channel_username}_{message_id}"
         case = {
-            "id": case_id,
-            "title": title,
-            "type": None,
-            "featured": False,
-            "status": "draft",
-            "cover": cover,
-            "images": [cover],
-            "task": "Демонстрационная публикация из Telegram-канала.",
-            "solution": "",
-            "result": "",
-            "related_service": None,
-            "source_post_url": post_url,
-            "source_title": title,
-            "source_cover": cover,
+            "id": case_id, "title": title, "type": None, "featured": False,
+            "status": "draft", "cover": cover, "images": gallery,
+            "task": caption or "Демонстрационная публикация из Telegram-канала.",
+            "solution": "", "result": "", "related_service": None,
+            "source_post_url": post_url, "source_title": title,
+            "source_cover": cover, "source_images": gallery,
+            "source_caption": caption or "Демонстрационная публикация из Telegram-канала.",
         }
+        if group_key:
+            case["source_group_key"] = group_key
         data["cases"].append(case)
         await _write("portfolio.json", data)
         return case, True
