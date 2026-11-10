@@ -14,8 +14,8 @@ class PortfolioModerationTests(unittest.IsolatedAsyncioTestCase):
         async def write(_, updated):
             data.clear()
             data.update(copy.deepcopy(updated))
-        with patch.object(content_store, "_upstash_enabled", return_value=False), \\
-             patch.object(content_store, "_read", side_effect=read), \\
+        with patch.object(content_store, "_upstash_enabled", return_value=False), \
+             patch.object(content_store, "_read", side_effect=read), \
              patch.object(content_store, "_write", side_effect=write):
             case, created = await content_store.upsert_channel_case(channel_username="portfolio_rrr17", message_id=6, title="Original", cover="old.jpg")
             self.assertTrue(created)
@@ -36,9 +36,9 @@ class PortfolioModerationTests(unittest.IsolatedAsyncioTestCase):
         async def write(_, updated):
             data.clear()
             data.update(copy.deepcopy(updated))
-        with patch.object(content_store, "_upstash_enabled", return_value=False), \\
-             patch.object(content_store, "_require_designer"), \\
-             patch.object(content_store, "_read", side_effect=read), \\
+        with patch.object(content_store, "_upstash_enabled", return_value=False), \
+             patch.object(content_store, "_require_designer"), \
+             patch.object(content_store, "_read", side_effect=read), \
              patch.object(content_store, "_write", side_effect=write):
             self.assertTrue(await content_store.set_case_status(1, "case_1", "trashed"))
             self.assertEqual(data["cases"][0]["cover"], "image.jpg")
