@@ -346,7 +346,11 @@ def format_lead_admin_detail(lead: dict) -> str:
         lines.append(f"<b>Ответы дизайнера ({len(owner_messages)})</b>")
         for m in reversed(owner_messages):  # последний сверху — самое актуальное видно сразу
             ts = (m.get("sent_at") or "")[:16].replace("T", " ")
-            failed_note = " ⚠️ не доставлено" if m.get("delivery_status") == "failed" else ""
+            failed_note = {
+                "failed": " ⚠️ не доставлено",
+                "sending": " ⚠️ доставка не подтверждена",
+                "unknown": " ⚠️ доставка не подтверждена",
+            }.get(m.get("delivery_status"), "")
             lines.append(f"— #{m['id']} ({ts}){failed_note}: {_esc(m.get('text', ''))}")
 
     lines.append("")

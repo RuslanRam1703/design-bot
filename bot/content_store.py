@@ -1937,6 +1937,52 @@ async def add_owner_message(actor_chat_id: int | str, lead_id: int, text: str, d
         return lead
 
 
+async def prepare_owner_reply(actor_chat_id: int | str, lead_id: int, source_key: str, text: str) -> dict | None:
+    """Persist intent before Telegram I/O. A source update can send at most once.
+
+    Search across leads so a replay cannot target a newly selected FSM lead.
+    In-flight intents never expire into an automatic retry: Bot API has no
+    idempotency key, so a crash may mean Telegram accepted the message.
+    """
+    _require_designer(actor_chat_id)
+    async with _lock("leads.json"):
+        leads = await _read_leads()
+        if any(m.get("source_key") == source_key for lead in leads
+               for m in lead.get("owner_messages", [])):
+            return None
+        lead = next((l for l in leads if l["id"] == lead_id), None)
+        if lead is None or not lead.get("telegram", {}).get("user_id"):
+            return None
+        messages = lead.setdefault("owner_messages", [])
+        entry = {
+            "id": max((m["id"] for m in messages), default=0) + 1,
+            "source_key": source_key,
+            "recipient_id": lead["telegram"]["user_id"],
+            "text": text,
+            "sent_at": datetime.now(timezone.utc).isoformat(),
+            "delivery_status": "sending",
+        }
+        messages.append(entry)
+        lead["updated_at"] = entry["sent_at"]
+        await _write_leads(leads)
+        return dict(entry)
+
+
+async def finish_owner_reply(actor_chat_id: int | str, lead_id: int, source_key: str, status: str) -> None:
+    _require_designer(actor_chat_id)
+    if status not in {"sent", "failed", "unknown"}:
+        raise ValueError("Invalid reply delivery status")
+    async with _lock("leads.json"):
+        leads = await _read_leads()
+        lead = next((l for l in leads if l["id"] == lead_id), None)
+        if lead is None:
+            raise LookupError("Reply lead missing")
+        entry = next(m for m in lead["owner_messages"] if m.get("source_key") == source_key)
+        entry["delivery_status"] = status
+        lead["updated_at"] = datetime.now(timezone.utc).isoformat()
+        await _write_leads(leads)
+
+
 async def delete_lead(actor_chat_id: int | str, lead_id: int) -> bool:
     _require_designer(actor_chat_id)
     async with _lock("leads.json"):

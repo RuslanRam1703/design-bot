@@ -193,6 +193,12 @@ async def handle_my_leads(request: web.Request) -> web.Response:
     if await access_control.is_blocked(user["id"], user.get("username")):
         return web.json_response({"error": "access_denied"}, status=403)
     leads = await content_store.list_leads_by_user(user["id"])
+    # Delivery deduplication keys include private admin/archive chat IDs.
+    # Keep those server-side; the client only needs the message and status.
+    leads = [dict(lead, owner_messages=[
+        {key: message[key] for key in ("id", "text", "sent_at", "delivery_status") if key in message}
+        for message in lead.get("owner_messages", [])
+    ]) for lead in leads]
     return web.json_response(leads, dumps=lambda d: json.dumps(d, ensure_ascii=False))
 
 

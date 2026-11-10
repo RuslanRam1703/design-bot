@@ -2002,6 +2002,7 @@ class AdminSuccessorStalenessAnchorTests(unittest.IsolatedAsyncioTestCase):
         state = await self._state_with_anchor(anchor_id=670, lead_id=lead["id"], cancel_to="root")
         msg = make_flow_message_factory(chat_id=self.actor, start_id=10100)(text="Ответ клиенту")
         msg.bot.send_message = AsyncMock()
+        msg.message_id = 10100
         await admin.lead_reply_send(msg, state)
         msg.bot.edit_message_text.assert_awaited_once()
         self.assertEqual(msg.bot.edit_message_text.await_args.kwargs["message_id"], 670)
@@ -11063,6 +11064,8 @@ def make_reply_message(chat_id: int, text: str, send_message: AsyncMock) -> Simp
     она падает на message.answer() тем же способом, что и раньше."""
     return SimpleNamespace(
         text=text,
+        message_id=501,
+        from_user=SimpleNamespace(id=chat_id),
         chat=SimpleNamespace(id=chat_id),
         delete=AsyncMock(),
         bot=SimpleNamespace(send_message=send_message, delete_message=AsyncMock(), edit_message_text=AsyncMock()),
@@ -11235,6 +11238,8 @@ class OwnerMessageTests(unittest.IsolatedAsyncioTestCase):
         lead = next(l for l in body if l["id"] == self.lead["id"])
         self.assertEqual(len(lead["owner_messages"]), 1)
         self.assertEqual(lead["owner_messages"][0]["text"], "Виден клиенту")
+        self.assertNotIn("source_key", lead["owner_messages"][0])
+        self.assertNotIn("recipient_id", lead["owner_messages"][0])
 
     def test_lead_without_owner_messages_has_empty_list_not_missing_key(self):
         # Существующие лиды (созданные до этой фичи) — отсутствие поля
