@@ -3269,9 +3269,9 @@ class AdminRemainingAnchorGapsTests(unittest.IsolatedAsyncioTestCase):
         await state.set_state(AdminStates.delete_case_confirm)
         cb = make_callback("admindelcaseconfirm:yes", chat_id=self.actor, message_id=msg_id)
         await admin.cases_delete_do(cb, state)
-        cb.message.edit_text.assert_awaited_once_with("Кейс удалён ✅", reply_markup=kb.admin_cases_menu_keyboard())
+        cb.message.edit_text.assert_awaited_once_with("Кейс перемещён в корзину. Его можно восстановить через «Статусы и публикация».", reply_markup=kb.admin_cases_menu_keyboard())
         remaining = await content_store.list_cases()
-        self.assertFalse(any(c["id"] == case["id"] for c in remaining))
+        self.assertTrue(any(c["id"] == case["id"] and c["status"] == "trashed" for c in remaining))
         await self._assert_main_menu_cleans_current_screen(state, msg_id, 12300)
 
     # ---- About: edit "done" ----
@@ -5260,7 +5260,7 @@ class AdminCaseManagementCompletenessTests(unittest.IsolatedAsyncioTestCase):
 
         await admin.cases_delete_do(cb, state)  # не должно бросить исключение
 
-        cb.message.edit_text.assert_awaited_once_with("Кейс удалён ✅", reply_markup=kb.admin_cases_menu_keyboard())
+        cb.message.edit_text.assert_awaited_once_with("Кейс не найден.", reply_markup=kb.admin_cases_menu_keyboard())
         data = await state.get_data()
         self.assertEqual(data.get(flow._ANCHOR_MSG_KEY), msg_id)
         self.assertEqual(data.get(flow._NAV_ANCHOR_MSG_KEY), 111)
@@ -8438,7 +8438,7 @@ class GalleryImageDeletionHandlerTests(unittest.IsolatedAsyncioTestCase):
              patch.object(admin.flow, "step_from_callback", new=AsyncMock()):
             await admin.cases_delete_do(cb, state)
         deleted = {c.kwargs["message_id"] for c in bot.delete_message.await_args_list}
-        self.assertIn(70, deleted)
+        self.assertNotIn(70, deleted)
 
     async def test_delete_case_does_not_delete_same_message_twice(self):
         # Если галерейную картинку выбрали обложкой, её ссылка может
@@ -8456,7 +8456,7 @@ class GalleryImageDeletionHandlerTests(unittest.IsolatedAsyncioTestCase):
              patch.object(admin.flow, "step_from_callback", new=AsyncMock()):
             await admin.cases_delete_do(cb, state)
         ids = [c.kwargs["message_id"] for c in bot.delete_message.await_args_list]
-        self.assertEqual(ids.count(70), 1)
+        self.assertEqual(ids.count(70), 0)
 
 
 class PersistentSectionAndAvatarTests(unittest.IsolatedAsyncioTestCase):
@@ -13232,8 +13232,8 @@ class ArchiveUploadFlowTests(unittest.IsolatedAsyncioTestCase):
 
         await admin.cases_delete_do(cb, state)
 
-        self.assertIsNone(await self._case("case_del"))
-        cb.bot.delete_message.assert_awaited_once_with(chat_id="@media_archive_da", message_id=700)
+        self.assertEqual((await self._case("case_del"))["status"], "trashed")
+        cb.bot.delete_message.assert_not_awaited()
 
     async def test_delete_case_does_not_touch_external_source(self):
         await content_store.add_case(
@@ -13263,7 +13263,7 @@ class ArchiveUploadFlowTests(unittest.IsolatedAsyncioTestCase):
         cb.bot.delete_message = AsyncMock(side_effect=RuntimeError("nope"))
 
         await admin.cases_delete_do(cb, state)
-        self.assertIsNone(await self._case("case_del_fail"))
+        self.assertEqual((await self._case("case_del_fail"))["status"], "trashed")
 
     # ---- gallery / non-cover media untouched ----
 
