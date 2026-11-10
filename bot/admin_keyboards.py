@@ -441,6 +441,13 @@ def lead_detail_keyboard(lead: dict) -> InlineKeyboardMarkup:
     username = lead["telegram"].get("username")
     if username:
         rows.append([InlineKeyboardButton(text="🔗 Открыть в Telegram", url=f"https://t.me/{username}")])
+    elif lead.get("telegram", {}).get("user_id"):
+        # Telegram ID deep links may be restricted by privacy/client settings.
+        # The bot reply action above remains available independently.
+        rows.append([InlineKeyboardButton(
+            text="🔗 Попробовать открыть профиль",
+            url=f"tg://user?id={int(lead['telegram']['user_id'])}",
+        )])
     rows.append([InlineKeyboardButton(text="🗑 Удалить заявку", callback_data="adminleadaction:delete")])
     rows.append([InlineKeyboardButton(text="◀️ К списку заявок", callback_data="adminleadaction:back")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
