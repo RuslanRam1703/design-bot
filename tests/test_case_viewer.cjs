@@ -4,7 +4,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const vm = require('node:vm');
 const source = fs.readFileSync(require('node:path').join(__dirname, '../webapp/js/case-viewer.js'), 'utf8');
-function setup({swipes = true, supported = true} = {}) {
+function setup({swipes = true, supported = true, desktop = false} = {}) {
   class Element {
     constructor() { this.attrs = {}; this.style = {cssText: ''}; this.events = {}; this.clientWidth = 390; this.clientHeight = 600; this.scrollLeft = 0; this.scrollTop = 0; }
     setAttribute(k, v) { this.attrs[k] = v; }
@@ -30,7 +30,7 @@ function setup({swipes = true, supported = true} = {}) {
     el.close = () => { el.open = false; };
     dialogs.push(el); return el;
   }};
-  const window = {scrollX: 0, scrollY: 420,
+  const window = {scrollX: 0, scrollY: 420, matchMedia: () => ({matches: desktop}),
     scrollTo: (x, y) => calls.scroll.push([x, y]),
     addEventListener: k => calls.listeners.add(k), removeEventListener: k => calls.listeners.delete(k),
     Telegram: {WebApp: {isVerticalSwipesEnabled: swipes,
@@ -177,4 +177,53 @@ test('selection callback keeps closed gallery aligned with the viewed photo', ()
   assert.equal(s.dialogs[0].querySelector('img').src,'b.jpg');
   s.dialogs[0].querySelector('[data-next]').fire('click');
   s.viewer.close(); assert.deepEqual(selected,[1,2]);
+});
+
+
+test('desktop wheel zoom anchors at cursor, normalizes deltas and leaves normal scroll native', () => {
+  const s = gestures(), area = s.area;
+  let prevented = 0;
+  const wheel = data => area.fire('wheel', {ctrlKey: true, cancelable: true, deltaMode: 0,
+    deltaY: -60, clientX: 100, clientY: 200, preventDefault() { prevented++; }, ...data});
+  wheel({ctrlKey: false}); assert.equal(prevented, 0); assert.equal(s.img.style.width, '366px');
+  wheel({cancelable: false}); assert.equal(prevented, 0);
+  wheel({}); const scale = parseFloat(s.img.style.width) / 366;
+  assert.ok(scale > 1 && scale < 2); assert.equal(prevented, 1);
+  assert.ok(Math.abs((100 - 12) * scale + 12 - 100 - area.scrollLeft) < .001);
+  for (let i=0;i<20;i++) wheel({deltaMode: 1, deltaY: -100});
+  assert.equal(s.img.style.width, '1464px');
+  for (let i=0;i<20;i++) wheel({deltaMode: 2, deltaY: 1});
+  assert.equal(s.img.style.width, '366px');
+});
+test('keyboard zoom, reset and pan do not change the photo; browser shortcuts are preserved', () => {
+  const s = gestures(['a.jpg','b.jpg']), d = s.dialogs[0];
+  d.fire('keydown',{key: '+',ctrlKey: true}); assert.equal(s.img.style.width,'366px');
+  d.fire('keydown',{key: '+'}); assert.equal(s.img.style.width,'457.5px');
+  const left = s.area.scrollLeft;
+  d.fire('keydown',{key: 'ArrowRight'}); assert.equal(s.area.scrollLeft,left+80);
+  assert.equal(s.img.src,'a.jpg');
+  d.fire('keydown',{key: '-'}); assert.equal(s.img.style.width,'366px');
+  d.fire('keydown',{key: '+'}); d.fire('keydown',{key: '0'});
+  assert.equal(s.img.style.width,'366px');
+  d.fire('keydown',{key: 'ArrowRight'}); assert.equal(s.img.src,'b.jpg');
+});
+test('desktop hints and cursor follow mouse pan, touch input and cancellation', () => {
+  const s = setup({desktop: true}); s.open(); const d = s.dialogs[0];
+  const img=d.querySelector('img'), area=d.querySelector('.case-viewer-scroll'), status=d.querySelector('[role=status]');
+  img.fire('load'); assert.match(status.textContent,/Ctrl/);
+  d.querySelector('[data-zoom]').fire('click'); assert.equal(area.style.cursor,'grab');
+  const mouse = {pointerType:'mouse',button:0,pointerId:1,clientX:200,clientY:200,timeStamp:100};
+  area.fire('pointerdown',mouse); assert.equal(area.style.cursor,'grabbing');
+  const before=area.scrollLeft;
+  area.fire('pointermove',{...mouse,clientX:100}); assert.equal(area.scrollLeft,before+100);
+  area.fire('pointercancel',mouse); assert.equal(area.style.cursor,'grab');
+  area.fire('pointerdown',{...mouse,pointerType:'touch'}); assert.match(status.textContent,/пальцем/);
+});
+test('wheel and keyboard cannot zoom an unloaded or broken image', () => {
+  const s = setup(); s.open(); const d=s.dialogs[0], area=d.querySelector('.case-viewer-scroll');
+  const width=d.querySelector('img').style.width;
+  area.fire('wheel',{ctrlKey:true,cancelable:true,deltaY:-100,clientX:50,clientY:50});
+  d.fire('keydown',{key:'+'}); assert.equal(d.querySelector('img').style.width,width);
+  d.querySelector('img').fire('error'); area.fire('wheel',{ctrlKey:true,cancelable:true,deltaY:-100});
+  assert.match(d.querySelector('[role=status]').textContent,/Не удалось/);
 });
