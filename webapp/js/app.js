@@ -752,6 +752,10 @@ function renderCaseContent(c) {
   `;
 }
 
+function formatPriceRange(from, to) {
+  return from === to ? formatMoney(from) : `${formatMoney(from)} – ${formatMoney(to)}`;
+}
+
 function safeLinkUrl(value) {
   if (typeof value !== "string") return "";
   const url = value.trim();
@@ -1171,7 +1175,7 @@ function renderCalculator() {
     <p class="hint">Сложность проекта и окончательную стоимость дизайнер уточнит после обсуждения задачи.</p>
 
     <div class="result-box">
-      <div class="price">${formatMoney(result.priceFrom)} – ${formatMoney(result.priceTo)}</div>
+      <div class="price">${formatPriceRange(result.priceFrom, result.priceTo)}</div>
       <div class="term">${formatDays(result.termFrom)}–${formatDays(result.termTo)} рабочих дней</div>
       <div class="hint">Точная сумма — предварительная, дизайнер подтвердит после брифа</div>
     </div>
@@ -1632,7 +1636,7 @@ function renderBrief() {
       </div>
       <p class="hint">Сложность проекта оценит дизайнер после изучения задачи.</p>
       <div class="result-box">
-        <div class="price">${formatMoney(result.priceFrom)} – ${formatMoney(result.priceTo)}</div>
+        <div class="price">${formatPriceRange(result.priceFrom, result.priceTo)}</div>
         <div class="term">${formatDays(result.termFrom)}–${formatDays(result.termTo)} рабочих дней</div>
         <div class="hint">Предварительная оценка стоимости по вашим параметрам</div>
       </div>
@@ -1922,7 +1926,7 @@ function renderMyLeads() {
   const cards = m.items.map((lead) => {
     const service = lead.payload?.service_name || "Без услуги";
     const price = lead.calc_summary
-      ? `${formatMoney(lead.calc_summary.price_from)} – ${formatMoney(lead.calc_summary.price_to)}`
+      ? `${formatPriceRange(lead.calc_summary.price_from, lead.calc_summary.price_to)}`
       : "";
     const status = MY_LEAD_STATUS_LABELS[lead.status] || lead.status;
     const { createdDate, updatedDate, updatedDiffers } = myLeadDateLines(lead);
@@ -1953,7 +1957,7 @@ function renderMyLeadDetail(lead) {
   const status = MY_LEAD_STATUS_LABELS[lead.status] || lead.status;
   const { createdDate, updatedDate, updatedDiffers } = myLeadDateLines(lead);
   const priceLine = lead.calc_summary
-    ? `<div class="result-box"><div class="price">${formatMoney(lead.calc_summary.price_from)} – ${formatMoney(lead.calc_summary.price_to)}</div><div class="hint">Точная сумма — предварительная</div></div>`
+    ? `<div class="result-box"><div class="price">${formatPriceRange(lead.calc_summary.price_from, lead.calc_summary.price_to)}</div><div class="hint">Точная сумма — предварительная</div></div>`
     : "";
   const optionsLine = lead.calc_summary && lead.calc_summary.selected_options && lead.calc_summary.selected_options.length
     ? `<div class="case-block"><div class="label">Опции</div><p>${lead.calc_summary.selected_options.map((o) => escapeHtml(o.name) + (o.qty > 1 ? ` ×${o.qty}` : "")).join(", ")}</p></div>`
