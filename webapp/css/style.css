@@ -170,8 +170,6 @@ textarea::placeholder, input::placeholder { color:var(--hint); opacity:.8; }
 @media (hover:hover) { .card:hover, .mini-case:hover, .service-item:hover, .lead-card:hover { border-color:var(--accent); } }
 
 /* Image inspection stays inside the existing WebView, outside #app layout. */
-.case-image-open { display:block; width:100%; padding:0; border:0; background:none; text-align:left; }
-.case-image-open span { display:block; padding:7px 2px; font-size:12px; color:var(--hint); }
 .case-viewer { position:fixed; inset:0; margin:0; padding:0; border:0; max-width:none; max-height:100%; width:100%; height:100dvh; height:var(--tg-viewport-stable-height,100dvh); background:var(--bg); color:var(--text); }
 .case-viewer[open] { display:flex; flex-direction:column; }
 .case-viewer::backdrop { background:#070910; }
@@ -180,3 +178,16 @@ textarea::placeholder, input::placeholder { color:var(--hint); opacity:.8; }
 .case-viewer-scroll { flex:1; min-height:0; overflow:auto; overscroll-behavior:contain; touch-action:none; }
 .case-viewer-scroll img { display:block; max-width:none; height:auto; margin:12px auto; }
 .case-viewer-status { flex-shrink:0; margin:0; padding:8px 12px max(8px,env(safe-area-inset-bottom,0px)); font-size:12px; color:var(--hint); }
+.case-gallery-open { display:block; width:100%; border:0; padding:0; background:transparent; text-align:left; }
+.case-gallery-open > span { display:flex; justify-content:space-between; padding:8px 2px; color:var(--hint); font-size:12px; }
+.case-gallery-multiple .case-gallery-open > img { height:clamp(180px,45vh,440px); object-fit:contain; background:var(--bg-secondary); }
+.case-gallery-thumbs { display:flex; gap:8px; overflow-x:auto; padding:4px 2px 8px; }
+.case-gallery-thumbs button { flex:0 0 72px; padding:3px; border:2px solid transparent; border-radius:12px; background:var(--bg-secondary); }
+.case-gallery-thumbs button[aria-pressed="true"] { border-color:var(--accent); }
+.case-gallery-thumbs button img { width:62px; height:52px; object-fit:cover; border:0; border-radius:7px; }
+.case-viewer-nav { display:flex; align-items:center; justify-content:center; gap:24px; flex-shrink:0; padding:4px 12px; }
+.case-viewer-nav[hidden] { display:none; }
+.case-viewer-nav button { width:44px; height:44px; border:1px solid var(--border); border-radius:12px; background:var(--bg-secondary); }
+.case-viewer-nav button:disabled { opacity:.35; }
+
+.case-viewer-scroll img[hidden] { display:none; }

@@ -211,3 +211,15 @@ test('content links permit contact URLs but cannot execute scripts', () => {
   ui.state.currentCase = {title: 'Case', external_url: 'javascript:alert(1)'};
   assert.doesNotMatch(ui.renderCase(), /external-case-link/);
 });
+
+test('closed case gallery has one main preview and ordered selectable thumbnails', () => {
+  const ui = appWithDraft();
+  ui.state.currentCase = {title:'Gallery',images:['https://example.invalid/a.jpg','https://example.invalid/b.jpg','https://example.invalid/c.jpg']};
+  const html = ui.renderCase();
+  assert.equal((html.match(/class="case-gallery-open"/g)||[]).length,1);
+  assert.equal((html.match(/data-gallery-thumb=/g)||[]).length,3);
+  assert.match(html,/data-gallery-count>1 \/ 3/);
+  assert.match(html,/data-gallery-thumb="0" aria-label="Изображение 1" aria-pressed="true"/);
+  ui.state.currentCase.images = ['https://example.invalid/a.jpg'];
+  assert.doesNotMatch(ui.renderCase(),/data-gallery-thumb=/);
+});

@@ -432,6 +432,27 @@ def _next_case_id(cases: list[dict]) -> str:
     return f"case_{max(nums, default=0) + 1}"
 
 
+async def ensure_gallery_demo_case() -> None:
+    """One owner-requested demo addition; never overwrite edits or resurrect removal."""
+    async with _lock("portfolio.json"):
+        data = await _read("portfolio.json")
+        if data.get("gallery_demo_seeded_v1"):
+            return
+        if not any(case.get("id") == "gallery_demo" for case in data["cases"]):
+            images = [f"img/gallery-demo/{name}.svg" for name in ("wide", "portrait", "long")]
+            types = data.get("types", [])
+            category = next((t["id"] for t in types if t["id"] == "landing"), types[0]["id"] if types else None)
+            data["cases"].append({
+                "id": "gallery_demo", "title": "Тестовая галерея — 3 формата",
+                "type": category, "status": "published", "cover": images[0], "images": images,
+                "task": "Демонстрационный кейс: горизонтальное изображение, постер и длинный макет. Проверьте превью, свайпы, увеличение и возврат.",
+                "solution": "Это тестовые материалы, а не реальная работа из портфолио.",
+                "result": "", "related_service": None,
+            })
+        data["gallery_demo_seeded_v1"] = True
+        await _write("portfolio.json", data)
+
+
 async def next_case_id() -> str:
     """Suggest an ID for the wizard; uniqueness is enforced when saving."""
     return _next_case_id(await list_cases())

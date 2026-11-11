@@ -128,6 +128,7 @@ async def main() -> None:
     # хранилище (см. production-hardening аудит, P0-1). При выключенном
     # Upstash — no-op (см. ensure_storage_initialized).
     await content_store.ensure_storage_initialized()
+    await content_store.ensure_gallery_demo_case()
 
     app = create_app(bot)
     webhook_secret = hashlib.sha256(config.BOT_TOKEN.encode("utf-8")).hexdigest()
