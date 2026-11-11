@@ -633,7 +633,7 @@ function renderPortfolio() {
           ${c.cover ? `<img src="${imageSrc(c.cover)}" alt="" loading="lazy" decoding="async" />` : '<div class="card-cover-empty"></div>'}
           ${typeLabels[c.type] ? `<span class="card-type">${escapeHtml(typeLabels[c.type])}</span>` : ""}
         </div>
-        <div class="card-title"><span>${escapeHtml(c.title)}</span><span class="card-arrow" aria-hidden="true">↗</span></div>
+        <div class="card-title"><span>${escapeHtml(c.title)}</span><span class="card-arrow" aria-hidden="true"><svg class="action-arrow" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 18 18 6M6 6h12v12"/></svg></span></div>
       </button>`
     )
     .join("");
@@ -642,7 +642,7 @@ function renderPortfolio() {
     <section class="portfolio-intro">
       <h1>Дизайн для вашего следующего проекта.</h1>
       <p>Интерфейсы, сайты и визуальные системы. Посмотрите работы и соберите предварительную оценку.</p>
-      ${state.uiConfig?.menu?.brief !== false ? '<button class="btn btn-primary" id="portfolio-order">Обсудить проект <span aria-hidden="true">↗</span></button>' : ""}
+      ${state.uiConfig?.menu?.brief !== false ? '<button class="btn btn-primary" id="portfolio-order">Обсудить проект <svg class="action-arrow" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 18 18 6M6 6h12v12"/></svg></button>' : ""}
     </section>
     <div class="section-heading"><h2>Портфолио</h2><span>${count} ${projectWord}</span></div>
     <div class="chips">${chips}</div>
