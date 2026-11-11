@@ -28,6 +28,7 @@ from aiogram.types import InlineKeyboardButton, WebAppInfo, BufferedInputFile, C
 
 from bot import admin_keyboards as kb
 from bot import access_control, behance, config, content_store, flow, media_archive, telegram_media, texts
+from bot import pricing_guidance
 from bot import lead as lead_format
 from bot.handlers.start import main_menu_or_confirm
 from bot.states import AdminStates
@@ -2036,7 +2037,10 @@ async def price_edit_field(callback: CallbackQuery, state: FSMContext) -> None:
         await callback.answer()
         return
     await state.update_data(field=field)
-    await callback.message.edit_text(f"Новое значение поля «{kb.SERVICE_FIELD_LABELS[field]}»:", reply_markup=kb.cancel_keyboard())
+    service = await content_store.get_service((await state.get_data())["service_id"])
+    current = escape(str((service or {}).get(field, "не задано")))
+    hint = "\nВведите сумму в рублях: 50000 означает 50 000 ₽. Диапазон и срочность настраиваются отдельно." if field == "base_price" else ""
+    await callback.message.edit_text(f"{kb.SERVICE_FIELD_LABELS[field]}\nСейчас: {current}{hint}\n\nВведите новое значение:", reply_markup=kb.cancel_keyboard())
     await state.set_state(AdminStates.edit_service_value)
     await callback.answer()
 
@@ -2101,11 +2105,25 @@ async def price_delete_do(callback: CallbackQuery, state: FSMContext) -> None:
     await callback.answer()
 
 
+@router.callback_query(F.data == "adminpricehelp")
+async def price_help(callback: CallbackQuery) -> None:
+    await callback.message.edit_text(pricing_guidance.GUIDE, reply_markup=kb.pricing_menu_keyboard())
+    await callback.answer()
+
+
+@router.callback_query(F.data == "adminpricesimple")
+async def price_simple(callback: CallbackQuery, state: FSMContext) -> None:
+    await content_store.stage_simple_pricing(callback.message.chat.id)
+    await callback.message.edit_text("Простой расчёт сохранён в черновик: базовая цена + выбранные опции. Например, база 50 000 ₽ без опций даст 50 000 ₽. Проверьте и примените прайс, чтобы обновить цены для клиентов.", reply_markup=kb.pricing_menu_keyboard())
+    await callback.answer()
+
+
 # ---- Коэффициенты и округление ----
 
 @router.callback_query(F.data == "adminpriceaction:coef")
 async def price_coef_start(callback: CallbackQuery, state: FSMContext) -> None:
-    await callback.message.edit_text("Что изменить?", reply_markup=kb.coefficients_menu_keyboard())
+    rules = await content_store.get_pricing_rules()
+    await callback.message.edit_text(pricing_guidance.settings_summary(rules), reply_markup=kb.coefficients_menu_keyboard())
     await state.update_data(cancel_to="pricing")
     await state.set_state(AdminStates.edit_coefficients_pick)
     await callback.answer()
@@ -2114,8 +2132,8 @@ async def price_coef_start(callback: CallbackQuery, state: FSMContext) -> None:
 @router.callback_query(AdminStates.edit_coefficients_pick, F.data.startswith("admineditcoef:"))
 async def price_coef_pick(callback: CallbackQuery, state: FSMContext) -> None:
     key = callback.data.split(":", 1)[1]
-    await state.update_data(kind="coef", key=key)
-    await callback.message.edit_text(f"Новое значение для «{kb.COEFFICIENT_LABELS[key]}» (например 1.25):", reply_markup=kb.cancel_keyboard())
+    await state.update_data(kind="coef", key=key, percent_input=True)
+    await callback.message.edit_text(f"Новое значение для «{kb.COEFFICIENT_LABELS[key]}» Введите процент надбавки: например 25 означает +25%, 0 — без надбавки. Сложность не выбирается клиентом в Mini App:", reply_markup=kb.cancel_keyboard())
     await state.set_state(AdminStates.edit_coefficients_value)
     await callback.answer()
 
@@ -2123,8 +2141,8 @@ async def price_coef_pick(callback: CallbackQuery, state: FSMContext) -> None:
 @router.callback_query(AdminStates.edit_coefficients_pick, F.data.startswith("admineditround:"))
 async def price_round_pick(callback: CallbackQuery, state: FSMContext) -> None:
     key = callback.data.split(":", 1)[1]
-    await state.update_data(kind="round", key=key)
-    await callback.message.edit_text(f"Новое значение для «{kb.ROUNDING_LABELS[key]}»:", reply_markup=kb.cancel_keyboard())
+    await state.update_data(kind="round", key=key, percent_input=True)
+    await callback.message.edit_text(f"{kb.ROUNDING_LABELS[key]}. Введите число. Для границ 10 означает 10%, 0 — без изменения; для округления 1 означает точность до рубля:", reply_markup=kb.cancel_keyboard())
     await state.set_state(AdminStates.edit_coefficients_value)
     await callback.answer()
 
@@ -2139,6 +2157,12 @@ async def price_coef_value(message: Message, state: FSMContext) -> None:
     if value is None:
         await flow.step_from_text(message, state, "Нужно число. Попробуйте ещё раз:", kb.cancel_keyboard())
         return
+    if data.get("percent_input"):
+        try:
+            value = pricing_guidance.percent_to_stored(data["kind"], data["key"], value)
+        except ValueError as exc:
+            await flow.step_from_text(message, state, str(exc), kb.cancel_keyboard())
+            return
     if data["kind"] == "coef":
         await content_store.update_coefficient(message.chat.id, data["key"], value, stage=True)
     else:

@@ -2655,3 +2655,14 @@ async def editor_media_retained(value: str) -> bool:
 async def _delete_unused_image(path: str) -> None:
     if not await editor_media_retained(path):
         await r2_storage.delete_image(path)
+
+
+async def stage_simple_pricing(actor_chat_id: int | str) -> None:
+    _require_designer(actor_chat_id)
+    async with _lock("pricing.json"):
+        stored = await _read("pricing.json")
+        working = _pricing_working(stored, start=True)
+        for rule in working["coefficients"].values():
+            rule["multiplier"] = 1
+        working["rounding"] = {"price_from_factor": 1, "price_to_factor": 1, "round_to": 1}
+        await _write("pricing.json", stored)

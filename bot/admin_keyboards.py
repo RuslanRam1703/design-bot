@@ -49,17 +49,17 @@ OPTION_FIELD_LABELS = {
     "name": "Название",
     "price": "Цена, +₽",
     "days": "Срок, +дней",
-    "multipliable": "Множится на количество",
+    "multipliable": "Доплата за каждую единицу",
 }
 
 COEFFICIENT_LABELS = {
-    "urgent": "Срочный проект — множитель",
-    "complex": "Высокая сложность — множитель",
+    "urgent": "Надбавка за срочность, %",
+    "complex": "Сложность — надбавка, % (служебная)",
 }
 
 ROUNDING_LABELS = {
-    "price_from_factor": "Нижняя граница вилки (доля от точной цены)",
-    "price_to_factor": "Верхняя граница вилки (доля от точной цены)",
+    "price_from_factor": "Нижняя граница — уменьшить на, %",
+    "price_to_factor": "Верхняя граница — увеличить на, %",
     "round_to": "Шаг округления, ₽",
 }
 
@@ -300,10 +300,11 @@ def about_field_keyboard(needs_review_fields: list[str] | None = None) -> Inline
 def pricing_menu_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
+            [InlineKeyboardButton(text="❓ Как настроить цену", callback_data="adminpricehelp")],
             [InlineKeyboardButton(text="➕ Добавить услугу", callback_data="adminpriceaction:add")],
             [InlineKeyboardButton(text="✏️ Редактировать услугу", callback_data="adminpriceaction:edit")],
             [InlineKeyboardButton(text="🗑 Удалить услугу", callback_data="adminpriceaction:delete")],
-            [InlineKeyboardButton(text="⚙️ Коэффициенты и округление", callback_data="adminpriceaction:coef")],
+            [InlineKeyboardButton(text="⚙️ Как показывать цену", callback_data="adminpriceaction:coef")],
             [InlineKeyboardButton(text="👁 Проверить и применить прайс", callback_data="adminreview:pricing")],
             [InlineKeyboardButton(text="◀️ Назад", callback_data="adminmenu:root")],
         ]
@@ -360,6 +361,7 @@ def yes_no_keyboard(prefix: str) -> InlineKeyboardMarkup:
 def coefficients_menu_keyboard() -> InlineKeyboardMarkup:
     rows = [[InlineKeyboardButton(text=label, callback_data=f"admineditcoef:{key}")] for key, label in COEFFICIENT_LABELS.items()]
     rows += [[InlineKeyboardButton(text=label, callback_data=f"admineditround:{key}")] for key, label in ROUNDING_LABELS.items()]
+    rows.append([InlineKeyboardButton(text="Простой расчёт: база + опции", callback_data="adminpricesimple")])
     rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data="adminmenu:pricing")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
