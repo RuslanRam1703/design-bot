@@ -24,7 +24,7 @@ function setup({swipes = true, supported = true} = {}) {
   const dialogs = [], calls = {disable: 0, enable: 0, closed: 0, scroll: [], listeners: new Set()};
   const document = {body, activeElement: origin, createElement() {
     const el = new Element();
-    const parts = Object.fromEntries(['[data-close]', '[data-zoom]', '.case-viewer-scroll', 'img', '[role=status]'].map(k => [k, new Element()]));
+    const parts = Object.fromEntries(['[data-close]', '[data-zoom]', '.case-viewer-scroll', 'img', '[role=status]', '[data-prev]', '[data-next]', '[data-count]', '.case-viewer-nav'].map(k => [k, new Element()]));
     el.querySelector = key => parts[key];
     if (supported) el.showModal = () => { el.open = true; };
     el.close = () => { el.open = false; };
@@ -40,7 +40,7 @@ function setup({swipes = true, supported = true} = {}) {
   };
   vm.runInNewContext(source, {window, document});
   return {viewer: window.CaseViewer, body, origin, dialogs, calls,
-    open: () => window.CaseViewer.open('https://example.invalid/photo.jpg', 'Test', () => calls.closed++)};
+    open: (sources = 'https://example.invalid/photo.jpg', index = 0) => window.CaseViewer.open(sources, 'Test', () => calls.closed++, index)};
 }
 
 test('close restores body style, document scroll, focus and Telegram gestures', () => {
@@ -79,8 +79,8 @@ test('unsupported dialog API leaves the page untouched', () => {
   assert.equal(s.body.child, undefined); assert.equal(s.calls.disable, 0);
 });
 
-function gestures() {
-  const s = setup(); s.open(); const dialog = s.dialogs[0];
+function gestures(sources) {
+  const s = setup(); s.open(sources); const dialog = s.dialogs[0];
   const area = dialog.querySelector('.case-viewer-scroll'), img = dialog.querySelector('img');
   img.fire('load');
   const send = (type, id, x, y, time = 100) => area.fire(type, {pointerId: id, pointerType: 'touch', clientX: x, clientY: y, timeStamp: time});
@@ -128,4 +128,53 @@ test('synthetic mouse double-click after touch does not undo touch zoom', () => 
   assert.equal(s.img.style.width, '732px');
   s.area.fire('dblclick', {pointerType: 'mouse', clientX: 100, clientY: 200, timeStamp: 1000});
   assert.equal(s.img.style.width, '366px');
+});
+
+test('landscape photo is vertically centered and tall photo fits both axes', () => {
+  const s = gestures();
+  s.img.naturalWidth = 1200; s.img.naturalHeight = 700; s.img.fire('load');
+  const [top, left] = s.img.style.margin.split(' ').map(parseFloat);
+  assert.equal(left, 12);
+  assert.ok(Math.abs(top - (600 - 366 * 700 / 1200) / 2) < .01);
+  s.img.naturalWidth = 900; s.img.naturalHeight = 3000; s.img.fire('load');
+  const [tallTop, tallLeft] = s.img.style.margin.split(' ').map(parseFloat);
+  assert.equal(tallTop, 12); assert.ok(tallLeft > 100);
+  assert.ok(parseFloat(s.img.style.width) * 3000 / 900 <= 576.01);
+});
+test('horizontal swipe selects next/previous, stops at boundaries and resets zoom', () => {
+  const s = gestures(['one.jpg','two.jpg','three.jpg']);
+  const count = s.dialogs[0].querySelector('[data-count]');
+  const swipe = (x1, x2) => {
+    s.send('pointerdown', 1, x1, 200, 1000); s.send('pointermove', 1, x2, 205, 1050);
+    s.send('pointerup', 1, x2, 205, 1100);
+  };
+  swipe(300,100); assert.equal(s.img.src, 'two.jpg'); assert.equal(count.textContent, '2 / 3');
+  s.img.fire('load'); swipe(100,300); assert.equal(s.img.src,'one.jpg');
+  s.img.fire('load'); swipe(100,300); assert.equal(s.img.src,'one.jpg');
+  s.dialogs[0].querySelector('[data-next]').fire('click'); s.img.fire('load');
+  s.dialogs[0].querySelector('[data-zoom]').fire('click');
+  s.dialogs[0].querySelector('[data-next]').fire('click'); s.img.fire('load');
+  assert.equal(s.img.style.width, '366px'); assert.equal(count.textContent,'3 / 3');
+  assert.equal(s.dialogs[0].querySelector('[data-next]').disabled,true);
+});
+test('zoomed drag and vertical swipe never switch photos', () => {
+  const s = gestures(['one.jpg','two.jpg']);
+  s.send('pointerdown',1,200,300); s.send('pointermove',1,180,100); s.send('pointerup',1,180,100,200);
+  assert.equal(s.img.src,'one.jpg');
+  s.dialogs[0].querySelector('[data-zoom]').fire('click');
+  s.send('pointerdown',1,300,200,1000); s.send('pointermove',1,100,200,1050); s.send('pointerup',1,100,200,1100);
+  assert.equal(s.img.src,'one.jpg'); assert.equal(s.img.style.width,'732px');
+});
+test('error on one image does not block navigation to another', () => {
+  const s = gestures(['broken.jpg','good.jpg']); s.img.fire('error');
+  s.dialogs[0].querySelector('[data-next]').fire('click'); s.img.fire('load');
+  assert.equal(s.img.src,'good.jpg'); assert.equal(s.img.hidden,false);
+  assert.equal(s.dialogs[0].querySelector('[data-zoom]').disabled,false);
+});
+test('selection callback keeps closed gallery aligned with the viewed photo', () => {
+  const s = setup(), selected=[];
+  s.viewer.open(['a.jpg','b.jpg','c.jpg'],'Test',()=>{},1,i=>selected.push(i));
+  assert.equal(s.dialogs[0].querySelector('img').src,'b.jpg');
+  s.dialogs[0].querySelector('[data-next]').fire('click');
+  s.viewer.close(); assert.deepEqual(selected,[1,2]);
 });

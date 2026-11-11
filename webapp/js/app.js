@@ -416,6 +416,11 @@ async function init() {
   const menu = state.uiConfig.menu || {};
   if (menu[state.screen] === false) state.screen = "portfolio";
 
+  if (params.get('gallery_demo') === '1' || realTG?.initDataUnsafe?.start_param === 'gallery_demo') {
+    const demo = state.portfolio.cases.find(c => c.id === 'gallery_demo');
+    if (demo) { state.currentCase = demo; state.history = ['portfolio']; state.screen = 'case'; }
+  }
+
   render();
   window.DesignAssistantBoot?.finish();
 }
@@ -720,8 +725,7 @@ function renderCaseContent(c) {
   if (c.sections && c.sections.length) {
     return c.sections.map((s) => {
       if (s.type === "gallery") {
-        const imgs = (s.images || []).map((src) => `<img src="${escapeHtml(imageSrc(src))}" alt="" loading="lazy" decoding="async" />`).join("");
-        return `<div class="case-block"><div class="label">${escapeHtml(s.title)}</div><div class="case-section-gallery">${imgs || '<p class="hint">Пока нет изображений</p>'}</div></div>`;
+        return `<div class="case-block"><div class="label">${escapeHtml(s.title)}</div><div class="case-section-gallery">${renderCaseGallery(s.images || [], s.title || c.title)}</div></div>`;
       }
       return `<div class="case-block"><div class="label">${escapeHtml(s.title)}</div><p>${escapeHtml(s.content || "")}</p></div>`;
     }).join("");
@@ -739,15 +743,18 @@ function safeLinkUrl(value) {
   return /^(https?:\/\/|mailto:|tel:|tg:\/\/)/i.test(url) ? url : "";
 }
 
+function renderCaseGallery(images, title, eager = false) {
+  if (!images.length) return '<div class="case-images-empty">Пока нет изображений</div>';
+  const thumbs = images.length > 1 ? `<div class="case-gallery-thumbs" aria-label="Изображения проекта">${images.map((src, i) =>
+    `<button type="button" data-gallery-thumb="${i}" aria-label="Изображение ${i + 1}" aria-pressed="${i === 0}"><img src="${escapeHtml(imageSrc(src))}" alt="" loading="lazy" decoding="async" /></button>`).join('')}</div>` : '';
+  return `<div class="case-gallery ${images.length > 1 ? 'case-gallery-multiple' : ''}">
+    <button type="button" class="case-gallery-open" aria-label="Открыть изображение"><img src="${escapeHtml(imageSrc(images[0]))}" alt="${escapeHtml(title)}" loading="${eager ? "eager" : "lazy"}" decoding="async" />
+    <span>Увеличить фото <span data-gallery-count>1 / ${images.length}</span></span></button>${thumbs}</div>`;
+}
+
 function renderCase() {
   const c = state.currentCase;
-  const hasImages = c.images && c.images.length > 0;
-  // Keep gallery order; inspection is a separate layer, without fullscreen.
-  const images = hasImages
-    ? c.images.map((src, i) =>
-        `<img src="${escapeHtml(imageSrc(src))}" alt="${escapeHtml(c.title)} — изображение ${i + 1}" loading="${i === 0 ? "eager" : "lazy"}" decoding="async" />`
-      ).join("")
-    : `<div class="case-images-empty">Пока нет изображений</div>`;
+  const images = renderCaseGallery(c.images || [], c.title, true);
   // external_url — необязательное поле (см. bot/content_store.py -> CASE_FIELD_LABELS);
   // ссылка показывается, только если дизайнер её заполнил для этого конкретного кейса.
   const externalUrl = safeLinkUrl(c.external_url);
@@ -769,23 +776,25 @@ function renderCase() {
 function attachCaseEvents() {
   document.getElementById("back").addEventListener("click", goBack);
   const c = state.currentCase;
-  if (window.CaseViewer && typeof HTMLDialogElement !== "undefined") {
-    document.querySelectorAll('.case-images img, .case-section-gallery img').forEach(img => {
-      const button = document.createElement('button');
-      button.type = 'button';
-      button.className = 'case-image-open';
-      button.setAttribute('aria-label', 'Увеличить фото');
-      img.replaceWith(button);
-      button.append(img);
-      const label = document.createElement('span');
-      label.textContent = 'Увеличить фото';
-      button.append(label);
-      button.addEventListener('click', () => {
-        const opened = window.CaseViewer.open(img.currentSrc || img.src, c.title, () => TG.backButton.show(goBack));
-        if (opened) TG.backButton.show(() => window.CaseViewer.close());
-      });
+  document.querySelectorAll('.case-gallery').forEach(gallery => {
+    const opener = gallery.querySelector('.case-gallery-open');
+    const mainImage = opener.querySelector('img');
+    const thumbs = [...gallery.querySelectorAll('[data-gallery-thumb]')];
+    const urls = thumbs.length ? thumbs.map(button => button.querySelector('img').src) : [mainImage.src];
+    let selected = 0;
+    function select(index) {
+      selected = index;
+      mainImage.src = urls[index];
+      gallery.querySelector('[data-gallery-count]').textContent = `${index + 1} / ${urls.length}`;
+      thumbs.forEach((button, i) => button.setAttribute('aria-pressed', String(i === index)));
+    }
+    thumbs.forEach((button, index) => button.addEventListener('click', () => select(index)));
+    opener.addEventListener('click', () => {
+      if (!window.CaseViewer) return;
+      const opened = window.CaseViewer.open(urls, c.title, () => TG.backButton.show(goBack), selected, select);
+      if (opened) TG.backButton.show(() => window.CaseViewer.close());
     });
-  }
+  });
   document.getElementById("want-similar").addEventListener("click", () => {
     // order_template.service_id (см. data/portfolio.json) — переносим ТОЛЬКО
     // услугу, не опции. order_template.options — статические demo-данные:

@@ -56,3 +56,24 @@ class CaseIdentityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(new['external_url'], 'https://example.invalid/project')
         callbacks = [b.callback_data for row in step.call_args.args[3].inline_keyboard for b in row]
         self.assertIn(f"adminsetcasestatus:published:{new['id']}", callbacks)
+
+    async def test_demo_seed_is_idempotent_and_preserves_existing_cases(self):
+        existing = await self.add('Existing')
+        await asyncio.gather(content_store.ensure_gallery_demo_case(), content_store.ensure_gallery_demo_case())
+        cases = await content_store.list_cases()
+        self.assertEqual(len(cases), 2)
+        self.assertEqual(next(c for c in cases if c['id'] == existing['id']), existing)
+        demo = next(c for c in cases if c['id'] == 'gallery_demo')
+        self.assertEqual(len(demo['images']), 3)
+        self.assertEqual(demo['status'], 'published')
+
+    async def test_demo_seed_does_not_overwrite_edits_or_resurrect_deleted_case(self):
+        await content_store.ensure_gallery_demo_case()
+        await content_store.update_case(777, 'gallery_demo', title='Edited')
+        await content_store.ensure_gallery_demo_case()
+        self.assertEqual((await content_store.list_cases())[0]['title'], 'Edited')
+        document = await content_store._read('portfolio.json')
+        document['cases'] = []
+        await content_store._write('portfolio.json', document)
+        await content_store.ensure_gallery_demo_case()
+        self.assertEqual(await content_store.list_cases(), [])
