@@ -70,9 +70,11 @@ a { color:var(--link); text-decoration:none; } a:hover { text-decoration:underli
 .chip.active { background:var(--soft); color:var(--text); border-color:var(--accent); }
 .grid, .mini-case-grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:var(--gap); }
 .card, .mini-case { min-width:0; background:var(--bg-secondary); border:1px solid var(--border); color:var(--text); border-radius:var(--radius); padding:0; overflow:hidden; text-align:left; box-shadow:var(--shadow); }
+.card { display:flex; flex-direction:column; align-items:stretch; }
 .card-media { position:relative; overflow:hidden; }
 .card img, .mini-case img { width:100%; display:block; aspect-ratio:4/3; object-fit:cover; }
 .card .card-title { display:flex; align-items:flex-start; justify-content:space-between; gap:8px; min-height:64px; padding:13px 12px; font-size:13px; font-weight:600; line-height:1.45; overflow-wrap:anywhere; }
+.action-arrow { width:16px; height:16px; flex:none; }
 .card-arrow { color:var(--accent); flex:none; font-size:17px; line-height:1; }
 .card-type { position:absolute; bottom:9px; left:9px; max-width:calc(100% - 18px); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; padding:3px 8px; border-radius:7px; background:#111a2b; color:#eef2ff; font-size:10px; border:1px solid #3b4c70; }
 .card-featured { grid-column:1/-1; }
