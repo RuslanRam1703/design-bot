@@ -714,9 +714,11 @@ async def cases_add_description(message: Message, state: FSMContext) -> None:
     # не трогая data, поэтому anchor переживает этот шаг.
     await flow.step_from_text(
         message, state,
-        f"Кейс «{escape(case['title'])}» добавлен и уже виден в Mini App ✅\n\n"
-        "Поля «Решение» и «Результат» пока пустые — заполнить можно через «✏️ Редактировать».",
-        kb.admin_cases_menu_keyboard(),
+        f"Кейс «{escape(case['title'])}» сохранён в черновиках ✅\n\n"
+        "Добавьте изображения и описание через «Редактировать». "
+        "Когда кейс будет готов, нажмите «Опубликовать» — он появится в Mini App. "
+        "Позже публикацией можно управлять через «Статусы и публикация».",
+        kb.case_saved_draft_keyboard(case["id"]),
     )
     await flow.finish_flow(state)
 

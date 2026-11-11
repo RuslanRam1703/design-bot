@@ -7,6 +7,28 @@ from bot import content_store
 
 
 class PortfolioModerationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_manual_case_stays_draft_until_explicit_publication(self):
+        data = {"cases": [{"id": "legacy", "title": "Existing"}], "types": []}
+        async def read(_):
+            return copy.deepcopy(data)
+        async def write(_, updated):
+            data.clear()
+            data.update(copy.deepcopy(updated))
+        with patch.object(content_store, "_upstash_enabled", return_value=False), \
+             patch.object(content_store, "_require_designer"), \
+             patch.object(content_store, "_read", side_effect=read), \
+             patch.object(content_store, "_write", side_effect=write):
+            case = await content_store.add_case(
+                1, case_id="new", title="New", type_id="web",
+                cover="image.jpg", task="Task", related_service=None,
+            )
+            self.assertEqual(case["status"], "draft")
+            self.assertEqual(data["cases"][1]["status"], "draft")
+            self.assertNotIn("status", data["cases"][0])
+            self.assertTrue(await content_store.set_case_status(1, "new", "published"))
+            self.assertEqual(data["cases"][1]["status"], "published")
+            self.assertEqual(data["cases"][1]["images"], ["image.jpg"])
+
     async def test_import_starts_as_draft_and_repeated_edit_preserves_curated_content(self):
         data = {"cases": [], "types": [{"id": "graphics", "label": "Графика"}]}
         async def read(_):
