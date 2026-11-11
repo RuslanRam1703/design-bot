@@ -19,7 +19,7 @@ function appWithDraft(saved = null) {
   vm.createContext(sandbox);
   const stripped = source.replace(/\ninit\(\);\s*$/, '\n');
   assert.notEqual(stripped, source, 'must skip only the final Mini App bootstrap');
-  vm.runInContext(stripped + '\nglobalThis.__ui = { state, restoreBriefDraft, renderBrief, renderMyLeadDetail, renderMyLeads };', sandbox);
+  vm.runInContext(stripped + '\nglobalThis.__ui = { state, restoreBriefDraft, renderBrief, renderMyLeadDetail, renderMyLeads, renderPortfolio, renderTabBar };', sandbox);
   return sandbox.__ui;
 }
 
@@ -112,4 +112,33 @@ test('my leads loading failures have a direct retry action', () => {
   const { state, renderMyLeads } = appWithDraft();
   state.myLeads.status = 'error';
   assert.match(renderMyLeads(), /id="my-leads-retry"/);
+});
+
+
+test('portfolio presentation preserves filtering and escapes project labels', () => {
+  const { state, renderPortfolio } = appWithDraft();
+  state.portfolio = {types: [{id: 'web', label: '<b>Web'}], cases: [
+    {id: 'one', type: 'web', title: '<script>One', featured: true},
+    {id: 'two', type: 'brand', title: 'Two'},
+  ]};
+  state.uiConfig = {menu: {brief: false}};
+  state.filter = 'web';
+  const html = renderPortfolio();
+  assert.match(html, /1 проект/);
+  assert.match(html, /data-case="one"/);
+  assert.doesNotMatch(html, /data-case="two"/);
+  assert.doesNotMatch(html, /id="portfolio-order"/);
+  assert.ok(html.includes('&lt;script&gt;One'));
+  assert.ok(html.includes('&lt;b&gt;Web'));
+});
+
+test('brand navigation retains settings and exposes the current page accessibly', () => {
+  const { state, renderTabBar } = appWithDraft();
+  state.uiConfig = {menu: {about: false}};
+  state.screen = 'brief';
+  const html = renderTabBar();
+  assert.doesNotMatch(html, /data-tab="about"/);
+  assert.match(html, /data-tab="brief" aria-current="page"/);
+  assert.match(html, /aria-label="Разделы приложения"/);
+  assert.match(html, /<svg/);
 });
