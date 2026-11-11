@@ -19,7 +19,7 @@ function appWithDraft(saved = null, document = { addEventListener() {} }) {
   vm.createContext(sandbox);
   const stripped = source.replace(/\ninit\(\);\s*$/, '\n');
   assert.notEqual(stripped, source, 'must skip only the final Mini App bootstrap');
-  vm.runInContext(stripped + '\nglobalThis.__ui = { state, restoreBriefDraft, renderBrief, renderMyLeadDetail, renderMyLeads, renderPortfolio, attachPortfolioEvents, renderTabBar };', sandbox);
+  vm.runInContext(stripped + '\nglobalThis.__ui = { state, restoreBriefDraft, renderBrief, renderMyLeadDetail, renderMyLeads, renderPortfolio, attachPortfolioEvents, renderTabBar, renderCase, renderCaseContent, renderAbout, imageSrc, safeLinkUrl };', sandbox);
   return sandbox.__ui;
 }
 
@@ -176,4 +176,38 @@ test('brand navigation retains settings and exposes the current page accessibly'
   assert.match(html, /data-tab="brief" aria-current="page"/);
   assert.match(html, /aria-label="Разделы приложения"/);
   assert.match(html, /<svg/);
+});
+
+
+test('case galleries escape image attributes and defer section images', () => {
+  const ui = appWithDraft();
+  const injected = 'https://example.invalid/a.jpg" onerror="alert(1)';
+  ui.state.currentCase = {title: 'Case', images: [injected], sections: [
+    {type: 'gallery', title: 'Gallery', images: [injected]},
+  ]};
+  const html = ui.renderCase();
+  assert.doesNotMatch(html, /src="[^"\n]*" onerror=/);
+  assert.match(html, /&quot; onerror=&quot;/);
+  assert.match(ui.renderCaseContent(ui.state.currentCase), /loading="lazy" decoding="async"/);
+});
+
+test('profile image escapes attributes and missing avatar has a fallback', () => {
+  const ui = appWithDraft();
+  ui.state.about = {name: 'Designer', specialization: [], tools: [],
+    avatar: 'https://example.invalid/a.jpg" onerror="alert(1)'};
+  assert.doesNotMatch(ui.renderAbout(), /src="[^"\n]*" onerror=/);
+  ui.state.about.avatar = null;
+  assert.match(ui.renderAbout(), /avatar_placeholder.svg/);
+});
+
+test('content links permit contact URLs but cannot execute scripts', () => {
+  const ui = appWithDraft();
+  for (const value of ['javascript:alert(1)', ' JAVASCRIPT:alert(1)', 'data:text/html,test', null]) {
+    assert.equal(ui.safeLinkUrl(value), '');
+  }
+  for (const value of ['https://example.invalid', 'mailto:test@example.invalid', 'tg://resolve?domain=test', 'tel:+123']) {
+    assert.equal(ui.safeLinkUrl(value), value);
+  }
+  ui.state.currentCase = {title: 'Case', external_url: 'javascript:alert(1)'};
+  assert.doesNotMatch(ui.renderCase(), /external-case-link/);
 });
