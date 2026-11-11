@@ -22,4 +22,5 @@ jobs:
           node-version: "22"
       - run: node --check webapp/js/app.js
       - run: node --check webapp/js/boot.js
-      - run: node --test tests/test_webapp_ux.cjs tests/test_webapp_boot.cjs
+      - run: node --check webapp/js/case-viewer.js
+      - run: node --test tests/test_webapp_ux.cjs tests/test_webapp_boot.cjs tests/test_case_viewer.cjs
