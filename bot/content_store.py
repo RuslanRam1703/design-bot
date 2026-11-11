@@ -1545,6 +1545,7 @@ async def _write_leads(leads: list[dict]) -> None:
         document = await _read("leads.json")
     except FileNotFoundError:
         document = {}
+    document["lead_id_highwater"] = max([document.get("lead_id_highwater", 0)] + [l["id"] for l in document.get("leads", [])] + [l["id"] for l in leads])
     document["leads"] = leads
     await _write("leads.json", document)
 
@@ -1647,7 +1648,11 @@ async def add_lead(payload: dict, telegram: dict, calc_summary: dict | None = No
                 await _write_leads(leads)
                 return {**existing, "created": False, "changed": changed}
 
-        next_id = max((l["id"] for l in leads), default=0) + 1
+        try:
+            document = await _read("leads.json")
+        except FileNotFoundError:
+            document = {}
+        next_id = max([document.get("lead_id_highwater", 0)] + [l["id"] for l in leads]) + 1
         lead = {
             "id": next_id,
             "draft_id": draft_id,
@@ -2439,6 +2444,13 @@ async def import_backup_bytes(actor_chat_id: int | str, zip_bytes: bytes) -> Bac
                 "старый бэкап не содержит список заблокированных пользователей",
                 found_json_filenames,
             )
+
+        # Restoring an older backup must not recycle IDs still present in Telegram topics.
+        if isinstance(previous_leads, dict) and isinstance(incoming_leads, dict):
+            previous_max = max([previous_leads.get("lead_id_highwater", 0)] + [l["id"] for l in previous_leads.get("leads", [])])
+            incoming_max = max([incoming_leads.get("lead_id_highwater", 0)] + [l["id"] for l in incoming_leads.get("leads", [])])
+            if previous_max > incoming_max:
+                incoming_leads["lead_id_highwater"] = previous_max
 
         # ---- Phase 2: запись JSON. Ошибка -> откат уже записанных к снапшоту.
         written: list[str] = []

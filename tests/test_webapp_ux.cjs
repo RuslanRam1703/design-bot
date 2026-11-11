@@ -236,3 +236,12 @@ test('owner case preview is visibly marked and cannot start an order from the ca
   ui.state.portfolio.owner_preview=false;
   assert.match(ui.renderCase(),/id="want-similar"/);
 });
+
+
+test('empty price list explains why ordering is unavailable', () => {
+  const ui = appWithDraft();
+  ui.state.pricing = {services:[],options:[]};
+  const html = ui.renderBrief();
+  assert.match(html,/Услуги пока не опубликованы/);
+  assert.doesNotMatch(html,/Отправить заявку/);
+});

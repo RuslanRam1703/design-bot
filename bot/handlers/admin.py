@@ -28,7 +28,7 @@ from aiogram.types import InlineKeyboardButton, WebAppInfo, BufferedInputFile, C
 
 from bot import admin_keyboards as kb
 from bot import access_control, behance, config, content_store, flow, media_archive, telegram_media, texts
-from bot import pricing_guidance
+from bot import pricing_guidance, owner_maintenance
 from bot import lead as lead_format
 from bot.handlers.start import main_menu_or_confirm
 from bot.states import AdminStates
@@ -494,6 +494,16 @@ async def menu_about(callback: CallbackQuery, state: FSMContext) -> None:
 @router.callback_query(F.data == "admincasesaction:add")
 async def cases_add_start(callback: CallbackQuery, state: FSMContext) -> None:
     types = await content_store.list_portfolio_types()
+    if not types:
+        await callback.message.edit_text(
+            "Сначала создайте категорию портфолио — например, «Сайты» или «Брендинг». Затем добавьте в неё кейс.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="Создать категорию", callback_data="admincataction:add")],
+                [InlineKeyboardButton(text="Назад", callback_data="adminmenu:cases")],
+            ]),
+        )
+        await callback.answer()
+        return
     await callback.message.edit_text("Категория нового кейса:", reply_markup=kb.category_pick_keyboard(types))
     await state.update_data(cancel_to="cases")
     await state.set_state(AdminStates.add_case_category)
@@ -2780,7 +2790,12 @@ async def lead_materials_back(callback: CallbackQuery, state: FSMContext) -> Non
 async def lead_delete_start(callback: CallbackQuery, state: FSMContext) -> None:
     data = await state.get_data()
     await callback.message.edit_text(
-        f"Удалить заявку #{data['lead_id']}? Это необратимо.", reply_markup=kb.confirm_keyboard("admindelleadconfirm")
+        "Удаление заявки\n\n«Только запись» удалит заявку, историю и ссылки на материалы из приложения. Тема и сообщения Telegram останутся.\n\n«Запись и тему» дополнительно удалит связанную тему текущей архивной группы со всеми её сообщениями. Копии в личном чате клиента и медиаархив портфолио не удаляются. Это необратимо.\n\nЗаявка со связанным проектом защищена от удаления.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="Удалить только запись", callback_data="admindelleadconfirm:yes")],
+            [InlineKeyboardButton(text="Удалить запись и тему", callback_data="admindelleadconfirm:with_topic")],
+            [InlineKeyboardButton(text="Отмена", callback_data="admindelleadconfirm:no")],
+        ])
     )
     await state.set_state(AdminStates.lead_delete_confirm)
     await callback.answer()
@@ -2792,13 +2807,21 @@ async def lead_delete_do(callback: CallbackQuery, state: FSMContext) -> None:
     data = await state.get_data()
     status = data.get("lead_filter", "ALL")
     deleted = False
-    if answer == "yes":
+    if answer == "with_topic":
+        try:
+            deleted = await owner_maintenance.delete_lead_with_topic(callback.message.chat.id, data["lead_id"], callback.bot)
+        except Exception:
+            logger.exception("Lead/topic deletion incomplete")
+            await callback.message.edit_text("Удаление не завершено. Заявка сохранена либо операция требует проверки. Проверьте права бота и доступность темы; при сетевом сбое тема могла уже удалиться. Можно повторить действие из карточки заявки.", reply_markup=kb.admin_root_keyboard())
+            await callback.answer()
+            return
+    elif answer == "yes":
         deleted = await content_store.delete_lead(callback.message.chat.id, data["lead_id"])
     leads = await content_store.list_leads(status)
-    if answer == "yes" and not deleted:
-        text = f"Заявка привязана к проекту либо уже удалена. Финансовая история сохранена.\\n\\nЗаявки ({len(leads)}):"
+    if answer in {"yes", "with_topic"} and not deleted:
+        text = f"Заявка привязана к проекту либо уже удалена. Финансовая история сохранена.\n\nЗаявки ({len(leads)}):"
     else:
-        text = f"Заявка удалена ✅\\n\\nЗаявки ({len(leads)}):" if deleted else f"Отменено.\\n\\nЗаявки ({len(leads)}):"
+        text = f"Заявка удалена. {'Связанная тема удалена или уже отсутствует.' if answer == 'with_topic' else 'Тема Telegram сохранена.'}\n\nЗаявки ({len(leads)}):" if deleted else f"Отменено.\n\nЗаявки ({len(leads)}):"
     await callback.message.edit_text(text, reply_markup=kb.leads_list_keyboard(leads, status))
     await state.set_state(AdminStates.leads_list)
     await callback.answer()
@@ -3100,6 +3123,51 @@ async def review_finish(callback: CallbackQuery, state: FSMContext) -> None:
     await flow.reset_state_keep_nav(state)
     await flow.step_from_callback(callback, state, "Изменения опубликованы ✅" if publish else "Черновые правки отменены. Действующая версия сохранена.", keyboard)
     await callback.answer()
+
+
+@router.callback_query(F.data == "adminclean:prepare")
+async def clean_start_prepare(callback: CallbackQuery, state: FSMContext) -> None:
+    await callback.answer("Готовлю резервную копию…")
+    backup, digest, counts = await owner_maintenance.prepare_clean_start(callback.message.chat.id)
+    await callback.message.answer_document(
+        BufferedInputFile(backup, filename="design-assistant-before-clean-start.zip"),
+        caption="Резервная копия перед очисткой. Содержит данные и ссылки на Telegram-материалы, но не полную выгрузку сообщений и файлов из Telegram. Сохраните этот архив.",
+    )
+    await state.update_data(clean_start_digest=digest)
+    summary = "\n".join(f"{name}: {count}" for name, count in counts.items())
+    await callback.message.edit_text(
+        "Подготовлена очистка данных приложения\n\n" + summary +
+        "\n\nТакже будут очищены профиль «Обо мне», черновики, история заявок и проектов. "
+        "Калькулятор начнёт с пустого списка услуг и простого расчёта. "
+        "Подключения, доступы и меню сохранятся.\n\n"
+        "Темы, сообщения в Telegram и медиаархив НЕ удаляются. Это отдельное необратимое действие. "
+        "Здесь очищается только приложение; восстановление возможно из выданного файла.\n\n"
+        "Проверьте копию и подтвердите удаление перечисленных данных.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="Очистить данные приложения", callback_data="adminclean:confirm:" + digest[:16])],
+            [InlineKeyboardButton(text="Отмена", callback_data="adminmenu:settings")],
+        ]),
+    )
+
+
+@router.callback_query(F.data.startswith("adminclean:confirm:"))
+async def clean_start_confirm(callback: CallbackQuery, state: FSMContext) -> None:
+    saved = await state.get_data()
+    digest = saved.get("clean_start_digest", "")
+    if not digest or callback.data.rsplit(":", 1)[-1] != digest[:16]:
+        await callback.answer("Подготовьте очистку заново: подтверждение устарело.", show_alert=True)
+        return
+    await callback.answer("Очищаю данные приложения…")
+    try:
+        await owner_maintenance.clean_start(callback.message.chat.id, digest)
+    except (ValueError, owner_maintenance.ResetFailedError) as exc:
+        await callback.message.edit_text(str(exc), reply_markup=kb.admin_settings_keyboard())
+        return
+    await flow.reset_state_keep_nav(state)
+    await flow.step_from_callback(callback, state,
+        "Данные приложения очищены. Подключения и меню сохранены. Темы и файлы Telegram сохранены. "
+        "Начните с «Услуги и цены → Добавить услугу», затем создайте категории и кейсы. Переоткройте Mini App.",
+        kb.admin_root_keyboard())
 
 
 @router.message(StateFilter(AdminStates))

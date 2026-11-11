@@ -7,7 +7,7 @@ import asyncio
 import logging
 from types import SimpleNamespace
 
-from aiogram.exceptions import TelegramAPIError, TelegramNetworkError, TelegramServerError
+from aiogram.exceptions import TelegramBadRequest, TelegramAPIError, TelegramNetworkError, TelegramServerError
 
 from bot import config, content_store
 
@@ -30,6 +30,8 @@ async def archive_lead_material(message, lead_id: int | str, *, retry: bool = Fa
     """
     entry = None
     copy_started = False
+    key = None
+    topic_id = None
     try:
         chat_id = _chat_id()
         if chat_id is None:
@@ -78,6 +80,15 @@ async def archive_lead_material(message, lead_id: int | str, *, retry: bool = Fa
         return True
     except Exception as exc:
         logger.exception("Could not archive material for lead #%s", lead_id)
+        if (key and topic_id is not None and isinstance(exc, TelegramBadRequest)
+                and any(token in str(exc).lower() for token in ('message thread not found', 'topic_id_invalid', 'topic_deleted'))):
+            try:
+                # Only forget this exact vanished topic, never a concurrently replaced mapping.
+                await asyncio.to_thread(content_store._upstash_command, 'EVAL',
+                    "if redis.call('GET', KEYS[1]) == ARGV[1] then return redis.call('DEL', KEYS[1]) else return 0 end",
+                    1, key, str(topic_id))
+            except Exception:
+                logger.exception("Could not detach missing archive topic")
         if entry and entry.get("claimed"):
             # Before copy_message, no material can have been copied. Once it
             # started, only an explicit Bot API rejection is safe to retry.

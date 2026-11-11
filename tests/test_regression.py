@@ -3807,9 +3807,13 @@ class AdminLeadWorkflowTests(unittest.IsolatedAsyncioTestCase):
         cb = make_callback("adminleadaction:delete", chat_id=self.actor, message_id=670)
         await admin.lead_delete_start(cb, state)
 
-        cb.message.edit_text.assert_awaited_once_with(
-            f"Удалить заявку #{self.lead['id']}? Это необратимо.", reply_markup=kb.confirm_keyboard("admindelleadconfirm")
-        )
+        cb.message.edit_text.assert_awaited_once()
+        text = cb.message.edit_text.call_args.args[0]
+        self.assertIn("Тема и сообщения Telegram останутся", text)
+        self.assertIn("Это необратимо", text)
+        buttons = cb.message.edit_text.call_args.kwargs["reply_markup"].inline_keyboard
+        self.assertEqual({b.callback_data for row in buttons for b in row},
+                         {"admindelleadconfirm:yes", "admindelleadconfirm:with_topic", "admindelleadconfirm:no"})
         self.assertEqual(await state.get_state(), AdminStates.lead_delete_confirm.state)
         self.assertIsNotNone(await content_store.get_lead(self.lead["id"]))  # ещё не удалена
 

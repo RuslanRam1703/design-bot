@@ -122,3 +122,12 @@ class ArchiveOutboxTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(content_store.StorageLeaseLostError):
             await content_store.finish_archive_copy(self.lead['id'], claim['key'], 'wrong', 'sent')
         self.assertEqual((await self.records())[0]['state'], 'sending')
+
+    async def test_missing_topic_detaches_only_exact_mapping_and_preserves_lead(self):
+        self.bot.copy_message.side_effect = TelegramBadRequest(method=None, message='message thread not found')
+        self.assertFalse(await archive.archive_lead_material(self.msg, self.lead['id']))
+        self.assertIsNotNone(await content_store.get_lead(self.lead['id']))
+        self.assertEqual((await self.records())[0]['state'], 'failed')
+        # Only this exact stale mapping is invalidated, never all Redis keys.
+        commands = content_store._upstash_command.call_args_list
+        self.assertTrue(any(c.args[0] == 'EVAL' and c.args[-1] == '77' for c in commands))
