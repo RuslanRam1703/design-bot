@@ -38,6 +38,8 @@ def _parse_and_split(init_data: str) -> tuple[dict[str, str], str | None, int] |
         return None
     total_field_count = len(pairs)
     data = dict(pairs)
+    if len(data) != total_field_count:
+        return None
     received_hash = data.pop("hash", None)
     return data, received_hash, total_field_count
 
@@ -52,14 +54,32 @@ def _compute_hash(data: dict[str, str], bot_token: str) -> str:
     return hmac.new(secret_key, data_check_string.encode("utf-8"), hashlib.sha256).hexdigest()
 
 
+def _hash_matches(computed: str, received: str) -> bool:
+    # compare_digest(str, str) raises TypeError for non-ASCII input.
+    return (len(received) == 64 and all(c in "0123456789abcdef" for c in received)
+            and hmac.compare_digest(computed, received))
+
+
+def _date_valid(value: str | None, max_age_seconds: int) -> bool:
+    try:
+        age = time.time() - int(value)
+        return -60 <= age <= max_age_seconds
+    except (TypeError, ValueError):
+        return False
+
+
+def _user_valid(user: Any) -> bool:
+    return (isinstance(user, dict) and type(user.get("id")) is int
+            and user["id"] > 0)
+
+
 def validate_init_data(init_data: str, bot_token: str, *, max_age_seconds: int = 86400) -> dict[str, Any] | None:
     """Возвращает распарсенный dict пользователя ({"id": ..., "username": ...,
     "first_name": ..., "last_name": ...}), если подпись верна и данные не
     протухли, иначе None. max_age_seconds — защита от повторного
     использования старой, ранее перехваченной initData (Telegram сам
-    рекомендует проверять auth_date). Логика 1:1 совпадает с версией до
-    вынесения _parse_and_split/_compute_hash — рефакторинг чисто
-    структурный, см. diagnose_init_data и тесты, подтверждающие это."""
+    рекомендует проверять auth_date). Дата обязательна; допустимое опережение часов — до 60 секунд.
+    Повторяющиеся поля и некорректный идентификатор отклоняются."""
     if not init_data or not bot_token:
         return None
 
@@ -71,16 +91,11 @@ def validate_init_data(init_data: str, bot_token: str, *, max_age_seconds: int =
         return None
 
     computed_hash = _compute_hash(data, bot_token)
-    if not hmac.compare_digest(computed_hash, received_hash):
+    if not _hash_matches(computed_hash, received_hash):
         return None
 
-    auth_date = data.get("auth_date")
-    if auth_date is not None:
-        try:
-            if time.time() - int(auth_date) > max_age_seconds:
-                return None
-        except ValueError:
-            return None
+    if not _date_valid(data.get("auth_date"), max_age_seconds):
+        return None
 
     user_raw = data.get("user")
     if not user_raw:
@@ -89,7 +104,7 @@ def validate_init_data(init_data: str, bot_token: str, *, max_age_seconds: int =
         user = json.loads(user_raw)
     except json.JSONDecodeError:
         return None
-    if not isinstance(user, dict) or "id" not in user:
+    if not _user_valid(user):
         return None
     return user
 
@@ -150,16 +165,13 @@ def diagnose_init_data(init_data: str, bot_token: str, *, max_age_seconds: int =
     if hash_present:
         computed_hash = _compute_hash(data, bot_token)
         calculated_hash_length = len(computed_hash)
-        hmac_valid = hmac.compare_digest(computed_hash, received_hash)
+        hmac_valid = _hash_matches(computed_hash, received_hash)
 
     auth_date = data.get("auth_date")
     auth_date_present = auth_date is not None
     auth_date_valid = None
     if auth_date_present:
-        try:
-            auth_date_valid = (time.time() - int(auth_date)) <= max_age_seconds
-        except ValueError:
-            auth_date_valid = False
+        auth_date_valid = _date_valid(auth_date, max_age_seconds)
 
     user_raw = data.get("user")
     user_present = bool(user_raw)
@@ -167,7 +179,7 @@ def diagnose_init_data(init_data: str, bot_token: str, *, max_age_seconds: int =
     if user_present:
         try:
             parsed_user = json.loads(user_raw)
-            user_json_ok = isinstance(parsed_user, dict) and "id" in parsed_user
+            user_json_ok = _user_valid(parsed_user)
         except json.JSONDecodeError:
             user_json_ok = False
 
