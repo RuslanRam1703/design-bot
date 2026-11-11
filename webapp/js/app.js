@@ -428,11 +428,25 @@ async function init() {
 // /calculator и команда бота остаются рабочими (не удалены), просто не
 // навязываются как равноценная альтернатива заявке в постоянной навигации.
 const TAB_SCREENS = [
-  { id: "portfolio", icon: "📁", label: "Портфолио" },
-  { id: "about", icon: "👤", label: "Обо мне" },
-  { id: "brief", icon: "✍️", label: "Заказать" },
-  { id: "myleads", icon: "📋", label: "Мои заявки" },
+  { id: "portfolio", label: "Портфолио" },
+  { id: "about", label: "Обо мне" },
+  { id: "brief", label: "Заказать" },
+  { id: "myleads", label: "Мои заявки" },
 ];
+
+function renderNavIcon(id) {
+  const paths = {
+    portfolio: '<rect x="3" y="5" width="18" height="15" rx="3"/><path d="m3 10 5-5h5"/>',
+    about: '<circle cx="12" cy="8" r="3.5"/><path d="M5 21v-2a7 7 0 0 1 14 0v2"/>',
+    brief: '<path d="m15 4 5 5M4 20l4-1L20 7a2 2 0 0 0-5-5L3 14l-1 7z"/>',
+    myleads: '<rect x="5" y="4" width="14" height="17" rx="3"/><path d="M9 4V2h6v2M9 10h6M9 15h4"/>',
+  };
+  return `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${paths[id] || ""}</svg>`;
+}
+
+function renderBrandHeader() {
+  return '<div class="brand-header"><span class="brand-symbol" aria-hidden="true"></span><div class="brand-name">Design Assistant<span class="brand-caption">Дизайн · Сайты · Интерфейсы</span></div></div>';
+}
 
 function renderTabBar() {
   const menu = (state.uiConfig && state.uiConfig.menu) || {};
@@ -440,12 +454,12 @@ function renderTabBar() {
   const active = state.screen === "case" ? "portfolio" : state.screen;
   const items = visibleTabs.map(
     (t) => `
-      <button class="tab-item ${t.id === active ? "active" : ""}" data-tab="${t.id}">
-        <span class="tab-icon">${t.icon}</span>
+      <button class="tab-item ${t.id === active ? "active" : ""}" data-tab="${t.id}" ${t.id === active ? 'aria-current="page"' : ""}>
+        <span class="tab-icon">${renderNavIcon(t.id)}</span>
         <span class="tab-label">${t.label}</span>
       </button>`
   ).join("");
-  return `<nav class="tab-bar">${items}</nav>`;
+  return `<nav class="tab-bar" aria-label="Разделы приложения">${items}</nav>`;
 }
 
 function attachTabBarEvents() {
@@ -558,7 +572,7 @@ function render() {
       showTabBar = false;
   }
 
-  app.innerHTML = content + (showTabBar ? renderTabBar() : "");
+  app.innerHTML = renderBrandHeader() + content + (showTabBar ? renderTabBar() : "");
 
   switch (state.screen) {
     case "portfolio": attachPortfolioEvents(); break;
@@ -607,24 +621,37 @@ function renderPortfolio() {
     )
     .join("");
 
+  const typeLabels = Object.fromEntries(types.map(type => [type.id, type.label]));
+  const count = filtered.length;
+  const projectWord = count % 100 >= 11 && count % 100 <= 14 ? "проектов"
+    : count % 10 === 1 ? "проект" : count % 10 >= 2 && count % 10 <= 4 ? "проекта" : "проектов";
   const cards = filtered
     .map(
-      (c) => `
-      <button class="card" data-case="${c.id}">
-        ${c.cover ? `<img src="${imageSrc(c.cover)}" alt="" loading="lazy" />` : '<div class="card-cover-empty"></div>'}
-        <div class="card-title">${escapeHtml(c.title)}</div>
+      (c, index) => `
+      <button class="card ${index === 0 && c.featured ? "card-featured" : ""}" data-case="${c.id}">
+        <div class="card-media">
+          ${c.cover ? `<img src="${imageSrc(c.cover)}" alt="" loading="lazy" decoding="async" />` : '<div class="card-cover-empty"></div>'}
+          ${typeLabels[c.type] ? `<span class="card-type">${escapeHtml(typeLabels[c.type])}</span>` : ""}
+        </div>
+        <div class="card-title"><span>${escapeHtml(c.title)}</span><span class="card-arrow" aria-hidden="true">↗</span></div>
       </button>`
     )
     .join("");
 
   return `
-    <div class="topbar"><h1>📁 Портфолио</h1></div>
+    <section class="portfolio-intro">
+      <h1>Дизайн для вашего следующего проекта.</h1>
+      <p>Интерфейсы, сайты и визуальные системы. Посмотрите работы и соберите предварительную оценку.</p>
+      ${state.uiConfig?.menu?.brief !== false ? '<button class="btn btn-primary" id="portfolio-order">Обсудить проект <span aria-hidden="true">↗</span></button>' : ""}
+    </section>
+    <div class="section-heading"><h2>Портфолио</h2><span>${count} ${projectWord}</span></div>
     <div class="chips">${chips}</div>
     <div class="grid">${cards || '<div class="empty-state">Пока нет кейсов в этой категории</div>'}</div>
   `;
 }
 
 function attachPortfolioEvents() {
+  document.getElementById("portfolio-order")?.addEventListener("click", () => navigate("brief"));
   document.querySelectorAll(".chip").forEach((el) =>
     el.addEventListener("click", () => {
       state.filter = el.dataset.filter;
@@ -673,7 +700,7 @@ function renderCase() {
   // значило бы показывать не то, что задал дизайнер.
   const images = hasImages
     ? c.images.map((src, i) =>
-        `<img src="${imageSrc(src)}" alt="${escapeHtml(c.title)} — изображение ${i + 1}" />`
+        `<img src="${imageSrc(src)}" alt="${escapeHtml(c.title)} — изображение ${i + 1}" loading="${i === 0 ? "eager" : "lazy"}" decoding="async" />`
       ).join("")
     : `<div class="case-images-empty">Пока нет изображений</div>`;
   // external_url — необязательное поле (см. bot/content_store.py -> CASE_FIELD_LABELS);
@@ -774,7 +801,7 @@ function renderAbout() {
   return `
     <div class="topbar">
       ${state.history.length > 0 ? '<button class="back-btn" id="back">←</button>' : ""}
-      <h1>👤 Обо мне</h1>
+      <h1>Обо мне</h1>
     </div>
 
     <div class="about-header">
@@ -1452,7 +1479,7 @@ function renderProgress(step) {
 // "Готово", которого к этому моменту уже нет (см. UX-аудит).
 function renderBriefEntryChoice() {
   return `
-    <div class="topbar"><h1>✍️ Заказать</h1></div>
+    <div class="topbar"><h1>Обсудим проект</h1></div>
     <div class="case-block">
       <p>У вас есть незавершённая заявка. Продолжить её или начать новую?</p>
     </div>
@@ -1677,8 +1704,9 @@ function wrapBrief(body, step) {
   return `
     <div class="topbar">
       ${backBtnHTML}
-      <h1>✍️ Заказать</h1>
+      <h1>Обсудим проект</h1>
     </div>
+    <p class="step-caption">Шаг ${step} из ${BRIEF_TOTAL_STEPS}</p>
     ${renderProgress(step)}
     ${serviceChip}
     ${body}
