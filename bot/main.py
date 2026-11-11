@@ -134,7 +134,7 @@ async def main() -> None:
 
     async def telegram_webhook(request: web.Request) -> web.Response:
         supplied = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
-        if not hmac.compare_digest(supplied, webhook_secret):
+        if not supplied.isascii() or not hmac.compare_digest(supplied, webhook_secret):
             return web.Response(status=403)
         try:
             payload = await request.json()
