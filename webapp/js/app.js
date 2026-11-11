@@ -742,12 +742,7 @@ function safeLinkUrl(value) {
 function renderCase() {
   const c = state.currentCase;
   const hasImages = c.images && c.images.length > 0;
-  // Изображения статичны: нажатие по ним ничего не делает. Поэтому ни
-  // tabindex, ни role="button" — картинка не элемент управления и не
-  // должна быть ни в порядке табуляции, ни объявлена кнопкой. Порядок
-  // images[] сохраняется как есть: cover не обязан быть первым (см.
-  // set_case_cover в bot/content_store.py), и переставлять его здесь
-  // значило бы показывать не то, что задал дизайнер.
+  // Keep gallery order; inspection is a separate layer, without fullscreen.
   const images = hasImages
     ? c.images.map((src, i) =>
         `<img src="${escapeHtml(imageSrc(src))}" alt="${escapeHtml(c.title)} — изображение ${i + 1}" loading="${i === 0 ? "eager" : "lazy"}" decoding="async" />`
@@ -774,7 +769,23 @@ function renderCase() {
 function attachCaseEvents() {
   document.getElementById("back").addEventListener("click", goBack);
   const c = state.currentCase;
-  // Изображениям обработчики не вешаются: они статичны (см. renderCase).
+  if (window.CaseViewer && typeof HTMLDialogElement !== "undefined") {
+    document.querySelectorAll('.case-images img, .case-section-gallery img').forEach(img => {
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.className = 'case-image-open';
+      button.setAttribute('aria-label', 'Увеличить фото');
+      img.replaceWith(button);
+      button.append(img);
+      const label = document.createElement('span');
+      label.textContent = 'Увеличить фото';
+      button.append(label);
+      button.addEventListener('click', () => {
+        const opened = window.CaseViewer.open(img.currentSrc || img.src, c.title, () => TG.backButton.show(goBack));
+        if (opened) TG.backButton.show(() => window.CaseViewer.close());
+      });
+    });
+  }
   document.getElementById("want-similar").addEventListener("click", () => {
     // order_template.service_id (см. data/portfolio.json) — переносим ТОЛЬКО
     // услугу, не опции. order_template.options — статические demo-данные:
