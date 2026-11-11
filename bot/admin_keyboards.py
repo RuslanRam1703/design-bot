@@ -100,6 +100,7 @@ def admin_settings_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🧭 Меню Mini App", callback_data="adminmenu:nav")],
         [InlineKeyboardButton(text="💾 Экспорт и восстановление", callback_data="adminmenu:backup")],
+        [InlineKeyboardButton(text="🧹 Подготовить очистку тестовых данных", callback_data="adminclean:prepare")],
         [InlineKeyboardButton(text="◀️ В админ-меню", callback_data="adminmenu:root")],
     ])
 

@@ -364,6 +364,14 @@ async function init() {
       getContent("about.json"), getContent("ui_config.json"),
     ]);
     await draftMigration;
+    if (uiConfig.content_epoch) {
+      try {
+        if (localStorage.getItem('designAssistant.contentEpoch') !== uiConfig.content_epoch) {
+          localStorage.removeItem(BRIEF_DRAFT_STORAGE_KEY);
+          localStorage.setItem('designAssistant.contentEpoch', uiConfig.content_epoch);
+        }
+      } catch (_) { /* Storage restrictions must not block the app. */ }
+    }
     const restored = restoreBriefDraft();
     if (!state.brief.draftId) state.brief.draftId = generateDraftId();
     // См. state.briefEntryPending — восстановленный черновик БЕЗ реального
@@ -975,6 +983,7 @@ function attachAboutEvents() {
 
 // ---- Экран: Калькулятор ----
 function attachCalculatorEvents() {
+  if (state.pricing?.services?.length === 0) return;
   const backBtn = document.getElementById("back");
   if (backBtn) backBtn.addEventListener("click", goBack);
 
@@ -1077,6 +1086,7 @@ function serviceItemHTML(s, label) {
 }
 
 function renderCalculator() {
+  if (state.pricing?.services?.length === 0) return '<div class="empty-state">Услуги пока не опубликованы.</div>';
   const { pricing } = state;
   // Калькулятор достижим только deep-link'ом — history пуст (тот же
   // принцип, что и in-app "←" в renderAbout()). Один общий флаг для всех
@@ -1191,6 +1201,7 @@ function renderCalculator() {
 const BRIEF_TOTAL_STEPS = 7;
 
 function attachBriefEvents() {
+  if (state.pricing?.services?.length === 0) return;
   if (state.briefEntryPending) {
     const continueBtn = document.getElementById("brief-entry-continue");
     if (continueBtn) continueBtn.addEventListener("click", () => {
@@ -1585,6 +1596,7 @@ function renderBriefEntryChoice() {
 }
 
 function renderBrief() {
+  if (state.pricing?.services?.length === 0) return '<div class="empty-state">Услуги пока не опубликованы. Оформление заявки станет доступно после добавления услуг.</div>';
   if (state.briefEntryPending) {
     return renderBriefEntryChoice();
   }
