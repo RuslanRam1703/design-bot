@@ -7,6 +7,13 @@ load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 DESIGNER_CHAT_ID = os.getenv("DESIGNER_CHAT_ID", "")
 WEBAPP_URL = os.getenv("WEBAPP_URL", "").rstrip("/")
+# Optional CDN frontend. WEBAPP_URL remains the bot/webhook backend.
+MINIAPP_URL = os.getenv("MINIAPP_URL", "").rstrip("/")
+
+
+def miniapp_url() -> str:
+    return MINIAPP_URL or WEBAPP_URL
+
 PORT = int(os.getenv("PORT", "8080"))
 
 # True: require signed Telegram Mini App identity to read all /data/*.json.

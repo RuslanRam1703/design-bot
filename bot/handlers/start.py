@@ -24,7 +24,7 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
     await flow.reset_nav_screen(message, state)
     # NAV anchor keeps the persistent reply keyboard; this separate
     # TRANSIENT screen contains the native inline entry points.
-    await flow.open_flow(message, state, texts.CLIENT_HOME, client_home_keyboard(config.WEBAPP_URL))
+    await flow.open_flow(message, state, texts.CLIENT_HOME, client_home_keyboard(config.miniapp_url()))
 
 
 @router.message(Command("id"))
@@ -43,17 +43,17 @@ async def cmd_portfolio(message: Message, state: FSMContext) -> None:
     # NAV anchor (persistent-клавиатура) гарантируется автоматически внутри
     # flow.open_root/open_flow (см. bot/flow.py::ensure_nav_anchor) —
     # отдельно заботиться о ней здесь не нужно.
-    await flow.open_root(message, state, "Открыть портфолио:", webapp_open_keyboard(config.WEBAPP_URL, "portfolio", "📁 Открыть портфолио"))
+    await flow.open_root(message, state, "Открыть портфолио:", webapp_open_keyboard(config.miniapp_url(), "portfolio", "📁 Открыть портфолио"))
 
 
 @router.message(Command("about"))
 async def cmd_about(message: Message, state: FSMContext) -> None:
-    await flow.open_root(message, state, "Открыть «Обо мне»:", webapp_open_keyboard(config.WEBAPP_URL, "about", "👤 Открыть «Обо мне»"))
+    await flow.open_root(message, state, "Открыть «Обо мне»:", webapp_open_keyboard(config.miniapp_url(), "about", "👤 Открыть «Обо мне»"))
 
 
 @router.message(Command("brief"))
 async def cmd_brief(message: Message, state: FSMContext) -> None:
-    await flow.open_root(message, state, "Открыть заявку:", webapp_open_keyboard(config.WEBAPP_URL, "brief", "✍️ Оставить заявку"))
+    await flow.open_root(message, state, "Открыть заявку:", webapp_open_keyboard(config.miniapp_url(), "brief", "✍️ Оставить заявку"))
 
 
 @router.message(Command("cancel"))
@@ -85,7 +85,7 @@ async def open_app_button(message: Message, state: FSMContext) -> None:
     await flow.open_root(
         message, state,
         "Открыть приложение:",
-        webapp_open_keyboard(config.WEBAPP_URL, "portfolio", texts.OPEN_APP_BUTTON),
+        webapp_open_keyboard(config.miniapp_url(), "portfolio", texts.OPEN_APP_BUTTON),
     )
 
 
@@ -107,7 +107,7 @@ async def main_menu_or_confirm(message: Message, state: FSMContext) -> None:
         if config.DESIGNER_CHAT_ID and str(message.chat.id) == str(config.DESIGNER_CHAT_ID):
             await flow.main_menu_cleanup(message, state)
         else:
-            await flow.open_root(message, state, texts.CLIENT_HOME, client_home_keyboard(config.WEBAPP_URL))
+            await flow.open_root(message, state, texts.CLIENT_HOME, client_home_keyboard(config.miniapp_url()))
         return
     await flow.delete_trigger(message)
     # NAV anchor не затронут этим экраном — освежать нечего (см. bot/flow.py).
@@ -126,7 +126,7 @@ async def main_menu_confirm(callback: CallbackQuery, state: FSMContext) -> None:
     # "Главное меню", не /start (см. bot/flow.py::main_menu_cleanup).
     await flow.main_menu_cleanup(callback.message, state)
     if not (config.DESIGNER_CHAT_ID and str(callback.message.chat.id) == str(config.DESIGNER_CHAT_ID)):
-        await flow.open_flow(callback.message, state, texts.CLIENT_HOME, client_home_keyboard(config.WEBAPP_URL))
+        await flow.open_flow(callback.message, state, texts.CLIENT_HOME, client_home_keyboard(config.miniapp_url()))
     await callback.answer()
 
 

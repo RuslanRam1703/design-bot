@@ -78,7 +78,7 @@ async def _setup_menu_button(bot: Bot) -> None:
     # сообщениях и legacy-команды /portfolio, /about, /brief остаются
     # рабочими как fallback/contextual launch (см. bot/handlers/start.py).
     await bot.set_chat_menu_button(
-        menu_button=MenuButtonWebApp(text="Открыть приложение", web_app=WebAppInfo(url=config.WEBAPP_URL))
+        menu_button=MenuButtonWebApp(text="Открыть приложение", web_app=WebAppInfo(url=config.miniapp_url()))
     )
 
 

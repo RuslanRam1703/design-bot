@@ -21,4 +21,5 @@ jobs:
         with:
           node-version: "22"
       - run: node --check webapp/js/app.js
-      - run: node --test tests/test_webapp_ux.cjs
+      - run: node --check webapp/js/boot.js
+      - run: node --test tests/test_webapp_ux.cjs tests/test_webapp_boot.cjs

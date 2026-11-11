@@ -7,6 +7,10 @@
  * "Мои заявки" (TG.initData() пустая вне настоящего Telegram).
  */
 
+function apiUrl(path) {
+  return window.DesignAssistantBoot ? window.DesignAssistantBoot.apiUrl(path) : path;
+}
+
 const HAVE_OPTIONS = [
   { id: "text", label: "Готовый текст" },
   { id: "references", label: "Референсы" },
@@ -323,24 +327,17 @@ function resetBriefState({ hardReset = false } = {}) {
 // ---- Загрузка данных и старт ----
 async function init() {
   const root = document.getElementById("app");
-  if (root) root.innerHTML = '<div class="empty-state" role="status">Загружаем приложение…</div>';
+  if (root && !window.DesignAssistantBoot) root.innerHTML = '<div class="empty-state" role="status">Загружаем приложение…</div>';
   TG.ready();
   TG.expand();
   applyTheme();
   TG.onThemeChanged(applyTheme);
-  const restored = restoreBriefDraft();
-  if (!state.brief.draftId) state.brief.draftId = generateDraftId();
-  // См. state.briefEntryPending — восстановленный черновик БЕЗ реального
-  // прогресса (пустой шаг 1) не требует спрашивать "продолжить или новую":
-  // спрашивать там нечего.
-  state.briefEntryPending = restored && briefDraftHasProgress(state.brief);
-
   // Send signed Telegram identity to every content endpoint so the
   // server can deny blocked accounts. In public preview mode an empty
   // initData is still accepted, but strict mode requires real Telegram.
   const publicHeaders = { "X-Telegram-Init-Data": TG.initData() };
   const getContent = async (name) => {
-    const response = await fetch(`/data/${name}`, { headers: publicHeaders, signal: AbortSignal.timeout(20000) });
+    const response = await fetch(apiUrl(`/data/${name}`), { headers: publicHeaders, signal: AbortSignal.timeout(20000) });
     if (response.status === 403) throw new Error("ACCESS_DENIED");
     if (response.status === 401) throw new Error("TELEGRAM_REQUIRED");
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
@@ -348,10 +345,21 @@ async function init() {
   };
   let pricing, portfolio, about, uiConfig;
   try {
+    if (window.DesignAssistantBoot) await window.DesignAssistantBoot.ready;
+    // Fetch content while the optional one-time origin migration is in flight.
+    const draftMigration = window.DesignAssistantBoot?.migrateDraft() || Promise.resolve();
     [pricing, portfolio, about, uiConfig] = await Promise.all([
       getContent("pricing.json"), getContent("portfolio.json"),
       getContent("about.json"), getContent("ui_config.json"),
     ]);
+    await draftMigration;
+    const restored = restoreBriefDraft();
+    if (!state.brief.draftId) state.brief.draftId = generateDraftId();
+    // См. state.briefEntryPending — восстановленный черновик БЕЗ реального
+    // прогресса (пустой шаг 1) не требует спрашивать "продолжить или новую":
+    // спрашивать там нечего.
+    state.briefEntryPending = restored && briefDraftHasProgress(state.brief);
+
   } catch (err) {
     const element = document.getElementById("app");
     if (element) element.textContent = err.message === "ACCESS_DENIED"
@@ -359,7 +367,11 @@ async function init() {
       : err.message === "TELEGRAM_REQUIRED"
         ? "Откройте приложение из Telegram, чтобы просмотреть портфолио."
         : "Не удалось загрузить данные. Попробуйте позже.";
-    if (element && !["ACCESS_DENIED", "TELEGRAM_REQUIRED"].includes(err.message)) {
+    if (window.DesignAssistantBoot) {
+      window.DesignAssistantBoot.fail(element?.textContent || "Не удалось загрузить приложение.",
+        !["ACCESS_DENIED", "TELEGRAM_REQUIRED"].includes(err.message));
+    }
+    if (!window.DesignAssistantBoot && element && !["ACCESS_DENIED", "TELEGRAM_REQUIRED"].includes(err.message)) {
       const retry = document.createElement("button");
       retry.className = "btn btn-primary";
       retry.textContent = "Повторить загрузку";
@@ -404,6 +416,7 @@ async function init() {
   if (menu[state.screen] === false) state.screen = "portfolio";
 
   render();
+  window.DesignAssistantBoot?.finish();
 }
 
 // ---- Нижнее меню (переключение экранов внутри уже открытого Mini App) ----
@@ -579,7 +592,7 @@ function escapeHtml(str) {
 // начале строки — ничего в JSON-схеме не меняется, миграция не нужна:
 // старые записи как были относительными путями, так и остаются.
 function imageSrc(path) {
-  return path.startsWith("http") ? path : `/${path}`;
+  return path.startsWith("http") ? path : apiUrl(`/${path.replace(/^\/+/, "")}`);
 }
 
 // ---- Экран: Портфолио ----
@@ -1368,7 +1381,7 @@ async function submitBrief() {
   render();
 
   try {
-    const res = await fetch("/api/leads", {
+    const res = await fetch(apiUrl("/api/leads"), {
       method: "POST",
       headers: { "Content-Type": "application/json", "X-Telegram-Init-Data": TG.initData() },
       body: JSON.stringify(payload),
@@ -1732,7 +1745,7 @@ async function fetchMyLeads() {
     // клиента в реальном Telegram (см. диагностику initData). Теперь запрос
     // уходит всегда, с диагностическими заголовками (не влияют на решение
     // сервера пустить/не пустить — только на то, что попадает в лог).
-    const res = await fetch("/api/my-leads", {
+    const res = await fetch(apiUrl("/api/my-leads"), {
       headers: {
         "X-Telegram-Init-Data": initData,
         "X-Debug-Platform": realTG?.platform || "",
@@ -2134,7 +2147,7 @@ async function submitSupplement() {
   };
 
   try {
-    const res = await fetch("/api/leads", {
+    const res = await fetch(apiUrl("/api/leads"), {
       method: "POST",
       headers: { "Content-Type": "application/json", "X-Telegram-Init-Data": TG.initData() },
       body: JSON.stringify({ mode: "supplement", lead_id: s.leadId, fields, wants_file: s.wantsFile }),
