@@ -3,6 +3,7 @@ import json
 import logging
 import os
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from aiogram import Bot
 from aiohttp import web
@@ -439,8 +440,72 @@ async def _no_cache(request: web.Request, response: web.StreamResponse) -> None:
     # заново открытая (не переиспользованная) страница всё равно показывала
     # старый JS. Не трогаем /img/ — картинки кейсов можно кэшировать, старая
     # картинка не ломает функциональность, в отличие от старого app.js.
-    if request.path.startswith(("/js/", "/css/", "/data/")):
+    if request.path.startswith(("/js/", "/css/", "/data/", "/api/")):
         response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
+
+
+def _frontend_origin() -> str | None:
+    if not config.MINIAPP_URL:
+        return None
+    value = urlsplit(config.MINIAPP_URL)
+    if value.scheme not in {"http", "https"} or not value.netloc or value.username or value.password:
+        return None
+    return f"{value.scheme}://{value.netloc}"
+
+
+async def handle_draft_bridge(request: web.Request) -> web.Response:
+    """Browser-only draft handoff to our configured frontend, never to arbitrary origins."""
+    origin = _frontend_origin()
+    if not origin:
+        raise web.HTTPNotFound()
+    allowed = json.dumps(origin).replace("<", "\\u003c")
+    body = """<!doctype html><meta charset="utf-8"><script>
+    const allowed = ALLOWED_ORIGIN;
+    window.addEventListener('message', event => {
+      if (event.source !== parent || event.origin !== allowed || event.data?.type !== 'design-assistant:read-draft') return;
+      let value = null;
+      try { value = localStorage.getItem('designAssistant.briefDraft'); } catch (_) {}
+      parent.postMessage({type:'design-assistant:draft', value}, allowed);
+    });
+    </script>""".replace("ALLOWED_ORIGIN", allowed)
+    return web.Response(text=body, content_type="text/html", headers={
+        "Cache-Control": "no-store", "Referrer-Policy": "no-referrer",
+        "Content-Security-Policy": f"default-src 'none'; script-src 'unsafe-inline'; frame-ancestors {origin}",
+    })
+
+
+@web.middleware
+async def miniapp_cors(request: web.Request, handler):
+    """Allow only the configured frontend; Telegram HMAC/ownership still apply."""
+    origin = request.headers.get("Origin")
+    protected_path = request.path.startswith(("/api/", "/data/")) or request.path == "/health"
+    if not origin or not protected_path:
+        return await handler(request)
+    backend = urlsplit(config.WEBAPP_URL)
+    allowed = {_frontend_origin(), f"{backend.scheme}://{backend.netloc}"}
+    if origin not in allowed:
+        return web.json_response({"error": "origin_denied"}, status=403)
+    allowed_methods = {"GET"}
+    if request.path == "/api/leads":
+        allowed_methods = {"POST"}
+    allowed_headers = {
+        "content-type", "x-telegram-init-data", "x-debug-platform", "x-debug-version",
+        "x-debug-has-hash", "x-debug-hash-has-tgwebappdata", "x-debug-initdata-ascii-only",
+    }
+    if request.method == "OPTIONS":
+        requested = {h.strip().lower() for h in request.headers.get("Access-Control-Request-Headers", "").split(",") if h.strip()}
+        if request.headers.get("Access-Control-Request-Method") not in allowed_methods or not requested <= allowed_headers:
+            return web.json_response({"error": "preflight_denied"}, status=403)
+        response = web.Response(status=204)
+        response.headers["Access-Control-Allow-Methods"] = ", ".join(sorted(allowed_methods))
+        response.headers["Access-Control-Allow-Headers"] = ", ".join(sorted(allowed_headers))
+        response.headers["Access-Control-Max-Age"] = "600"
+    else:
+        response = await handler(request)
+    response.headers["Access-Control-Allow-Origin"] = origin
+    response.headers["Vary"] = "Origin"
+    response.headers["Cache-Control"] = "no-store"
+    return response
 
 
 def create_app(bot: Bot) -> web.Application:
@@ -448,7 +513,7 @@ def create_app(bot: Bot) -> web.Application:
     минимально необходимый способ дать handle_create_lead возможность
     уведомить DESIGNER_CHAT_ID (aiohttp-приложение раньше не имело доступа
     ни к Bot, ни к Dispatcher вообще — см. аудит перед этим изменением)."""
-    app = web.Application(client_max_size=64 * 1024)
+    app = web.Application(client_max_size=64 * 1024, middlewares=[miniapp_cors])
     app["bot"] = bot
     # Per-worker, per-client-IP short-burst limit; no daily lead quota.
     app["lead_burst"] = BurstLimiter(limit=20, window_seconds=10)
@@ -456,6 +521,7 @@ def create_app(bot: Bot) -> web.Application:
     for path in ("/", "/portfolio", "/about", "/calculator", "/brief", "/myleads"):
         app.router.add_get(path, handle_index)
     app.router.add_get("/health", handle_health)
+    app.router.add_get("/draft-bridge", handle_draft_bridge)
     app.router.add_get("/api/my-leads", handle_my_leads)
     app.router.add_post("/api/leads", handle_create_lead)
     app.router.add_static("/css/", WEBAPP_DIR / "css")

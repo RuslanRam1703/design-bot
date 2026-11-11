@@ -1,9 +1,26 @@
 <!doctype html>
-<html lang="ru">
+<html lang="ru" class="booting">
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
 <title>Дизайнер — портфолио и заявки</title>
+<style>
+.booting, .booting body { background:#070910; }
+.booting #app { visibility:hidden; }
+#boot-screen { position:fixed; inset:0; z-index:1000; display:flex; flex-direction:column; align-items:center; justify-content:center; padding:32px 24px; padding-bottom:max(32px,env(safe-area-inset-bottom)); background:#070910; color:#f3f5ff; text-align:center; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; }
+#boot-screen[hidden] { display:none; }
+.boot-emblem { width:144px; height:144px; margin-bottom:30px; flex-shrink:0; }
+.boot-ring { display:block; width:100%; height:100%; animation:boot-orbit 18s linear infinite; }
+.boot-title { margin:0 0 14px; font-size:23px; line-height:1.3; font-weight:600; letter-spacing:-.5px; }
+#boot-status { margin:0; font-size:15px; line-height:1.5; color:#d3d9ed; }
+#boot-detail { min-height:44px; max-width:285px; margin:12px 0 0; font-size:13px; line-height:1.6; color:#8993af; }
+#boot-retry { margin-top:22px; padding:13px 22px; border:1px solid #3d4d96; border-radius:12px; background:#17234c; color:#edf2ff; font:inherit; font-size:14px; cursor:pointer; }
+#boot-retry[hidden] { display:none; }
+#boot-retry:focus-visible { outline:2px solid #9eaaff; outline-offset:4px; }
+.boot-error .boot-ring, .page-hidden .boot-ring { animation-play-state:paused; }
+@keyframes boot-orbit { to { transform:rotate(360deg); } }
+@media (prefers-reduced-motion:reduce) { .boot-ring { animation:none; } }
+</style>
 <link rel="stylesheet" href="/css/style.css" />
 <!-- Официальный SDK Telegram для Mini Apps — обязателен для работы внутри Telegram.
      defer — иначе это блокирующий тег в <head>: пока telegram.org не отдаст
@@ -13,10 +30,22 @@
      defer скрипты выполняются по порядку уже после разбора HTML, не блокируя
      отрисовку — а app.js и так корректно работает, если Telegram.WebApp не
      подгрузился (см. `realTG` в app.js). -->
+<script src="/js/runtime-config.js" defer></script>
+<script src="/js/boot.js" defer></script>
 <script src="https://telegram.org/js/telegram-web-app.js" defer></script>
 </head>
 <body>
-  <div id="app"></div>
+  <div id="boot-screen" role="status" aria-live="polite" aria-atomic="true">
+    <div class="boot-emblem"><svg class="boot-ring" viewBox="0 0 160 160" aria-hidden="true" focusable="false">
+<defs><linearGradient id="boot-light" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#77dbff"/><stop offset=".46" stop-color="#3463ff"/><stop offset="1" stop-color="#bd8cff"/></linearGradient>
+<ellipse id="boot-strand" cx="80" cy="80" rx="61" ry="36" fill="none" stroke="url(#boot-light)" stroke-width="1.15"/></defs>
+<use href="#boot-strand" transform="rotate(0.0 80 80)" opacity="0.55"/><use href="#boot-strand" transform="rotate(11.25 80 80)" opacity="0.67"/><use href="#boot-strand" transform="rotate(22.5 80 80)" opacity="0.79"/><use href="#boot-strand" transform="rotate(33.75 80 80)" opacity="0.91"/><use href="#boot-strand" transform="rotate(45.0 80 80)" opacity="0.55"/><use href="#boot-strand" transform="rotate(56.25 80 80)" opacity="0.67"/><use href="#boot-strand" transform="rotate(67.5 80 80)" opacity="0.79"/><use href="#boot-strand" transform="rotate(78.75 80 80)" opacity="0.91"/><use href="#boot-strand" transform="rotate(90.0 80 80)" opacity="0.55"/><use href="#boot-strand" transform="rotate(101.25 80 80)" opacity="0.67"/><use href="#boot-strand" transform="rotate(112.5 80 80)" opacity="0.79"/><use href="#boot-strand" transform="rotate(123.75 80 80)" opacity="0.91"/><use href="#boot-strand" transform="rotate(135.0 80 80)" opacity="0.55"/><use href="#boot-strand" transform="rotate(146.25 80 80)" opacity="0.67"/><use href="#boot-strand" transform="rotate(157.5 80 80)" opacity="0.79"/><use href="#boot-strand" transform="rotate(168.75 80 80)" opacity="0.91"/></svg></div>
+    <h1 class="boot-title">Design Assistant</h1>
+    <p id="boot-status">Подготавливаем приложение…</p>
+    <p id="boot-detail">Портфолио, услуги и ваши проекты</p>
+    <button id="boot-retry" type="button" hidden>Повторить загрузку</button>
+  </div>
+  <div id="app" aria-hidden="true" aria-busy="true"></div>
   <script src="/js/calculator.js" defer></script>
   <script src="/js/app.js" defer></script>
 </body>
