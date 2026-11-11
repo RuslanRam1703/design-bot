@@ -212,6 +212,14 @@ function navigate(screen, { resetBrief = false, hardReset = false, pushHistory =
 }
 
 function goBack() {
+  if (state.portfolio?.owner_preview) {
+    if (!TG.close()) {
+      const url = new URL(window.location.href);
+      url.searchParams.delete('preview_case');
+      window.location.replace(url.href);
+    }
+    return;
+  }
   const prev = state.history.pop();
   state.screen = prev || "portfolio";
   render();
@@ -584,6 +592,7 @@ function render() {
       showTabBar = false;
   }
 
+  if (state.portfolio?.owner_preview) showTabBar = false;
   app.innerHTML = renderBrandHeader() + content + (showTabBar ? renderTabBar() : "");
 
   switch (state.screen) {
@@ -770,7 +779,7 @@ function renderCase() {
   return `
     ${state.portfolio?.owner_preview ? '<p class="hint" role="status">Предпросмотр владельца · изменения не опубликованы</p>' : ""}
     <div class="topbar">
-      <button class="back-btn" id="back">←</button>
+      <button class="back-btn" id="back">${state.portfolio?.owner_preview ? "← В редактор" : "←"}</button>
       <h1>${escapeHtml(c.title)}</h1>
     </div>
     <div class="case-images">${images}</div>

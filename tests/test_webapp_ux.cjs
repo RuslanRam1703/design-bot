@@ -231,6 +231,7 @@ test('owner case preview is visibly marked and cannot start an order from the ca
   ui.state.currentCase = {id:'one',title:'Draft',images:[],sections:[]};
   const html = ui.renderCase();
   assert.match(html,/Предпросмотр владельца/);
+  assert.match(html,/В редактор/);
   assert.doesNotMatch(html,/id="want-similar"/);
   ui.state.portfolio.owner_preview=false;
   assert.match(ui.renderCase(),/id="want-similar"/);
