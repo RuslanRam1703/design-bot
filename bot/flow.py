@@ -101,6 +101,24 @@ async def step_from_callback(
     )
 
 
+async def panel_after_attachment(callback: CallbackQuery, state: FSMContext,
+                                 text: str, reply_markup: InlineKeyboardMarkup | None = None) -> None:
+    """Move active controls below a retained file without resetting the wizard.
+
+    Send first: if Telegram rejects the new panel, the old controls survive.
+    The document is deliberately never made a transient anchor or deleted.
+    """
+    sent = await callback.message.answer(text, reply_markup=reply_markup)
+    await state.update_data(**{_ANCHOR_MSG_KEY: sent.message_id, _ANCHOR_CHAT_KEY: sent.chat.id})
+    try:
+        await callback.message.delete()
+    except TelegramAPIError:
+        try:
+            await callback.message.edit_reply_markup(reply_markup=None)
+        except TelegramAPIError:
+            pass
+
+
 async def step_from_text(
     message: Message, state: FSMContext, text: str, reply_markup: InlineKeyboardMarkup | None = None
 ) -> None:
