@@ -14064,8 +14064,9 @@ class AddCaseFullFlowIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(case.get("external_url"))
 
         call = final.bot.edit_message_text.await_args or final.answer.await_args
-        self.assertIn("добавлен", call.args[0])
-        self.assertEqual(call.kwargs.get("reply_markup"), kb.admin_cases_menu_keyboard())
+        self.assertEqual(case["status"], "draft")
+        self.assertIn("сохранён в черновиках", call.args[0])
+        self.assertEqual(call.kwargs.get("reply_markup"), kb.case_saved_draft_keyboard(case_id))
         self.assertIsNone(await state.get_state())     # finish_flow
 
     # ---- 11. полный сбой резолвера -> контролируемая ошибка + retry ----

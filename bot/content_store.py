@@ -440,6 +440,7 @@ async def add_case(actor_chat_id: int | str, *, case_id: str, title: str, type_i
         case = {
             "id": case_id,
             "title": title,
+            "status": "draft",
             "type": type_id,
             "cover": cover,
             "images": [cover],
