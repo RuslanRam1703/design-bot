@@ -2890,6 +2890,7 @@ async def backup_export(callback: CallbackQuery, state: FSMContext) -> None:
         BufferedInputFile(zip_bytes, filename=filename),
         caption=caption,
     )
+    await flow.panel_after_attachment(callback, state, "Резервная копия отправлена. Что дальше?", kb.backup_menu_keyboard())
     await callback.answer()
 
 
@@ -3131,11 +3132,11 @@ async def clean_start_prepare(callback: CallbackQuery, state: FSMContext) -> Non
     backup, digest, counts = await owner_maintenance.prepare_clean_start(callback.message.chat.id)
     await callback.message.answer_document(
         BufferedInputFile(backup, filename="design-assistant-before-clean-start.zip"),
-        caption="Резервная копия перед очисткой. Содержит данные и ссылки на Telegram-материалы, но не полную выгрузку сообщений и файлов из Telegram. Сохраните этот архив.",
+        caption="Копия данных перед очисткой. Файлы и сообщения Telegram целиком в неё не входят.",
     )
     await state.update_data(clean_start_digest=digest)
     summary = "\n".join(f"{name}: {count}" for name, count in counts.items())
-    await callback.message.edit_text(
+    await flow.panel_after_attachment(callback, state,
         "Подготовлена очистка данных приложения\n\n" + summary +
         "\n\nТакже будут очищены профиль «Обо мне», черновики, история заявок и проектов. "
         "Калькулятор начнёт с пустого списка услуг и простого расчёта. "

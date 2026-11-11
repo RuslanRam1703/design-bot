@@ -5619,7 +5619,8 @@ class AdminBackupHandlersTests(unittest.IsolatedAsyncioTestCase):
                 chat=SimpleNamespace(id=self.actor),
                 edit_text=AsyncMock(),
                 answer_document=AsyncMock(),
-                answer=AsyncMock(),
+                answer=AsyncMock(return_value=SimpleNamespace(message_id=101, chat=SimpleNamespace(id=self.actor))),
+                delete=AsyncMock(),
             ),
             answer=AsyncMock(),
         )
