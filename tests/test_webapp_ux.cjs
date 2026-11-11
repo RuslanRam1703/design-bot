@@ -6,11 +6,11 @@ const path = require('node:path');
 const vm = require('node:vm');
 
 const source = fs.readFileSync(path.join(__dirname, '../webapp/js/app.js'), 'utf8');
-function appWithDraft(saved = null) {
+function appWithDraft(saved = null, document = { addEventListener() {} }) {
   const storage = { getItem: () => saved, setItem() {}, removeItem() {} };
   const sandbox = {
     window: { Telegram: { WebApp: { initDataUnsafe: { user: { id: 31, first_name: 'Клиент', username: 'client' } } } } },
-    document: { addEventListener() {} },
+    document,
     localStorage: storage,
     console,
     setTimeout,
@@ -19,7 +19,7 @@ function appWithDraft(saved = null) {
   vm.createContext(sandbox);
   const stripped = source.replace(/\ninit\(\);\s*$/, '\n');
   assert.notEqual(stripped, source, 'must skip only the final Mini App bootstrap');
-  vm.runInContext(stripped + '\nglobalThis.__ui = { state, restoreBriefDraft, renderBrief, renderMyLeadDetail, renderMyLeads, renderPortfolio, renderTabBar };', sandbox);
+  vm.runInContext(stripped + '\nglobalThis.__ui = { state, restoreBriefDraft, renderBrief, renderMyLeadDetail, renderMyLeads, renderPortfolio, attachPortfolioEvents, renderTabBar };', sandbox);
   return sandbox.__ui;
 }
 
@@ -125,11 +125,46 @@ test('portfolio presentation preserves filtering and escapes project labels', ()
   state.filter = 'web';
   const html = renderPortfolio();
   assert.match(html, /1 проект/);
-  assert.match(html, /data-case="one"/);
-  assert.doesNotMatch(html, /data-case="two"/);
+  assert.match(html, /data-open-case="one"/);
+  assert.doesNotMatch(html, /data-open-case="two"|data-preview-case/);
   assert.doesNotMatch(html, /id="portfolio-order"/);
   assert.ok(html.includes('&lt;script&gt;One'));
   assert.ok(html.includes('&lt;b&gt;Web'));
+});
+
+test('thumbnail taps update the preview without navigating or reordering cards', () => {
+  function element(properties = {}) {
+    return {
+      ...properties,
+      addEventListener(event, listener) { this[event] = listener; },
+      setAttribute(name, value) { this[name] = value; },
+    };
+  }
+  const preview = element({ getBoundingClientRect: () => ({ top: 10 }) });
+  const first = element({ dataset: { previewCase: 'one' } });
+  const second = element({ dataset: { previewCase: 'two' } });
+  const document = {
+    addEventListener() {},
+    getElementById: id => id === 'portfolio-preview' ? preview : null,
+    querySelectorAll: selector => selector === '[data-preview-case]' ? [first, second] : [],
+  };
+  const { state, renderPortfolio, attachPortfolioEvents } = appWithDraft(null, document);
+  state.screen = 'portfolio';
+  state.portfolio = {types: [], cases: [
+    {id: 'one', type: 'web', title: 'One', featured: true},
+    {id: 'two', type: 'brand', title: 'Two'},
+  ]};
+  assert.match(renderPortfolio(), /data-open-case="one"/);
+  attachPortfolioEvents();
+  second.click();
+  assert.equal(state.screen, 'portfolio');
+  assert.equal(state.history.length, 0);
+  assert.match(preview.innerHTML, /data-open-case="two"/);
+  assert.equal(first['aria-pressed'], 'false');
+  assert.equal(second['aria-pressed'], 'true');
+  assert.match(renderPortfolio(), /data-preview-case="one"[\s\S]*data-preview-case="two"/);
+  state.filter = 'web';
+  assert.match(renderPortfolio(), /data-open-case="one"/);
 });
 
 test('brand navigation retains settings and exposes the current page accessibly', () => {

@@ -121,6 +121,7 @@ const state = {
   screen: "loading",
   history: [],
   filter: "all",
+  portfolioPreviewId: null,
   currentCase: null,
   myLeads: { status: "idle", items: [], selected: null, ownerHistoryExpanded: false }, // status: idle | loading | loaded | error | no-telegram
   calc: { serviceId: null, openGroupId: null, options: {}, urgent: false, complex: false },
@@ -610,6 +611,23 @@ function imageSrc(path) {
 }
 
 // ---- Экран: Портфолио ----
+function renderPortfolioCover(project, typeLabel, preview = false) {
+  return `<div class="card-media">
+    ${project.cover ? `<img src="${escapeHtml(imageSrc(project.cover))}" alt="" ${preview ? "" : 'loading="lazy"'} decoding="async" />` : '<div class="card-cover-empty"></div>'}
+    ${typeLabel ? `<span class="card-type">${escapeHtml(typeLabel)}</span>` : ""}
+  </div>`;
+}
+
+function renderPortfolioPreview(project, typeLabel) {
+  return `<button type="button" class="card portfolio-preview-card" data-open-case="${escapeHtml(project.id)}">
+    ${renderPortfolioCover(project, typeLabel, true)}
+    <div class="card-title">
+      <span>${escapeHtml(project.title)}</span>
+      <span class="portfolio-open-label">Открыть кейс</span>
+    </div>
+  </button>`;
+}
+
 function renderPortfolio() {
   const { types, cases } = state.portfolio;
   const filtered = state.filter === "all" ? cases : cases.filter((c) => c.type === state.filter);
@@ -617,23 +635,24 @@ function renderPortfolio() {
   const chips = [{ id: "all", label: "Все" }, ...types.map((t) => ({ id: t.id, label: t.label }))]
     .map(
       (t) =>
-        `<button class="chip ${t.id === state.filter ? "active" : ""}" data-filter="${t.id}">${escapeHtml(t.label)}</button>`
+        `<button class="chip ${t.id === state.filter ? "active" : ""}" data-filter="${escapeHtml(t.id)}" aria-pressed="${t.id === state.filter}">${escapeHtml(t.label)}</button>`
     )
     .join("");
 
   const typeLabels = Object.fromEntries(types.map(type => [type.id, type.label]));
+  const selected = filtered.find(project => project.id === state.portfolioPreviewId)
+    || filtered.find(project => project.featured)
+    || filtered[0];
+  state.portfolioPreviewId = selected?.id ?? null;
   const count = filtered.length;
   const projectWord = count % 100 >= 11 && count % 100 <= 14 ? "проектов"
     : count % 10 === 1 ? "проект" : count % 10 >= 2 && count % 10 <= 4 ? "проекта" : "проектов";
   const cards = filtered
     .map(
-      (c, index) => `
-      <button class="card ${index === 0 && c.featured ? "card-featured" : ""}" data-case="${c.id}">
-        <div class="card-media">
-          ${c.cover ? `<img src="${imageSrc(c.cover)}" alt="" loading="lazy" decoding="async" />` : '<div class="card-cover-empty"></div>'}
-          ${typeLabels[c.type] ? `<span class="card-type">${escapeHtml(typeLabels[c.type])}</span>` : ""}
-        </div>
-        <div class="card-title"><span>${escapeHtml(c.title)}</span><span class="card-arrow" aria-hidden="true"><svg class="action-arrow" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 18 18 6M6 6h12v12"/></svg></span></div>
+      (c) => `
+      <button type="button" class="card" data-preview-case="${escapeHtml(c.id)}" aria-pressed="${c === selected}" aria-controls="portfolio-preview">
+        ${renderPortfolioCover(c, typeLabels[c.type])}
+        <div class="card-title">${escapeHtml(c.title)}</div>
       </button>`
     )
     .join("");
@@ -646,7 +665,9 @@ function renderPortfolio() {
     </section>
     <div class="section-heading"><h2>Портфолио</h2><span>${count} ${projectWord}</span></div>
     <div class="chips">${chips}</div>
-    <div class="grid">${cards || '<div class="empty-state">Пока нет кейсов в этой категории</div>'}</div>
+    ${selected ? `<div id="portfolio-preview" aria-live="polite">${renderPortfolioPreview(selected, typeLabels[selected.type])}</div>`
+      : '<div class="empty-state">Пока нет кейсов в этой категории</div>'}
+    ${count > 1 ? `<div class="grid" role="group" aria-label="Выбрать проект для предпросмотра">${cards}</div>` : ""}
   `;
 }
 
@@ -658,10 +679,32 @@ function attachPortfolioEvents() {
       render();
     })
   );
-  document.querySelectorAll(".card").forEach((el) =>
+  const preview = document.getElementById("portfolio-preview");
+  if (!preview) return;
+  preview.addEventListener("click", (event) => {
+    const button = event.target.closest("[data-open-case]");
+    if (!button) return;
+    const project = state.portfolio.cases.find(c => c.id === button.dataset.openCase);
+    if (!project) return;
+    state.currentCase = project;
+    navigate("case");
+  });
+
+  const thumbnails = document.querySelectorAll("[data-preview-case]");
+  thumbnails.forEach((el) =>
     el.addEventListener("click", () => {
-      state.currentCase = state.portfolio.cases.find((c) => c.id === el.dataset.case);
-      navigate("case");
+      const project = state.portfolio.cases.find(c => c.id === el.dataset.previewCase);
+      if (!project) return;
+      if (project.id !== state.portfolioPreviewId) {
+        state.portfolioPreviewId = project.id;
+        const typeLabel = state.portfolio.types.find(type => type.id === project.type)?.label;
+        preview.innerHTML = renderPortfolioPreview(project, typeLabel);
+        thumbnails.forEach(button => button.setAttribute("aria-pressed", String(button === el)));
+      }
+      if (preview.getBoundingClientRect().top < 0) {
+        preview.querySelector("button").focus({ preventScroll: true });
+        preview.scrollIntoView({ block: "start" });
+      }
     })
   );
 }
