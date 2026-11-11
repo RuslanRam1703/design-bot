@@ -79,7 +79,7 @@ test('blocked Telegram account closes Mini App before content is rendered', asyn
     onEvent() {}, close() { closed += 1; },
   };
   const context = {
-    window: { Telegram: { WebApp: fakeTG } },
+    window: { Telegram: { WebApp: fakeTG }, location: {search: ""} },
     document: {
       addEventListener() {},
       documentElement: { style: { setProperty() {} }, dataset: {} },
@@ -87,7 +87,7 @@ test('blocked Telegram account closes Mini App before content is rendered', asyn
     },
     localStorage: { getItem() { return null; }, setItem() {}, removeItem() {} },
     fetch: async () => ({ status: 403, ok: false }),
-    console, setTimeout, clearTimeout, AbortSignal,
+    console, setTimeout, clearTimeout, AbortSignal, URLSearchParams,
   };
   vm.createContext(context);
   const sourceWithoutBootstrap = source.replace(/\ninit\(\);\s*$/, '\n');
@@ -222,4 +222,16 @@ test('closed case gallery has one main preview and ordered selectable thumbnails
   assert.match(html,/data-gallery-thumb="0" aria-label="Изображение 1" aria-pressed="true"/);
   ui.state.currentCase.images = ['https://example.invalid/a.jpg'];
   assert.doesNotMatch(ui.renderCase(),/data-gallery-thumb=/);
+});
+
+
+test('owner case preview is visibly marked and cannot start an order from the case', () => {
+  const ui = appWithDraft();
+  ui.state.portfolio = {owner_preview:true};
+  ui.state.currentCase = {id:'one',title:'Draft',images:[],sections:[]};
+  const html = ui.renderCase();
+  assert.match(html,/Предпросмотр владельца/);
+  assert.doesNotMatch(html,/id="want-similar"/);
+  ui.state.portfolio.owner_preview=false;
+  assert.match(ui.renderCase(),/id="want-similar"/);
 });

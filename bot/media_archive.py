@@ -141,6 +141,9 @@ async def delete_archive_message(bot: Any, source_ref: str | None) -> bool:
         return False
     chat, message_id = parsed
     try:
+        from bot import content_store
+        if await content_store.editor_media_retained(source_ref):
+            return False
         await bot.delete_message(chat_id=chat, message_id=message_id)
     except Exception as e:
         logger.error(

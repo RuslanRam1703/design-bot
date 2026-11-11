@@ -49,6 +49,9 @@ Backup (export/import) держит все 6 локов на всю операц
 """
 
 import asyncio
+import copy
+import hashlib
+import math
 import contextvars
 import io
 import json
@@ -576,7 +579,7 @@ async def restore_trashed_case(actor_chat_id: int | str, case_id: str) -> bool:
         return True
 
 
-async def update_case(actor_chat_id: int | str, case_id: str, **fields: Any) -> bool:
+async def update_case(actor_chat_id: int | str, case_id: str, stage: bool = False, **fields: Any) -> bool:
     """"cover" через это поле — быстрый путь "загрузить новую обложку":
     новое фото ДОБАВЛЯЕТСЯ в галерею (images) и становится cover, но не
     стирает остальные изображения кейса — за полным управлением галереей
@@ -597,9 +600,14 @@ async def update_case(actor_chat_id: int | str, case_id: str, **fields: Any) -> 
         data = await _read("portfolio.json")
         for c in data["cases"]:
             if c["id"] == case_id:
+                c = _editable_case(data, case_id, start=stage)
                 found = True
                 if "cover" in fields and fields["cover"] != c.get("cover"):
                     old_cover = c.get("cover")
+                # Replacing the cover keeps the previous image in the gallery.
+                # Keep its archive reference too, so cleanup cannot break that image.
+                if c.get("cover") and c.get("source_ref") and "source_ref" in fields:
+                    c.setdefault("image_refs", {})[c["cover"]] = c["source_ref"]
                 c.update(fields)
                 if "cover" in fields:
                     images = c.setdefault("images", [])
@@ -608,7 +616,7 @@ async def update_case(actor_chat_id: int | str, case_id: str, **fields: Any) -> 
                 await _write("portfolio.json", data)
                 break
     if old_cover:
-        await r2_storage.delete_image(old_cover)
+        await _delete_unused_image(old_cover)
     return found
 
 
@@ -623,6 +631,7 @@ async def add_case_image(
     *,
     set_as_cover: bool = False,
     archive_ref: str | None = None,
+    stage: bool = False,
 ) -> bool:
     """archive_ref — ссылка на архивное сообщение, из которого получен
     image_path (см. bot/media_archive.py::build_source_ref). Хранится в
@@ -646,7 +655,7 @@ async def add_case_image(
     _require_designer(actor_chat_id)
     async with _lock("portfolio.json"):
         data = await _read("portfolio.json")
-        case = _find_case(data, case_id)
+        case = _editable_case(data, case_id, start=stage)
         if case is None:
             return False
         images = case.setdefault("images", [])
@@ -687,7 +696,7 @@ def case_gallery_refs(case: dict | None) -> list[str]:
     return [v for v in refs.values() if isinstance(v, str) and v]
 
 
-async def remove_case_image(actor_chat_id: int | str, case_id: str, image_path: str) -> bool:
+async def remove_case_image(actor_chat_id: int | str, case_id: str, image_path: str, *, stage: bool = False) -> bool:
     """Если удаляемое изображение было обложкой — обложка автоматически
     переходит на первое оставшееся; если изображений не осталось вовсе —
     cover становится None (Mini App показывает пустое состояние, не
@@ -699,7 +708,7 @@ async def remove_case_image(actor_chat_id: int | str, case_id: str, image_path: 
     _require_designer(actor_chat_id)
     async with _lock("portfolio.json"):
         data = await _read("portfolio.json")
-        case = _find_case(data, case_id)
+        case = _editable_case(data, case_id, start=stage)
         if case is None or image_path not in case.get("images", []):
             return False
         case["images"] = [i for i in case["images"] if i != image_path]
@@ -715,16 +724,16 @@ async def remove_case_image(actor_chat_id: int | str, case_id: str, image_path: 
         if case.get("cover") == image_path:
             case["cover"] = case["images"][0] if case["images"] else None
         await _write("portfolio.json", data)
-    await r2_storage.delete_image(image_path)
+    await _delete_unused_image(image_path)
     return True
 
 
-async def reorder_case_image(actor_chat_id: int | str, case_id: str, image_path: str, direction: str) -> bool:
+async def reorder_case_image(actor_chat_id: int | str, case_id: str, image_path: str, direction: str, *, stage: bool = False) -> bool:
     """direction: "up" (раньше в галерее) | "down" (позже)."""
     _require_designer(actor_chat_id)
     async with _lock("portfolio.json"):
         data = await _read("portfolio.json")
-        case = _find_case(data, case_id)
+        case = _editable_case(data, case_id, start=stage)
         if case is None or image_path not in case.get("images", []):
             return False
         images = case["images"]
@@ -737,11 +746,11 @@ async def reorder_case_image(actor_chat_id: int | str, case_id: str, image_path:
         return True
 
 
-async def set_case_cover(actor_chat_id: int | str, case_id: str, image_path: str) -> bool:
+async def set_case_cover(actor_chat_id: int | str, case_id: str, image_path: str, *, stage: bool = False) -> bool:
     _require_designer(actor_chat_id)
     async with _lock("portfolio.json"):
         data = await _read("portfolio.json")
-        case = _find_case(data, case_id)
+        case = _editable_case(data, case_id, start=stage)
         if case is None or image_path not in case.get("images", []):
             return False
         case["cover"] = image_path
@@ -749,7 +758,7 @@ async def set_case_cover(actor_chat_id: int | str, case_id: str, image_path: str
         return True
 
 
-async def update_case_category(actor_chat_id: int | str, case_id: str, new_type_id: str) -> bool:
+async def update_case_category(actor_chat_id: int | str, case_id: str, new_type_id: str, *, stage: bool = False) -> bool:
     """Меняет категорию существующего кейса — раньше это было возможно
     только при создании. related_service подставляется из дефолта НОВОЙ
     категории только если у кейса он либо не задан, либо совпадал с
@@ -758,7 +767,7 @@ async def update_case_category(actor_chat_id: int | str, case_id: str, new_type_
     _require_designer(actor_chat_id)
     async with _lock("portfolio.json"):
         data = await _read("portfolio.json")
-        case = _find_case(data, case_id)
+        case = _editable_case(data, case_id, start=stage)
         if case is None:
             return False
         old_type_id = case.get("type")
@@ -777,11 +786,11 @@ async def update_case_category(actor_chat_id: int | str, case_id: str, new_type_
 # sections (пока не мигрированы) продолжают рендериться по task/solution/
 # result как раньше — см. backward-compatible рендер в webapp/js/app.js.
 
-async def add_case_section(actor_chat_id: int | str, case_id: str, *, section_type: str, title: str, content: str = "", images: list[str] | None = None) -> bool:
+async def add_case_section(actor_chat_id: int | str, case_id: str, *, section_type: str, title: str, content: str = "", images: list[str] | None = None, stage: bool = False) -> bool:
     _require_designer(actor_chat_id)
     async with _lock("portfolio.json"):
         data = await _read("portfolio.json")
-        case = _find_case(data, case_id)
+        case = _editable_case(data, case_id, start=stage)
         if case is None:
             return False
         section: dict[str, Any] = {"type": section_type, "title": title}
@@ -794,11 +803,11 @@ async def add_case_section(actor_chat_id: int | str, case_id: str, *, section_ty
         return True
 
 
-async def update_case_section(actor_chat_id: int | str, case_id: str, index: int, **fields: Any) -> bool:
+async def update_case_section(actor_chat_id: int | str, case_id: str, index: int, stage: bool = False, **fields: Any) -> bool:
     _require_designer(actor_chat_id)
     async with _lock("portfolio.json"):
         data = await _read("portfolio.json")
-        case = _find_case(data, case_id)
+        case = _editable_case(data, case_id, start=stage)
         if case is None:
             return False
         sections = case.get("sections", [])
@@ -816,6 +825,7 @@ async def add_case_section_image(
     image_path: str,
     *,
     archive_ref: str | None = None,
+    stage: bool = False,
 ) -> bool:
     """Добавляет изображение в gallery-секцию и запоминает его архивную
     ссылку — ровно тем же механизмом, что и верхнеуровневая галерея.
@@ -834,7 +844,7 @@ async def add_case_section_image(
     _require_designer(actor_chat_id)
     async with _lock("portfolio.json"):
         data = await _read("portfolio.json")
-        case = _find_case(data, case_id)
+        case = _editable_case(data, case_id, start=stage)
         if case is None:
             return False
         sections = case.get("sections", [])
@@ -849,7 +859,7 @@ async def add_case_section_image(
         return True
 
 
-async def remove_case_section_image(actor_chat_id: int | str, case_id: str, index: int, img_index: int) -> bool:
+async def remove_case_section_image(actor_chat_id: int | str, case_id: str, index: int, img_index: int, *, stage: bool = False) -> bool:
     """Batch 3 — удаление ОДНОГО изображения из gallery-секции, с R2-cleanup
     (тот же принцип, что и remove_case_image для верхнеуровневой галереи).
     Раньше это делалось напрямую через update_case_section(images=remaining)
@@ -861,7 +871,7 @@ async def remove_case_section_image(actor_chat_id: int | str, case_id: str, inde
     removed_path: str | None = None
     async with _lock("portfolio.json"):
         data = await _read("portfolio.json")
-        case = _find_case(data, case_id)
+        case = _editable_case(data, case_id, start=stage)
         if case is None:
             return False
         sections = case.get("sections", [])
@@ -881,11 +891,11 @@ async def remove_case_section_image(actor_chat_id: int | str, case_id: str, inde
                 case.pop("image_refs", None)
         await _write("portfolio.json", data)
     if removed_path:
-        await r2_storage.delete_image(removed_path)
+        await _delete_unused_image(removed_path)
     return True
 
 
-async def delete_case_section(actor_chat_id: int | str, case_id: str, index: int) -> bool:
+async def delete_case_section(actor_chat_id: int | str, case_id: str, index: int, *, stage: bool = False) -> bool:
     """Batch 3 — если удаляемая секция была gallery-типа, её images (см.
     add_case_section) удаляются из R2 после успешной записи (тот же
     принцип, что и в delete_case выше)."""
@@ -893,7 +903,7 @@ async def delete_case_section(actor_chat_id: int | str, case_id: str, index: int
     removed_images: list[str] = []
     async with _lock("portfolio.json"):
         data = await _read("portfolio.json")
-        case = _find_case(data, case_id)
+        case = _editable_case(data, case_id, start=stage)
         if case is None:
             return False
         sections = case.get("sections", [])
@@ -903,15 +913,15 @@ async def delete_case_section(actor_chat_id: int | str, case_id: str, index: int
         del sections[index]
         await _write("portfolio.json", data)
     for path in removed_images:
-        await r2_storage.delete_image(path)
+        await _delete_unused_image(path)
     return True
 
 
-async def reorder_case_section(actor_chat_id: int | str, case_id: str, index: int, direction: str) -> bool:
+async def reorder_case_section(actor_chat_id: int | str, case_id: str, index: int, direction: str, *, stage: bool = False) -> bool:
     _require_designer(actor_chat_id)
     async with _lock("portfolio.json"):
         data = await _read("portfolio.json")
-        case = _find_case(data, case_id)
+        case = _editable_case(data, case_id, start=stage)
         if case is None:
             return False
         sections = case.get("sections", [])
@@ -1130,8 +1140,9 @@ async def save_about_photo(actor_chat_id: int | str, bot: Any, file_id: str) -> 
 
 # ---- Услуги калькулятора ----
 
-async def list_services() -> list[dict]:
-    return (await _read("pricing.json"))["services"]
+async def list_services(*, live: bool = False) -> list[dict]:
+    data = await _read("pricing.json")
+    return (data if live else _pricing_working(data))["services"]
 
 
 async def get_service(service_id: str) -> dict | None:
@@ -1142,7 +1153,8 @@ async def next_service_id() -> str:
     """Встроенные услуги (LEND, SITE...) имеют смысловые id — для новых,
     добавленных админом, генерируем нейтральный SVC_N, чтобы не гадать с
     транслитерацией названия."""
-    data = await _read("pricing.json")
+    stored = await _read("pricing.json")
+    data = _pricing_working(stored)
     nums = []
     for s in data["services"]:
         if s["id"].startswith("SVC_"):
@@ -1153,10 +1165,11 @@ async def next_service_id() -> str:
     return f"SVC_{max(nums, default=0) + 1}"
 
 
-async def add_service(actor_chat_id: int | str, *, service_id: str, name: str, base_price: float, term_min: float, term_max: float, includes: str) -> dict:
+async def add_service(actor_chat_id: int | str, *, service_id: str, name: str, base_price: float, term_min: float, term_max: float, includes: str, stage: bool = False) -> dict:
     _require_designer(actor_chat_id)
     async with _lock("pricing.json"):
-        data = await _read("pricing.json")
+        stored = await _read("pricing.json")
+        data = _pricing_working(stored, start=stage)
         service = {
             "id": service_id,
             "name": name,
@@ -1166,23 +1179,24 @@ async def add_service(actor_chat_id: int | str, *, service_id: str, name: str, b
             "includes": includes,
         }
         data["services"].append(service)
-        await _write("pricing.json", data)
+        await _write("pricing.json", stored)
         return service
 
 
-async def update_service(actor_chat_id: int | str, service_id: str, **fields: Any) -> bool:
+async def update_service(actor_chat_id: int | str, service_id: str, stage: bool = False, **fields: Any) -> bool:
     _require_designer(actor_chat_id)
     async with _lock("pricing.json"):
-        data = await _read("pricing.json")
+        stored = await _read("pricing.json")
+        data = _pricing_working(stored, start=stage)
         for s in data["services"]:
             if s["id"] == service_id:
                 s.update(fields)
-                await _write("pricing.json", data)
+                await _write("pricing.json", stored)
                 return True
         return False
 
 
-async def delete_service(actor_chat_id: int | str, service_id: str) -> bool:
+async def delete_service(actor_chat_id: int | str, service_id: str, *, stage: bool = False) -> bool:
     """Удаляет услугу вместе с её опциями. Кейсы портфолио и категории
     портфолио, ссылавшиеся на неё через related_service, не удаляются —
     просто теряют автоподстановку услуги (related_service -> None), и там,
@@ -1199,7 +1213,8 @@ async def delete_service(actor_chat_id: int | str, service_id: str) -> bool:
     обнулён"."""
     _require_designer(actor_chat_id)
     async with _lock("portfolio.json", "pricing.json"):
-        data = await _read("pricing.json")
+        stored = await _read("pricing.json")
+        data = _pricing_working(stored, start=stage)
         before = len(data["services"])
         data["services"] = [s for s in data["services"] if s["id"] != service_id]
         if len(data["services"]) == before:
@@ -1207,8 +1222,10 @@ async def delete_service(actor_chat_id: int | str, service_id: str) -> bool:
         data["options"] = [o for o in data["options"] if o["service_id"] != service_id]
         for g in data.get("groups", []):
             g["service_ids"] = [sid for sid in g["service_ids"] if sid != service_id]
-        await _write("pricing.json", data)
+        await _write("pricing.json", stored)
 
+        if "_editor" in stored:
+            return True
         portfolio = await _read("portfolio.json")
         changed = False
         for c in portfolio["cases"]:
@@ -1227,11 +1244,12 @@ async def delete_service(actor_chat_id: int | str, service_id: str) -> bool:
 # ---- Опции услуг ----
 
 async def list_options(service_id: str) -> list[dict]:
-    return [o for o in (await _read("pricing.json"))["options"] if o["service_id"] == service_id]
+    return [o for o in _pricing_working(await _read("pricing.json"))["options"] if o["service_id"] == service_id]
 
 
 async def next_option_id(service_id: str) -> str:
-    data = await _read("pricing.json")
+    stored = await _read("pricing.json")
+    data = _pricing_working(stored)
     nums = []
     prefix = f"{service_id}_"
     for o in data["options"]:
@@ -1243,10 +1261,11 @@ async def next_option_id(service_id: str) -> str:
     return f"{prefix}{max(nums, default=0) + 1}"
 
 
-async def add_option(actor_chat_id: int | str, *, option_id: str, service_id: str, name: str, price: float, days: float, multipliable: bool) -> dict:
+async def add_option(actor_chat_id: int | str, *, option_id: str, service_id: str, name: str, price: float, days: float, multipliable: bool, stage: bool = False) -> dict:
     _require_designer(actor_chat_id)
     async with _lock("pricing.json"):
-        data = await _read("pricing.json")
+        stored = await _read("pricing.json")
+        data = _pricing_working(stored, start=stage)
         option = {
             "service_id": service_id,
             "id": option_id,
@@ -1256,60 +1275,65 @@ async def add_option(actor_chat_id: int | str, *, option_id: str, service_id: st
             "multipliable": multipliable,
         }
         data["options"].append(option)
-        await _write("pricing.json", data)
+        await _write("pricing.json", stored)
         return option
 
 
-async def update_option(actor_chat_id: int | str, option_id: str, **fields: Any) -> bool:
+async def update_option(actor_chat_id: int | str, option_id: str, stage: bool = False, **fields: Any) -> bool:
     _require_designer(actor_chat_id)
     async with _lock("pricing.json"):
-        data = await _read("pricing.json")
+        stored = await _read("pricing.json")
+        data = _pricing_working(stored, start=stage)
         for o in data["options"]:
             if o["id"] == option_id:
                 o.update(fields)
-                await _write("pricing.json", data)
+                await _write("pricing.json", stored)
                 return True
         return False
 
 
-async def delete_option(actor_chat_id: int | str, option_id: str) -> bool:
+async def delete_option(actor_chat_id: int | str, option_id: str, *, stage: bool = False) -> bool:
     _require_designer(actor_chat_id)
     async with _lock("pricing.json"):
-        data = await _read("pricing.json")
+        stored = await _read("pricing.json")
+        data = _pricing_working(stored, start=stage)
         before = len(data["options"])
         data["options"] = [o for o in data["options"] if o["id"] != option_id]
         if len(data["options"]) == before:
             return False
-        await _write("pricing.json", data)
+        await _write("pricing.json", stored)
         return True
 
 
 # ---- Коэффициенты и округление вилки ----
 
 async def get_pricing_rules() -> dict:
-    data = await _read("pricing.json")
+    stored = await _read("pricing.json")
+    data = _pricing_working(stored)
     return {"coefficients": data["coefficients"], "rounding": data["rounding"]}
 
 
-async def update_coefficient(actor_chat_id: int | str, key: str, multiplier: float) -> bool:
+async def update_coefficient(actor_chat_id: int | str, key: str, multiplier: float, *, stage: bool = False) -> bool:
     _require_designer(actor_chat_id)
     async with _lock("pricing.json"):
-        data = await _read("pricing.json")
+        stored = await _read("pricing.json")
+        data = _pricing_working(stored, start=stage)
         if key not in data["coefficients"]:
             return False
         data["coefficients"][key]["multiplier"] = multiplier
-        await _write("pricing.json", data)
+        await _write("pricing.json", stored)
         return True
 
 
-async def update_rounding(actor_chat_id: int | str, field: str, value: float) -> bool:
+async def update_rounding(actor_chat_id: int | str, field: str, value: float, *, stage: bool = False) -> bool:
     _require_designer(actor_chat_id)
     async with _lock("pricing.json"):
-        data = await _read("pricing.json")
+        stored = await _read("pricing.json")
+        data = _pricing_working(stored, start=stage)
         if field not in data["rounding"]:
             return False
         data["rounding"][field] = value
-        await _write("pricing.json", data)
+        await _write("pricing.json", stored)
         return True
 
 
@@ -2465,3 +2489,169 @@ async def import_backup_bytes(actor_chat_id: int | str, zip_bytes: bytes) -> Bac
         restored_images=restored_images,
         failed_images=failed_images,
     )
+
+
+# ---- Owner review / explicit publication. Stored alongside existing data. ----
+def _without_editor(value: dict) -> dict:
+    return {k: copy.deepcopy(v) for k, v in value.items() if k != "_editor"}
+
+
+def editor_digest(value: dict) -> str:
+    return hashlib.sha256(json.dumps(value, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+
+
+def _editable_case(data: dict, case_id: str, *, start: bool = False) -> dict | None:
+    case = _find_case(data, case_id)
+    if case and start and case.get("status", "published") == "published" and "_editor" not in case:
+        live = _without_editor(case)
+        case["_editor"] = {"base": editor_digest(live), "working": live}
+    return case.get("_editor", {}).get("working", case) if case else None
+
+
+def _pricing_working(data: dict, *, start: bool = False) -> dict:
+    if start and "_editor" not in data:
+        live = _without_editor(data)
+        data["_editor"] = {"base": editor_digest(live), "working": live}
+    return data.get("_editor", {}).get("working", data)
+
+
+async def begin_case_edit(actor_chat_id: int | str, case_id: str) -> bool:
+    _require_designer(actor_chat_id)
+    async with _lock("portfolio.json"):
+        data = await _read("portfolio.json")
+        case = _find_case(data, case_id)
+        if case is None or case.get("status") == "trashed":
+            return False
+        if case.get("status", "published") == "published" and "_editor" not in case:
+            live = _without_editor(case)
+            case["_editor"] = {"base": editor_digest(live), "working": live}
+            await _write("portfolio.json", data)
+        return True
+
+
+async def get_case_edit(actor_chat_id: int | str, case_id: str) -> dict | None:
+    _require_designer(actor_chat_id)
+    return _editable_case(await _read("portfolio.json"), case_id)
+
+
+async def begin_pricing_edit(actor_chat_id: int | str) -> None:
+    _require_designer(actor_chat_id)
+    async with _lock("pricing.json"):
+        data = await _read("pricing.json")
+        if "_editor" not in data:
+            live = _without_editor(data)
+            data["_editor"] = {"base": editor_digest(live), "working": live}
+            await _write("pricing.json", data)
+
+
+async def get_pricing_edit(actor_chat_id: int | str) -> dict:
+    _require_designer(actor_chat_id)
+    return _pricing_working(await _read("pricing.json"))
+
+
+def validate_pricing(pricing: dict) -> None:
+    """Reject invalid staged input before any live write or preview calculation."""
+    def number(v, positive=False):
+        if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) or v < 0 or (positive and v == 0):
+            raise ValueError("Цены и сроки должны быть конечными неотрицательными числами; коэффициенты и шаг округления — больше нуля.")
+    if not pricing.get("services"):
+        raise ValueError("Добавьте хотя бы одну услугу перед применением прайса.")
+    ids = set()
+    for service in pricing["services"]:
+        if not service.get("name", "").strip() or service["id"] in ids:
+            raise ValueError("Проверьте названия и уникальность услуг.")
+        ids.add(service["id"])
+        for key in ("base_price", "term_min", "term_max"): number(service[key])
+        if service["term_min"] > service["term_max"]:
+            raise ValueError("Минимальный срок не может быть больше максимального.")
+    option_ids = set()
+    for option in pricing["options"]:
+        if option["service_id"] not in ids or option["id"] in option_ids:
+            raise ValueError("Проверьте привязку и уникальность опций.")
+        option_ids.add(option["id"])
+        number(option["price"]); number(option["days"])
+    for coefficient in pricing["coefficients"].values(): number(coefficient["multiplier"], True)
+    rounding = pricing["rounding"]
+    for key in ("price_from_factor", "price_to_factor", "round_to"): number(rounding[key], True)
+    if rounding["price_from_factor"] > rounding["price_to_factor"]:
+        raise ValueError("Нижняя граница цены не может быть больше верхней.")
+    # Finite inputs can still overflow when combined; check every service.
+    from bot.calculator import calculate
+    for service in pricing["services"]:
+        selected = [{"id": o["id"], "qty": 1} for o in pricing["options"] if o["service_id"] == service["id"]]
+        try:
+            result = calculate(pricing, service["id"], selected, True, True)
+            if not all(math.isfinite(v) for v in (result.exact_price, result.price_from, result.price_to, result.term_from, result.term_to)):
+                raise OverflowError
+        except (OverflowError, ValueError):
+            raise ValueError("Значения прайса слишком велики для расчёта. Уменьшите цены, сроки или коэффициенты.") from None
+
+
+
+async def finish_case_edit(actor_chat_id: int | str, case_id: str, expected: str, *, publish: bool) -> bool:
+    _require_designer(actor_chat_id)
+    async with _lock("portfolio.json", "pricing.json"):
+        data = await _read("portfolio.json")
+        case = _find_case(data, case_id)
+        if not case or case.get("status") == "trashed": return False
+        working = case.get("_editor", {}).get("working", case)
+        if editor_digest(working) != expected:
+            raise ValueError("Кейс изменился после просмотра. Откройте предпросмотр ещё раз.")
+        if publish:
+            revision = case.get("_editor")
+            if revision and revision["base"] != editor_digest(_without_editor(case)):
+                raise ValueError("Опубликованная версия изменилась. Отмените черновые правки и начните заново.")
+            pricing = await _read("pricing.json")
+            if working.get("related_service") and working["related_service"] not in {s["id"] for s in pricing["services"]}:
+                raise ValueError("Связанная услуга ещё не опубликована или удалена. Измените связь с услугой.")
+            if not working.get("title", "").strip() or working.get("type") not in {t["id"] for t in data.get("types", [])}:
+                raise ValueError("Перед публикацией задайте название и категорию.")
+            replacement = _without_editor(working)
+            replacement["status"] = "published"
+            case.clear(); case.update(replacement)
+        else:
+            if "_editor" not in case:
+                return False
+            case.pop("_editor", None)
+        await _write("portfolio.json", data)
+        return True
+
+
+async def finish_pricing_edit(actor_chat_id: int | str, expected: str, *, publish: bool) -> bool:
+    _require_designer(actor_chat_id)
+    async with _lock("portfolio.json", "pricing.json"):
+        data = await _read("pricing.json")
+        revision = data.get("_editor")
+        if not revision: return False
+        working = revision["working"]
+        if editor_digest(working) != expected:
+            raise ValueError("Прайс изменился после проверки. Проверьте расчёт ещё раз.")
+        if publish:
+            if revision["base"] != editor_digest(_without_editor(data)):
+                raise ValueError("Действующий прайс изменился. Отмените черновик и начните заново.")
+            validate_pricing(working)
+            # References to removed services are harmless: public CTA falls back to manual choice.
+            # Keep portfolio data intact; no multi-key partial write or hidden draft replacement.
+            await _write("pricing.json", _without_editor(working))
+        else:
+            data.pop("_editor", None)
+            await _write("pricing.json", data)
+        return True
+
+
+def _contains_value(value: Any, needle: str) -> bool:
+    if isinstance(value, dict):
+        return needle in value or any(_contains_value(v, needle) for v in value.values())
+    if isinstance(value, list): return any(_contains_value(v, needle) for v in value)
+    return value == needle
+
+
+async def editor_media_retained(value: str) -> bool:
+    """Retain references in live cases and drafts, including after a concurrent discard."""
+    data = await _read("portfolio.json")
+    return any(_contains_value(c, value) for c in data["cases"])
+
+
+async def _delete_unused_image(path: str) -> None:
+    if not await editor_media_retained(path):
+        await r2_storage.delete_image(path)

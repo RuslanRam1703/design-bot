@@ -159,6 +159,7 @@ def case_pick_keyboard(cases: list[dict], prefix: str) -> InlineKeyboardMarkup:
 
 def case_field_keyboard() -> InlineKeyboardMarkup:
     rows = [[InlineKeyboardButton(text=label, callback_data=f"admineditfield:{key}")] for key, label in CASE_FIELD_LABELS.items()]
+    rows.append([InlineKeyboardButton(text="👁 Проверить и опубликовать", callback_data="adminreview:case")])
     rows.append([InlineKeyboardButton(text="◀️ Назад к кейсам", callback_data="admineditfield:done")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -303,6 +304,7 @@ def pricing_menu_keyboard() -> InlineKeyboardMarkup:
             [InlineKeyboardButton(text="✏️ Редактировать услугу", callback_data="adminpriceaction:edit")],
             [InlineKeyboardButton(text="🗑 Удалить услугу", callback_data="adminpriceaction:delete")],
             [InlineKeyboardButton(text="⚙️ Коэффициенты и округление", callback_data="adminpriceaction:coef")],
+            [InlineKeyboardButton(text="👁 Проверить и применить прайс", callback_data="adminreview:pricing")],
             [InlineKeyboardButton(text="◀️ Назад", callback_data="adminmenu:root")],
         ]
     )

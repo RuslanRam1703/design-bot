@@ -12,6 +12,7 @@
 """
 
 import logging
+from urllib.parse import urlencode, urlsplit, urlunsplit, parse_qsl
 from html import escape
 import math
 import zipfile
@@ -23,7 +24,7 @@ from aiogram.exceptions import TelegramAPIError
 from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State
-from aiogram.types import BufferedInputFile, CallbackQuery, InlineKeyboardMarkup, Message
+from aiogram.types import InlineKeyboardButton, WebAppInfo, BufferedInputFile, CallbackQuery, InlineKeyboardMarkup, Message
 
 from bot import admin_keyboards as kb
 from bot import access_control, behance, config, content_store, flow, media_archive, telegram_media, texts
@@ -246,7 +247,7 @@ async def _resolve_cancel(data: dict) -> tuple[str, InlineKeyboardMarkup, State 
             {"service_id": data["service_id"]},
         )
     if target == "sections" and data.get("case_id"):
-        case = next((c for c in await content_store.list_cases() if c["id"] == data["case_id"]), None)
+        case = await content_store.get_case_edit(config.DESIGNER_CHAT_ID, data["case_id"])
         return (
             "Отменено. Разделы кейса:",
             kb.case_sections_menu_keyboard(case.get("sections", []) if case else []),
@@ -254,7 +255,7 @@ async def _resolve_cancel(data: dict) -> tuple[str, InlineKeyboardMarkup, State 
             {"case_id": data["case_id"]},
         )
     if target == "images" and data.get("case_id"):
-        case = next((c for c in await content_store.list_cases() if c["id"] == data["case_id"]), None)
+        case = await content_store.get_case_edit(config.DESIGNER_CHAT_ID, data["case_id"])
         return (
             "Отменено. Изображения кейса:",
             kb.case_images_menu_keyboard(case.get("images", []) if case else [], case.get("cover") if case else None),
@@ -437,7 +438,8 @@ async def menu_faq(callback: CallbackQuery, state: FSMContext) -> None:
 @router.callback_query(F.data == "adminmenu:pricing")
 async def menu_pricing(callback: CallbackQuery, state: FSMContext) -> None:
     await flow.reset_state_keep_nav(state)
-    await flow.step_from_callback(callback, state, "Услуги и цены:", kb.pricing_menu_keyboard())
+    await content_store.begin_pricing_edit(callback.message.chat.id)
+    await flow.step_from_callback(callback, state, "Черновик прайса. Изменения станут видны клиентам только после проверки и применения.", kb.pricing_menu_keyboard())
     await callback.answer()
 
 
@@ -700,7 +702,7 @@ async def cases_add_description(message: Message, state: FSMContext) -> None:
         if value:
             extra[key] = value
     if extra:
-        await content_store.update_case(message.chat.id, case["id"], **extra)
+        await content_store.update_case(message.chat.id, case["id"], **extra, stage=True)
     # step_from_text, затем finish_flow, НЕ reset_state_keep_nav (P1-3,
     # Batch 4 — исправляет собственную находку Batch 1): когда edit
     # внутри step_from_text успевает отредактировать существующий anchor
@@ -805,11 +807,11 @@ async def cases_moderate_set_category(callback: CallbackQuery) -> None:
     if type_id not in types:
         await callback.answer("Тип работы не найден", show_alert=True)
         return
-    updated = await content_store.update_case_category(callback.message.chat.id, case_id, type_id)
+    updated = await content_store.update_case_category(callback.message.chat.id, case_id, type_id, stage=True)
     if not updated:
         await callback.answer("Кейс не найден", show_alert=True)
         return
-    await callback.answer("Тип работы обновлён")
+    await callback.answer("Категория сохранена. Правки опубликованного кейса применяются через редактор.", show_alert=True)
     await cases_moderate_pick_for_id(callback, case_id)
 
 
@@ -870,8 +872,11 @@ async def cases_edit_start(callback: CallbackQuery, state: FSMContext) -> None:
 @router.callback_query(AdminStates.edit_case_pick, F.data.startswith("admineditcase:"))
 async def cases_edit_picked(callback: CallbackQuery, state: FSMContext) -> None:
     case_id = callback.data.split(":", 1)[1]
+    if not await content_store.begin_case_edit(callback.message.chat.id, case_id):
+        await callback.answer("Кейс недоступен для редактирования", show_alert=True)
+        return
     await state.update_data(case_id=case_id)
-    await callback.message.edit_text("Что изменить?", reply_markup=kb.case_field_keyboard())
+    await callback.message.edit_text("Редактирование кейса. Для опубликованного кейса правки сохраняются отдельно. Когда закончите, нажмите «Проверить и опубликовать».", reply_markup=kb.case_field_keyboard())
     await state.set_state(AdminStates.edit_case_field_pick)
     await callback.answer()
 
@@ -890,7 +895,7 @@ async def cases_edit_field(callback: CallbackQuery, state: FSMContext) -> None:
         return
     await state.update_data(field=field)
     if field == "related_service":
-        services = await content_store.list_services()
+        services = await content_store.list_services(live=True)
         await callback.message.edit_text(
             "С какой услугой связать кейс (для «Хочу похожий проект»)?",
             reply_markup=kb.related_service_pick_keyboard(services, "admincaserelservice"),
@@ -934,7 +939,7 @@ async def cases_edit_field(callback: CallbackQuery, state: FSMContext) -> None:
 async def cases_edit_related_service(callback: CallbackQuery, state: FSMContext) -> None:
     value = callback.data.split(":", 1)[1]
     data = await state.get_data()
-    await content_store.update_case(callback.message.chat.id, data["case_id"], related_service=None if value == "none" else value)
+    await content_store.update_case(callback.message.chat.id, data["case_id"], related_service=None if value == "none" else value, stage=True)
     await callback.message.edit_text("Обновлено ✅\n\nЧто ещё изменить?", reply_markup=kb.case_field_keyboard())
     await callback.answer()
 
@@ -943,7 +948,7 @@ async def cases_edit_related_service(callback: CallbackQuery, state: FSMContext)
 async def cases_edit_category(callback: CallbackQuery, state: FSMContext) -> None:
     new_type_id = callback.data.split(":", 1)[1]
     data = await state.get_data()
-    await content_store.update_case_category(callback.message.chat.id, data["case_id"], new_type_id)
+    await content_store.update_case_category(callback.message.chat.id, data["case_id"], new_type_id, stage=True)
     await callback.message.edit_text("Обновлено ✅\n\nЧто ещё изменить?", reply_markup=kb.case_field_keyboard())
     await callback.answer()
 
@@ -964,7 +969,7 @@ def _is_valid_image_upload(message: Message) -> bool:
 
 
 async def _current_case(case_id: str) -> dict | None:
-    return next((c for c in await content_store.list_cases() if c["id"] == case_id), None)
+    return await content_store.get_case_edit(config.DESIGNER_CHAT_ID, case_id)
 
 
 async def _current_section(case_id: str, index: int) -> dict | None:
@@ -1016,7 +1021,7 @@ async def case_image_add_receive(message: Message, state: FSMContext) -> None:
         logger.exception("Unexpected gallery image upload failure (case_id=%s)", data["case_id"])
         await flow.step_from_text(message, state, _COVER_UPLOAD_ERROR, kb.cancel_keyboard())
         return
-    await content_store.add_case_image(message.chat.id, data["case_id"], path, archive_ref=archive_ref)
+    await content_store.add_case_image(message.chat.id, data["case_id"], path, archive_ref=archive_ref, stage=True)
     case = await _current_case(data["case_id"])
     # flow.step_from_text (P1-3, Batch 3) — success-переход в case_images_menu
     # (AdminStates-активное, cancel_to="images" сохраняется) — без него
@@ -1090,7 +1095,7 @@ async def case_image_action(callback: CallbackQuery, state: FSMContext) -> None:
         stale_external = bool(cover_changed and case_before.get("external_url"))
         old_source_ref = case_before.get("source_ref") if case_before else None
 
-        await content_store.set_case_cover(callback.message.chat.id, case_id, image_path)
+        await content_store.set_case_cover(callback.message.chat.id, case_id, image_path, stage=True)
 
         if stale_external:
             # source_ref=None, а не "архивная ссылка выбранной картинки".
@@ -1103,13 +1108,13 @@ async def case_image_action(callback: CallbackQuery, state: FSMContext) -> None:
             # к своей картинке.
             await content_store.update_case(
                 callback.message.chat.id, case_id, **_uploaded_cover_fields(None),
-            )
+             stage=True)
         if cover_changed and old_source_ref and old_source_ref != image_path:
             # Прежняя обложка была архивной, а теперь ею стала картинка из
             # галереи — архивное сообщение осиротело. Убираем ПОСЛЕ записи.
             await media_archive.delete_archive_message(callback.bot, old_source_ref)
     elif action in ("up", "down"):
-        await content_store.reorder_case_image(callback.message.chat.id, case_id, image_path, action)
+        await content_store.reorder_case_image(callback.message.chat.id, case_id, image_path, action, stage=True)
     # "back" — просто возвращает к списку, ничего не меняя
 
     case = await _current_case(case_id)
@@ -1134,7 +1139,7 @@ async def case_image_delete_do(callback: CallbackQuery, state: FSMContext) -> No
         # картинок (демо-SVG, старые данные) ссылки нет — тогда
         # delete_archive_message просто ничего не делает.
         image_ref = content_store.case_image_ref(await _current_case(case_id), image_path)
-        await content_store.remove_case_image(callback.message.chat.id, case_id, image_path)
+        await content_store.remove_case_image(callback.message.chat.id, case_id, image_path, stage=True)
         await media_archive.delete_archive_message(callback.bot, image_ref)
     case = await _current_case(case_id)
     await callback.message.edit_text(
@@ -1180,7 +1185,7 @@ async def case_section_add_title(message: Message, state: FSMContext) -> None:
     data = await state.get_data()
     title = message.text.strip()
     if data["section_type"] == "gallery":
-        await content_store.add_case_section(message.chat.id, data["case_id"], section_type="gallery", title=title, images=[])
+        await content_store.add_case_section(message.chat.id, data["case_id"], section_type="gallery", title=title, images=[], stage=True)
         case = await _current_case(data["case_id"])
         await flow.step_from_text(
             message, state,
@@ -1197,7 +1202,7 @@ async def case_section_add_title(message: Message, state: FSMContext) -> None:
 @router.message(AdminStates.case_section_add_content, F.text)
 async def case_section_add_content(message: Message, state: FSMContext) -> None:
     data = await state.get_data()
-    await content_store.add_case_section(message.chat.id, data["case_id"], section_type="text", title=data["section_title"], content=message.text.strip())
+    await content_store.add_case_section(message.chat.id, data["case_id"], section_type="text", title=data["section_title"], content=message.text.strip(), stage=True)
     case = await _current_case(data["case_id"])
     await flow.step_from_text(message, state, "Раздел добавлен ✅\n\nРазделы кейса:", kb.case_sections_menu_keyboard(case.get("sections", []) if case else []))
     await state.set_state(AdminStates.case_sections_menu)
@@ -1274,7 +1279,7 @@ async def case_section_action(callback: CallbackQuery, state: FSMContext) -> Non
         await callback.answer()
         return
     if action in ("up", "down"):
-        await content_store.reorder_case_section(callback.message.chat.id, case_id, index, action)
+        await content_store.reorder_case_section(callback.message.chat.id, case_id, index, action, stage=True)
         case = await _current_case(case_id)
         await callback.message.edit_text("Разделы кейса:", reply_markup=kb.case_sections_menu_keyboard(case.get("sections", []) if case else []))
         await state.set_state(AdminStates.case_sections_menu)
@@ -1308,7 +1313,7 @@ async def case_section_delete_do(callback: CallbackQuery, state: FSMContext) -> 
     data = await state.get_data()
     case_id, index = data["case_id"], data["section_index"]
     if answer == "yes":
-        await content_store.delete_case_section(callback.message.chat.id, case_id, index)
+        await content_store.delete_case_section(callback.message.chat.id, case_id, index, stage=True)
         text = "Раздел удалён ✅\n\nРазделы кейса:"
     else:
         text = "Разделы кейса:"
@@ -1339,7 +1344,7 @@ async def case_section_remove_image(callback: CallbackQuery, state: FSMContext) 
         # нет (тот же порядок, что и в case_image_delete_do). У неархивных
         # картинок (старые данные) ссылки нет — уборка ничего не делает.
         image_ref = content_store.case_image_ref(await _current_case(case_id), images[img_index])
-        await content_store.remove_case_section_image(callback.message.chat.id, case_id, index, img_index)
+        await content_store.remove_case_section_image(callback.message.chat.id, case_id, index, img_index, stage=True)
         await media_archive.delete_archive_message(callback.bot, image_ref)
         section = await _current_section(case_id, index) or section
     await callback.message.edit_text(f"«{section['title']}»:", reply_markup=kb.case_section_action_keyboard(section["type"]))
@@ -1382,12 +1387,12 @@ async def case_section_edit_value(message: Message, state: FSMContext) -> None:
             logger.exception("Unexpected section image upload failure (case_id=%s)", case_id)
             await flow.step_from_text(message, state, _COVER_UPLOAD_ERROR, kb.cancel_keyboard())
             return
-        await content_store.add_case_section_image(message.chat.id, case_id, index, path, archive_ref=archive_ref)
+        await content_store.add_case_section_image(message.chat.id, case_id, index, path, archive_ref=archive_ref, stage=True)
     else:
         if not message.text:
             await flow.step_from_text(message, state, "Нужен текст.", kb.cancel_keyboard())
             return
-        await content_store.update_case_section(message.chat.id, case_id, index, **{field: message.text.strip()})
+        await content_store.update_case_section(message.chat.id, case_id, index, **{field: message.text.strip()}, stage=True)
 
     # _current_section, не case["sections"][index] напрямую (P1-3, Batch 6)
     # — раздел (или сам кейс) мог быть удалён между показом prompt'а и
@@ -1441,7 +1446,7 @@ async def cases_edit_value(message: Message, state: FSMContext) -> None:
                 logger.exception("Unexpected source resolve failure (edit case %s, caption)", data["case_id"])
                 await flow.step_from_text(message, state, _COVER_UPLOAD_ERROR, kb.cancel_keyboard())
                 return
-            await content_store.update_case(message.chat.id, data["case_id"], cover=cover, **source_fields)
+            await content_store.update_case(message.chat.id, data["case_id"], cover=cover, **source_fields, stage=True)
             # Прежнее архивное сообщение осиротело — убираем ПОСЛЕ записи
             # (тот же порядок, что и в остальных переходах).
             await media_archive.delete_archive_message(message.bot, old_source_ref)
@@ -1487,7 +1492,7 @@ async def cases_edit_value(message: Message, state: FSMContext) -> None:
         # upload -> upload (с заменой archive-ссылки).
         await content_store.update_case(
             message.chat.id, data["case_id"], cover=value, **source_fields,
-        )
+         stage=True)
         if old_source_ref and old_source_ref != source_fields.get("source_ref"):
             await media_archive.delete_archive_message(message.bot, old_source_ref)
     else:
@@ -1520,7 +1525,7 @@ async def cases_edit_value(message: Message, state: FSMContext) -> None:
             await content_store.update_case(
                 message.chat.id, data["case_id"],
                 external_url=value, cover=cover, source_type="behance", source_ref=value,
-            )
+             stage=True)
             # upload -> behance: архивное сообщение прежней обложки больше
             # никому не принадлежит. Удаляем ПОСЛЕ записи (Task 6).
             await media_archive.delete_archive_message(message.bot, old_source_ref)
@@ -1548,10 +1553,10 @@ async def cases_edit_value(message: Message, state: FSMContext) -> None:
                 message.chat.id, data["case_id"],
                 external_url=normalized, cover=cover,
                 source_type="telegram_post", source_ref=normalized,
-            )
+             stage=True)
             await media_archive.delete_archive_message(message.bot, old_source_ref)
         else:
-            await content_store.update_case(message.chat.id, data["case_id"], **{field: value})
+            await content_store.update_case(message.chat.id, data["case_id"], **{field: value}, stage=True)
     # flow.step_from_text (P1-3, Batch 3) — success-переход в
     # edit_case_field_pick (cancel_to="cases" сохраняется).
     await flow.step_from_text(message, state, "Обновлено ✅\n\nЧто ещё изменить?", kb.case_field_keyboard())
@@ -1985,7 +1990,7 @@ async def price_add_includes(message: Message, state: FSMContext) -> None:
         term_min=data["term_min"],
         term_max=data["term_max"],
         includes=message.text.strip(),
-    )
+     stage=True)
     # step_from_text, затем finish_flow, НЕ reset_state_keep_nav (P1-3,
     # Batch 4) — см. то же обоснование в cases_add_description выше.
     await flow.step_from_text(message, state, f"Услуга «{service['name']}» добавлена ✅", kb.pricing_menu_keyboard())
@@ -2045,9 +2050,9 @@ async def price_edit_value(message: Message, state: FSMContext) -> None:
         if value is None:
             await flow.step_from_text(message, state, "Нужно число. Попробуйте ещё раз:", kb.cancel_keyboard())
             return
-        await content_store.update_service(message.chat.id, data["service_id"], **{field: value})
+        await content_store.update_service(message.chat.id, data["service_id"], **{field: value}, stage=True)
     else:
-        await content_store.update_service(message.chat.id, data["service_id"], **{field: message.text.strip()})
+        await content_store.update_service(message.chat.id, data["service_id"], **{field: message.text.strip()}, stage=True)
     # flow.step_from_text (P1-3, Batch 3) — success-переход в
     # edit_service_field_pick (cancel_to="pricing" сохраняется).
     await flow.step_from_text(message, state, "Обновлено ✅\n\nЧто изменить?", kb.service_field_keyboard())
@@ -2084,7 +2089,7 @@ async def price_delete_do(callback: CallbackQuery, state: FSMContext) -> None:
     answer = callback.data.split(":", 1)[1]
     data = await state.get_data()
     if answer == "yes":
-        await content_store.delete_service(callback.message.chat.id, data["service_id"])
+        await content_store.delete_service(callback.message.chat.id, data["service_id"], stage=True)
         text = "Услуга удалена ✅"
     else:
         text = "Отменено."
@@ -2135,9 +2140,9 @@ async def price_coef_value(message: Message, state: FSMContext) -> None:
         await flow.step_from_text(message, state, "Нужно число. Попробуйте ещё раз:", kb.cancel_keyboard())
         return
     if data["kind"] == "coef":
-        await content_store.update_coefficient(message.chat.id, data["key"], value)
+        await content_store.update_coefficient(message.chat.id, data["key"], value, stage=True)
     else:
-        await content_store.update_rounding(message.chat.id, data["key"], value)
+        await content_store.update_rounding(message.chat.id, data["key"], value, stage=True)
     # flow.step_from_text (P1-3, Batch 3) — success-переход в
     # edit_coefficients_pick (cancel_to="pricing" сохраняется).
     await flow.step_from_text(message, state, "Обновлено ✅\n\nЧто ещё изменить?", kb.coefficients_menu_keyboard())
@@ -2238,7 +2243,7 @@ async def option_add_multipliable(callback: CallbackQuery, state: FSMContext) ->
         price=data["opt_price"],
         days=data["opt_days"],
         multipliable=multipliable,
-    )
+     stage=True)
     await callback.message.edit_text("Опция добавлена ✅\n\nОпции этой услуги:", reply_markup=kb.options_menu_keyboard())
     await state.set_state(AdminStates.edit_service_field_pick)
     await callback.answer()
@@ -2274,7 +2279,7 @@ async def option_edit_field(callback: CallbackQuery, state: FSMContext) -> None:
 async def option_edit_value_bool(callback: CallbackQuery, state: FSMContext) -> None:
     value = callback.data.split(":", 1)[1] == "yes"
     data = await state.get_data()
-    await content_store.update_option(callback.message.chat.id, data["option_id"], multipliable=value)
+    await content_store.update_option(callback.message.chat.id, data["option_id"], multipliable=value, stage=True)
     await callback.message.edit_text("Обновлено ✅\n\nЧто изменить?", reply_markup=kb.option_field_keyboard())
     await state.set_state(AdminStates.option_edit_field_pick)
     await callback.answer()
@@ -2289,9 +2294,9 @@ async def option_edit_value_text(message: Message, state: FSMContext) -> None:
         if value is None:
             await flow.step_from_text(message, state, "Нужно число. Попробуйте ещё раз:", kb.cancel_keyboard())
             return
-        await content_store.update_option(message.chat.id, data["option_id"], **{field: value})
+        await content_store.update_option(message.chat.id, data["option_id"], **{field: value}, stage=True)
     else:
-        await content_store.update_option(message.chat.id, data["option_id"], **{field: message.text.strip()})
+        await content_store.update_option(message.chat.id, data["option_id"], **{field: message.text.strip()}, stage=True)
     # flow.step_from_text (P1-3, Batch 3) — success-переход в
     # option_edit_field_pick (cancel_to="options" сохраняется).
     await flow.step_from_text(message, state, "Обновлено ✅\n\nЧто изменить?", kb.option_field_keyboard())
@@ -2315,7 +2320,7 @@ async def option_delete_do(callback: CallbackQuery, state: FSMContext) -> None:
     answer = callback.data.split(":", 1)[1]
     data = await state.get_data()
     if answer == "yes":
-        await content_store.delete_option(callback.message.chat.id, data["option_id"])
+        await content_store.delete_option(callback.message.chat.id, data["option_id"], stage=True)
         text = "Опция удалена ✅"
     else:
         text = "Отменено."
@@ -2394,7 +2399,7 @@ async def cat_relservice_start(callback: CallbackQuery, state: FSMContext) -> No
 async def cat_relservice_picked(callback: CallbackQuery, state: FSMContext) -> None:
     type_id = callback.data.split(":", 1)[1]
     await state.update_data(type_id=type_id)
-    services = await content_store.list_services()
+    services = await content_store.list_services(live=True)
     await callback.message.edit_text(
         "С какой услугой связать эту категорию (подставляется в новые кейсы этой категории)?",
         reply_markup=kb.related_service_pick_keyboard(services, "admincatrelservice"),
@@ -2973,6 +2978,106 @@ async def backup_import_wrong(message: Message, state: FSMContext) -> None:
 # более конкретный хендлер выше не подошёл (например, стикер вместо текста,
 # голосовое вместо числа). Раньше такие сообщения проваливались сквозь все
 # роутеры бота без единого ответа — админ не понимал, жив ли бот.
+
+def _preview_url(case_id: str) -> str:
+    parts = urlsplit(config.WEBAPP_URL)
+    query = dict(parse_qsl(parts.query)); query["preview_case"] = case_id
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), ""))
+
+
+async def _review_screen(callback: CallbackQuery, state: FSMContext, kind: str) -> None:
+    actor = callback.message.chat.id
+    data = await state.get_data()
+    if kind == "case":
+        case_id = data.get("case_id")
+        working = await content_store.get_case_edit(actor, case_id) if case_id else None
+        if not working:
+            await callback.answer("Сначала выберите кейс для редактирования", show_alert=True); return
+        live_case = next((c for c in await content_store.list_cases() if c["id"] == case_id), {})
+        can_discard = "_editor" in live_case
+        target = case_id
+        text = "Проверка кейса: " + escape(working.get("title", "")) + "\n\nОткройте предпросмотр. Клиенты увидят изменения только после публикации."
+        back = "adminreviewback"
+        extra = [[InlineKeyboardButton(text="👁 Открыть предпросмотр", web_app=WebAppInfo(url=_preview_url(case_id)))]]
+    else:
+        await content_store.begin_pricing_edit(actor)
+        working = await content_store.get_pricing_edit(actor)
+        target = "pricing"
+        can_discard = True
+        text = "Проверка черновика прайса\n\nВыберите услугу для контрольного расчёта. Применение обновит весь прайс; уже сохранённые заявки не изменятся."
+        back = "adminmenu:pricing"
+        extra = [[InlineKeyboardButton(text=service["name"][:60], callback_data=f"adminsample:{i}")] for i, service in enumerate(working["services"])]
+    digest = content_store.editor_digest(working)
+    await state.update_data(review_kind=kind, review_target=target, review_digest=digest)
+    apply_rows = [[InlineKeyboardButton(text="✅ Опубликовать кейс" if kind == "case" else "✅ Применить прайс", callback_data=f"adminapply:{digest[:16]}")]] if kind == "case" or data.get("sample_digest") == digest else []
+    discard_rows = [[InlineKeyboardButton(text="Отменить черновые правки", callback_data=f"admindiscard:{digest[:16]}")]] if can_discard else []
+    rows = extra + apply_rows + discard_rows + [
+        [InlineKeyboardButton(text="◀️ Назад", callback_data=back)],
+    ]
+    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+    await callback.answer()
+
+
+@router.callback_query(F.data == "adminreviewback")
+async def review_back_to_case(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.set_state(AdminStates.edit_case_field_pick)
+    await callback.message.edit_text("Черновик кейса: что изменить?", reply_markup=kb.case_field_keyboard())
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("adminreview:"))
+async def review_start(callback: CallbackQuery, state: FSMContext) -> None:
+    await _review_screen(callback, state, callback.data.split(":", 1)[1])
+
+
+@router.callback_query(F.data.startswith("adminsample:"))
+async def review_price_sample(callback: CallbackQuery, state: FSMContext) -> None:
+    from bot.calculator import calculate
+    saved = await state.get_data()
+    pricing = await content_store.get_pricing_edit(callback.message.chat.id)
+    try:
+        if content_store.editor_digest(pricing) != saved.get("review_digest"):
+            raise ValueError("Прайс изменился. Откройте проверку заново.")
+        content_store.validate_pricing(pricing)
+        service = pricing["services"][int(callback.data.split(":", 1)[1])]
+        selected = [{"id": o["id"], "qty": 1} for o in pricing["options"] if o["service_id"] == service["id"]]
+        rows = []
+        for label, options, urgent in [("Базовая услуга", [], False), ("Все опции по 1 шт.", selected, False), ("Все опции по 1 шт. + срочность", selected, True)]:
+            result = calculate(pricing, service["id"], options, urgent, False)
+            rows.append(f"{label}: {result.price_from:,.0f}–{result.price_to:,.0f} ₽; {result.term_from:g}–{result.term_to:g} дней")
+        await state.update_data(sample_digest=content_store.editor_digest(pricing))
+        text = "Контрольный расчёт: " + escape(service["name"]) + "\n\n" + "\n\n".join(rows) + "\n\nЭто пример, заявка не создаётся."
+    except (ValueError, IndexError, KeyError, OverflowError) as exc:
+        text = escape(str(exc)) if isinstance(exc, ValueError) else "Не удалось проверить прайс. Проверьте значения и повторите."
+    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="◀️ К проверке прайса", callback_data="adminreview:pricing")]]))
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("adminapply:"))
+@router.callback_query(F.data.startswith("admindiscard:"))
+async def review_finish(callback: CallbackQuery, state: FSMContext) -> None:
+    saved = await state.get_data()
+    expected = saved.get("review_digest", "")
+    if not expected or callback.data.split(":", 1)[1] != expected[:16]:
+        await callback.answer("Эта проверка устарела. Откройте предпросмотр заново.", show_alert=True); return
+    publish = callback.data.startswith("adminapply:")
+    try:
+        if saved.get("review_kind") == "case":
+            ok = await content_store.finish_case_edit(callback.message.chat.id, saved["review_target"], expected, publish=publish)
+            keyboard = kb.admin_cases_menu_keyboard()
+        else:
+            if publish and saved.get("sample_digest") != expected:
+                raise ValueError("Сначала выполните контрольный расчёт.")
+            ok = await content_store.finish_pricing_edit(callback.message.chat.id, expected, publish=publish)
+            keyboard = kb.pricing_menu_keyboard()
+        if not ok: raise ValueError("Черновик больше недоступен. Откройте редактор заново.")
+    except ValueError as exc:
+        await callback.answer(str(exc), show_alert=True); return
+    await flow.reset_state_keep_nav(state)
+    await flow.step_from_callback(callback, state, "Изменения опубликованы ✅" if publish else "Черновые правки отменены. Действующая версия сохранена.", keyboard)
+    await callback.answer()
+
+
 @router.message(StateFilter(AdminStates))
 async def admin_unexpected_input(message: Message) -> None:
     await message.answer(

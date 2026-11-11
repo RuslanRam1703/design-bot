@@ -95,14 +95,23 @@ async def handle_public_data(request: web.Request) -> web.Response:
     except Exception:
         logger.exception("Не удалось прочитать публичный /data/%s", filename)
         return web.json_response({"error": "internal"}, status=500)
-    if filename == "portfolio.json":
-        # Public visitors must never receive drafts, rejected or trashed cases.
-        # Legacy cases have no status and remain published for compatibility.
-        data = {**data, "cases": [
-            case for case in data.get("cases", [])
-            if case.get("status", "published") == "published"
+    preview_id = request.query.get("preview_case")
+    if preview_id:
+        if user is None or str(user["id"]) != str(config.DESIGNER_CHAT_ID):
+            return web.json_response({"error": "owner_required"}, status=403)
+        case = next((c for c in data.get("cases", []) if c.get("id") == preview_id), None)
+        if filename != "portfolio.json" or case is None or case.get("status") == "trashed":
+            raise web.HTTPNotFound()
+        working = case.get("_editor", {}).get("working", case)
+        data = {"types": data.get("types", []), "cases": [{k: v for k, v in working.items() if k != "_editor"}], "owner_preview": True}
+    elif filename == "portfolio.json":
+        data = {"types": data.get("types", []), "cases": [
+            {k: v for k, v in case.items() if k != "_editor"}
+            for case in data.get("cases", []) if case.get("status", "published") == "published"
         ]}
-    return web.json_response(data, dumps=lambda d: json.dumps(d, ensure_ascii=False))
+    elif filename == "pricing.json":
+        data = {k: v for k, v in data.items() if k != "_editor"}
+    return web.json_response(data, dumps=lambda d: json.dumps(d, ensure_ascii=False), headers={"Cache-Control": "no-store"})
 
 
 async def handle_my_leads(request: web.Request) -> web.Response:
