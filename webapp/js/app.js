@@ -212,6 +212,14 @@ function navigate(screen, { resetBrief = false, hardReset = false, pushHistory =
 }
 
 function goBack() {
+  if (state.portfolio?.owner_preview) {
+    if (!TG.close()) {
+      const url = new URL(window.location.href);
+      url.searchParams.delete('preview_case');
+      window.location.replace(url.href);
+    }
+    return;
+  }
   const prev = state.history.pop();
   state.screen = prev || "portfolio";
   render();
@@ -337,8 +345,10 @@ async function init() {
   // server can deny blocked accounts. In public preview mode an empty
   // initData is still accepted, but strict mode requires real Telegram.
   const publicHeaders = { "X-Telegram-Init-Data": TG.initData() };
+  const previewCaseId = new URLSearchParams(window.location.search).get("preview_case");
   const getContent = async (name) => {
-    const response = await fetch(apiUrl(`/data/${name}`), { headers: publicHeaders, signal: AbortSignal.timeout(20000) });
+    const suffix = name === "portfolio.json" && previewCaseId ? "?preview_case=" + encodeURIComponent(previewCaseId) : "";
+    const response = await fetch(apiUrl(`/data/${name}${suffix}`), { headers: publicHeaders, signal: AbortSignal.timeout(20000) });
     if (response.status === 403) throw new Error("ACCESS_DENIED");
     if (response.status === 401) throw new Error("TELEGRAM_REQUIRED");
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
@@ -415,6 +425,10 @@ async function init() {
   // не показываем пустой/битый вид, откатываемся на портфолио.
   const menu = state.uiConfig.menu || {};
   if (menu[state.screen] === false) state.screen = "portfolio";
+
+  if (state.portfolio?.owner_preview && state.portfolio.cases.length) {
+    state.currentCase = state.portfolio.cases[0]; state.history = ['portfolio']; state.screen = 'case';
+  }
 
   if (params.get('gallery_demo') === '1' || realTG?.initDataUnsafe?.start_param === 'gallery_demo') {
     const demo = state.portfolio.cases.find(c => c.id === 'gallery_demo');
@@ -578,6 +592,7 @@ function render() {
       showTabBar = false;
   }
 
+  if (state.portfolio?.owner_preview) showTabBar = false;
   app.innerHTML = renderBrandHeader() + content + (showTabBar ? renderTabBar() : "");
 
   switch (state.screen) {
@@ -762,14 +777,15 @@ function renderCase() {
     ? `<a class="external-case-link" href="${escapeHtml(externalUrl)}" target="_blank" rel="noopener">Смотреть подробнее ↗</a>`
     : "";
   return `
+    ${state.portfolio?.owner_preview ? '<p class="hint" role="status">Предпросмотр владельца · изменения не опубликованы</p>' : ""}
     <div class="topbar">
-      <button class="back-btn" id="back">←</button>
+      <button class="back-btn" id="back">${state.portfolio?.owner_preview ? "← В редактор" : "←"}</button>
       <h1>${escapeHtml(c.title)}</h1>
     </div>
     <div class="case-images">${images}</div>
     ${renderCaseContent(c)}
     ${externalLink}
-    <button class="btn btn-primary" id="want-similar">Хочу похожий проект</button>
+    ${state.portfolio?.owner_preview ? '<p class="muted">Предпросмотр владельца. Для публикации вернитесь в чат бота.</p>' : '<button class="btn btn-primary" id="want-similar">Хочу похожий проект</button>'}
   `;
 }
 
@@ -795,7 +811,7 @@ function attachCaseEvents() {
       if (opened) TG.backButton.show(() => window.CaseViewer.close());
     });
   });
-  document.getElementById("want-similar").addEventListener("click", () => {
+  document.getElementById("want-similar")?.addEventListener("click", () => {
     // order_template.service_id (см. data/portfolio.json) — переносим ТОЛЬКО
     // услугу, не опции. order_template.options — статические demo-данные:
     // ни один код в bot/content_store.py их не создаёт и не обновляет, и

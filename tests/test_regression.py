@@ -8084,10 +8084,12 @@ class CaseImageManagementTests(unittest.IsolatedAsyncioTestCase):
             await content_store.remove_case_image(self.actor, "case_img_test", "img/portfolio/b.svg")
         mock_delete.assert_awaited_once_with("img/portfolio/b.svg")
 
-    async def test_update_case_cover_replacement_deletes_old_cover(self):
+    async def test_update_case_cover_replacement_retains_old_gallery_image(self):
         with patch.object(content_store.r2_storage, "delete_image", new=AsyncMock()) as mock_delete:
             await content_store.update_case(self.actor, "case_img_test", cover="https://pub-test.r2.dev/portfolio/new.jpg")
-        mock_delete.assert_awaited_once_with("img/portfolio/a.svg")  # старый cover, не новый
+        mock_delete.assert_not_awaited()  # Previous cover is still part of the gallery.
+        case = next(c for c in await content_store.list_cases() if c["id"] == "case_img_test")
+        self.assertIn("img/portfolio/a.svg", case["images"])
 
     async def test_update_case_setting_same_cover_does_not_call_delete(self):
         # Regression guard: не должно случайно удалять текущий, всё ещё
@@ -13137,7 +13139,7 @@ class ArchiveUploadFlowTests(unittest.IsolatedAsyncioTestCase):
             source_ref=f"archive:@media_archive_da:{message_id}",
         )
 
-    async def test_replace_deletes_old_archive_only_after_persist(self):
+    async def test_replace_retains_archive_for_previous_gallery_image(self):
         await self._seed_upload_case("case_repl", 200)
         state = make_state(self.actor)
         await state.set_state(AdminStates.edit_case_value)
@@ -13150,7 +13152,9 @@ class ArchiveUploadFlowTests(unittest.IsolatedAsyncioTestCase):
         case = await self._case("case_repl")
         self.assertEqual(case["cover"], self.NEW_COVER)
         self.assertEqual(case["source_ref"], "archive:@media_archive_da:201")
-        msg.bot.delete_message.assert_awaited_once_with(chat_id="@media_archive_da", message_id=200)
+        msg.bot.delete_message.assert_not_awaited()
+        self.assertIn(self.ARCHIVE_COVER, case["images"])
+        self.assertEqual(case["image_refs"][self.ARCHIVE_COVER], "archive:@media_archive_da:200")
 
     async def test_replace_failure_keeps_old_cover_and_old_archive(self):
         await self._seed_upload_case("case_keep", 300)
@@ -13185,7 +13189,7 @@ class ArchiveUploadFlowTests(unittest.IsolatedAsyncioTestCase):
 
     # ---- transitions carrying source_ref ----
 
-    async def test_upload_to_behance_clears_archive_and_deletes_message(self):
+    async def test_upload_to_behance_retains_previous_gallery_archive(self):
         await self._seed_upload_case("case_u2b", 500)
         state = make_state(self.actor)
         await state.set_state(AdminStates.edit_case_value)
@@ -13201,7 +13205,9 @@ class ArchiveUploadFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(case["source_type"], "behance")
         self.assertEqual(case["source_ref"], BehanceAdminFlowTests.PROJECT_URL)
         self.assertEqual(case["external_url"], BehanceAdminFlowTests.PROJECT_URL)
-        msg.bot.delete_message.assert_awaited_once_with(chat_id="@media_archive_da", message_id=500)
+        msg.bot.delete_message.assert_not_awaited()
+        self.assertIn(self.ARCHIVE_COVER, case["images"])
+        self.assertEqual(case["image_refs"][self.ARCHIVE_COVER], "archive:@media_archive_da:500")
 
     async def test_behance_to_upload_sets_archive_ref_and_clears_link(self):
         await content_store.add_case(
@@ -13586,8 +13592,10 @@ class CaptionSourceRoutingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(case["source_type"], "telegram_post")
         self.assertEqual(case["cover"], self.TG_CDN)
         self.assertEqual(case["external_url"], self.POST_URL)
-        # Осиротевшее архивное сообщение прежней обложки убрано.
-        msg.bot.delete_message.assert_awaited_once_with(chat_id="@media_archive_da", message_id=77)
+        # Прежняя обложка остаётся в галерее: архив нельзя удалять.
+        msg.bot.delete_message.assert_not_awaited()
+        self.assertIn("https://cdn4.telesco.pe/file/OLD", case["images"])
+        self.assertEqual(case["image_refs"]["https://cdn4.telesco.pe/file/OLD"], "archive:@media_archive_da:77")
 
     async def test_cover_replacement_without_caption_still_uploads(self):
         await content_store.add_case(
