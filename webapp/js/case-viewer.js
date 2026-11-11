@@ -31,6 +31,18 @@
     let lastTap = null;
     let lastTouchTime = -Infinity;
     let finished = false;
+    let inputMode = window.matchMedia?.('(hover: hover) and (pointer: fine)').matches ? 'mouse' : 'touch';
+    function hint(mode = inputMode) {
+      inputMode = mode;
+      if (zoomButton.disabled) return;
+      status.textContent = mode === 'mouse'
+        ? (scale > 1.01
+          ? 'Перетаскивайте фото мышью или прокручивайте. Ctrl + колёсико — масштаб. Двойной щелчок — вписать.'
+          : 'Двойной щелчок или Ctrl + колёсико — увеличить.' + (sources.length > 1 ? ' ← → — сменить фото.' : ''))
+        : (scale > 1.01 ? 'Перемещайте фото пальцем. Сведите пальцы или нажмите дважды, чтобы уменьшить.'
+          : (sources.length > 1 ? 'Листайте свайпом. ' : '') + 'Для увеличения разведите пальцы или нажмите дважды.');
+      scroller.style.cursor = scale > 1.01 ? 'grab' : 'zoom-in';
+    }
     function fit() {
       const availableWidth = Math.max(1, scroller.clientWidth - 24);
       const availableHeight = Math.max(1, scroller.clientHeight - 24);
@@ -58,8 +70,22 @@
     prev.addEventListener('click', () => select(index - 1));
     next.addEventListener('click', () => select(index + 1));
     dialog.addEventListener('keydown', event => {
-      if (scale > 1.01 || (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight')) return;
-      event.preventDefault(); select(index + (event.key === 'ArrowLeft' ? -1 : 1));
+      // Preserve browser/system shortcuts (including accessibility page zoom).
+      if (event.ctrlKey || event.metaKey || event.altKey) return;
+      const center = { x: scroller.clientWidth / 2, y: scroller.clientHeight / 2 };
+      if (['+', '=', '-', '0'].includes(event.key) && !zoomButton.disabled) {
+        event.preventDefault();
+        zoom(event.key === '0' ? 1 : scale * (event.key === '-' ? 1 / 1.25 : 1.25), center);
+        hint('mouse');
+      } else if (['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown'].includes(event.key)) {
+        if (scale > 1.01) {
+          event.preventDefault();
+          scroller.scrollTo(scroller.scrollLeft + (event.key === 'ArrowLeft' ? -80 : event.key === 'ArrowRight' ? 80 : 0),
+                            scroller.scrollTop + (event.key === 'ArrowUp' ? -80 : event.key === 'ArrowDown' ? 80 : 0));
+        } else if (event.key === 'ArrowLeft' || event.key === 'ArrowRight') {
+          event.preventDefault(); select(index + (event.key === 'ArrowLeft' ? -1 : 1));
+        }
+      }
     });
 
     function close() {
@@ -92,14 +118,29 @@
       scroller.scrollTo(x * scale + offset.x - target.x, y * scale + offset.y - target.y);
       zoomButton.textContent = scale > 1.01 ? 'Уменьшить' : 'Увеличить';
       zoomButton.setAttribute('aria-pressed', String(scale > 1.01));
+      hint();
     }
     function toggle(anchor) { zoom(scale > 1.01 ? 1 : 2, anchor); }
     zoomButton.addEventListener('click', () => {
       if (!zoomButton.disabled) toggle({ x: scroller.clientWidth / 2, y: scroller.clientHeight / 2 });
     });
+    // Plain wheel/two-finger scrolling keeps native panning of long images.
+    // Trackpad pinch is delivered as Ctrl+wheel by Chromium/Firefox WebViews.
+    scroller.addEventListener('wheel', event => {
+      if (!event.ctrlKey || !event.cancelable) return;
+      event.preventDefault();
+      if (zoomButton.disabled || pointers.size) return;
+      const unit = event.deltaMode === 1 ? 16 : event.deltaMode === 2 ? scroller.clientHeight : 1;
+      const delta = Math.max(-120, Math.min(120, event.deltaY * unit));
+      if (!Number.isFinite(delta)) return;
+      zoom(scale * Math.exp(-delta * 0.005), point(event));
+      hint('mouse');
+    }, { passive: false });
     scroller.addEventListener('pointerdown', event => {
       if (zoomButton.disabled || (event.pointerType === 'mouse' && event.button !== 0)) return;
       if (event.pointerType !== 'mouse') lastTouchTime = event.timeStamp;
+      hint(event.pointerType === 'mouse' ? 'mouse' : 'touch');
+      if (scale > 1.01) scroller.style.cursor = 'grabbing';
       const p = point(event);
       pointers.set(event.pointerId, p);
       scroller.setPointerCapture(event.pointerId);
@@ -147,6 +188,7 @@
         }
       } else lastTap = null;
       pointers.delete(event.pointerId);
+      if (!pointers.size) hint();
       tap = null;
     }
     scroller.addEventListener('pointerup', release);
@@ -159,7 +201,7 @@
     zoomButton.disabled = true;
     img.addEventListener('load', () => {
       zoomButton.disabled = false; img.hidden = false; fit();
-      status.textContent = sources.length > 1 ? 'Листайте свайпом. Для увеличения разведите пальцы.' : 'Для увеличения разведите пальцы или нажмите дважды.';
+      hint();
     });
     img.addEventListener('error', () => {
       zoomButton.disabled = true;
