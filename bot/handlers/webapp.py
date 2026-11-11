@@ -11,6 +11,7 @@ from bot.data import load_pricing
 from bot.handlers.start import relay_client_media_to_designer
 from bot.lead import format_lead_message, format_material_message
 from bot.notifications import notify_designer_lead
+from bot.lead_validation import valid_new_lead_payload
 
 router = Router(name="webapp")
 logger = logging.getLogger(__name__)
@@ -23,13 +24,17 @@ async def handle_webapp_data(message: Message) -> None:
     (https://core.telegram.org/bots/webapps) — мы ушли от этой кнопки ради
     initData (см. bot/keyboards.py), поэтому submitBrief() теперь шлёт
     POST /api/leads (bot/webserver.py::handle_create_lead), а не sendData().
-    Хендлер оставлен нетронутым как fallback — на случай, если что-то в
+    Хендлер оставлен как fallback с общей проверкой входных данных — на случай, если что-то в
     будущем всё же вызовет sendData() (например, старый закэшированный
     app.js у части клиентов до следующего обращения к серверу)."""
     try:
         payload = json.loads(message.web_app_data.data)
     except (json.JSONDecodeError, TypeError):
-        logger.warning("Не удалось разобрать web_app_data: %r", message.web_app_data.data)
+        logger.warning("Не удалось разобрать web_app_data")
+        await message.answer("Не получилось обработать данные из мини-приложения.")
+        return
+
+    if not isinstance(payload, dict):
         await message.answer("Не получилось обработать данные из мини-приложения.")
         return
 
@@ -41,6 +46,9 @@ async def handle_webapp_data(message: Message) -> None:
 
 
 async def _handle_brief_submission(message: Message, payload: dict) -> None:
+    if not valid_new_lead_payload(payload):
+        await message.answer("Не получилось обработать заявку. Откройте мини-приложение и проверьте заполненные поля.")
+        return
     calc_result = None
     calc_payload = payload.get("calc")
     if calc_payload and calc_payload.get("service_id"):
@@ -71,7 +79,11 @@ async def _handle_brief_submission(message: Message, payload: dict) -> None:
     # awaiting_tz_file из payload["attach_tz"] — см. bot/content_store.py,
     # тот же persistent-механизм, что и для основного HTTP-пути
     # (handle_tz_file ниже не различает, откуда взялась заявка).
-    lead = await content_store.add_lead(payload, telegram_identity, calc_summary, draft_id=payload.get("draft_id"))
+    try:
+        lead = await content_store.add_lead(payload, telegram_identity, calc_summary, draft_id=payload.get("draft_id"))
+    except content_store.NotLeadOwnerError:
+        await message.answer("Не получилось обновить заявку. Откройте мини-приложение и создайте новую.")
+        return
 
     # Both legacy and HTTP submission use the same persisted delivery state.
     if lead["created"] or lead.get("changed") or (lead.get("designer_notification") or {}).get("state") != "sent":
