@@ -6,12 +6,14 @@ const vm = require('node:vm');
 const source = fs.readFileSync(require('node:path').join(__dirname, '../webapp/js/case-viewer.js'), 'utf8');
 function setup({swipes = true, supported = true} = {}) {
   class Element {
-    constructor() { this.attrs = {}; this.style = {cssText: ''}; this.events = {}; this.clientWidth = 390; this.scrollLeft = 0; this.scrollTop = 0; }
+    constructor() { this.attrs = {}; this.style = {cssText: ''}; this.events = {}; this.clientWidth = 390; this.clientHeight = 600; this.scrollLeft = 0; this.scrollTop = 0; }
     setAttribute(k, v) { this.attrs[k] = v; }
     getAttribute(k) { return this.attrs[k] ?? null; }
     removeAttribute(k) { delete this.attrs[k]; }
     addEventListener(k, f) { this.events[k] = f; }
-    fire(k) { this.events[k]?.({preventDefault() {}}); }
+    fire(k, data = {}) { this.events[k]?.({type: k, preventDefault() {}, ...data}); }
+    getBoundingClientRect() { return {left: 0, top: 0}; }
+    setPointerCapture() {}
     append(el) { this.child = el; }
     focus() { this.focused = true; }
     remove() { this.removed = true; }
@@ -75,4 +77,55 @@ test('failed image leaves a usable close control and explains the failure', () =
 test('unsupported dialog API leaves the page untouched', () => {
   const s = setup({supported: false}); s.open();
   assert.equal(s.body.child, undefined); assert.equal(s.calls.disable, 0);
+});
+
+function gestures() {
+  const s = setup(); s.open(); const dialog = s.dialogs[0];
+  const area = dialog.querySelector('.case-viewer-scroll'), img = dialog.querySelector('img');
+  img.fire('load');
+  const send = (type, id, x, y, time = 100) => area.fire(type, {pointerId: id, pointerType: 'touch', clientX: x, clientY: y, timeStamp: time});
+  return {...s, area, img, send};
+}
+test('pinch enlarges around the touched point and clamps to four times width', () => {
+  const s = gestures();
+  s.send('pointerdown', 1, 100, 200); s.send('pointerdown', 2, 200, 200);
+  s.send('pointermove', 2, 300, 200);
+  assert.equal(s.img.style.width, '732px');
+  assert.equal(s.area.scrollLeft, 88); // original midpoint remains under new midpoint
+  s.send('pointermove', 2, 1000, 200);
+  assert.equal(s.img.style.width, '1464px');
+  s.send('pointermove', 2, 110, 200);
+  assert.equal(s.img.style.width, '366px');
+});
+test('single finger pans and pointer cancellation stops movement', () => {
+  const s = gestures(); s.area.scrollTo(100, 200);
+  s.send('pointerdown', 1, 200, 250); s.send('pointermove', 1, 160, 180);
+  assert.equal(s.area.scrollLeft, 140); assert.equal(s.area.scrollTop, 270);
+  s.send('pointercancel', 1, 160, 180); s.send('pointermove', 1, 10, 10);
+  assert.equal(s.area.scrollTop, 270);
+});
+test('double tap zooms in and a second double tap resets; dragging is not a tap', () => {
+  const s = gestures();
+  function tap(time) { s.send('pointerdown', 1, 100, 200, time); s.send('pointerup', 1, 100, 200, time + 40); }
+  tap(100); tap(250); assert.equal(s.img.style.width, '732px');
+  tap(1000); tap(1150); assert.equal(s.img.style.width, '366px');
+  s.send('pointerdown', 1, 100, 200, 2000); s.send('pointermove', 1, 100, 100, 2020);
+  s.send('pointerup', 1, 100, 100, 2040); tap(2100);
+  assert.equal(s.img.style.width, '366px');
+});
+test('lifting one finger after pinch allows panning without zoom jump', () => {
+  const s = gestures();
+  s.send('pointerdown', 1, 100, 200); s.send('pointerdown', 2, 200, 200);
+  s.send('pointermove', 2, 300, 200); s.send('pointerup', 2, 300, 200);
+  const before = s.area.scrollTop;
+  s.send('pointermove', 1, 100, 180);
+  assert.equal(s.img.style.width, '732px'); assert.equal(s.area.scrollTop, before + 20);
+});
+test('synthetic mouse double-click after touch does not undo touch zoom', () => {
+  const s = gestures();
+  for (const t of [100, 250]) { s.send('pointerdown', 1, 100, 200, t); s.send('pointerup', 1, 100, 200, t + 40); }
+  s.area.fire('dblclick', {clientX: 100, clientY: 200, timeStamp: 300});
+  assert.equal(s.img.style.width, '732px');
+  s.area.fire('dblclick', {pointerType: 'mouse', clientX: 100, clientY: 200, timeStamp: 1000});
+  assert.equal(s.img.style.width, '366px');
 });

@@ -177,6 +177,6 @@ textarea::placeholder, input::placeholder { color:var(--hint); opacity:.8; }
 .case-viewer::backdrop { background:#070910; }
 .case-viewer-bar { display:flex; justify-content:space-between; gap:8px; padding:12px; padding-top:max(12px,var(--tg-content-safe-area-inset-top,0px)); flex-shrink:0; border-bottom:1px solid var(--border); }
 .case-viewer-bar button { min-height:44px; padding:8px 12px; border:1px solid var(--border); border-radius:12px; background:var(--bg-secondary); font-size:14px; }
-.case-viewer-scroll { flex:1; min-height:0; overflow:auto; overscroll-behavior:contain; touch-action:pan-x pan-y; }
+.case-viewer-scroll { flex:1; min-height:0; overflow:auto; overscroll-behavior:contain; touch-action:none; }
 .case-viewer-scroll img { display:block; max-width:none; height:auto; margin:12px auto; }
 .case-viewer-status { flex-shrink:0; margin:0; padding:8px 12px max(8px,env(safe-area-inset-bottom,0px)); font-size:12px; color:var(--hint); }

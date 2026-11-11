@@ -774,11 +774,11 @@ function attachCaseEvents() {
       const button = document.createElement('button');
       button.type = 'button';
       button.className = 'case-image-open';
-      button.setAttribute('aria-label', 'Рассмотреть изображение');
+      button.setAttribute('aria-label', 'Увеличить фото');
       img.replaceWith(button);
       button.append(img);
       const label = document.createElement('span');
-      label.textContent = 'Рассмотреть изображение ↗';
+      label.textContent = 'Увеличить фото';
       button.append(label);
       button.addEventListener('click', () => {
         const opened = window.CaseViewer.open(img.currentSrc || img.src, c.title, () => TG.backButton.show(goBack));

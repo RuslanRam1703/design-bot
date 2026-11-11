@@ -1,4 +1,4 @@
-// Experimental image inspection. No fullscreen, custom pinch or swipe navigation.
+// Image inspection within the existing WebView. No fullscreen or slide navigation.
 (() => {
   let active = null;
   function open(source, title, onClose) {
@@ -18,12 +18,16 @@
     const savedStyle = document.body.getAttribute('style');
     const telegram = window.Telegram?.WebApp;
     const restoreSwipes = telegram?.isVerticalSwipesEnabled === true;
-    let enlarged = false;
+    let scale = 1;
+    const pointers = new Map();
+    let tap = null;
+    let lastTap = null;
+    let lastTouchTime = -Infinity;
     let finished = false;
     function fit() {
       const width = Math.max(1, scroller.clientWidth - 24);
-      img.style.width = `${width * (enlarged ? 2 : 1)}px`;
-      img.style.marginInline = enlarged ? '12px' : 'auto';
+      img.style.width = `${width * scale}px`;
+      img.style.marginInline = '12px';
     }
     function close() {
       if (finished) return;
@@ -42,19 +46,77 @@
     }
     closeButton.addEventListener('click', close);
     dialog.addEventListener('cancel', event => { event.preventDefault(); close(); });
-    zoomButton.addEventListener('click', () => {
-      enlarged = !enlarged;
-      zoomButton.textContent = enlarged ? 'Уменьшить' : 'Увеличить';
-      zoomButton.setAttribute('aria-pressed', String(enlarged));
-      status.textContent = enlarged ? 'Прокручивайте фото, чтобы рассмотреть детали' : 'Масштаб по ширине окна';
-      const x = scroller.scrollLeft, y = scroller.scrollTop;
+    function point(event) {
+      const rect = scroller.getBoundingClientRect();
+      return { x: event.clientX - rect.left, y: event.clientY - rect.top };
+    }
+    function zoom(next, anchor, target = anchor) {
+      const previous = scale;
+      scale = Math.max(1, Math.min(4, next));
+      const x = (scroller.scrollLeft + anchor.x - 12) / previous;
+      const y = (scroller.scrollTop + anchor.y - 12) / previous;
       fit();
-      scroller.scrollTo(x * (enlarged ? 2 : .5), y * (enlarged ? 2 : .5));
+      scroller.scrollTo(x * scale + 12 - target.x, y * scale + 12 - target.y);
+      zoomButton.textContent = scale > 1.01 ? 'Уменьшить' : 'Увеличить';
+      zoomButton.setAttribute('aria-pressed', String(scale > 1.01));
+    }
+    function toggle(anchor) { zoom(scale > 1.01 ? 1 : 2, anchor); }
+    zoomButton.addEventListener('click', () => {
+      if (!zoomButton.disabled) toggle({ x: scroller.clientWidth / 2, y: scroller.clientHeight / 2 });
+    });
+    scroller.addEventListener('pointerdown', event => {
+      if (zoomButton.disabled || (event.pointerType === 'mouse' && event.button !== 0)) return;
+      if (event.pointerType !== 'mouse') lastTouchTime = event.timeStamp;
+      const p = point(event);
+      pointers.set(event.pointerId, p);
+      scroller.setPointerCapture(event.pointerId);
+      tap = pointers.size === 1 ? { ...p, time: event.timeStamp } : null;
+      if (pointers.size > 1) lastTap = null;
+    });
+    const distance = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
+    const middle = (a, b) => ({ x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 });
+    scroller.addEventListener('pointermove', event => {
+      const previous = pointers.get(event.pointerId);
+      if (!previous) return;
+      const oldPoints = [...pointers.values()];
+      const next = point(event);
+      pointers.set(event.pointerId, next);
+      if (tap && distance(tap, next) > 8) { tap = null; lastTap = null; }
+      if (pointers.size === 1) {
+        scroller.scrollTo(scroller.scrollLeft + previous.x - next.x,
+                          scroller.scrollTop + previous.y - next.y);
+      } else if (pointers.size === 2) {
+        const newPoints = [...pointers.values()];
+        const before = distance(...oldPoints);
+        if (before > 4) zoom(scale * distance(...newPoints) / before,
+                            middle(...oldPoints), middle(...newPoints));
+      }
+    });
+    function release(event) {
+      if (!pointers.has(event.pointerId)) return;
+      if (event.type === 'pointerup' && event.pointerType !== 'mouse' && tap &&
+          pointers.size === 1 && event.timeStamp - tap.time < 300) {
+        const p = point(event);
+        if (distance(tap, p) <= 8) {
+          if (lastTap && event.timeStamp - lastTap.time < 350 && distance(lastTap, p) < 35) {
+            toggle(p); lastTap = null;
+          } else lastTap = { ...p, time: event.timeStamp };
+        }
+      } else lastTap = null;
+      pointers.delete(event.pointerId);
+      tap = null;
+    }
+    scroller.addEventListener('pointerup', release);
+    scroller.addEventListener('pointercancel', release);
+    scroller.addEventListener('lostpointercapture', release);
+    scroller.addEventListener('dblclick', event => {
+      if (!zoomButton.disabled && event.timeStamp - lastTouchTime > 500 &&
+          (!event.pointerType || event.pointerType === 'mouse')) toggle(point(event));
     });
     zoomButton.disabled = true;
     img.addEventListener('load', () => {
       zoomButton.disabled = false;
-      status.textContent = 'Масштаб по ширине окна';
+      status.textContent = 'Разведите пальцы или нажмите «Увеличить». Перемещайте фото для просмотра.';
     });
     img.addEventListener('error', () => {
       zoomButton.disabled = true;
@@ -64,7 +126,13 @@
     img.alt = title || 'Изображение проекта';
     document.body.append(dialog);
     document.body.style.cssText += `;position:fixed;top:${-scrollY}px;left:${-scrollX}px;width:100%;overflow:hidden;`;
-    dialog.showModal();
+    try { dialog.showModal(); } catch (_) {
+      dialog.remove();
+      if (savedStyle === null) document.body.removeAttribute('style');
+      else document.body.setAttribute('style', savedStyle);
+      window.scrollTo(scrollX, scrollY);
+      return false;
+    }
     active = { close };
     fit();
     img.src = source;
