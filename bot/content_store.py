@@ -421,8 +421,7 @@ async def list_portfolio_types() -> list[dict]:
     return (await _read("portfolio.json"))["types"]
 
 
-async def next_case_id() -> str:
-    cases = await list_cases()
+def _next_case_id(cases: list[dict]) -> str:
     nums = []
     for c in cases:
         if c["id"].startswith("case_"):
@@ -433,10 +432,19 @@ async def next_case_id() -> str:
     return f"case_{max(nums, default=0) + 1}"
 
 
+async def next_case_id() -> str:
+    """Suggest an ID for the wizard; uniqueness is enforced when saving."""
+    return _next_case_id(await list_cases())
+
+
 async def add_case(actor_chat_id: int | str, *, case_id: str, title: str, type_id: str, cover: str, task: str, related_service: str | None) -> dict:
     _require_designer(actor_chat_id)
     async with _lock("portfolio.json"):
         data = await _read("portfolio.json")
+        # A second wizard/import may have saved since next_case_id().
+        # Allocate under the same storage lock as the actual write.
+        if any(item["id"] == case_id for item in data["cases"]):
+            case_id = _next_case_id(data["cases"])
         case = {
             "id": case_id,
             "title": title,

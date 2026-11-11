@@ -700,7 +700,7 @@ async def cases_add_description(message: Message, state: FSMContext) -> None:
         if value:
             extra[key] = value
     if extra:
-        await content_store.update_case(message.chat.id, data["case_id"], **extra)
+        await content_store.update_case(message.chat.id, case["id"], **extra)
     # step_from_text, затем finish_flow, НЕ reset_state_keep_nav (P1-3,
     # Batch 4 — исправляет собственную находку Batch 1): когда edit
     # внутри step_from_text успевает отредактировать существующий anchor
