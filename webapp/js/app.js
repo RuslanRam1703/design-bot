@@ -607,7 +607,8 @@ function escapeHtml(str) {
 // начале строки — ничего в JSON-схеме не меняется, миграция не нужна:
 // старые записи как были относительными путями, так и остаются.
 function imageSrc(path) {
-  return path.startsWith("http") ? path : apiUrl(`/${path.replace(/^\/+/, "")}`);
+  if (typeof path !== "string" || !path.trim()) return "";
+  return /^https?:\/\//i.test(path) ? path : apiUrl(`/${path.replace(/^\/+/, "")}`);
 }
 
 // ---- Экран: Портфолио ----
@@ -719,7 +720,7 @@ function renderCaseContent(c) {
   if (c.sections && c.sections.length) {
     return c.sections.map((s) => {
       if (s.type === "gallery") {
-        const imgs = (s.images || []).map((src) => `<img src="${imageSrc(src)}" alt="" />`).join("");
+        const imgs = (s.images || []).map((src) => `<img src="${escapeHtml(imageSrc(src))}" alt="" loading="lazy" decoding="async" />`).join("");
         return `<div class="case-block"><div class="label">${escapeHtml(s.title)}</div><div class="case-section-gallery">${imgs || '<p class="hint">Пока нет изображений</p>'}</div></div>`;
       }
       return `<div class="case-block"><div class="label">${escapeHtml(s.title)}</div><p>${escapeHtml(s.content || "")}</p></div>`;
@@ -730,6 +731,12 @@ function renderCaseContent(c) {
     <div class="case-block"><div class="label">Решение</div><p>${escapeHtml(c.solution || "")}</p></div>
     <div class="case-block"><div class="label">Результат</div><p>${escapeHtml(c.result || "")}</p></div>
   `;
+}
+
+function safeLinkUrl(value) {
+  if (typeof value !== "string") return "";
+  const url = value.trim();
+  return /^(https?:\/\/|mailto:|tel:|tg:\/\/)/i.test(url) ? url : "";
 }
 
 function renderCase() {
@@ -743,13 +750,14 @@ function renderCase() {
   // значило бы показывать не то, что задал дизайнер.
   const images = hasImages
     ? c.images.map((src, i) =>
-        `<img src="${imageSrc(src)}" alt="${escapeHtml(c.title)} — изображение ${i + 1}" loading="${i === 0 ? "eager" : "lazy"}" decoding="async" />`
+        `<img src="${escapeHtml(imageSrc(src))}" alt="${escapeHtml(c.title)} — изображение ${i + 1}" loading="${i === 0 ? "eager" : "lazy"}" decoding="async" />`
       ).join("")
     : `<div class="case-images-empty">Пока нет изображений</div>`;
   // external_url — необязательное поле (см. bot/content_store.py -> CASE_FIELD_LABELS);
   // ссылка показывается, только если дизайнер её заполнил для этого конкретного кейса.
-  const externalLink = c.external_url
-    ? `<a class="external-case-link" href="${escapeHtml(c.external_url)}" target="_blank" rel="noopener">Смотреть подробнее ↗</a>`
+  const externalUrl = safeLinkUrl(c.external_url);
+  const externalLink = externalUrl
+    ? `<a class="external-case-link" href="${escapeHtml(externalUrl)}" target="_blank" rel="noopener">Смотреть подробнее ↗</a>`
     : "";
   return `
     <div class="topbar">
@@ -833,11 +841,12 @@ function renderAbout() {
       </div>`
     : "";
 
-  const linksHTML = a.links && a.links.length
+  const links = (a.links || []).filter((link) => safeLinkUrl(link.url));
+  const linksHTML = links.length
     ? `
       <div class="about-block">
         <h2>Ссылки</h2>
-        <div class="links-list">${a.links.map((l) => `<a href="${escapeHtml(l.url)}" target="_blank" rel="noopener">${escapeHtml(l.label)}</a>`).join("")}</div>
+        <div class="links-list">${links.map((l) => `<a href="${escapeHtml(safeLinkUrl(l.url))}" target="_blank" rel="noopener">${escapeHtml(l.label)}</a>`).join("")}</div>
       </div>`
     : "";
 
@@ -848,7 +857,7 @@ function renderAbout() {
     </div>
 
     <div class="about-header">
-      <img class="about-avatar" src="${imageSrc(a.avatar)}" alt="" />
+      <img class="about-avatar" src="${escapeHtml(imageSrc(a.avatar || "img/about/avatar_placeholder.svg"))}" alt="" />
       <div class="about-name">${escapeHtml(a.name)}</div>
       <div class="hint">${escapeHtml(a.tagline)}</div>
       ${a.location ? `<div class="hint">📍 ${escapeHtml(a.location)}</div>` : ""}
