@@ -3272,7 +3272,7 @@ class AdminRemainingAnchorGapsTests(unittest.IsolatedAsyncioTestCase):
         await state.set_state(AdminStates.delete_case_confirm)
         cb = make_callback("admindelcaseconfirm:yes", chat_id=self.actor, message_id=msg_id)
         await admin.cases_delete_do(cb, state)
-        cb.message.edit_text.assert_awaited_once_with("Кейс перемещён в корзину. Его можно восстановить через «Статусы и публикация».", reply_markup=kb.admin_cases_menu_keyboard())
+        cb.message.edit_text.assert_awaited_once_with("Кейс перемещён в корзину. Его можно восстановить или удалить навсегда через «Корзина».", reply_markup=kb.admin_cases_menu_keyboard())
         remaining = await content_store.list_cases()
         self.assertTrue(any(c["id"] == case["id"] and c["status"] == "trashed" for c in remaining))
         await self._assert_main_menu_cleans_current_screen(state, msg_id, 12300)

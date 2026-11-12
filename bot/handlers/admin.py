@@ -736,6 +736,55 @@ async def cases_add_description(message: Message, state: FSMContext) -> None:
     await flow.finish_flow(state)
 
 
+@router.callback_query(F.data == "admincasesaction:trash")
+async def cases_trash(callback: CallbackQuery) -> None:
+    cases = [c for c in await content_store.list_cases() if c.get("status") == "trashed"]
+    rows = [[InlineKeyboardButton(text=c["title"], callback_data=f"admintrashcase:{c['id']}")] for c in cases]
+    rows.append([InlineKeyboardButton(text="К кейсам", callback_data="adminmenu:cases")])
+    await callback.message.edit_text("Корзина. Выберите кейс для восстановления или окончательного удаления." if cases else "Корзина пуста.", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admintrashcase:"))
+async def cases_trash_pick(callback: CallbackQuery) -> None:
+    case_id = callback.data.split(":", 1)[1]
+    case = next((c for c in await content_store.list_cases() if c["id"] == case_id and c.get("status") == "trashed"), None)
+    if not case:
+        await callback.answer("Кейс уже восстановлен или удалён", show_alert=True)
+        return
+    await callback.message.edit_text(f"В корзине: {escape(case['title'])}", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Восстановить", callback_data=f"adminrestorecase:{case_id}")],
+        [InlineKeyboardButton(text="Удалить навсегда", callback_data=f"adminpurgeask:{case_id}")],
+        [InlineKeyboardButton(text="К корзине", callback_data="admincasesaction:trash")],
+    ]))
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("adminpurgeask:"))
+async def cases_purge_confirm(callback: CallbackQuery) -> None:
+    case_id = callback.data.split(":", 1)[1]
+    case = next((c for c in await content_store.list_cases() if c["id"] == case_id and c.get("status") == "trashed"), None)
+    if not case:
+        await callback.answer("Кейс уже восстановлен или удалён", show_alert=True)
+        return
+    await callback.message.edit_text(f"Удалить кейс «{escape(case['title'])}» навсегда? Восстановить из корзины будет нельзя. Исходная публикация и сообщения Telegram останутся.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Да, удалить навсегда", callback_data=f"adminpurgedo:{case_id}")],
+        [InlineKeyboardButton(text="Отмена", callback_data=f"admintrashcase:{case_id}")],
+    ]))
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("adminpurgedo:"))
+async def cases_purge_do(callback: CallbackQuery) -> None:
+    case_id = callback.data.split(":", 1)[1]
+    deleted = await content_store.delete_case(callback.message.chat.id, case_id, only_trashed=True)
+    await callback.message.edit_text("Кейс удалён навсегда. Если категория больше нигде не используется, её теперь можно удалить." if deleted else "Кейс уже удалён или восстановлен. Удаление не выполнено.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="К корзине", callback_data="admincasesaction:trash")],
+        [InlineKeyboardButton(text="К категориям", callback_data="adminmenu:categories")],
+    ]))
+    await callback.answer()
+
+
 # Portfolio moderation: all transitions are reversible and do not delete assets.
 _PORTFOLIO_STATUS_LABELS = {
     "draft": "Черновик",
@@ -1605,7 +1654,7 @@ async def cases_delete_do(callback: CallbackQuery, state: FSMContext) -> None:
     data = await state.get_data()
     if answer == "yes":
         moved = await content_store.set_case_status(callback.message.chat.id, data["case_id"], "trashed")
-        text = "Кейс перемещён в корзину. Его можно восстановить через «Статусы и публикация»." if moved else "Кейс не найден."
+        text = "Кейс перемещён в корзину. Его можно восстановить или удалить навсегда через «Корзина»." if moved else "Кейс не найден."
     else:
         text = "Отменено."
     # flow.step_from_callback (P1-3, Batch 4) — тот же паттерн, что
@@ -2475,8 +2524,11 @@ async def cat_delete_confirm(callback: CallbackQuery, state: FSMContext) -> None
         await flow.step_from_callback(
             callback, state,
             f"Нельзя удалить — категория используется в {in_use} кейс(ах). "
-            "Сначала перенесите эти кейсы в другую категорию (редактирование кейса) или удалите их.",
-            kb.categories_menu_keyboard(),
+            "Учитываются также кейсы в корзине и черновые правки. Перенесите кейсы в другую категорию или удалите их навсегда из корзины.",
+            InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="Открыть корзину", callback_data="admincasesaction:trash")],
+                [InlineKeyboardButton(text="К категориям", callback_data="adminmenu:categories")],
+            ]),
         )
         await callback.answer()
         return
@@ -2491,8 +2543,8 @@ async def cat_delete_do(callback: CallbackQuery, state: FSMContext) -> None:
     answer = callback.data.split(":", 1)[1]
     data = await state.get_data()
     if answer == "yes":
-        await content_store.delete_portfolio_type(callback.message.chat.id, data["type_id"])
-        text = "Категория удалена ✅"
+        deleted = await content_store.delete_portfolio_type(callback.message.chat.id, data["type_id"])
+        text = "Категория удалена ✅" if deleted else "Категория уже удалена или используется кейсом. Обновите список категорий."
     else:
         text = "Отменено."
     # flow.step_from_callback (P1-3, Batch 4).
