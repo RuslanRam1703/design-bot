@@ -933,7 +933,7 @@ async def reorder_case_section(actor_chat_id: int | str, case_id: str, index: in
         return True
 
 
-async def delete_case(actor_chat_id: int | str, case_id: str) -> bool:
+async def delete_case(actor_chat_id: int | str, case_id: str, *, only_trashed: bool = False) -> bool:
     """Batch 3 — удаляет из R2 ВСЕ изображения кейса: и верхнеуровневую
     галерею (case["images"], всегда включает cover — см. add_case/
     update_case/add_case_image), и images каждой gallery-секции (отдельный,
@@ -945,15 +945,19 @@ async def delete_case(actor_chat_id: int | str, case_id: str) -> bool:
     async with _lock("portfolio.json"):
         data = await _read("portfolio.json")
         case = _find_case(data, case_id)
-        if case is None:
+        if case is None or (only_trashed and case.get("status") != "trashed"):
             return False
         image_paths.extend(case.get("images", []))
         for section in case.get("sections", []):
             image_paths.extend(section.get("images", []))
+        working = case.get("_editor", {}).get("working", {})
+        image_paths.extend(working.get("images", []))
+        for section in working.get("sections", []):
+            image_paths.extend(section.get("images", []))
         data["cases"] = [c for c in data["cases"] if c["id"] != case_id]
         await _write("portfolio.json", data)
-    for path in image_paths:
-        await r2_storage.delete_image(path)
+    for path in set(image_paths):
+        await _delete_unused_image(path)
     return True
 
 
@@ -1400,27 +1404,24 @@ async def rename_portfolio_type(actor_chat_id: int | str, type_id: str, new_labe
         return False
 
 
+def _case_uses_type(case: dict, type_id: str) -> bool:
+    return case.get("type") == type_id or case.get("_editor", {}).get("working", {}).get("type") == type_id
+
+
 async def count_cases_with_type(type_id: str) -> int:
-    return sum(1 for c in await list_cases() if c["type"] == type_id)
+    return sum(1 for c in await list_cases() if _case_uses_type(c, type_id))
 
 
 async def delete_portfolio_type(actor_chat_id: int | str, type_id: str) -> bool:
-    """Отказывает, если категория ещё используется хоть одним кейсом —
-    вызывающий код (admin.py) должен сначала проверить count_cases_with_type
-    и показать дизайнеру понятное сообщение, а не просто получить False.
+    """Keep categories referenced by live, trashed or staged cases.
 
-    count_cases_with_type — tier-0 read, вызывается ДО приобретения
-    portfolio.json lock; сама запись ниже повторно проверяет актуальность
-    (before/after длины списка) на СВЕЖЕ прочитанных внутри лока данных —
-    тот же defensive-паттерн, что был и до этого рефакторинга (admin-действия
-    и так сериализованы SimpleEventIsolation per-chat, см. P1-1 design
-    review — второй параллельный delete/add одной и той же категории с
-    одного и того же DESIGNER_CHAT_ID физически невозможен)."""
+    Check references and remove the category under the same storage lock.
+    """
     _require_designer(actor_chat_id)
-    if await count_cases_with_type(type_id) > 0:
-        return False
     async with _lock("portfolio.json"):
         data = await _read("portfolio.json")
+        if any(_case_uses_type(c, type_id) for c in data["cases"]):
+            return False
         before = len(data["types"])
         data["types"] = [t for t in data["types"] if t["id"] != type_id]
         if len(data["types"]) == before:

@@ -109,3 +109,36 @@ class MaintenanceTests(unittest.IsolatedAsyncioTestCase):
         await store.import_backup_bytes(self.actor,backup)
         new=await store.add_lead({'service_name':'Next'},{'user_id':333})
         self.assertEqual(new['id'],19)
+
+    async def test_trash_purge_releases_category_and_preserves_shared_image(self):
+        await store._write('portfolio.json', {'types':[{'id':'test','label':'Тест'},{'id':'other','label':'Другое'}], 'cases':[
+            {'id':'a','title':'A','type':'test','status':'trashed','images':['shared','unique']},
+            {'id':'b','title':'B','type':'other','status':'published','images':['shared']}]})
+        self.assertFalse(await store.delete_portfolio_type(self.actor,'test'))
+        with patch.object(store.r2_storage,'delete_image',new_callable=AsyncMock) as remove:
+            self.assertTrue(await store.delete_case(self.actor,'a',only_trashed=True))
+            remove.assert_awaited_once_with('unique')
+        self.assertTrue(await store.delete_portfolio_type(self.actor,'test'))
+        self.assertEqual([c['id'] for c in await store.list_cases()],['b'])
+
+    async def test_restored_case_cannot_be_purged_by_stale_button(self):
+        await store._write('portfolio.json', {'types':[], 'cases':[{'id':'a','type':'test','status':'published','images':[]}]})
+        self.assertFalse(await store.delete_case(self.actor,'a',only_trashed=True))
+        self.assertEqual(len(await store.list_cases()),1)
+
+    async def test_staged_case_category_blocks_removal(self):
+        await store._write('portfolio.json', {'types':[{'id':'test','label':'Тест'}], 'cases':[{'id':'a','type':'other','_editor':{'working':{'type':'test'}}}]})
+        self.assertEqual(await store.count_cases_with_type('test'),1)
+        self.assertFalse(await store.delete_portfolio_type(self.actor,'test'))
+
+    async def test_trash_has_visible_entry_and_purge_requires_confirmation(self):
+        from bot import admin_keyboards as kb
+        from bot.handlers import admin
+        self.assertIn('admincasesaction:trash',str(kb.admin_cases_menu_keyboard()))
+        await store._write('portfolio.json', {'types':[], 'cases':[{'id':'a','title':'<test>','type':'test','status':'trashed'}]})
+        callback=SimpleNamespace(data='adminpurgeask:a', answer=AsyncMock(), message=SimpleNamespace(edit_text=AsyncMock()))
+        await admin.cases_purge_confirm(callback)
+        self.assertEqual(len(await store.list_cases()),1)
+        call=callback.message.edit_text.await_args
+        self.assertIn('&lt;test&gt;',call.args[0])
+        self.assertIn('adminpurgedo:a',str(call.kwargs['reply_markup']))
