@@ -737,26 +737,18 @@ async def cases_add_description(message: Message, state: FSMContext) -> None:
 
 
 @router.callback_query(F.data == "admincasesaction:trash")
-async def cases_trash(callback: CallbackQuery) -> None:
+async def cases_trash(callback: CallbackQuery, state: FSMContext) -> None:
+    await flow.reset_state_keep_nav(state)
     cases = [c for c in await content_store.list_cases() if c.get("status") == "trashed"]
     rows = [[InlineKeyboardButton(text=c["title"], callback_data=f"admintrashcase:{c['id']}")] for c in cases]
     rows.append([InlineKeyboardButton(text="К кейсам", callback_data="adminmenu:cases")])
-    await callback.message.edit_text("Корзина. Выберите кейс для восстановления или окончательного удаления." if cases else "Корзина пуста.", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+    await flow.step_from_callback(callback, state, "Корзина. Выберите кейс для восстановления или окончательного удаления." if cases else "Корзина пуста.", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
     await callback.answer()
 
 
 @router.callback_query(F.data.startswith("admintrashcase:"))
 async def cases_trash_pick(callback: CallbackQuery) -> None:
-    case_id = callback.data.split(":", 1)[1]
-    case = next((c for c in await content_store.list_cases() if c["id"] == case_id and c.get("status") == "trashed"), None)
-    if not case:
-        await callback.answer("Кейс уже восстановлен или удалён", show_alert=True)
-        return
-    await callback.message.edit_text(f"В корзине: {escape(case['title'])}", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Восстановить", callback_data=f"adminrestorecase:{case_id}")],
-        [InlineKeyboardButton(text="Удалить навсегда", callback_data=f"adminpurgeask:{case_id}")],
-        [InlineKeyboardButton(text="К корзине", callback_data="admincasesaction:trash")],
-    ]))
+    await cases_moderate_pick_for_id(callback, callback.data.split(":", 1)[1])
     await callback.answer()
 
 
@@ -796,12 +788,13 @@ _PORTFOLIO_STATUS_LABELS = {
 
 
 @router.callback_query(F.data == "admincasesaction:moderate")
-async def cases_moderate_start(callback: CallbackQuery) -> None:
-    cases = await content_store.list_cases()
+async def cases_moderate_start(callback: CallbackQuery, state: FSMContext) -> None:
+    await flow.reset_state_keep_nav(state)
+    cases = [c for c in await content_store.list_cases() if c.get("status") != "trashed"]
     if not cases:
-        await callback.message.edit_text("Кейсов пока нет.", reply_markup=kb.admin_cases_menu_keyboard())
+        await flow.step_from_callback(callback, state, "Кейсов вне корзины пока нет. Удалённые кейсы доступны через «Корзина».", reply_markup=kb.admin_cases_menu_keyboard())
     else:
-        await callback.message.edit_text(
+        await flow.step_from_callback(callback, state,
             "Выбери кейс для управления публикацией:",
             reply_markup=kb.case_pick_keyboard(cases, "adminmoderatecase"),
         )
@@ -810,26 +803,7 @@ async def cases_moderate_start(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data.startswith("adminmoderatecase:"))
 async def cases_moderate_pick(callback: CallbackQuery) -> None:
-    from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
-
-    case_id = callback.data.split(":", 1)[1]
-    case = next((item for item in await content_store.list_cases() if item["id"] == case_id), None)
-    if case is None:
-        await callback.answer("Кейс не найден", show_alert=True)
-        return
-    current = case.get("status", "published")
-    rows = [
-        [InlineKeyboardButton(text=label, callback_data=f"adminsetcasestatus:{status}:{case_id}")]
-        for status, label in _PORTFOLIO_STATUS_LABELS.items() if status != current
-    ]
-    if current == "trashed":
-        rows.insert(0, [InlineKeyboardButton(text="Восстановить прежний статус", callback_data=f"adminrestorecase:{case_id}")])
-    rows.append([InlineKeyboardButton(text="Выбрать тип работы", callback_data=f"adminmoderatecategory:{case_id}")])
-    rows.append([InlineKeyboardButton(text="◀️ К списку", callback_data="admincasesaction:moderate")])
-    await callback.message.edit_text(
-        f"Кейс: {escape(case['title'])}\nСтатус: {_PORTFOLIO_STATUS_LABELS.get(current, current)}\n\nВыбери действие:",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
-    )
+    await cases_moderate_pick_for_id(callback, callback.data.split(":", 1)[1])
     await callback.answer()
 
 
@@ -896,29 +870,37 @@ async def cases_moderate_apply(callback: CallbackQuery) -> None:
 
 
 async def cases_moderate_pick_for_id(callback: CallbackQuery, case_id: str) -> None:
-    from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
-
     case = next((item for item in await content_store.list_cases() if item["id"] == case_id), None)
     if case is None:
+        await callback.message.edit_text("Кейс уже удалён. Откройте актуальный список.", reply_markup=kb.admin_cases_menu_keyboard())
         return
     current = case.get("status", "published")
-    rows = [
-        [InlineKeyboardButton(text=label, callback_data=f"adminsetcasestatus:{status}:{case_id}")]
-        for status, label in _PORTFOLIO_STATUS_LABELS.items() if status != current
-    ]
     if current == "trashed":
-        rows.insert(0, [InlineKeyboardButton(text="Восстановить прежний статус", callback_data=f"adminrestorecase:{case_id}")])
-    rows.append([InlineKeyboardButton(text="Выбрать тип работы", callback_data=f"adminmoderatecategory:{case_id}")])
-    rows.append([InlineKeyboardButton(text="◀️ К списку", callback_data="admincasesaction:moderate")])
+        rows = [
+            [InlineKeyboardButton(text="Восстановить", callback_data=f"adminrestorecase:{case_id}")],
+            [InlineKeyboardButton(text="Удалить навсегда", callback_data=f"adminpurgeask:{case_id}")],
+            [InlineKeyboardButton(text="К корзине", callback_data="admincasesaction:trash")],
+        ]
+    else:
+        rows = [[InlineKeyboardButton(text="Редактировать и проверить", callback_data=f"admincaseedit:{case_id}")]]
+        if current != "published":
+            rows.append([InlineKeyboardButton(text="Опубликовать", callback_data=f"adminsetcasestatus:published:{case_id}")])
+        else:
+            rows.append([InlineKeyboardButton(text="Снять с публикации", callback_data=f"adminsetcasestatus:unpublished:{case_id}")])
+        rows.extend([
+            [InlineKeyboardButton(text="Переместить в корзину", callback_data=f"admincardtrash:{case_id}")],
+            [InlineKeyboardButton(text="К списку кейсов", callback_data="admincasesaction:moderate")],
+        ])
     await callback.message.edit_text(
-        f"Кейс: {escape(case['title'])}\nСтатус: {_PORTFOLIO_STATUS_LABELS[current]}\n\nВыбери действие:",
+        f"Кейс: {escape(case['title'])}\nСтатус: {_PORTFOLIO_STATUS_LABELS.get(current, current)}" +
+        ("\nЕсть черновые правки. Проверьте и примените их в редакторе." if case.get("_editor") else ""),
         reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
     )
 
 
 @router.callback_query(F.data == "admincasesaction:edit")
 async def cases_edit_start(callback: CallbackQuery, state: FSMContext) -> None:
-    cases = await content_store.list_cases()
+    cases = [c for c in await content_store.list_cases() if c.get("status") != "trashed"]
     if not cases:
         await callback.message.edit_text("Кейсов пока нет.", reply_markup=kb.admin_cases_menu_keyboard())
         await callback.answer()
@@ -929,14 +911,15 @@ async def cases_edit_start(callback: CallbackQuery, state: FSMContext) -> None:
     await callback.answer()
 
 
+@router.callback_query(F.data.startswith("admincaseedit:"))
 @router.callback_query(AdminStates.edit_case_pick, F.data.startswith("admineditcase:"))
 async def cases_edit_picked(callback: CallbackQuery, state: FSMContext) -> None:
     case_id = callback.data.split(":", 1)[1]
     if not await content_store.begin_case_edit(callback.message.chat.id, case_id):
         await callback.answer("Кейс недоступен для редактирования", show_alert=True)
         return
-    await state.update_data(case_id=case_id)
-    await callback.message.edit_text("Редактирование кейса. Для опубликованного кейса правки сохраняются отдельно. Когда закончите, нажмите «Проверить и опубликовать».", reply_markup=kb.case_field_keyboard())
+    await state.update_data(case_id=case_id, cancel_to="cases")
+    await flow.step_from_callback(callback, state, "Редактирование кейса. Для опубликованного кейса правки сохраняются отдельно. Когда закончите, нажмите «Проверить и опубликовать».", reply_markup=kb.case_field_keyboard())
     await state.set_state(AdminStates.edit_case_field_pick)
     await callback.answer()
 
@@ -1637,6 +1620,7 @@ async def cases_delete_start(callback: CallbackQuery, state: FSMContext) -> None
     await callback.answer()
 
 
+@router.callback_query(F.data.startswith("admincardtrash:"))
 @router.callback_query(AdminStates.delete_case_pick, F.data.startswith("admindelcase:"))
 async def cases_delete_confirm(callback: CallbackQuery, state: FSMContext) -> None:
     case_id = callback.data.split(":", 1)[1]
