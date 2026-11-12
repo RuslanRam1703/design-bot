@@ -2685,7 +2685,8 @@ class AdminFaqEditDeleteAnchorTests(unittest.IsolatedAsyncioTestCase):
         cb = make_callback("admineditfaqfield:done", chat_id=self.actor, message_id=msg_id)
         await admin.faq_edit_field(cb, state)
 
-        cb.message.edit_text.assert_awaited_once_with("FAQ:", reply_markup=kb.admin_faq_menu_keyboard())
+        cb.message.edit_text.assert_awaited_once()
+        self.assertIn("adminfaqopen:", str(cb.message.edit_text.await_args.kwargs["reply_markup"]))
         data = await state.get_data()
         self.assertEqual(data.get(flow._ANCHOR_MSG_KEY), msg_id)
         self.assertEqual(data.get(flow._ANCHOR_CHAT_KEY), self.actor)

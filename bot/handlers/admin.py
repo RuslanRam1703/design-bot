@@ -422,32 +422,86 @@ async def menu_settings(callback: CallbackQuery, state: FSMContext) -> None:
     await callback.answer()
 
 
+async def show_content_list(callback: CallbackQuery, state: FSMContext, section: str, page: int = 0) -> None:
+    await flow.reset_state_keep_nav(state)
+    if section == "cases":
+        items = [c for c in await content_store.list_cases() if c.get("status") != "trashed"]
+        title, prefix, key, menu = "Кейсы портфолио", "adminmoderatecase", "title", kb.admin_cases_menu_keyboard()
+    elif section == "categories":
+        items = await content_store.list_portfolio_types()
+        title, prefix, key, menu = "Категории портфолио", "admincategory", "label", kb.categories_menu_keyboard()
+    elif section == "faq":
+        items = await content_store.list_faq()
+        title, prefix, key, menu = "Вопросы и ответы", "adminfaqopen", "question", kb.admin_faq_menu_keyboard()
+    else:
+        await content_store.begin_pricing_edit(callback.message.chat.id)
+        items = await content_store.list_services()
+        title, prefix, key, menu = "Услуги и цены", "adminserviceopen", "name", kb.pricing_menu_keyboard()
+    # Entry lists replace redundant edit selectors, while old callbacks remain compatible.
+    hidden = {
+        "cases": {"admincasesaction:edit", "admincasesaction:moderate", "admincasesaction:delete"},
+        "categories": {"admincataction:rename", "admincataction:relservice", "admincataction:delete"},
+        "faq": {"adminfaqaction:edit"},
+        "pricing": {"adminpriceaction:edit"},
+    }
+    menu = InlineKeyboardMarkup(inline_keyboard=[
+        row for row in menu.inline_keyboard if not any(b.callback_data in hidden[section] for b in row)
+    ])
+    text = f"{title} — {len(items)}.\n" + ("Выберите запись из списка." if items else "Пока ничего нет. Добавьте первую запись.")
+    if section == "pricing":
+        text += "\nИзменения прайса видны клиентам только после проверки и применения."
+    await flow.step_from_callback(callback, state, text, kb.content_list_keyboard(
+        items, section=section, prefix=prefix, label_key=key, menu=menu, page=page))
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("adminlist:"))
+async def content_list_page(callback: CallbackQuery, state: FSMContext) -> None:
+    _, section, page = callback.data.split(":")
+    if section not in {"cases", "categories", "faq", "pricing"} or not page.isdigit():
+        await callback.answer("Обновите список.")
+        return
+    await show_content_list(callback, state, section, int(page))
+
+
 @router.callback_query(F.data == "adminmenu:cases")
 async def menu_cases(callback: CallbackQuery, state: FSMContext) -> None:
-    await flow.reset_state_keep_nav(state)
-    await flow.step_from_callback(callback, state, "Кейсы портфолио:", kb.admin_cases_menu_keyboard())
-    await callback.answer()
+    await show_content_list(callback, state, "cases")
 
 
 @router.callback_query(F.data == "adminmenu:faq")
 async def menu_faq(callback: CallbackQuery, state: FSMContext) -> None:
-    await flow.reset_state_keep_nav(state)
-    await flow.step_from_callback(callback, state, "FAQ:", kb.admin_faq_menu_keyboard())
-    await callback.answer()
+    await show_content_list(callback, state, "faq")
 
 
 @router.callback_query(F.data == "adminmenu:pricing")
 async def menu_pricing(callback: CallbackQuery, state: FSMContext) -> None:
-    await flow.reset_state_keep_nav(state)
-    await content_store.begin_pricing_edit(callback.message.chat.id)
-    await flow.step_from_callback(callback, state, "Черновик прайса. Изменения станут видны клиентам только после проверки и применения.", kb.pricing_menu_keyboard())
-    await callback.answer()
+    await show_content_list(callback, state, "pricing")
 
 
 @router.callback_query(F.data == "adminmenu:categories")
 async def menu_categories(callback: CallbackQuery, state: FSMContext) -> None:
+    await show_content_list(callback, state, "categories")
+
+
+@router.callback_query(F.data.startswith("admincategory:"))
+async def category_card(callback: CallbackQuery, state: FSMContext) -> None:
+    category_id = callback.data.split(":", 1)[1]
+    category = next((t for t in await content_store.list_portfolio_types() if t["id"] == category_id), None)
+    if category is None:
+        await menu_categories(callback, state)
+        return
     await flow.reset_state_keep_nav(state)
-    await flow.step_from_callback(callback, state, "Категории портфолио:", kb.categories_menu_keyboard())
+    await state.update_data(cancel_to="categories")
+    services = await content_store.list_services(live=True)
+    service = next((s["name"] for s in services if s["id"] == category.get("related_service")), "Не выбрана")
+    count = await content_store.count_cases_with_type(category_id)
+    await flow.step_from_callback(callback, state,
+        f"Категория: {escape(category['label'])}\nКейсов, включая корзину и черновики: {count}\nПохожая услуга: {escape(service)}",
+        InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text=label, callback_data=f"{prefix}:{category_id}")]
+            for label, prefix in [("Переименовать", "admincategoryrename"), ("Похожая услуга", "admincategoryservice"), ("Удалить категорию", "admincategorydelete")]
+        ] + [[InlineKeyboardButton(text="К списку категорий", callback_data="adminmenu:categories")]]))
     await callback.answer()
 
 
@@ -513,7 +567,7 @@ async def cases_add_start(callback: CallbackQuery, state: FSMContext) -> None:
 @router.callback_query(AdminStates.add_case_category, F.data.startswith("admincat:"))
 async def cases_add_category(callback: CallbackQuery, state: FSMContext) -> None:
     type_id = callback.data.split(":", 1)[1]
-    await state.update_data(type_id=type_id)
+    await state.update_data(type_id=type_id, cancel_to="categories")
     await callback.message.edit_text("Название кейса (текстом):", reply_markup=kb.cancel_keyboard())
     await state.set_state(AdminStates.add_case_title)
     await callback.answer()
@@ -1686,11 +1740,16 @@ async def faq_edit_start(callback: CallbackQuery, state: FSMContext) -> None:
     await callback.answer()
 
 
+@router.callback_query(F.data.startswith("adminfaqopen:"))
 @router.callback_query(AdminStates.edit_faq_pick, F.data.startswith("admineditfaq:"))
 async def faq_edit_picked(callback: CallbackQuery, state: FSMContext) -> None:
     faq_id = int(callback.data.split(":", 1)[1])
-    await state.update_data(faq_id=faq_id)
-    await callback.message.edit_text("Что изменить?", reply_markup=kb.faq_field_keyboard())
+    item = next((item for item in await content_store.list_faq() if item["id"] == faq_id), None)
+    if item is None:
+        await menu_faq(callback, state)
+        return
+    await state.update_data(faq_id=faq_id, cancel_to="faq")
+    await flow.step_from_callback(callback, state, f"Вопрос: {escape(item['question'])[:800]}\n\nЧто изменить?", kb.faq_field_keyboard())
     await state.set_state(AdminStates.edit_faq_field_pick)
     await callback.answer()
 
@@ -1706,8 +1765,7 @@ async def faq_edit_field(callback: CallbackQuery, state: FSMContext) -> None:
         # него не указывает — тот же паттерн, что Batch 1 исправил для
         # menu_* section navigation.
         await flow.reset_state_keep_nav(state)
-        await flow.step_from_callback(callback, state, "FAQ:", kb.admin_faq_menu_keyboard())
-        await callback.answer()
+        await menu_faq(callback, state)
         return
     await state.update_data(field=field)
     await callback.message.edit_text("Новый текст:", reply_markup=kb.cancel_keyboard())
@@ -1737,7 +1795,7 @@ async def faq_delete_start(callback: CallbackQuery, state: FSMContext) -> None:
 @router.callback_query(AdminStates.delete_faq_pick, F.data.startswith("admindelfaq:"))
 async def faq_delete_confirm(callback: CallbackQuery, state: FSMContext) -> None:
     faq_id = int(callback.data.split(":", 1)[1])
-    await state.update_data(faq_id=faq_id)
+    await state.update_data(faq_id=faq_id, cancel_to="faq")
     await callback.message.edit_text(f"Удалить вопрос №{faq_id}? Это необратимо.", reply_markup=kb.confirm_keyboard("admindelfaqconfirm"))
     await state.set_state(AdminStates.delete_faq_confirm)
     await callback.answer()
@@ -2052,11 +2110,16 @@ async def price_edit_start(callback: CallbackQuery, state: FSMContext) -> None:
     await callback.answer()
 
 
+@router.callback_query(F.data.startswith("adminserviceopen:"))
 @router.callback_query(AdminStates.edit_service_pick, F.data.startswith("admineditservice:"))
 async def price_edit_picked(callback: CallbackQuery, state: FSMContext) -> None:
     service_id = callback.data.split(":", 1)[1]
-    await state.update_data(service_id=service_id)
-    await callback.message.edit_text("Что изменить?", reply_markup=kb.service_field_keyboard())
+    service = await content_store.get_service(service_id)
+    if service is None:
+        await menu_pricing(callback, state)
+        return
+    await state.update_data(service_id=service_id, cancel_to="pricing")
+    await flow.step_from_callback(callback, state, f"Услуга: {escape(service['name'])[:800]}\n\nЧто изменить?", kb.service_field_keyboard())
     await state.set_state(AdminStates.edit_service_field_pick)
     await callback.answer()
 
@@ -2072,8 +2135,7 @@ async def price_edit_field(callback: CallbackQuery, state: FSMContext) -> None:
         # него не указывает — тот же паттерн, что Batch 1/2 исправили для
         # menu_* section navigation и faq_edit_field's "done" ветки.
         await flow.reset_state_keep_nav(state)
-        await flow.step_from_callback(callback, state, "Услуги и цены:", kb.pricing_menu_keyboard())
-        await callback.answer()
+        await menu_pricing(callback, state)
         return
     if field == "options":
         await callback.message.edit_text("Опции этой услуги:", reply_markup=kb.options_menu_keyboard())
@@ -2121,7 +2183,7 @@ async def price_delete_start(callback: CallbackQuery, state: FSMContext) -> None
 async def price_delete_confirm(callback: CallbackQuery, state: FSMContext) -> None:
     service_id = callback.data.split(":", 1)[1]
     service = await content_store.get_service(service_id)
-    await state.update_data(service_id=service_id)
+    await state.update_data(service_id=service_id, cancel_to="pricing")
     name = service["name"] if service else service_id
     await callback.message.edit_text(
         f"Удалить услугу «{name}»? Вместе с ней удалятся все её опции. Это необратимо.",
@@ -2431,10 +2493,11 @@ async def cat_rename_start(callback: CallbackQuery, state: FSMContext) -> None:
     await callback.answer()
 
 
+@router.callback_query(F.data.startswith("admincategoryrename:"))
 @router.callback_query(AdminStates.rename_category_pick, F.data.startswith("adminrenamecat:"))
 async def cat_rename_picked(callback: CallbackQuery, state: FSMContext) -> None:
     type_id = callback.data.split(":", 1)[1]
-    await state.update_data(type_id=type_id)
+    await state.update_data(type_id=type_id, cancel_to="categories")
     await callback.message.edit_text("Новое название категории:", reply_markup=kb.cancel_keyboard())
     await state.set_state(AdminStates.rename_category_value)
     await callback.answer()
@@ -2462,10 +2525,12 @@ async def cat_relservice_start(callback: CallbackQuery, state: FSMContext) -> No
     await callback.answer()
 
 
+@router.callback_query(F.data.startswith("admincategoryservice:"))
 @router.callback_query(AdminStates.category_related_service_pick, F.data.startswith("admincatrelpick:"))
 async def cat_relservice_picked(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.set_state(AdminStates.category_related_service_pick)
     type_id = callback.data.split(":", 1)[1]
-    await state.update_data(type_id=type_id)
+    await state.update_data(type_id=type_id, cancel_to="categories")
     services = await content_store.list_services(live=True)
     await callback.message.edit_text(
         "С какой услугой связать эту категорию (подставляется в новые кейсы этой категории)?",
@@ -2494,6 +2559,7 @@ async def cat_delete_start(callback: CallbackQuery, state: FSMContext) -> None:
     await callback.answer()
 
 
+@router.callback_query(F.data.startswith("admincategorydelete:"))
 @router.callback_query(AdminStates.delete_category_pick, F.data.startswith("admindelcat:"))
 async def cat_delete_confirm(callback: CallbackQuery, state: FSMContext) -> None:
     type_id = callback.data.split(":", 1)[1]
@@ -2516,7 +2582,7 @@ async def cat_delete_confirm(callback: CallbackQuery, state: FSMContext) -> None
         )
         await callback.answer()
         return
-    await state.update_data(type_id=type_id)
+    await state.update_data(type_id=type_id, cancel_to="categories")
     await callback.message.edit_text("Удалить категорию? Это необратимо.", reply_markup=kb.confirm_keyboard("admindelcatconfirm"))
     await state.set_state(AdminStates.delete_category_confirm)
     await callback.answer()

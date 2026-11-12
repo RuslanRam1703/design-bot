@@ -126,6 +126,7 @@ def case_saved_draft_keyboard(case_id: str) -> InlineKeyboardMarkup:
 def admin_cases_menu_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
+            [InlineKeyboardButton(text="📋 К списку кейсов", callback_data="adminmenu:cases")],
             [InlineKeyboardButton(text="➕ Добавить", callback_data="admincasesaction:add")],
             [InlineKeyboardButton(text="✏️ Редактировать", callback_data="admincasesaction:edit")],
             [InlineKeyboardButton(text="📂 Кейсы и публикация", callback_data="admincasesaction:moderate")],
@@ -139,6 +140,7 @@ def admin_cases_menu_keyboard() -> InlineKeyboardMarkup:
 def admin_faq_menu_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
+            [InlineKeyboardButton(text="📋 К списку вопросов", callback_data="adminmenu:faq")],
             [InlineKeyboardButton(text="➕ Добавить", callback_data="adminfaqaction:add")],
             [InlineKeyboardButton(text="✏️ Редактировать", callback_data="adminfaqaction:edit")],
             [InlineKeyboardButton(text="🗑 Удалить", callback_data="adminfaqaction:delete")],
@@ -302,6 +304,7 @@ def about_field_keyboard(needs_review_fields: list[str] | None = None) -> Inline
 def pricing_menu_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
+            [InlineKeyboardButton(text="📋 К списку услуг", callback_data="adminmenu:pricing")],
             [InlineKeyboardButton(text="❓ Как настроить цену", callback_data="adminpricehelp")],
             [InlineKeyboardButton(text="➕ Добавить услугу", callback_data="adminpriceaction:add")],
             [InlineKeyboardButton(text="✏️ Редактировать услугу", callback_data="adminpriceaction:edit")],
@@ -371,6 +374,7 @@ def coefficients_menu_keyboard() -> InlineKeyboardMarkup:
 def categories_menu_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
+            [InlineKeyboardButton(text="📋 К списку категорий", callback_data="adminmenu:categories")],
             [InlineKeyboardButton(text="➕ Добавить категорию", callback_data="admincataction:add")],
             [InlineKeyboardButton(text="✏️ Переименовать", callback_data="admincataction:rename")],
             [InlineKeyboardButton(text="🔗 Похожая услуга", callback_data="admincataction:relservice")],
@@ -514,4 +518,26 @@ def lead_history_keyboard(page: int, total: int) -> InlineKeyboardMarkup:
     rows = [pager] if pager else []
     rows.append([InlineKeyboardButton(text="💬 Написать заказчику", callback_data="adminleadaction:reply")])
     rows.append([InlineKeyboardButton(text="◀️ Карточка заявки", callback_data="adminleadhistory:back")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def content_list_keyboard(items: list[dict], *, section: str, prefix: str,
+                          label_key: str, menu: InlineKeyboardMarkup,
+                          page: int = 0) -> InlineKeyboardMarkup:
+    """Bounded lists keep every record reachable without oversized Telegram panels."""
+    size = 8
+    last = max(0, (len(items) - 1) // size)
+    page = max(0, min(page, last))
+    rows = [[InlineKeyboardButton(text=str(item[label_key])[:80] or "Без названия",
+                                  callback_data=f"{prefix}:{item['id']}")]
+            for item in items[page * size:(page + 1) * size]]
+    arrows = []
+    if page:
+        arrows.append(InlineKeyboardButton(text="← Предыдущие", callback_data=f"adminlist:{section}:{page - 1}"))
+    if page < last:
+        arrows.append(InlineKeyboardButton(text="Следующие →", callback_data=f"adminlist:{section}:{page + 1}"))
+    if arrows:
+        rows.append(arrows)
+    rows.extend(row for row in menu.inline_keyboard
+                if not any(b.callback_data == f"adminmenu:{section}" for b in row))
     return InlineKeyboardMarkup(inline_keyboard=rows)
