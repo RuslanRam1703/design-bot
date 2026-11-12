@@ -601,7 +601,8 @@ function render() {
   }
 
   if (state.portfolio?.owner_preview) showTabBar = false;
-  app.innerHTML = renderBrandHeader() + content + (showTabBar ? renderTabBar() : "");
+  app.innerHTML = renderBrandHeader() + (showTabBar ? renderTabBar() : "") + `<main class="screen screen-${state.screen}">${content}</main>`;
+  window.DesktopMode?.attach(realTG, document);
 
   switch (state.screen) {
     case "portfolio": attachPortfolioEvents(); break;
@@ -794,10 +795,12 @@ function renderCase() {
       <button class="back-btn" id="back">${state.portfolio?.owner_preview ? "← В редактор" : "←"}</button>
       <h1>${escapeHtml(c.title)}</h1>
     </div>
+    <div class="case-layout ${c.sections?.some(s => s.type === "gallery") ? "case-layout-story" : ""}">
     <div class="case-images">${images}</div>
-    ${renderCaseContent(c)}
+    <div class="case-description">${renderCaseContent(c)}
     ${externalLink}
     ${state.portfolio?.owner_preview ? '<p class="muted">Предпросмотр владельца. Для публикации вернитесь в чат бота.</p>' : '<button class="btn btn-primary" id="want-similar">Хочу похожий проект</button>'}
+    </div></div>
   `;
 }
 
@@ -1170,6 +1173,7 @@ function renderCalculator() {
       ${backBtnHTML}
       <h1>💰 Калькулятор</h1>
     </div>
+    <div class="estimate-layout"><div class="estimate-options">
     <div class="summary-box">
       Услуга: <b>${escapeHtml(service.name)}</b>
       · <a href="#" id="change-service">изменить</a>
@@ -1184,13 +1188,13 @@ function renderCalculator() {
     </div>
     <p class="hint">Сложность проекта и окончательную стоимость дизайнер уточнит после обсуждения задачи.</p>
 
-    <div class="result-box">
+    </div><aside class="estimate-summary" aria-label="Предварительная стоимость"><div class="result-box">
       <div class="price">${formatPriceRange(result.priceFrom, result.priceTo)}</div>
       <div class="term">${formatDays(result.termFrom)}–${formatDays(result.termTo)} рабочих дней</div>
       <div class="hint">Точная сумма — предварительная, дизайнер подтвердит после брифа</div>
     </div>
 
-    <button class="btn btn-primary" id="submit-with-calc">Отправить заявку с этим расчётом</button>
+    <button class="btn btn-primary" id="submit-with-calc">Отправить заявку с этим расчётом</button></aside></div>
   `;
 }
 
@@ -1639,6 +1643,7 @@ function renderBrief() {
       .join("");
     body = `
       <h2>Собираем проект</h2>
+      <div class="estimate-layout"><div class="estimate-options">
       <div class="summary-box">Услуга: <b>${escapeHtml(service.name)}</b> · <a href="#" id="order-change-service">изменить</a></div>
       ${service.includes ? `<p class="hint">В базовую стоимость входит: ${escapeHtml(service.includes)}</p>` : ""}
       ${optionRows}
@@ -1647,12 +1652,12 @@ function renderBrief() {
         <label class="switch"><input type="checkbox" id="order-urgent-toggle" ${b.urgent ? "checked" : ""} /><span class="track"></span></label>
       </div>
       <p class="hint">Сложность проекта оценит дизайнер после изучения задачи.</p>
-      <div class="result-box">
+      </div><aside class="estimate-summary" aria-label="Предварительная стоимость"><div class="result-box">
         <div class="price">${formatPriceRange(result.priceFrom, result.priceTo)}</div>
         <div class="term">${formatDays(result.termFrom)}–${formatDays(result.termTo)} рабочих дней</div>
         <div class="hint">Предварительная оценка стоимости по вашим параметрам</div>
       </div>
-      <button class="btn btn-primary" id="order-next">Далее</button>
+      <button class="btn btn-primary" id="order-next">Далее</button></aside></div>
     `;
     return wrapBrief(body, step);
   } else if (step === 1 && b.openGroupId) {

@@ -191,3 +191,31 @@ textarea::placeholder, input::placeholder { color:var(--hint); opacity:.8; }
 .case-viewer-nav button:disabled { opacity:.35; }
 
 .case-viewer-scroll img[hidden] { display:none; }
+
+/* Layout follows available window space, including resized Telegram windows. */
+.screen, .case-description, .estimate-options, .estimate-summary { min-width:0; }
+.desktop-window-controls { margin-left:auto; text-align:right; }
+.desktop-window-controls button { border:1px solid var(--border); border-radius:12px; padding:8px 12px; background:var(--bg-secondary); font-size:12px; min-height:40px; }
+.desktop-window-controls .hint { max-width:230px; margin:4px 0 0; font-size:11px; }
+#app { padding-top:max(20px,var(--tg-content-safe-area-inset-top,0px)); }
+@media (min-width:900px) {
+  #app { max-width:1200px; padding:28px 32px 48px; padding-top:max(28px,var(--tg-content-safe-area-inset-top,0px)); }
+  .brand-header { margin-bottom:20px; }
+  .tab-bar { position:sticky; top:max(12px,var(--tg-content-safe-area-inset-top,0px)); left:auto; bottom:auto; transform:none; width:100%; margin-bottom:28px; border-radius:18px; }
+  .tab-item { flex-direction:row; gap:10px; font-size:14px; min-height:46px; }
+  .case-layout:not(.case-layout-story) { display:grid; grid-template-columns:minmax(0,1.25fr) minmax(0,1fr); gap:28px; align-items:start; }
+  .case-layout-story { max-width:960px; margin-inline:auto; }
+  .case-layout .case-images { margin-bottom:0; }
+  .case-layout-story .case-images { margin-bottom:24px; }
+  .estimate-layout { display:grid; grid-template-columns:minmax(0,1.5fr) minmax(280px,1fr); gap:28px; align-items:start; }
+  .estimate-summary { position:sticky; top:100px; }
+  .estimate-summary .result-box { margin-top:0; }
+  .screen-brief:not(:has(.estimate-layout)), .screen-about, .screen-supplement, .screen-submitted { max-width:820px; margin-inline:auto; }
+  .service-list, .lead-card-list { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); align-items:stretch; }
+  .service-item { height:100%; }
+  .portfolio-preview-card { display:grid; grid-template-columns:minmax(0,1.6fr) minmax(0,1fr); align-items:stretch; }
+  .portfolio-preview-card .card-title { align-content:center; padding:28px; font-size:23px; }
+  .portfolio-preview-card img { max-height:400px; }
+  .grid { gap:20px; }
+}
+@media (min-width:1100px) { .grid { grid-template-columns:repeat(4,minmax(0,1fr)); } }

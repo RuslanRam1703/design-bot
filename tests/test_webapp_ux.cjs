@@ -245,3 +245,37 @@ test('empty price list explains why ordering is unavailable', () => {
   assert.match(html,/Услуги пока не опубликованы/);
   assert.doesNotMatch(html,/Отправить заявку/);
 });
+
+test('desktop fullscreen is optional, handles refusal and does not duplicate listeners', () => {
+  const handlers = {}; let requests = 0, listeners = 0;
+  function element(tag) { return { tag, children: [], append(...x) { this.children.push(...x); }, setAttribute() {}, addEventListener(_, fn) { this.click = fn; }, querySelector(name) { return this.children.find(e => e.tag === name); } }; }
+  const header = element('header');
+  const doc = { createElement: element, querySelector(s) { return s === '.brand-header' ? header : header.children.at(-1); } };
+  const sandbox = { window: {} }; vm.createContext(sandbox);
+  vm.runInContext(fs.readFileSync(path.join(__dirname, '../webapp/js/desktop-mode.js'), 'utf8'), sandbox);
+  const tg = { platform: 'tdesktop', isVersionAtLeast: () => true, requestFullscreen() { requests++; }, exitFullscreen() {}, onEvent(name, fn) { handlers[name] = fn; listeners++; } };
+  const attach = sandbox.window.DesktopMode.attach;
+  attach({ ...tg, platform: 'android' }, doc);
+  assert.equal(header.children.length, 0);
+  attach(tg, doc); assert.equal(requests, 0);
+  header.children.at(-1).querySelector('button').click(); assert.equal(requests, 1);
+  attach(tg, doc); assert.equal(listeners, 2);
+  tg.isFullscreen = true; handlers.fullscreenChanged();
+  assert.equal(header.children.at(-1).querySelector('button').textContent, 'Свернуть экран');
+  handlers.fullscreenFailed({ error: 'UNSUPPORTED' });
+  assert.equal(header.children.at(-1).querySelector('button').disabled, true);
+  assert.match(header.children.at(-1).querySelector('p').textContent, /Можно продолжить/);
+});
+
+test('case galleries keep editorial order while ordinary cases allow side-by-side layout', () => {
+  const { state, renderCase } = appWithDraft();
+  state.currentCase = { title: 'Кейс', images: [], sections: [{ type: 'gallery', title: 'Экраны', images: [] }, { title: 'Результат', content: 'Текст' }] };
+  const story = renderCase();
+  assert.match(story, /case-layout-story/);
+  assert.ok(story.indexOf('Экраны') < story.indexOf('Результат'));
+  state.currentCase = { title: 'Кейс', images: [], task: 'Задача' };
+  const ordinary = renderCase();
+  assert.doesNotMatch(ordinary, /case-layout-story/);
+  assert.match(ordinary, /case-description/);
+  assert.match(ordinary, /id="want-similar"/);
+});
