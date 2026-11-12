@@ -240,6 +240,9 @@ CANCEL_TARGETS: dict[str, tuple[str, Callable[[], InlineKeyboardMarkup]]] = {
 
 async def _resolve_cancel(data: dict) -> tuple[str, InlineKeyboardMarkup, State | None, dict]:
     target = data.get("cancel_to")
+    if target == "appearance":
+        text, markup = await appearance_panel()
+        return text, markup, None, {}
     if target == "options" and data.get("service_id"):
         return (
             "Отменено. Опции этой услуги:",
@@ -503,6 +506,94 @@ async def category_card(callback: CallbackQuery, state: FSMContext) -> None:
             for label, prefix in [("Переименовать", "admincategoryrename"), ("Похожая услуга", "admincategoryservice"), ("Удалить категорию", "admincategorydelete")]
         ] + [[InlineKeyboardButton(text="К списку категорий", callback_data="adminmenu:categories")]]))
     await callback.answer()
+
+
+APPEARANCE_LABELS = {
+    "brand_name": "Название в шапке", "brand_caption": "Подпись в шапке",
+    "hero_title": "Заголовок баннера", "hero_description": "Описание баннера",
+    "hero_button": "Текст кнопки баннера",
+}
+
+
+async def appearance_panel() -> tuple[str, InlineKeyboardMarkup]:
+    values = await content_store.appearance_settings(draft=True)
+    text = "Оформление Mini App — черновик\n\n" + "\n\n".join(
+        f"{label}:\n{escape(str(values[key]))}" for key, label in APPEARANCE_LABELS.items())
+    text += "\n\nБаннер: " + ("показан" if values["hero_visible"] else "скрыт")
+    text += "\nИзменения видны клиентам только после применения. Название самого бота в Telegram не меняется."
+    rows = [[InlineKeyboardButton(text=label, callback_data=f"appearanceedit:{key}")] for key, label in APPEARANCE_LABELS.items()]
+    rows += [
+        [InlineKeyboardButton(text="Скрыть баннер" if values["hero_visible"] else "Показать баннер", callback_data="appearance:hide" if values["hero_visible"] else "appearance:show")],
+        [InlineKeyboardButton(text="Предпросмотр", callback_data="appearance:preview")],
+        [InlineKeyboardButton(text="Отменить черновые правки", callback_data="appearance:discardask")],
+        [InlineKeyboardButton(text="Видимость разделов", callback_data="adminmenu:nav")],
+        [InlineKeyboardButton(text="Назад к настройкам", callback_data="adminmenu:settings")],
+    ]
+    return text, InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@router.callback_query(F.data.startswith("appearance:"))
+async def appearance_action(callback: CallbackQuery, state: FSMContext) -> None:
+    action = callback.data.split(":")[1]
+    await flow.reset_state_keep_nav(state)
+    if action in {"hide", "show"}:
+        await content_store.stage_appearance(callback.message.chat.id, "hero_visible", action == "show")
+    elif action in {"apply", "discard"}:
+        digest = callback.data.split(":", 2)[2] if callback.data.count(":") == 2 else ""
+        try:
+            await content_store.finish_appearance(callback.message.chat.id, apply=action == "apply", expected_digest=digest)
+        except ValueError as exc:
+            await callback.answer(str(exc), show_alert=True)
+            return
+    text, markup = await appearance_panel()
+    digest = content_store.editor_digest(await content_store.appearance_settings(draft=True))[:24]
+    if action == "preview":
+        text = "Проверка оформления перед применением\n\n" + text
+        url = config.miniapp_url()
+        url += ("&" if "?" in url else "?") + "preview_appearance=1"
+        markup = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="Посмотреть в Mini App", web_app=WebAppInfo(url=url))],
+            [InlineKeyboardButton(text="Применить оформление", callback_data=f"appearance:apply:{digest}")],
+            [InlineKeyboardButton(text="Вернуться к правкам", callback_data="appearance:root")],
+        ])
+    elif action == "discardask":
+        text = "Отменить черновые правки оформления? Опубликованное оформление сохранится."
+        markup = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="Отменить правки", callback_data=f"appearance:discard:{digest}")],
+            [InlineKeyboardButton(text="Вернуться", callback_data="appearance:root")],
+        ])
+    elif action == "apply":
+        text = "Оформление применено. Переоткройте Mini App.\n\n" + text
+    await flow.step_from_callback(callback, state, text, markup)
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("appearanceedit:"))
+async def appearance_edit(callback: CallbackQuery, state: FSMContext) -> None:
+    key = callback.data.split(":")[1]
+    if key not in APPEARANCE_LABELS:
+        await callback.answer("Поле не найдено.")
+        return
+    values = await content_store.appearance_settings(draft=True)
+    await state.update_data(appearance_key=key, cancel_to="appearance")
+    await flow.step_from_callback(callback, state,
+        f"{APPEARANCE_LABELS[key]}\nСейчас: {escape(values[key])}\n\nВведите текст, до {content_store.APPEARANCE_LIMITS[key]} символов.",
+        kb.cancel_keyboard())
+    await state.set_state(AdminStates.appearance_value)
+    await callback.answer()
+
+
+@router.message(AdminStates.appearance_value, F.text)
+async def appearance_value(message: Message, state: FSMContext) -> None:
+    key = (await state.get_data())["appearance_key"]
+    try:
+        await content_store.stage_appearance(message.chat.id, key, message.text)
+    except ValueError as exc:
+        await flow.step_from_text(message, state, str(exc), kb.cancel_keyboard())
+        return
+    text, markup = await appearance_panel()
+    await flow.step_from_text(message, state, "Сохранено в черновик.\n\n" + text, markup)
+    await flow.finish_flow(state)
 
 
 @router.callback_query(F.data == "adminmenu:nav")
@@ -3277,5 +3368,5 @@ async def clean_start_confirm(callback: CallbackQuery, state: FSMContext) -> Non
 async def admin_unexpected_input(message: Message) -> None:
     await message.answer(
         "Не поняла это сообщение 🙂 Нажмите кнопку в сообщении выше или пришлите нужный текст/число. "
-        "Чтобы выйти — /cancel."
+        "Чтобы выйти — /cancel. Восстановить нижние кнопки — /menu."
     )

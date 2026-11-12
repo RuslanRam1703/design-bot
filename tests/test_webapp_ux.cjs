@@ -245,3 +245,17 @@ test('empty price list explains why ordering is unavailable', () => {
   assert.match(html,/Услуги пока не опубликованы/);
   assert.doesNotMatch(html,/Отправить заявку/);
 });
+
+test('owner appearance is escaped, optional and respects the disabled order section', () => {
+  const ui = appWithDraft();
+  ui.state.portfolio = {types: [], cases: []};
+  ui.state.uiConfig = {menu: {}, appearance: {hero_title: '<img src=x>', hero_description: 'My work', hero_button: 'Contact'}};
+  let html = ui.renderPortfolio();
+  assert.match(html, /&lt;img src=x&gt;/);
+  assert.match(html, />Contact /);
+  ui.state.uiConfig.menu.brief = false;
+  assert.doesNotMatch(ui.renderPortfolio(), /id="portfolio-order"/);
+  ui.state.uiConfig.appearance.hero_visible = false;
+  assert.doesNotMatch(ui.renderPortfolio(), /portfolio-intro/);
+  assert.match(ui.renderPortfolio(), /Портфолио/);
+});

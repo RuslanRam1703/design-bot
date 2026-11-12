@@ -191,3 +191,8 @@ textarea::placeholder, input::placeholder { color:var(--hint); opacity:.8; }
 .case-viewer-nav button:disabled { opacity:.35; }
 
 .case-viewer-scroll img[hidden] { display:none; }
+
+/* Owner-authored text must wrap on narrow screens. */
+.brand-name { min-width:0; overflow-wrap:anywhere; }
+.portfolio-intro h1, .portfolio-intro p, .portfolio-intro .btn { overflow-wrap:anywhere; }
+.portfolio-intro .btn { max-width:100%; }

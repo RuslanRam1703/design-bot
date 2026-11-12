@@ -402,3 +402,15 @@ async def open_root(
     провалиться в хендлер, который всё ещё думает, что сценарий активен)."""
     await finish_flow(state)
     await open_flow(message, state, text, reply_markup)
+
+
+async def refresh_nav_keyboard(message: Message, state: FSMContext) -> None:
+    """Send keyboard again before retiring its previous carrier; preserve current flow."""
+    data = await state.get_data()
+    old_id, old_chat = data.get(_NAV_ANCHOR_MSG_KEY), data.get(_NAV_ANCHOR_CHAT_KEY)
+    await _create_nav_anchor(message, state)
+    if old_id and old_chat:
+        try:
+            await message.bot.delete_message(chat_id=old_chat, message_id=old_id)
+        except TelegramAPIError:
+            pass
