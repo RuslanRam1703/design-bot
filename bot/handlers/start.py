@@ -11,10 +11,10 @@ from bot import client_materials_archive
 from bot.keyboards import client_home_keyboard, main_menu_confirm_keyboard, webapp_open_keyboard
 
 router = Router(name="start")
+recovery_router = Router(name="navigation_recovery")
 logger = logging.getLogger(__name__)
 
 
-@router.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext) -> None:
     # NAV anchor (persistent reply-клавиатура) и TRANSIENT-экран — теперь
     # разделены (см. bot/flow.py, UX-аудит про исчезающую клавиатуру после
@@ -25,6 +25,14 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
     # NAV anchor keeps the persistent reply keyboard; this separate
     # TRANSIENT screen contains the native inline entry points.
     await flow.open_flow(message, state, texts.CLIENT_HOME, client_home_keyboard(config.miniapp_url()))
+
+
+@recovery_router.message(Command("menu"))
+@recovery_router.message(CommandStart())
+async def recover_menu(message: Message, state: FSMContext) -> None:
+    # Explicit recovery takes precedence over every FSM text handler.
+    await flow.refresh_nav_keyboard(message, state)
+    await cmd_start(message, state)
 
 
 @router.message(Command("id"))

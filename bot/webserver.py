@@ -95,6 +95,12 @@ async def handle_public_data(request: web.Request) -> web.Response:
     except Exception:
         logger.exception("Не удалось прочитать публичный /data/%s", filename)
         return web.json_response({"error": "internal"}, status=500)
+    if filename == "ui_config.json":
+        if request.query.get("preview_appearance") == "1":
+            if user is None or str(user["id"]) != str(config.DESIGNER_CHAT_ID):
+                return web.json_response({"error": "owner_required"}, status=403)
+            data = {**data, "appearance": data.get("_appearance_draft", data.get("appearance", {}))}
+        data = {k: v for k, v in data.items() if k != "_appearance_draft"}
     preview_id = request.query.get("preview_case")
     if preview_id:
         if user is None or str(user["id"]) != str(config.DESIGNER_CHAT_ID):

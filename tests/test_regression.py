@@ -938,7 +938,7 @@ class EntryPointArchitectureTests(unittest.IsolatedAsyncioTestCase):
         import bot.main as bot_main
 
         command_names = [c.command for c in bot_main.CLIENT_COMMANDS]
-        self.assertEqual(command_names, ["start", "faq"])
+        self.assertEqual(command_names, ["start", "menu", "faq"])
         self.assertNotIn("portfolio", command_names)
         self.assertNotIn("about", command_names)
         self.assertNotIn("brief", command_names)
@@ -948,7 +948,7 @@ class EntryPointArchitectureTests(unittest.IsolatedAsyncioTestCase):
         import bot.main as bot_main
 
         owner_names = [c.command for c in bot_main.CLIENT_COMMANDS + bot_main.ADMIN_EXTRA_COMMANDS]
-        self.assertEqual(owner_names, ["start", "faq", "admin"])
+        self.assertEqual(owner_names, ["start", "menu", "faq", "admin"])
 
     async def test_legacy_command_handlers_still_registered(self):
         # /portfolio, /about, /brief убраны только из видимого command list —

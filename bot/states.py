@@ -2,6 +2,7 @@ from aiogram.fsm.state import State, StatesGroup
 
 
 class AdminStates(StatesGroup):
+    appearance_value = State()
     add_case_category = State()
     add_case_title = State()
     add_case_photo = State()

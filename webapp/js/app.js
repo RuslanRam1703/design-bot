@@ -347,7 +347,7 @@ async function init() {
   const publicHeaders = { "X-Telegram-Init-Data": TG.initData() };
   const previewCaseId = new URLSearchParams(window.location.search).get("preview_case");
   const getContent = async (name) => {
-    const suffix = name === "portfolio.json" && previewCaseId ? "?preview_case=" + encodeURIComponent(previewCaseId) : "";
+    const suffix = name === "portfolio.json" && previewCaseId ? "?preview_case=" + encodeURIComponent(previewCaseId) : name === "ui_config.json" && new URLSearchParams(window.location.search).get("preview_appearance") === "1" ? "?preview_appearance=1" : "";
     const response = await fetch(apiUrl(`/data/${name}${suffix}`), { headers: publicHeaders, signal: AbortSignal.timeout(20000) });
     if (response.status === 403) throw new Error("ACCESS_DENIED");
     if (response.status === 401) throw new Error("TELEGRAM_REQUIRED");
@@ -473,7 +473,7 @@ function renderNavIcon(id) {
 }
 
 function renderBrandHeader() {
-  return '<div class="brand-header"><span class="brand-symbol" aria-hidden="true"></span><div class="brand-name">Design Assistant<span class="brand-caption">Дизайн · Сайты · Интерфейсы</span></div></div>';
+  return '<div class="brand-header"><span class="brand-symbol" aria-hidden="true"></span><div class="brand-name">'+escapeHtml(state.uiConfig?.appearance?.brand_name ?? "Design Assistant")+'<span class="brand-caption">'+escapeHtml(state.uiConfig?.appearance?.brand_caption ?? "Дизайн · Сайты · Интерфейсы")+'</span></div></div>';
 }
 
 function renderTabBar() {
@@ -687,11 +687,11 @@ function renderPortfolio() {
     .join("");
 
   return `
-    <section class="portfolio-intro">
-      <h1>Дизайн для вашего следующего проекта.</h1>
-      <p>Интерфейсы, сайты и визуальные системы. Посмотрите работы и соберите предварительную оценку.</p>
-      ${state.uiConfig?.menu?.brief !== false ? '<button class="btn btn-primary" id="portfolio-order">Обсудить проект <svg class="action-arrow" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 18 18 6M6 6h12v12"/></svg></button>' : ""}
-    </section>
+    ${state.uiConfig?.appearance?.hero_visible !== false ? `<section class="portfolio-intro">
+      <h1>${escapeHtml(state.uiConfig?.appearance?.hero_title ?? "Дизайн для вашего следующего проекта.")}</h1>
+      <p>${escapeHtml(state.uiConfig?.appearance?.hero_description ?? "Интерфейсы, сайты и визуальные системы. Посмотрите работы и соберите предварительную оценку.")}</p>
+      ${state.uiConfig?.menu?.brief !== false ? '<button class="btn btn-primary" id="portfolio-order">' + escapeHtml(state.uiConfig?.appearance?.hero_button ?? "Обсудить проект") + ' <svg class="action-arrow" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 18 18 6M6 6h12v12"/></svg></button>' : ""}
+    </section>` : ""}
     <div class="section-heading"><h2>Портфолио</h2><span>${count} ${projectWord}</span></div>
     <div class="chips">${chips}</div>
     ${selected ? `<div id="portfolio-preview" aria-live="polite">${renderPortfolioPreview(selected, typeLabels[selected.type])}</div>`

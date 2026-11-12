@@ -35,6 +35,7 @@ logger = logging.getLogger(__name__)
 # просто больше не рекламируются в командном меню.
 CLIENT_COMMANDS = [
     BotCommand(command="start", description="Начать / приветствие"),
+    BotCommand(command="menu", description="Восстановить кнопки и главное меню"),
     BotCommand(command="faq", description="Частые вопросы"),
 ]
 
@@ -113,6 +114,7 @@ async def main() -> None:
     from bot.access_control import AccessMiddleware
     dp.message.outer_middleware(AccessMiddleware())
     dp.callback_query.outer_middleware(AccessMiddleware())
+    dp.include_router(start.recovery_router)
     dp.include_router(archive_setup.router)
     dp.include_router(portfolio_channel.router)
     dp.include_router(admin_access.router)

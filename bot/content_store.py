@@ -1436,6 +1436,57 @@ async def get_ui_config() -> dict:
     return await _read("ui_config.json")
 
 
+APPEARANCE_DEFAULTS = {
+    "brand_name": "Design Assistant",
+    "brand_caption": "Дизайн · Сайты · Интерфейсы",
+    "hero_title": "Дизайн для вашего следующего проекта.",
+    "hero_description": "Интерфейсы, сайты и визуальные системы. Посмотрите работы и соберите предварительную оценку.",
+    "hero_button": "Обсудить проект",
+    "hero_visible": True,
+}
+APPEARANCE_LIMITS = {"brand_name": 40, "brand_caption": 80, "hero_title": 120,
+                     "hero_description": 300, "hero_button": 32}
+
+
+async def appearance_settings(*, draft: bool = False) -> dict:
+    data = await get_ui_config()
+    values = data.get("_appearance_draft") if draft else None
+    return {**APPEARANCE_DEFAULTS, **(values if values is not None else data.get("appearance", {}))}
+
+
+async def stage_appearance(actor_chat_id: int | str, key: str, value) -> None:
+    _require_designer(actor_chat_id)
+    if key == "hero_visible":
+        if not isinstance(value, bool):
+            raise ValueError("Нужно выбрать показать или скрыть.")
+    elif key not in APPEARANCE_LIMITS or not isinstance(value, str) or not value.strip() or len(value.strip()) > APPEARANCE_LIMITS[key]:
+        raise ValueError("Проверьте длину текста: пустое значение недопустимо.")
+    else:
+        value = value.strip()
+    async with _lock("ui_config.json"):
+        data = await _read("ui_config.json")
+        working = {**APPEARANCE_DEFAULTS, **data.get("_appearance_draft", data.get("appearance", {}))}
+        working[key] = value
+        data["_appearance_draft"] = working
+        await _write("ui_config.json", data)
+
+
+async def finish_appearance(actor_chat_id: int | str, *, apply: bool, expected_digest: str) -> bool:
+    _require_designer(actor_chat_id)
+    async with _lock("ui_config.json"):
+        data = await _read("ui_config.json")
+        current = {**APPEARANCE_DEFAULTS, **data.get("_appearance_draft", data.get("appearance", {}))}
+        if editor_digest(current)[:24] != expected_digest:
+            raise ValueError("Оформление изменилось. Откройте предпросмотр заново.")
+        draft = data.pop("_appearance_draft", None)
+        if draft is None:
+            return False
+        if apply:
+            data["appearance"] = draft
+        await _write("ui_config.json", data)
+        return True
+
+
 async def set_menu_item_enabled(actor_chat_id: int | str, key: str, enabled: bool) -> bool:
     _require_designer(actor_chat_id)
     async with _lock("ui_config.json"):
