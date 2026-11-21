@@ -456,6 +456,51 @@ async def ensure_gallery_demo_case() -> None:
         await _write("portfolio.json", data)
 
 
+PORTFOLIO_DEMO_MARKER = "portfolio_demo_pack_v1"
+PORTFOLIO_DEMO_CATEGORY = "demo_pack"
+PORTFOLIO_DEMO_PREFIX = "demo_pack_"
+
+
+async def ensure_portfolio_demo_pack() -> None:
+    """Install the requested demo portfolio once, alongside existing cases."""
+    async with _lock("portfolio.json"):
+        data = await _read("portfolio.json")
+        if data.get(PORTFOLIO_DEMO_MARKER):
+            return
+        source = _read_local("portfolio.json")
+        existing = {case["id"]: case for case in data["cases"]}
+        cases = [
+            {**case, "id": PORTFOLIO_DEMO_PREFIX + case["id"], "type": PORTFOLIO_DEMO_CATEGORY,
+             "related_service": None, "featured": False, "status": "published"}
+            for case in source["cases"]
+            if existing.get(case["id"], {}).get("cover") != case["cover"]
+        ]
+        # Demo cases should never point to a possibly unrelated production service.
+        for case in cases:
+            case.pop("order_template", None)
+        images = [f"img/gallery-demo/{name}.svg" for name in ("wide", "portrait", "long")]
+        gallery = {
+            "id": PORTFOLIO_DEMO_PREFIX + "gallery",
+            "type": PORTFOLIO_DEMO_CATEGORY,
+            "title": "Демо-галерея — 3 формата",
+            "status": "published", "cover": images[0], "images": images,
+            "task": "Проверьте переключение кадров, увеличенный просмотр и порядок галереи.",
+        }
+        if existing.get("gallery_demo", {}).get("images") != images:
+            cases.append(gallery)
+        if cases and not any(kind["id"] == PORTFOLIO_DEMO_CATEGORY for kind in data["types"]):
+            data["types"].append({"id": PORTFOLIO_DEMO_CATEGORY, "label": "Демо", "related_service": None})
+        additions = [case for case in cases if case["id"] not in existing]
+        data["cases"].extend(additions)
+        data[PORTFOLIO_DEMO_MARKER] = True
+        await _write("portfolio.json", data)
+        logger.info("Temporary portfolio demo pack: added %s cases", len(additions))
+
+
+def is_portfolio_demo_case(case: dict) -> bool:
+    return case["id"].startswith(PORTFOLIO_DEMO_PREFIX)
+
+
 async def next_case_id() -> str:
     """Suggest an ID for the wizard; uniqueness is enforced when saving."""
     return _next_case_id(await list_cases())
@@ -557,6 +602,34 @@ async def set_portfolio_start_case(actor_chat_id: int | str, case_id: str) -> bo
         return True
 
 
+def _change_case_status(data: dict, case: dict, status: str) -> None:
+    current = case.get("status", "published")
+    revision = case.get("_editor")
+    can_rebase = revision and revision["base"] == editor_digest(_without_editor(case))
+    if status == "trashed" and current != "trashed":
+        case["status_before_trash"] = current
+    elif current == "trashed" and status != "trashed":
+        case.pop("status_before_trash", None)
+    case["status"] = status
+    if can_rebase:
+        revision["base"] = editor_digest(_without_editor(case))
+        revision["working"]["status"] = status
+    if status != "published" and data.get("start_case_id") == case["id"]:
+        data.pop("start_case_id")
+
+
+async def trash_portfolio_demo_pack(actor_chat_id: int | str) -> None:
+    _require_designer(actor_chat_id)
+    async with _lock("portfolio.json"):
+        data = await _read("portfolio.json")
+        cases = [case for case in data["cases"] if is_portfolio_demo_case(case) and case.get("status") != "trashed"]
+        if not cases:
+            return
+        for case in cases:
+            _change_case_status(data, case, "trashed")
+        await _write("portfolio.json", data)
+
+
 async def set_case_status(actor_chat_id: int | str, case_id: str, status: str) -> bool:
     """Change visibility without destroying case data or associated images."""
     _require_designer(actor_chat_id)
@@ -567,19 +640,7 @@ async def set_case_status(actor_chat_id: int | str, case_id: str, status: str) -
         case = _find_case(data, case_id)
         if case is None:
             return False
-        current = case.get("status", "published")
-        revision = case.get("_editor")
-        can_rebase = revision and revision["base"] == editor_digest(_without_editor(case))
-        if status == "trashed" and current != "trashed":
-            case["status_before_trash"] = current
-        elif current == "trashed" and status != "trashed":
-            case.pop("status_before_trash", None)
-        case["status"] = status
-        if can_rebase:
-            revision["base"] = editor_digest(_without_editor(case))
-            revision["working"]["status"] = status
-        if status != "published" and data.get("start_case_id") == case_id:
-            data.pop("start_case_id")
+        _change_case_status(data, case, status)
         await _write("portfolio.json", data)
         return True
 

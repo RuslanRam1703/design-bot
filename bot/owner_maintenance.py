@@ -53,6 +53,8 @@ async def clean_start(actor, expected_digest):
             'leads.json': {'leads': [], 'projects': [], 'lead_id_highwater': watermark, 'access_control': copy.deepcopy(previous['leads.json'].get('access_control', {}))},
             'ui_config.json': {**copy.deepcopy(previous['ui_config.json']), 'content_epoch': uuid.uuid4().hex},
         }
+        if previous['portfolio.json'].get(store.PORTFOLIO_DEMO_MARKER):
+            replacements['portfolio.json'][store.PORTFOLIO_DEMO_MARKER] = True
         attempted = []
         try:
             for name in store.DATA_FILENAMES:
