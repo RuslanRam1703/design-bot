@@ -456,69 +456,33 @@ async def ensure_gallery_demo_case() -> None:
         await _write("portfolio.json", data)
 
 
-PORTFOLIO_DEMO_MARKER = "portfolio_demo_pack_v1"
-PORTFOLIO_DEMO_CATEGORY = "demo_pack"
-PORTFOLIO_DEMO_PREFIX = "demo_pack_"
-PORTFOLIO_DEMO_FRAMES = ("img/gallery-demo/portrait.svg", "img/gallery-demo/long.svg")
-
-
-async def expand_portfolio_demo_galleries() -> None:
-    """Give stock demo cards a gallery without changing edited or removed cases."""
-    marker = "portfolio_demo_galleries_v1"
+async def remove_production_demo_portfolio() -> None:
+    """Remove only known sample cases, without touching owner content or media."""
+    marker = "production_demo_portfolio_removed_v1"
     async with _lock("portfolio.json"):
         data = await _read("portfolio.json")
         if data.get(marker):
             return
-        stock_covers = {
-            PORTFOLIO_DEMO_PREFIX + case["id"]: case["cover"]
-            for case in _read_local("portfolio.json")["cases"]
+        stock = {case["id"]: case for case in _read_local("portfolio.json")["cases"]}
+        demo_ids = {"demo_pack_gallery", "gallery_demo", *("demo_pack_" + case_id for case_id in stock)}
+        removed = {
+            case["id"] for case in data["cases"]
+            if case["id"] in demo_ids or (
+                (sample := stock.get(case["id"])) is not None
+                and case.get("title") == sample["title"] and case.get("cover") == sample["cover"]
+            )
         }
-        updated = 0
-        for case in data["cases"]:
-            cover = stock_covers.get(case["id"])
-            if (cover and case.get("status") == "published" and "_editor" not in case
-                    and case.get("cover") == cover and case.get("images") == [cover]):
-                case["images"].extend(PORTFOLIO_DEMO_FRAMES)
-                updated += 1
+        data["cases"] = [case for case in data["cases"] if case["id"] not in removed]
+        if data.get("start_case_id") in removed:
+            data.pop("start_case_id")
+        if not any(_case_uses_type(case, "demo_pack") for case in data["cases"]):
+            data["types"] = [
+                kind for kind in data.get("types", [])
+                if not (kind["id"] == "demo_pack" and kind.get("label") == "Демо")
+            ]
         data[marker] = True
         await _write("portfolio.json", data)
-        logger.info("Temporary portfolio demo galleries: expanded %s cases", updated)
-
-
-async def ensure_portfolio_demo_pack() -> None:
-    """Install the requested demo portfolio once, alongside existing cases."""
-    async with _lock("portfolio.json"):
-        data = await _read("portfolio.json")
-        if data.get(PORTFOLIO_DEMO_MARKER):
-            return
-        source = _read_local("portfolio.json")
-        existing = {case["id"]: case for case in data["cases"]}
-        cases = [
-            {**case, "id": PORTFOLIO_DEMO_PREFIX + case["id"], "type": PORTFOLIO_DEMO_CATEGORY,
-             "related_service": None, "featured": False, "status": "published"}
-            for case in source["cases"]
-            if existing.get(case["id"], {}).get("cover") != case["cover"]
-        ]
-        # Demo cases should never point to a possibly unrelated production service.
-        for case in cases:
-            case.pop("order_template", None)
-        images = [f"img/gallery-demo/{name}.svg" for name in ("wide", "portrait", "long")]
-        gallery = {
-            "id": PORTFOLIO_DEMO_PREFIX + "gallery",
-            "type": PORTFOLIO_DEMO_CATEGORY,
-            "title": "Демо-галерея — 3 формата",
-            "status": "published", "cover": images[0], "images": images,
-            "task": "Проверьте переключение кадров, увеличенный просмотр и порядок галереи.",
-        }
-        if existing.get("gallery_demo", {}).get("images") != images:
-            cases.append(gallery)
-        if cases and not any(kind["id"] == PORTFOLIO_DEMO_CATEGORY for kind in data["types"]):
-            data["types"].append({"id": PORTFOLIO_DEMO_CATEGORY, "label": "Демо", "related_service": None})
-        additions = [case for case in cases if case["id"] not in existing]
-        data["cases"].extend(additions)
-        data[PORTFOLIO_DEMO_MARKER] = True
-        await _write("portfolio.json", data)
-        logger.info("Temporary portfolio demo pack: added %s cases", len(additions))
+        logger.info("Production demo cleanup removed %s portfolio cases", len(removed))
 
 
 async def next_case_id() -> str:
@@ -2810,8 +2774,6 @@ def validate_pricing(pricing: dict) -> None:
     def number(v, positive=False):
         if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) or v < 0 or (positive and v == 0):
             raise ValueError("Цены и сроки должны быть конечными неотрицательными числами; коэффициенты и шаг округления — больше нуля.")
-    if not pricing.get("services"):
-        raise ValueError("Добавьте хотя бы одну услугу перед применением прайса.")
     ids = set()
     for service in pricing["services"]:
         if not service.get("name", "").strip() or service["id"] in ids:

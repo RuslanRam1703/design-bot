@@ -108,6 +108,27 @@ class EditorTests(unittest.IsolatedAsyncioTestCase):
         await store.finish_pricing_edit(self.actor, digest, publish=True)
         self.assertEqual(self.data['pricing.json']['services'][0]['base_price'], 2000)
 
+    async def test_last_service_can_be_removed_through_pricing_review(self):
+        await store.delete_service(self.actor, "S", stage=True)
+        data = {}
+
+        async def update_data(**changes):
+            data.update(changes)
+
+        state = SimpleNamespace(get_data=AsyncMock(side_effect=lambda: dict(data)), update_data=update_data)
+        callback = SimpleNamespace(
+            message=SimpleNamespace(chat=SimpleNamespace(id=self.actor), edit_text=AsyncMock()),
+            answer=AsyncMock(),
+        )
+        await admin._review_screen(callback, state, "pricing")
+        rows = callback.message.edit_text.await_args.kwargs["reply_markup"].inline_keyboard
+        button = next(button for row in rows for button in row if button.text == "Применить пустой прайс")
+        callback.data = button.callback_data
+        with patch.object(admin.flow, "reset_state_keep_nav", AsyncMock()), patch.object(admin.flow, "step_from_callback", AsyncMock()):
+            await admin.review_finish(callback, state)
+        self.assertEqual(await store.list_services(live=True), [])
+        self.assertNotIn("_editor", self.data["pricing.json"])
+
     async def test_invalid_price_never_reaches_clients(self):
         for fields in [{'term_min': 10}, {'base_price': float('nan')}, {'base_price': -1}]:
             await store.update_service(self.actor, 'S', **fields, stage=True)
