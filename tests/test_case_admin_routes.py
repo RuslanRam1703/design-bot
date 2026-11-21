@@ -33,6 +33,15 @@ class CaseAdminRoutes(unittest.IsolatedAsyncioTestCase):
             await self.route('admincaseedit:a')
         self.assertEqual(await self.state.get_state(),AdminStates.edit_case_field_pick.state)
 
+    async def test_case_card_has_direct_gallery_link_and_publication(self):
+        self.cases[0]["images"] = ["img/example.svg"]
+        cb = await self.route("adminmoderatecase:a")
+        keyboard = cb.message.edit_text.await_args.kwargs["reply_markup"]
+        buttons = [button for row in keyboard.inline_keyboard for button in row]
+        gallery = next(button for button in buttons if button.text == "Галерея в Mini App")
+        self.assertIn("preview_case=a&edit_gallery=1", gallery.web_app.url)
+        self.assertIn("adminsetcasestatus:published:a", [button.callback_data for button in buttons])
+
     async def test_publish_status_button_routes_to_preview_and_confirmation(self):
         with (
             patch.object(admin.content_store, "begin_case_edit", AsyncMock(return_value=True)),

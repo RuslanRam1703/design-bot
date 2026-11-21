@@ -133,6 +133,7 @@ async def main() -> None:
     await content_store.ensure_gallery_demo_case()
     if content_store._upstash_enabled():
         await content_store.ensure_portfolio_demo_pack()
+        await content_store.expand_portfolio_demo_galleries()
 
     app = create_app(bot)
     webhook_secret = hashlib.sha256(config.BOT_TOKEN.encode("utf-8")).hexdigest()

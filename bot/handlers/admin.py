@@ -450,8 +450,6 @@ async def show_content_list(callback: CallbackQuery, state: FSMContext, section:
     menu = InlineKeyboardMarkup(inline_keyboard=[
         row for row in menu.inline_keyboard if not any(b.callback_data in hidden[section] for b in row)
     ])
-    if section == "cases" and any(content_store.is_portfolio_demo_case(case) for case in items):
-        menu.inline_keyboard.insert(0, [InlineKeyboardButton(text="Убрать демо-кейсы", callback_data="admindemotrash:ask")])
     text = f"{title} — {len(items)}.\n" + ("Выберите запись из списка." if items else "Пока ничего нет. Добавьте первую запись.")
     if section == "pricing":
         text += "\nИзменения прайса видны клиентам только после проверки и применения."
@@ -471,24 +469,6 @@ async def content_list_page(callback: CallbackQuery, state: FSMContext) -> None:
 
 @router.callback_query(F.data == "adminmenu:cases")
 async def menu_cases(callback: CallbackQuery, state: FSMContext) -> None:
-    await show_content_list(callback, state, "cases")
-
-
-@router.callback_query(F.data == "admindemotrash:ask")
-async def ask_demo_trash(callback: CallbackQuery, state: FSMContext) -> None:
-    await flow.step_from_callback(
-        callback, state, "Переместить демо-кейсы в корзину? Их можно будет восстановить.",
-        InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="Убрать демо-кейсы", callback_data="admindemotrash:yes")],
-            [InlineKeyboardButton(text="Отмена", callback_data="adminmenu:cases")],
-        ]),
-    )
-    await callback.answer()
-
-
-@router.callback_query(F.data == "admindemotrash:yes")
-async def move_demo_cases_to_trash(callback: CallbackQuery, state: FSMContext) -> None:
-    await content_store.trash_portfolio_demo_pack(callback.message.chat.id)
     await show_content_list(callback, state, "cases")
 
 
@@ -1061,9 +1041,13 @@ async def cases_moderate_pick_for_id(callback: CallbackQuery, case_id: str) -> N
         ]
     else:
         rows = [[InlineKeyboardButton(text="Редактировать и проверить", callback_data=f"admincaseedit:{case_id}")]]
-        if current != "published":
-            rows.append([InlineKeyboardButton(text="Проверить и опубликовать", callback_data=f"adminsetcasestatus:published:{case_id}")])
-        else:
+        working = case.get("_editor", {}).get("working", case)
+        if working.get("images"):
+            rows.append([InlineKeyboardButton(
+                text="Галерея в Mini App", web_app=WebAppInfo(url=_preview_url(case_id, edit_gallery=True)),
+            )])
+        rows.append([InlineKeyboardButton(text="Проверить и опубликовать", callback_data=f"adminsetcasestatus:published:{case_id}")])
+        if current == "published":
             if not is_start_case:
                 rows.append([InlineKeyboardButton(text="Показывать первым", callback_data=f"adminstartcase:{case_id}")])
             rows.append([InlineKeyboardButton(text="Снять с публикации", callback_data=f"adminsetcasestatus:unpublished:{case_id}")])
@@ -3254,9 +3238,12 @@ async def backup_import_wrong(message: Message, state: FSMContext) -> None:
 # голосовое вместо числа). Раньше такие сообщения проваливались сквозь все
 # роутеры бота без единого ответа — админ не понимал, жив ли бот.
 
-def _preview_url(case_id: str) -> str:
+def _preview_url(case_id: str, *, edit_gallery: bool = False) -> str:
     parts = urlsplit(config.miniapp_url())
-    query = dict(parse_qsl(parts.query)); query["preview_case"] = case_id
+    query = dict(parse_qsl(parts.query))
+    query["preview_case"] = case_id
+    if edit_gallery:
+        query["edit_gallery"] = "1"
     return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), ""))
 
 
