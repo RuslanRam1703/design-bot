@@ -164,6 +164,24 @@ class EditorTests(unittest.IsolatedAsyncioTestCase):
                 await store.finish_case_edit(self.actor, "one", saved["revision"], publish=True)
                 self.assertEqual((await store.list_cases())[0]["cover"], "next.jpg")
 
+    async def test_removing_cover_in_gallery_keeps_live_media_until_publication(self):
+        await store.add_case_image(self.actor, "one", "next.jpg", archive_ref="archive:@archive:2")
+        working = await self.case()
+        saved = await store.save_case_gallery(self.actor, "one", store.editor_digest(working), [1], "next.jpg")
+        self.assertEqual(saved["images"], ["next.jpg"])
+        self.assertEqual(saved["cover"], "next.jpg")
+        self.assertIsNone(saved["source_ref"])
+        self.assertTrue(await store.editor_media_retained("archive:@archive:1"))
+        await store.finish_case_edit(self.actor, "one", store.editor_digest(saved), publish=True)
+        self.assertEqual((await store.list_cases())[0]["images"], ["next.jpg"])
+        self.assertFalse(await store.editor_media_retained("archive:@archive:1"))
+
+    async def test_profile_can_be_filled_again_after_clean_start(self):
+        self.data["about.json"] = {}
+        self.assertTrue(await store.update_about_field(self.actor, "name", "Designer"))
+        self.assertFalse(await store.update_about_field(self.actor, "unknown", "value"))
+        self.assertEqual((await store.get_about())["name"], "Designer")
+
     async def test_review_requires_sample_and_rejects_stale_button(self):
         callback = SimpleNamespace(data='adminapply:abc', message=SimpleNamespace(chat=SimpleNamespace(id=self.actor), edit_text=AsyncMock()), answer=AsyncMock())
         state = SimpleNamespace(get_data=AsyncMock(return_value={'review_digest':'abc','review_kind':'pricing'}))

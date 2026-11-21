@@ -6,7 +6,7 @@ No client material is processed. Duplicate deliveries are idempotent.
 import logging
 
 from aiogram import Router
-from aiogram.types import Message
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 from bot import config, content_store, telegram_media
 
@@ -40,14 +40,6 @@ async def import_post(message: Message) -> None:
             media_group_id=group_id, images=images, caption=message.caption,
         )
         logger.info("Portfolio case %s: %s", "created" if created else "updated", case["id"])
-        if created and config.DESIGNER_CHAT_ID:
-            await message.bot.send_message(
-                chat_id=int(config.DESIGNER_CHAT_ID),
-                text=f"Создан черновик проекта «{title}».\nИзображений: {len(images)}.\n"
-                     "Проверьте описание и категорию: Админ → Контент → Кейсы → Статусы и публикация.\n"
-                     f"Источник: {post_url}",
-                parse_mode=None,
-            )
     except Exception:
         logger.exception("Portfolio import failed for %s", post_url)
         if config.DESIGNER_CHAT_ID:
@@ -60,6 +52,21 @@ async def import_post(message: Message) -> None:
                 )
             except Exception:
                 logger.exception("Could not notify owner about portfolio import failure")
+        return
+    if created and config.DESIGNER_CHAT_ID:
+        try:
+            await message.bot.send_message(
+                chat_id=int(config.DESIGNER_CHAT_ID),
+                text=f"Создан черновик проекта «{title}».\nИзображений: {len(images)}.\n"
+                     "Чтобы кейс появился в Mini App, выберите категорию и опубликуйте его.\n"
+                     f"Источник: {post_url}",
+                parse_mode=None,
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                    InlineKeyboardButton(text="Открыть черновик", callback_data=f"admincaseedit:{case['id']}"),
+                ]]),
+            )
+        except Exception:
+            logger.exception("Imported case %s but could not notify the owner", case["id"])
 
 
 @router.channel_post()

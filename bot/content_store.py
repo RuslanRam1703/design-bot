@@ -1133,6 +1133,12 @@ async def get_about() -> dict:
     return await _read("about.json")
 
 
+ABOUT_EDITABLE_FIELDS = frozenset({
+    "name", "tagline", "location", "experience_years", "experience_text", "approach",
+    "specialization", "skills", "tools", "avatar", "experience",
+})
+
+
 async def update_about_field(actor_chat_id: int | str, field: str, value: Any) -> bool:
     """Batch 3 — при замене "avatar" старое значение (если это был R2-объект)
     удаляется после успешной записи (тот же принцип, что и update_case для
@@ -1142,7 +1148,7 @@ async def update_about_field(actor_chat_id: int | str, field: str, value: Any) -
     old_avatar: str | None = None
     async with _lock("about.json"):
         data = await _read("about.json")
-        if field not in data:
+        if field not in data and field not in ABOUT_EDITABLE_FIELDS:
             return False
         if field == "avatar" and value != data.get("avatar"):
             old_avatar = data.get("avatar")
@@ -2718,14 +2724,25 @@ async def save_case_gallery(
         if editor_digest(working) != revision:
             raise ValueError("Кейс изменился. Откройте предпросмотр заново.")
         images = working.get("images", [])
-        if sorted(order) != list(range(len(images))):
+        if len(set(order)) != len(order) or any(index < 0 or index >= len(images) for index in order):
             raise ValueError("Состав галереи изменился. Откройте предпросмотр заново.")
-        if cover is not None and cover != working.get("cover") and cover not in images:
-            raise ValueError("Выберите обложку из галереи кейса.")
+        remaining = [images[index] for index in order]
+        original_cover = working.get("cover")
+        if cover is not None and cover not in remaining and (cover != original_cover or cover in images):
+            raise ValueError("Выберите обложку из оставшихся кадров.")
         working = _editable_case(data, case_id, start=True)
-        working["images"] = [images[index] for index in order]
-        if cover is not None:
-            working["cover"] = cover
+        working["images"] = remaining
+        working["cover"] = cover
+        if cover != original_cover and str(working.get("source_ref", "")).startswith("archive:"):
+            if original_cover:
+                working.setdefault("image_refs", {}).setdefault(original_cover, working["source_ref"])
+            working["source_ref"] = None
+        retained_images = set(remaining)
+        retained_images.add(cover)
+        for section in working.get("sections", []):
+            retained_images.update(section.get("images", []))
+        if "image_refs" in working:
+            working["image_refs"] = {path: ref for path, ref in working["image_refs"].items() if path in retained_images}
         await _write("portfolio.json", data)
         return _without_editor(working)
 
