@@ -2577,17 +2577,12 @@ async def cat_add_start(callback: CallbackQuery, state: FSMContext) -> None:
 
 @router.message(AdminStates.add_category_label, F.text)
 async def cat_add_label(message: Message, state: FSMContext) -> None:
-    type_id = await content_store.next_portfolio_type_id()
-    cat = await content_store.add_portfolio_type(message.chat.id, type_id=type_id, label=message.text.strip())
-    # step_from_text, затем finish_flow, НЕ reset_state_keep_nav (P1-3,
-    # Batch 4): reset_state_keep_nav делает полную замену state.data и
-    # стирает _flow_msg_id заново, даже когда step_from_text только что
-    # успешно отредактировал существующий anchor на месте (он не трогает
-    # state.data в этом случае — значение уже верное) — итог: физический
-    # экран корректен, но "⌂ Главное меню" сразу после не находит, что
-    # удалять (эмпирически подтверждено). finish_flow (как в
-    # faq_add_answer) гасит FSM-состояние, не трогая data.
-    await flow.step_from_text(message, state, f"Категория «{cat['label']}» добавлена ✅", kb.categories_menu_keyboard())
+    try:
+        cat = await content_store.add_portfolio_type(message.chat.id, label=message.text)
+    except ValueError as exc:
+        await flow.step_from_text(message, state, escape(str(exc)), kb.cancel_keyboard())
+        return
+    await flow.step_from_text(message, state, f"Категория «{escape(cat['label'])}» добавлена ✅", kb.categories_menu_keyboard())
     await flow.finish_flow(state)
 
 
@@ -2613,10 +2608,13 @@ async def cat_rename_picked(callback: CallbackQuery, state: FSMContext) -> None:
 @router.message(AdminStates.rename_category_value, F.text)
 async def cat_rename_value(message: Message, state: FSMContext) -> None:
     data = await state.get_data()
-    await content_store.rename_portfolio_type(message.chat.id, data["type_id"], message.text.strip())
-    # step_from_text, затем finish_flow, НЕ reset_state_keep_nav (P1-3,
-    # Batch 4) — см. обоснование в cat_add_label.
-    await flow.step_from_text(message, state, "Переименовано ✅", kb.categories_menu_keyboard())
+    try:
+        renamed = await content_store.rename_portfolio_type(message.chat.id, data["type_id"], message.text)
+    except ValueError as exc:
+        await flow.step_from_text(message, state, escape(str(exc)), kb.cancel_keyboard())
+        return
+    text = "Переименовано ✅" if renamed else "Категория уже удалена. Откройте актуальный список."
+    await flow.step_from_text(message, state, text, kb.categories_menu_keyboard())
     await flow.finish_flow(state)
 
 
@@ -3237,7 +3235,7 @@ async def backup_import_wrong(message: Message, state: FSMContext) -> None:
 # роутеры бота без единого ответа — админ не понимал, жив ли бот.
 
 def _preview_url(case_id: str) -> str:
-    parts = urlsplit(config.WEBAPP_URL)
+    parts = urlsplit(config.miniapp_url())
     query = dict(parse_qsl(parts.query)); query["preview_case"] = case_id
     return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), ""))
 

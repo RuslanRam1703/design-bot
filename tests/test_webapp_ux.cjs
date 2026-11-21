@@ -321,3 +321,10 @@ test('start case applies to All and keeps the visitor selection available', () =
   state.filter = 'web';
   assert.match(renderPortfolio(), /data-open-case="first"/);
 });
+
+test('case hides its order action when orders are disabled in admin settings', () => {
+  const { state, renderCase } = appWithDraft();
+  state.currentCase = { id: 'one', title: 'Case' };
+  state.uiConfig = { menu: { brief: false } };
+  assert.doesNotMatch(renderCase(), /want-similar/);
+});

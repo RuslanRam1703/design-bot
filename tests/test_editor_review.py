@@ -69,12 +69,23 @@ class EditorTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ValueError): await store.finish_case_edit(self.actor, 'one', digest, publish=True)
         self.assertEqual((await store.list_cases())[0]['title'], 'Live')
 
+    async def test_unpublish_keeps_draft_and_invalidates_old_confirmation(self):
+        await store.update_case(self.actor, 'one', title='Draft', stage=True)
+        old_digest = store.editor_digest(await self.case())
+        await store.set_case_status(self.actor, 'one', 'unpublished')
+        with self.assertRaises(ValueError):
+            await store.finish_case_edit(self.actor, 'one', old_digest, publish=True)
+        self.assertEqual((await store.list_cases())[0]['status'], 'unpublished')
+        await store.finish_case_edit(self.actor, 'one', store.editor_digest(await self.case()), publish=True)
+        self.assertEqual((await store.list_cases())[0]['title'], 'Draft')
+
     async def test_live_change_rejects_revision_overwrite(self):
-        await store.begin_case_edit(self.actor, 'one')
+        await store.update_case(self.actor, 'one', title='Draft', stage=True)
+        self.data['portfolio.json']['cases'][0]['title'] = 'Changed outside editor'
         await store.set_case_status(self.actor, 'one', 'unpublished')
         with self.assertRaises(ValueError):
             await store.finish_case_edit(self.actor, 'one', store.editor_digest(await self.case()), publish=True)
-        self.assertEqual((await store.list_cases())[0]['status'], 'unpublished')
+        self.assertEqual((await store.list_cases())[0]['title'], 'Changed outside editor')
 
     async def test_drafts_persist_in_storage_and_resume_without_reset(self):
         await store.update_case(self.actor, 'one', title='Draft', stage=True)
