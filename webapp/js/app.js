@@ -552,6 +552,7 @@ function loadSection(key) {
 function render() {
   persistBriefDraft();
   const app = document.getElementById("app");
+  app.dataset.screen = state.screen;
   const section = sectionForScreen[state.screen];
   if (sectionLoader && section && !state[section]) {
     if (!sectionRequests.has(section)) loadSection(section);
@@ -713,6 +714,7 @@ function renderPortfolio() {
 
   const typeLabels = Object.fromEntries(types.map(type => [type.id, type.label]));
   const selected = filtered.find(project => project.id === state.portfolioPreviewId)
+    || (state.filter === "all" && filtered.find(project => project.id === state.portfolio.start_case_id))
     || filtered.find(project => project.featured)
     || filtered[0];
   state.portfolioPreviewId = selected?.id ?? null;
@@ -747,6 +749,7 @@ function attachPortfolioEvents() {
   document.getElementById("portfolio-order")?.addEventListener("click", () => navigate("brief"));
   document.querySelectorAll(".chip").forEach((el) =>
     el.addEventListener("click", () => {
+      if (el.dataset.filter !== state.filter) state.portfolioPreviewId = null;
       state.filter = el.dataset.filter;
       render();
     })

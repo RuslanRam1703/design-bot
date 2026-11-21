@@ -1,3 +1,4 @@
+import asyncio
 import dataclasses
 import json
 import logging
@@ -12,7 +13,6 @@ from bot import access_control, config, content_store, texts
 from bot.burst_guard import BurstLimiter
 from bot.calculator import calculate
 from bot.data import load_pricing
-from bot.lead import format_lead_message, format_lead_supplement_message
 from bot.lead_validation import valid_new_lead_payload as _valid_new_lead_payload
 from bot.notifications import notify_designer_lead, notify_designer_supplement
 from bot.telegram_auth import diagnose_init_data, validate_init_data
@@ -111,10 +111,14 @@ async def handle_public_data(request: web.Request) -> web.Response:
         working = case.get("_editor", {}).get("working", case)
         data = {"types": data.get("types", []), "cases": [{k: v for k, v in working.items() if k != "_editor"}], "owner_preview": True}
     elif filename == "portfolio.json":
-        data = {"types": data.get("types", []), "cases": [
+        cases = [
             {k: v for k, v in case.items() if k != "_editor"}
             for case in data.get("cases", []) if case.get("status", "published") == "published"
-        ]}
+        ]
+        start_case_id = data.get("start_case_id")
+        data = {"types": data.get("types", []), "cases": cases}
+        if any(case["id"] == start_case_id for case in cases):
+            data["start_case_id"] = start_case_id
     elif filename == "pricing.json":
         data = {k: v for k, v in data.items() if k != "_editor"}
     return web.json_response(data, dumps=lambda d: json.dumps(d, ensure_ascii=False), headers={"Cache-Control": "no-store"})
@@ -233,8 +237,8 @@ async def handle_create_lead(request: web.Request) -> web.Response:
             return web.json_response({"error": "invalid_fields"}, status=400)
         if "wants_file" in payload and not isinstance(payload["wants_file"], bool):
             return web.json_response({"error": "invalid_payload"}, status=400)
-        return await _handle_lead_supplement(payload, telegram_identity, bot)
-    return await _handle_lead_create(payload, telegram_identity, bot)
+        return await _handle_lead_supplement(payload, telegram_identity, bot, request.app[LEAD_NOTICES])
+    return await _handle_lead_create(payload, telegram_identity, bot, request.app[LEAD_NOTICES])
 
 
 async def _notify_client(bot: Bot, telegram_identity: dict, text: str, *, lead_id: int) -> None:
@@ -275,7 +279,29 @@ def _price_range_text(calc_summary: dict | None) -> str | None:
     return f"{calc_summary['price_from']:,} – {calc_summary['price_to']:,} ₽".replace(",", " ")
 
 
-async def _handle_lead_create(payload: dict, telegram_identity: dict, bot: Bot) -> web.Response:
+LEAD_NOTICES = web.AppKey("lead_notices", set)
+
+
+def _send_notice(tasks: set, coroutine) -> None:
+    def finished(task):
+        tasks.discard(task)
+        if not task.cancelled() and (error := task.exception()) is not None:
+            logger.error("Lead notification failed after saving the request", exc_info=error)
+
+    task = asyncio.create_task(coroutine)
+    tasks.add(task)
+    task.add_done_callback(finished)
+
+
+async def _drain_notices(app: web.Application) -> None:
+    if app[LEAD_NOTICES]:
+        _, pending = await asyncio.wait(app[LEAD_NOTICES], timeout=5)
+        for task in pending:
+            task.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
+
+
+async def _handle_lead_create(payload: dict, telegram_identity: dict, bot: Bot, notices: set) -> web.Response:
     calc_result = None
     calc_payload = payload.get("calc")
     if isinstance(calc_payload, dict) and calc_payload.get("service_id"):
@@ -310,7 +336,7 @@ async def _handle_lead_create(payload: dict, telegram_identity: dict, bot: Bot) 
     if created or lead.get("changed") or (lead.get("designer_notification") or {}).get("state") != "sent":
         if not config.DESIGNER_CHAT_ID:
             logger.warning("DESIGNER_CHAT_ID не задан — уведомление о заявке #%s ожидает отправки", lead["id"])
-        await notify_designer_lead(bot, lead)
+        _send_notice(notices, notify_designer_lead(bot, lead))
 
     if created:
         # Подтверждение клиенту — под тем же `if created`, что и уведомление
@@ -319,11 +345,11 @@ async def _handle_lead_create(payload: dict, telegram_identity: dict, bot: Bot) 
         # получил при первой отправке).
         attach_tz = bool(payload.get("attach_tz"))
         ack = texts.lead_ack_ask_file if attach_tz else texts.lead_received_ack
-        await _notify_client(
+        _send_notice(notices, _notify_client(
             bot, telegram_identity,
             ack(lead["id"], payload.get("service_name"), _price_range_text(calc_summary)),
             lead_id=lead["id"],
-        )
+        ))
 
     price_range = None
     if calc_summary:
@@ -336,7 +362,7 @@ async def _handle_lead_create(payload: dict, telegram_identity: dict, bot: Bot) 
     )
 
 
-async def _handle_lead_supplement(payload: dict, telegram_identity: dict, bot: Bot) -> web.Response:
+async def _handle_lead_supplement(payload: dict, telegram_identity: dict, bot: Bot, notices: set) -> web.Response:
     """mode="supplement" — дополнение к уже существующей заявке, адресуется
     строго по lead_id (НЕ draft_id — тот принадлежит другому, уже
     закрытому этапу жизни заявки, см. content_store.add_lead_supplement).
@@ -386,17 +412,17 @@ async def _handle_lead_supplement(payload: dict, telegram_identity: dict, bot: B
         return web.json_response({"error": "lead_closed"}, status=409)
 
     if not lead.get("_supplement_replayed"):
-        await notify_designer_supplement(bot, lead, supplement_id)
+        _send_notice(notices, notify_designer_supplement(bot, lead, supplement_id))
 
         # Тот же принцип, что и при создании заявки: клиент, закрывший Mini App,
         # должен увидеть в чате и подтверждение, и — если отметил файл —
         # инструкцию его прислать (add_lead_supplement уже выставил
         # awaiting_tz_file, см. wants_file выше).
-        await _notify_client(
+        _send_notice(notices, _notify_client(
             bot, telegram_identity,
             texts.supplement_ack_ask_file(lead_id) if wants_file else texts.supplement_ack(lead_id),
             lead_id=lead_id,
-        )
+        ))
 
     return web.json_response(
         {"lead_id": lead_id, "supplement_id": supplement_id},
@@ -490,6 +516,8 @@ def create_app(bot: Bot) -> web.Application:
     ни к Bot, ни к Dispatcher вообще — см. аудит перед этим изменением)."""
     app = web.Application(client_max_size=64 * 1024, middlewares=[miniapp_cors])
     app["bot"] = bot
+    app[LEAD_NOTICES] = set()
+    app.on_cleanup.append(_drain_notices)
     # Per-worker, per-client-IP short-burst limit; no daily lead quota.
     app["lead_burst"] = BurstLimiter(limit=20, window_seconds=10)
     app.on_response_prepare.append(_no_cache)

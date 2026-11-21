@@ -262,7 +262,7 @@ test('owner appearance is escaped, optional and respects the disabled order sect
 
 test('portfolio survives a pricing load failure and retries only pricing', async () => {
   const requests = [];
-  const root = { innerHTML: '' };
+  const root = { innerHTML: '', dataset: {} };
   let retry;
   const context = {
     window: { location: { pathname: '/portfolio', search: '' }, scrollTo() {} },
@@ -305,4 +305,19 @@ test('portfolio survives a pricing load failure and retries only pricing', async
   await new Promise(setImmediate);
   assert.match(root.innerHTML, /Услуги пока не опубликованы/);
   assert.deepEqual(requests.slice(2), ['/data/pricing.json', '/data/pricing.json']);
+});
+
+test('start case applies to All and keeps the visitor selection available', () => {
+  const { state, renderPortfolio } = appWithDraft();
+  state.portfolio = {
+    types: [{ id: 'web', label: 'Сайты' }],
+    cases: [{ id: 'first', type: 'web', title: 'First' }, { id: 'start', type: 'web', title: 'Start' }],
+    start_case_id: 'start',
+  };
+  assert.match(renderPortfolio(), /data-open-case="start"/);
+  state.portfolioPreviewId = 'first';
+  assert.match(renderPortfolio(), /data-open-case="first"/);
+  state.portfolioPreviewId = null;
+  state.filter = 'web';
+  assert.match(renderPortfolio(), /data-open-case="first"/);
 });
