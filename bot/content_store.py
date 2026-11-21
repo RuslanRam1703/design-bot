@@ -459,6 +459,30 @@ async def ensure_gallery_demo_case() -> None:
 PORTFOLIO_DEMO_MARKER = "portfolio_demo_pack_v1"
 PORTFOLIO_DEMO_CATEGORY = "demo_pack"
 PORTFOLIO_DEMO_PREFIX = "demo_pack_"
+PORTFOLIO_DEMO_FRAMES = ("img/gallery-demo/portrait.svg", "img/gallery-demo/long.svg")
+
+
+async def expand_portfolio_demo_galleries() -> None:
+    """Give stock demo cards a gallery without changing edited or removed cases."""
+    marker = "portfolio_demo_galleries_v1"
+    async with _lock("portfolio.json"):
+        data = await _read("portfolio.json")
+        if data.get(marker):
+            return
+        stock_covers = {
+            PORTFOLIO_DEMO_PREFIX + case["id"]: case["cover"]
+            for case in _read_local("portfolio.json")["cases"]
+        }
+        updated = 0
+        for case in data["cases"]:
+            cover = stock_covers.get(case["id"])
+            if (cover and case.get("status") == "published" and "_editor" not in case
+                    and case.get("cover") == cover and case.get("images") == [cover]):
+                case["images"].extend(PORTFOLIO_DEMO_FRAMES)
+                updated += 1
+        data[marker] = True
+        await _write("portfolio.json", data)
+        logger.info("Temporary portfolio demo galleries: expanded %s cases", updated)
 
 
 async def ensure_portfolio_demo_pack() -> None:
@@ -495,10 +519,6 @@ async def ensure_portfolio_demo_pack() -> None:
         data[PORTFOLIO_DEMO_MARKER] = True
         await _write("portfolio.json", data)
         logger.info("Temporary portfolio demo pack: added %s cases", len(additions))
-
-
-def is_portfolio_demo_case(case: dict) -> bool:
-    return case["id"].startswith(PORTFOLIO_DEMO_PREFIX)
 
 
 async def next_case_id() -> str:
@@ -602,34 +622,6 @@ async def set_portfolio_start_case(actor_chat_id: int | str, case_id: str) -> bo
         return True
 
 
-def _change_case_status(data: dict, case: dict, status: str) -> None:
-    current = case.get("status", "published")
-    revision = case.get("_editor")
-    can_rebase = revision and revision["base"] == editor_digest(_without_editor(case))
-    if status == "trashed" and current != "trashed":
-        case["status_before_trash"] = current
-    elif current == "trashed" and status != "trashed":
-        case.pop("status_before_trash", None)
-    case["status"] = status
-    if can_rebase:
-        revision["base"] = editor_digest(_without_editor(case))
-        revision["working"]["status"] = status
-    if status != "published" and data.get("start_case_id") == case["id"]:
-        data.pop("start_case_id")
-
-
-async def trash_portfolio_demo_pack(actor_chat_id: int | str) -> None:
-    _require_designer(actor_chat_id)
-    async with _lock("portfolio.json"):
-        data = await _read("portfolio.json")
-        cases = [case for case in data["cases"] if is_portfolio_demo_case(case) and case.get("status") != "trashed"]
-        if not cases:
-            return
-        for case in cases:
-            _change_case_status(data, case, "trashed")
-        await _write("portfolio.json", data)
-
-
 async def set_case_status(actor_chat_id: int | str, case_id: str, status: str) -> bool:
     """Change visibility without destroying case data or associated images."""
     _require_designer(actor_chat_id)
@@ -640,7 +632,19 @@ async def set_case_status(actor_chat_id: int | str, case_id: str, status: str) -
         case = _find_case(data, case_id)
         if case is None:
             return False
-        _change_case_status(data, case, status)
+        current = case.get("status", "published")
+        revision = case.get("_editor")
+        can_rebase = revision and revision["base"] == editor_digest(_without_editor(case))
+        if status == "trashed" and current != "trashed":
+            case["status_before_trash"] = current
+        elif current == "trashed" and status != "trashed":
+            case.pop("status_before_trash", None)
+        case["status"] = status
+        if can_rebase:
+            revision["base"] = editor_digest(_without_editor(case))
+            revision["working"]["status"] = status
+        if status != "published" and data.get("start_case_id") == case_id:
+            data.pop("start_case_id")
         await _write("portfolio.json", data)
         return True
 

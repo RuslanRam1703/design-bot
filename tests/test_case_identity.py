@@ -100,13 +100,17 @@ class CaseIdentityTests(unittest.IsolatedAsyncioTestCase):
         ):
             await content_store.ensure_portfolio_demo_pack()
             await content_store.ensure_portfolio_demo_pack()
+            await content_store.expand_portfolio_demo_galleries()
+            await content_store.expand_portfolio_demo_galleries()
         live = await content_store._read("portfolio.json")
-        demos = [case for case in live["cases"] if content_store.is_portfolio_demo_case(case)]
+        demos = [case for case in live["cases"] if case["id"].startswith(content_store.PORTFOLIO_DEMO_PREFIX)]
         self.assertEqual(len(demos), 2)
         self.assertEqual(live["cases"][0], existing)
         self.assertEqual(live["start_case_id"], existing["id"])
         self.assertNotIn("order_template", demos[0])
-        await content_store.trash_portfolio_demo_pack(777)
+        self.assertEqual(len(demos[0]["images"]), 3)
+        for case in demos:
+            await content_store.set_case_status(777, case["id"], "trashed")
         await content_store.ensure_portfolio_demo_pack()
         cases = await content_store.list_cases()
         self.assertEqual(len(cases), 3)

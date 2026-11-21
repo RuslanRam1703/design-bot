@@ -475,6 +475,9 @@ async function init() {
         : galleryDemo ? portfolio.cases.find(c => c.id === "gallery_demo") : null;
       if (project) {
         state.currentCase = project;
+        if (portfolio.owner_preview && portfolio.revision && params.get("edit_gallery") === "1" && project.images?.length) {
+          galleryEditor = createGalleryEditor(project);
+        }
         state.history = ["portfolio"];
         state.screen = "case";
       }
@@ -877,6 +880,10 @@ function renderCaseGallery(images, title, eager = false) {
 
 let galleryEditor = null;
 
+function createGalleryEditor(project) {
+  return { order: project.images.map((_, index) => index), cover: project.cover || null, dirty: false, saving: false };
+}
+
 function renderGalleryEditor(editor) {
   const dirty = editor.dirty;
   const locked = editor.saving ? "disabled" : "";
@@ -1036,7 +1043,7 @@ function renderCase() {
       <button class="back-btn" id="back">${state.portfolio?.owner_preview ? "← В редактор" : "←"}</button>
       <h1>${escapeHtml(c.title)}</h1>
     </div>
-    ${state.portfolio?.gallerySaved ? '<p id="gallery-saved" class="hint" role="status" tabindex="-1">Галерея сохранена в черновик. Для публикации вернитесь в чат и нажмите «Обновить после правок в Mini App».</p>' : ""}
+    ${state.portfolio?.gallerySaved ? '<p id="gallery-saved" class="hint" role="status" tabindex="-1">Галерея сохранена в черновик. Для публикации вернитесь в чат и откройте «Проверить и опубликовать» или обновите открытую проверку.</p>' : ""}
     ${canEditGallery ? '<button type="button" class="btn btn-secondary gallery-editor-entry" id="open-gallery-editor">Редактировать галерею</button>' : ""}
     <div class="case-images">${images}</div>
     ${renderCaseContent(c)}
@@ -1053,7 +1060,7 @@ function attachCaseEvents() {
   }
   const c = state.currentCase;
   document.getElementById("open-gallery-editor")?.addEventListener("click", () => {
-    galleryEditor = { order: c.images.map((_, index) => index), cover: c.cover || null, dirty: false, saving: false };
+    galleryEditor = createGalleryEditor(c);
     render();
     document.querySelector("#gallery-editor [data-gallery-cover]")?.focus();
   });
