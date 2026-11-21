@@ -214,6 +214,15 @@ function navigate(screen, { resetBrief = false, hardReset = false, pushHistory =
 
 function goBack() {
   if (state.portfolio?.owner_preview) {
+    if (galleryEditor?.saving) return;
+    if (galleryEditor) {
+      if (!galleryEditor.dirty || window.confirm("Выйти из галереи без сохранения?")) {
+        galleryEditor = null;
+        render();
+        document.getElementById("open-gallery-editor")?.focus();
+      }
+      return;
+    }
     if (!TG.close()) {
       const url = new URL(window.location.href);
       url.searchParams.delete('preview_case');
@@ -831,9 +840,155 @@ function renderCaseGallery(images, title, eager = false) {
     <span>Увеличить фото <span data-gallery-count>1 / ${images.length}</span></span></button>${thumbs}</div>`;
 }
 
+let galleryEditor = null;
+
+function renderGalleryEditor(editor) {
+  const dirty = editor.dirty;
+  const locked = editor.saving ? "disabled" : "";
+  const images = state.currentCase.images;
+  const cards = editor.order.map((imageIndex, position) => {
+    const src = images[imageIndex];
+    const isCover = src === editor.cover;
+    return `<li class="gallery-editor-card${isCover ? " is-cover" : ""}" data-position="${position}">
+      <figure draggable="${!editor.saving}" title="Перетащите для смены порядка">
+        <img src="${escapeHtml(imageSrc(src))}" alt="Кадр ${position + 1}" loading="lazy" draggable="false">
+        <figcaption>Кадр ${position + 1}${isCover ? " · Обложка" : ""}</figcaption>
+      </figure>
+      <div class="gallery-editor-actions">
+        <button type="button" data-gallery-move="-1" aria-label="Переместить кадр ${position + 1} раньше" ${position === 0 ? "disabled" : locked}>←</button>
+        <button type="button" data-gallery-move="1" aria-label="Переместить кадр ${position + 1} позже" ${position === images.length - 1 ? "disabled" : locked}>→</button>
+        <button type="button" data-gallery-cover aria-pressed="${isCover}" ${locked}>${isCover ? "Обложка" : "На обложку"}</button>
+      </div>
+    </li>`;
+  }).join("");
+  const originalCover = state.currentCase.cover;
+  const separateCover = originalCover && !images.includes(originalCover);
+  return `<section id="gallery-editor" class="gallery-editor" aria-label="Редактор галереи">
+    <h2>Галерея кейса</h2>
+    <p class="hint">Перетащите кадры или поменяйте их порядок стрелками. Обложку можно выбрать отдельно.</p>
+    ${separateCover ? `<div class="gallery-editor-current"><img src="${escapeHtml(imageSrc(originalCover))}" alt="">
+      <button type="button" class="btn btn-secondary" id="keep-original-cover" aria-pressed="${editor.cover === originalCover}" ${locked}>${editor.cover === originalCover ? "Текущая обложка вне галереи" : "Вернуть отдельную обложку"}</button></div>` : ""}
+    <ol class="gallery-editor-grid">${cards}</ol>
+    <p class="hint" role="status">${escapeHtml(editor.message || (dirty ? "Есть несохранённые правки" : ""))}</p>
+    <div class="btn-row">
+      <button type="button" class="btn btn-primary" id="save-gallery" ${dirty ? locked : "disabled"}>${editor.saving ? "Сохраняю…" : "Сохранить в черновик"}</button>
+      <button type="button" class="btn btn-secondary" id="close-gallery" ${locked}>Вернуться к предпросмотру</button>
+    </div>
+  </section>`;
+}
+
+function attachGalleryEditor() {
+  const editor = galleryEditor;
+  const panel = document.getElementById("gallery-editor");
+  let from = null;
+
+  function update(position, selector) {
+    editor.dirty = editor.cover !== (state.currentCase.cover || null)
+      || editor.order.some((imageIndex, index) => imageIndex !== index);
+    editor.message = "";
+    const scrollY = window.scrollY;
+    panel.outerHTML = renderGalleryEditor(editor);
+    attachGalleryEditor();
+    if (position === null) {
+      document.getElementById("keep-original-cover")?.focus({ preventScroll: true });
+      return;
+    }
+    const card = document.querySelector(`#gallery-editor [data-position="${position}"]`);
+    const control = card?.querySelector(selector);
+    (control && !control.disabled ? control : card?.querySelector("[data-gallery-cover]"))?.focus({ preventScroll: true });
+    window.scrollTo(0, scrollY);
+  }
+
+  function move(source, target, selector) {
+    if (source === target || target < 0 || target >= editor.order.length || editor.saving) return;
+    const [removed] = editor.order.splice(source, 1);
+    editor.order.splice(target, 0, removed);
+    update(target, selector);
+  }
+
+  panel.querySelectorAll("[data-position]").forEach(card => {
+    const position = Number(card.dataset.position);
+    card.querySelectorAll("[data-gallery-move]").forEach(button => button.addEventListener("click", () => {
+      const offset = Number(button.dataset.galleryMove);
+      move(position, position + offset, `[data-gallery-move="${offset}"]`);
+    }));
+    card.querySelector("[data-gallery-cover]").addEventListener("click", () => {
+      editor.cover = state.currentCase.images[editor.order[position]];
+      update(position, "[data-gallery-cover]");
+    });
+    card.querySelector("figure").addEventListener("dragstart", event => {
+      from = position;
+      event.dataTransfer.effectAllowed = "move";
+      event.dataTransfer.setData("text/plain", String(position + 1));
+    });
+    card.addEventListener("dragover", event => {
+      if (from !== null) {
+        event.preventDefault();
+        event.dataTransfer.dropEffect = "move";
+      }
+    });
+    card.addEventListener("drop", event => {
+      if (from === null) return;
+      event.preventDefault();
+      move(from, position, "[data-gallery-cover]");
+      from = null;
+    });
+    card.addEventListener("dragend", () => { from = null; });
+  });
+  document.getElementById("keep-original-cover")?.addEventListener("click", () => {
+    editor.cover = state.currentCase.cover;
+    update(null);
+  });
+  document.getElementById("close-gallery").addEventListener("click", goBack);
+  document.getElementById("save-gallery").addEventListener("click", saveGalleryEditor);
+}
+
+async function saveGalleryEditor() {
+  const editor = galleryEditor;
+  if (editor.saving || !editor.dirty) return;
+  editor.saving = true;
+  editor.message = "";
+  render();
+  try {
+    const response = await fetch(apiUrl("/api/owner/case-gallery"), {
+      method: "POST",
+      signal: AbortSignal.timeout(20000),
+      headers: { "Content-Type": "application/json", "X-Telegram-Init-Data": TG.initData() },
+      body: JSON.stringify({
+        case_id: state.currentCase.id, revision: state.portfolio.revision,
+        order: editor.order, cover: editor.cover,
+      }),
+    });
+    if (response.status === 409) {
+      editor.message = (await response.json()).message;
+    } else if (response.ok) {
+      const { case: saved, revision } = await response.json();
+      state.portfolio.revision = revision;
+      state.portfolio.cases = [saved];
+      state.currentCase = saved;
+      state.portfolio.gallerySaved = true;
+      galleryEditor = null;
+    } else {
+      editor.message = "Не удалось сохранить галерею. Проверьте доступ к предпросмотру и попробуйте ещё раз.";
+    }
+  } catch (_) {
+    editor.message = "Сохранение не подтверждено. Проверьте соединение и повторите.";
+  } finally {
+    editor.saving = false;
+    render();
+    document.getElementById(galleryEditor ? "save-gallery" : "gallery-saved")?.focus();
+  }
+}
+
 function renderCase() {
   const c = state.currentCase;
   const images = renderCaseGallery(c.images || [], c.title, true);
+  const ownerPreview = state.portfolio?.owner_preview;
+  const canEditGallery = ownerPreview && state.portfolio.revision && c.images?.length;
+  if (galleryEditor) {
+    return `<div class="topbar"><button class="back-btn" id="back" aria-label="К предпросмотру">←</button>
+      <h1>${escapeHtml(c.title)}</h1></div>${renderGalleryEditor(galleryEditor)}`;
+  }
   // external_url — необязательное поле (см. bot/content_store.py -> CASE_FIELD_LABELS);
   // ссылка показывается, только если дизайнер её заполнил для этого конкретного кейса.
   const externalUrl = safeLinkUrl(c.external_url);
@@ -846,6 +1001,8 @@ function renderCase() {
       <button class="back-btn" id="back">${state.portfolio?.owner_preview ? "← В редактор" : "←"}</button>
       <h1>${escapeHtml(c.title)}</h1>
     </div>
+    ${state.portfolio?.gallerySaved ? '<p id="gallery-saved" class="hint" role="status" tabindex="-1">Галерея сохранена в черновик. Для публикации вернитесь в чат и нажмите «Обновить после правок в Mini App».</p>' : ""}
+    ${canEditGallery ? '<button type="button" class="btn btn-secondary gallery-editor-entry" id="open-gallery-editor">Редактировать галерею</button>' : ""}
     <div class="case-images">${images}</div>
     ${renderCaseContent(c)}
     ${externalLink}
@@ -855,7 +1012,16 @@ function renderCase() {
 
 function attachCaseEvents() {
   document.getElementById("back").addEventListener("click", goBack);
+  if (galleryEditor) {
+    attachGalleryEditor();
+    return;
+  }
   const c = state.currentCase;
+  document.getElementById("open-gallery-editor")?.addEventListener("click", () => {
+    galleryEditor = { order: c.images.map((_, index) => index), cover: c.cover || null, dirty: false, saving: false };
+    render();
+    document.querySelector("#gallery-editor [data-gallery-cover]")?.focus();
+  });
   document.querySelectorAll('.case-gallery').forEach(gallery => {
     const opener = gallery.querySelector('.case-gallery-open');
     const mainImage = opener.querySelector('img');

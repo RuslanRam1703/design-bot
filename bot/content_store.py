@@ -2639,6 +2639,32 @@ async def begin_case_edit(actor_chat_id: int | str, case_id: str) -> bool:
         return True
 
 
+async def save_case_gallery(
+    actor_chat_id: int | str, case_id: str, revision: str, order: list[int], cover: str | None,
+) -> dict | None:
+    """Reorder existing media and set the cover in one draft write."""
+    _require_designer(actor_chat_id)
+    async with _lock("portfolio.json"):
+        data = await _read("portfolio.json")
+        live = _find_case(data, case_id)
+        if live is None or live.get("status") == "trashed":
+            return None
+        working = _editable_case(data, case_id)
+        if editor_digest(working) != revision:
+            raise ValueError("Кейс изменился. Откройте предпросмотр заново.")
+        images = working.get("images", [])
+        if sorted(order) != list(range(len(images))):
+            raise ValueError("Состав галереи изменился. Откройте предпросмотр заново.")
+        if cover is not None and cover != working.get("cover") and cover not in images:
+            raise ValueError("Выберите обложку из галереи кейса.")
+        working = _editable_case(data, case_id, start=True)
+        working["images"] = [images[index] for index in order]
+        if cover is not None:
+            working["cover"] = cover
+        await _write("portfolio.json", data)
+        return _without_editor(working)
+
+
 async def get_case_edit(actor_chat_id: int | str, case_id: str) -> dict | None:
     _require_designer(actor_chat_id)
     return _editable_case(await _read("portfolio.json"), case_id)

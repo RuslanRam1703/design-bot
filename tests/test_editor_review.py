@@ -138,6 +138,32 @@ class EditorTests(unittest.IsolatedAsyncioTestCase):
                     r = await client.get('/data/portfolio.json?preview_case=one', headers={'X-Telegram-Init-Data':'test'})
                     self.assertEqual(r.status,403)
 
+    async def test_gallery_save_checks_owner_revision_and_keeps_public_case_until_publish(self):
+        live = self.data["portfolio.json"]["cases"][0]
+        live["images"].append("next.jpg")
+        revision = store.editor_digest(live)
+        payload = {"case_id": "one", "revision": revision, "order": [1, 0], "cover": "next.jpg"}
+        async with TestClient(TestServer(webserver.create_app(AsyncMock()))) as client:
+            path = webserver.CASE_GALLERY_PATH
+            with patch.object(webserver, "validate_init_data", return_value={"id": 222}):
+                response = await client.post(path, json=payload)
+                self.assertEqual(response.status, 403)
+            with (
+                patch.object(webserver, "validate_init_data", return_value={"id": int(self.actor)}),
+                patch.object(webserver.access_control, "is_blocked", return_value=False),
+            ):
+                invalid = await client.post(path, json={**payload, "order": [0, 0]})
+                self.assertEqual(invalid.status, 409)
+                response = await client.post(path, json=payload)
+                self.assertEqual(response.status, 200)
+                saved = await response.json()
+                stale = await client.post(path, json=payload)
+                self.assertEqual(stale.status, 409)
+                self.assertEqual((await store.list_cases())[0]["cover"], "old.jpg")
+                self.assertEqual(saved["case"]["images"], ["next.jpg", "old.jpg"])
+                await store.finish_case_edit(self.actor, "one", saved["revision"], publish=True)
+                self.assertEqual((await store.list_cases())[0]["cover"], "next.jpg")
+
     async def test_review_requires_sample_and_rejects_stale_button(self):
         callback = SimpleNamespace(data='adminapply:abc', message=SimpleNamespace(chat=SimpleNamespace(id=self.actor), edit_text=AsyncMock()), answer=AsyncMock())
         state = SimpleNamespace(get_data=AsyncMock(return_value={'review_digest':'abc','review_kind':'pricing'}))
