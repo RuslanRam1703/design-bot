@@ -354,15 +354,11 @@ async function init() {
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     return response.json();
   };
-  let pricing, portfolio, about, uiConfig;
+  let uiConfig;
   try {
     if (window.DesignAssistantBoot) await window.DesignAssistantBoot.ready;
-    // Fetch content while the optional one-time origin migration is in flight.
     const draftMigration = window.DesignAssistantBoot?.migrateDraft() || Promise.resolve();
-    [pricing, portfolio, about, uiConfig] = await Promise.all([
-      getContent("pricing.json"), getContent("portfolio.json"),
-      getContent("about.json"), getContent("ui_config.json"),
-    ]);
+    uiConfig = await getContent("ui_config.json");
     await draftMigration;
     if (uiConfig.content_epoch) {
       try {
@@ -404,9 +400,6 @@ async function init() {
     }
     return;
   }
-  state.pricing = pricing;
-  state.portfolio = portfolio;
-  state.about = about;
   state.uiConfig = uiConfig;
 
   // Путь (/calculator, /brief, /about) — основной способ понять, с какого
@@ -434,14 +427,29 @@ async function init() {
   const menu = state.uiConfig.menu || {};
   if (menu[state.screen] === false) state.screen = "portfolio";
 
-  if (state.portfolio?.owner_preview && state.portfolio.cases.length) {
-    state.currentCase = state.portfolio.cases[0]; state.history = ['portfolio']; state.screen = 'case';
-  }
-
-  if (params.get('gallery_demo') === '1' || realTG?.initDataUnsafe?.start_param === 'gallery_demo') {
-    const demo = state.portfolio.cases.find(c => c.id === 'gallery_demo');
-    if (demo) { state.currentCase = demo; state.history = ['portfolio']; state.screen = 'case'; }
-  }
+  const galleryDemo = params.get("gallery_demo") === "1" || realTG?.initDataUnsafe?.start_param === "gallery_demo";
+  if (previewCaseId || galleryDemo) state.screen = "portfolio";
+  sectionLoader = async key => {
+    state[key] = await getContent(key + ".json");
+    if (key === "pricing" && state.brief.serviceId) {
+      const service = state.pricing.services.find(item => item.id === state.brief.serviceId);
+      if (service) state.brief.serviceName = service.name;
+      else Object.assign(state.brief, {
+        step: 1, serviceId: null, serviceName: null, orderOptions: {}, calc: null, openGroupId: null,
+      });
+    }
+    if (key === "portfolio" && state.screen === "portfolio") {
+      const portfolio = state.portfolio;
+      const project = portfolio.owner_preview ? portfolio.cases[0]
+        : galleryDemo ? portfolio.cases.find(c => c.id === "gallery_demo") : null;
+      if (project) {
+        state.currentCase = project;
+        state.history = ["portfolio"];
+        state.screen = "case";
+      }
+    }
+  };
+  ownerCasePreview = Boolean(previewCaseId);
 
   render();
   window.DesignAssistantBoot?.finish();
@@ -523,10 +531,45 @@ function attachTabBarEvents() {
   );
 }
 
+let sectionLoader;
+let ownerCasePreview = false;
+const sectionRequests = new Map();
+const sectionForScreen = { portfolio: "portfolio", about: "about", brief: "pricing", calculator: "pricing" };
+
+function loadSection(key) {
+  sectionRequests.set(key, "loading");
+  void sectionLoader(key).then(() => {
+    sectionRequests.delete(key);
+    if (sectionForScreen[state.screen] === key || (key === "portfolio" && state.screen === "case")) render();
+  }).catch(error => {
+    sectionRequests.set(key, "error");
+    if (error.message === "ACCESS_DENIED" && realTG) TG.close();
+    if (sectionForScreen[state.screen] === key) render();
+  });
+}
+
 // ---- Рендер ----
 function render() {
   persistBriefDraft();
   const app = document.getElementById("app");
+  const section = sectionForScreen[state.screen];
+  if (sectionLoader && section && !state[section]) {
+    if (!sectionRequests.has(section)) loadSection(section);
+    const failed = sectionRequests.get(section) === "error";
+    const showNavigation = !ownerCasePreview;
+    const message = failed ? "Не удалось загрузить раздел." : "Загружаем раздел…";
+    app.innerHTML = renderBrandHeader() + '<div class="empty-state" role="status">' + message +
+      (failed ? '<button type="button" class="btn btn-primary" id="section-retry">Повторить загрузку</button>' : "") +
+      '</div>' + (showNavigation ? renderTabBar() : "");
+    document.getElementById("section-retry")?.addEventListener("click", () => {
+      loadSection(section);
+      render();
+    });
+    if (showNavigation) attachTabBarEvents();
+    if (state.history.length) TG.backButton.show(goBack);
+    else TG.backButton.hide();
+    return;
+  }
   let content;
   let showTabBar = true;
 
@@ -835,8 +878,8 @@ function attachCaseEvents() {
     // меняется, заказ — независимая копия.
     const template = c.order_template;
     const serviceId = template?.service_id || c.related_service;
-    const service = state.pricing.services.find((s) => s.id === serviceId);
-    state.brief.serviceId = service?.id || null;
+    const service = state.pricing?.services.find((s) => s.id === serviceId);
+    state.brief.serviceId = service?.id || (!state.pricing ? serviceId : null) || null;
     state.brief.serviceName = service?.name || null;
     state.brief.calc = null;
     state.brief.source = "case";
@@ -1513,6 +1556,7 @@ async function submitBrief() {
   try {
     const res = await fetch(apiUrl("/api/leads"), {
       method: "POST",
+      signal: AbortSignal.timeout(20000),
       headers: { "Content-Type": "application/json", "X-Telegram-Init-Data": TG.initData() },
       body: JSON.stringify(payload),
     });
@@ -1560,7 +1604,7 @@ async function submitBrief() {
     // Черновик НЕ теряем при ошибке — пользователь остаётся на том же шаге
     // с уже заполненными полями и может просто попробовать ещё раз.
     state.submitting = false;
-    state.briefSubmitError = "Не получилось отправить заявку. Проверьте соединение и попробуйте ещё раз.";
+    state.briefSubmitError = "Не удалось подтвердить отправку. Черновик сохранён. Можно повторить отправку этой заявки.";
     render();
   }
 }
@@ -1878,6 +1922,7 @@ async function fetchMyLeads() {
     // уходит всегда, с диагностическими заголовками (не влияют на решение
     // сервера пустить/не пустить — только на то, что попадает в лог).
     const res = await fetch(apiUrl("/api/my-leads"), {
+      signal: AbortSignal.timeout(20000),
       headers: {
         "X-Telegram-Init-Data": initData,
         "X-Debug-Platform": realTG?.platform || "",
@@ -2142,6 +2187,7 @@ function openSupplementFor(lead) {
     error: null,
     sent: false,
     supplementId: null,
+    pendingRequest: null,
   };
   navigate("supplement");
 }
@@ -2170,6 +2216,7 @@ function renderSupplement() {
     `;
   }
 
+  const lockFields = s.submitting || s.pendingRequest ? "disabled" : "";
   return `
     <div class="topbar">
       <button class="back-btn" id="back">←</button>
@@ -2177,22 +2224,22 @@ function renderSupplement() {
     </div>
     <div class="field">
       <label>Что хотите добавить/изменить?</label>
-      <textarea id="supp-comment" rows="4" placeholder="Опишите, что нужно уточнить или добавить">${escapeHtml(s.comment)}</textarea>
+      <textarea id="supp-comment" ${lockFields} rows="4" placeholder="Опишите, что нужно уточнить или добавить">${escapeHtml(s.comment)}</textarea>
     </div>
     <div class="field">
       <label>Дополнительные требования (необязательно)</label>
-      <textarea id="supp-additional" rows="3">${escapeHtml(s.additionalRequirements)}</textarea>
+      <textarea id="supp-additional" ${lockFields} rows="3">${escapeHtml(s.additionalRequirements)}</textarea>
     </div>
     <div class="field">
       <label>Референсы (необязательно)</label>
-      <textarea id="supp-references" rows="3">${escapeHtml(s.references)}</textarea>
+      <textarea id="supp-references" ${lockFields} rows="3">${escapeHtml(s.references)}</textarea>
     </div>
     <div class="field">
       <label>Контакты</label>
-      <input type="text" id="supp-contact" value="${escapeHtml(s.contact)}" placeholder="@username или +7..." />
+      <input type="text" id="supp-contact" ${lockFields} value="${escapeHtml(s.contact)}" placeholder="@username или +7..." />
     </div>
     <div class="field">
-      <button type="button" class="pick ${s.wantsFile ? "selected" : ""}" id="supp-wants-file">
+      <button type="button" class="pick ${s.wantsFile ? "selected" : ""}" id="supp-wants-file" ${lockFields}>
         📎 ${s.wantsFile ? "Пришлю файл следующим сообщением ✓" : "Хочу приложить файл"}
       </button>
     </div>
@@ -2279,30 +2326,40 @@ async function submitSupplement() {
   };
 
   try {
+    s.pendingRequest ??= {
+      mode: "supplement", lead_id: s.leadId, fields, wants_file: s.wantsFile, request_id: generateDraftId(),
+    };
     const res = await fetch(apiUrl("/api/leads"), {
       method: "POST",
+      signal: AbortSignal.timeout(20000),
       headers: { "Content-Type": "application/json", "X-Telegram-Init-Data": TG.initData() },
-      body: JSON.stringify({ mode: "supplement", lead_id: s.leadId, fields, wants_file: s.wantsFile }),
+      body: JSON.stringify(s.pendingRequest),
     });
     if (res.status === 409) {
       // Batch 2 — заявку закрыли (DONE/CANCELLED), пока клиент заполнял
       // экран; отдельное, содержательное сообщение вместо generic "не
       // получилось отправить" ниже — тот случай про сеть/сервер, этот
       // про реальное состояние заявки, которое клиенту стоит понимать.
-      state.supplement.submitting = false;
-      state.supplement.error = "Эта заявка уже закрыта — дополнить её нельзя.";
+      s.submitting = false;
+      s.pendingRequest = null;
+      s.error = "Эта заявка уже закрыта — дополнить её нельзя.";
       render();
       return;
     }
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    if (!res.ok) {
+      if (res.status === 400) s.pendingRequest = null;
+      throw new Error(`HTTP ${res.status}`);
+    }
     const result = await res.json();
-    state.supplement.submitting = false;
-    state.supplement.sent = true;
-    state.supplement.supplementId = result.supplement_id;
+    s.submitting = false;
+    s.sent = true;
+    s.supplementId = result.supplement_id;
     render();
   } catch (e) {
-    state.supplement.submitting = false;
-    state.supplement.error = "Не получилось отправить дополнение. Проверьте соединение и попробуйте ещё раз.";
+    s.submitting = false;
+    s.error = s.pendingRequest
+      ? "Не удалось подтвердить отправку. Повторите отправку этого дополнения."
+      : "Дополнение не принято. Проверьте данные и попробуйте ещё раз.";
     render();
   }
 }

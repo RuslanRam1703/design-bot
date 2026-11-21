@@ -874,7 +874,7 @@ async def cases_add_description(message: Message, state: FSMContext) -> None:
         message, state,
         f"Кейс «{escape(case['title'])}» сохранён в черновиках ✅\n\n"
         "Добавьте изображения и описание через «Редактировать». "
-        "Когда кейс будет готов, нажмите «Опубликовать» — он появится в Mini App. "
+        "Когда кейс будет готов, нажмите «Проверить и опубликовать» — после подтверждения он появится в Mini App. "
         "Позже публикацией можно управлять через «Статусы и публикация».",
         kb.case_saved_draft_keyboard(case["id"]),
     )
@@ -995,17 +995,18 @@ async def cases_moderate_set_category(callback: CallbackQuery) -> None:
 
 
 @router.callback_query(F.data.startswith("adminsetcasestatus:"))
-async def cases_moderate_apply(callback: CallbackQuery) -> None:
+async def cases_moderate_apply(callback: CallbackQuery, state: FSMContext) -> None:
     _, status, case_id = callback.data.split(":", 2)
     if status not in _PORTFOLIO_STATUS_LABELS:
         await callback.answer("Недопустимый статус", show_alert=True)
         return
     if status == "published":
-        case = next((item for item in await content_store.list_cases() if item["id"] == case_id), None)
-        types = {item["id"] for item in await content_store.list_portfolio_types()}
-        if case is None or case.get("type") not in types:
-            await callback.answer("Сначала выбери действующий тип работы в редактировании кейса", show_alert=True)
+        if not await content_store.begin_case_edit(callback.message.chat.id, case_id):
+            await callback.answer("Кейс недоступен для публикации", show_alert=True)
             return
+        await state.update_data(case_id=case_id, cancel_to="cases")
+        await _review_screen(callback, state, "case")
+        return
     updated = await content_store.set_case_status(callback.message.chat.id, case_id, status)
     if not updated:
         await callback.answer("Кейс не найден", show_alert=True)
@@ -1029,7 +1030,7 @@ async def cases_moderate_pick_for_id(callback: CallbackQuery, case_id: str) -> N
     else:
         rows = [[InlineKeyboardButton(text="Редактировать и проверить", callback_data=f"admincaseedit:{case_id}")]]
         if current != "published":
-            rows.append([InlineKeyboardButton(text="Опубликовать", callback_data=f"adminsetcasestatus:published:{case_id}")])
+            rows.append([InlineKeyboardButton(text="Проверить и опубликовать", callback_data=f"adminsetcasestatus:published:{case_id}")])
         else:
             rows.append([InlineKeyboardButton(text="Снять с публикации", callback_data=f"adminsetcasestatus:unpublished:{case_id}")])
         rows.extend([

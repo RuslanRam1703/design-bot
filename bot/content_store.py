@@ -1807,7 +1807,10 @@ async def pending_designer_notifications(limit: int = 20) -> list[tuple[dict, in
     return pending[:limit]
 
 
-async def add_lead_supplement(lead_id: int, telegram: dict, fields: dict, wants_file: bool = False) -> tuple[dict, int]:
+async def add_lead_supplement(
+    lead_id: int, telegram: dict, fields: dict, wants_file: bool = False,
+    *, request_id: str | None = None,
+) -> tuple[dict, int]:
     """Дополнение к уже существующей заявке — НЕ трогает lead["payload"]
     (исходные ответы Order Builder остаются как есть), только добавляет
     append-only запись в lead["supplements"]. lead_id — единственный и
@@ -1831,6 +1834,10 @@ async def add_lead_supplement(lead_id: int, telegram: dict, fields: dict, wants_
             raise LeadNotFoundError(lead_id)
         if lead.get("telegram", {}).get("user_id") != telegram.get("user_id"):
             raise NotLeadOwnerError(lead_id)
+        if request_id:
+            for supplement in lead.get("supplements", []):
+                if supplement.get("request_id") == request_id:
+                    return {**lead, "_supplement_replayed": True}, supplement["id"]
         if lead["status"] in TERMINAL_LEAD_STATUSES:
             # Batch 2 product decision: DONE/CANCELLED — терминальные для
             # клиента, hard-block без auto-reopen. Дизайнер вручную меняет
@@ -1844,6 +1851,7 @@ async def add_lead_supplement(lead_id: int, telegram: dict, fields: dict, wants_
             "id": next_supplement_id,
             "created_at": datetime.now(timezone.utc).isoformat(),
             "fields": fields,
+            **({"request_id": request_id} if request_id else {}),
             "designer_notification": {"revision": 1, "state": "pending", "attempts": 0, "retry_after": None},
         })
         lead["updated_at"] = datetime.now(timezone.utc).isoformat()

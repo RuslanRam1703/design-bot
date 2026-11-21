@@ -33,6 +33,18 @@ class CaseAdminRoutes(unittest.IsolatedAsyncioTestCase):
             await self.route('admincaseedit:a')
         self.assertEqual(await self.state.get_state(),AdminStates.edit_case_field_pick.state)
 
+    async def test_publish_status_button_routes_to_preview_and_confirmation(self):
+        with (
+            patch.object(admin.content_store, "begin_case_edit", AsyncMock(return_value=True)),
+            patch.object(admin.content_store, "get_case_edit", AsyncMock(return_value=self.cases[0])),
+            patch.object(admin.content_store, "set_case_status", AsyncMock()) as direct_write,
+        ):
+            cb = await self.route("adminsetcasestatus:published:a")
+        markup = str(cb.message.edit_text.await_args.kwargs["reply_markup"])
+        self.assertIn("preview_case=a", markup)
+        self.assertIn("adminapply:", markup)
+        direct_write.assert_not_awaited()
+
     async def test_card_trash_uses_existing_confirm_and_cancel_does_not_write(self):
         with patch.object(admin.content_store,'set_case_status',AsyncMock()) as write:
             cb=await self.route('admincardtrash:a')

@@ -259,3 +259,50 @@ test('owner appearance is escaped, optional and respects the disabled order sect
   assert.doesNotMatch(ui.renderPortfolio(), /portfolio-intro/);
   assert.match(ui.renderPortfolio(), /Портфолио/);
 });
+
+test('portfolio survives a pricing load failure and retries only pricing', async () => {
+  const requests = [];
+  const root = { innerHTML: '' };
+  let retry;
+  const context = {
+    window: { location: { pathname: '/portfolio', search: '' }, scrollTo() {} },
+    document: {
+      addEventListener() {},
+      documentElement: { style: { setProperty() {} }, dataset: {} },
+      querySelectorAll() { return []; },
+      getElementById(id) {
+        if (id === 'app') return root;
+        if (id === 'section-retry' && root.innerHTML.includes(id)) {
+          return { addEventListener(_, callback) { retry = callback; } };
+        }
+        return null;
+      },
+    },
+    localStorage: { getItem() { return null; }, setItem() {}, removeItem() {} },
+    async fetch(url) {
+      requests.push(url);
+      if (url.endsWith('pricing.json') && requests.filter(path => path === url).length === 1) {
+        return { status: 503, ok: false };
+      }
+      const data = url.endsWith('portfolio.json') ? { cases: [], types: [] }
+        : url.endsWith('pricing.json') ? { services: [] } : {};
+      return { ok: true, json: async () => data };
+    },
+    console, setTimeout, clearTimeout, AbortSignal, URLSearchParams,
+  };
+  vm.createContext(context);
+  vm.runInContext(source.replace(/\ninit\(\);\s*$/, ''), context);
+  await vm.runInContext('init()', context);
+  await new Promise(setImmediate);
+  assert.deepEqual(requests, ['/data/ui_config.json', '/data/portfolio.json']);
+  assert.match(root.innerHTML, /Пока нет кейсов/);
+
+  vm.runInContext('navigate("brief")', context);
+  await new Promise(setImmediate);
+  assert.match(root.innerHTML, /Не удалось загрузить раздел/);
+  assert.match(root.innerHTML, /data-tab="portfolio"/);
+  retry();
+  await new Promise(setImmediate);
+  assert.match(root.innerHTML, /Услуги пока не опубликованы/);
+  assert.deepEqual(requests.slice(2), ['/data/pricing.json', '/data/pricing.json']);
+});
