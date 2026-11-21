@@ -205,6 +205,7 @@ function getMenuEntries(pricing) {
 }
 
 function navigate(screen, { resetBrief = false, hardReset = false, pushHistory = true } = {}) {
+  if (state.uiConfig?.menu?.[screen] === false) return;
   if (pushHistory && state.screen !== "loading") state.history.push(state.screen);
   if (resetBrief) resetBriefState({ hardReset });
   state.screen = screen;
@@ -221,7 +222,7 @@ function goBack() {
     return;
   }
   const prev = state.history.pop();
-  state.screen = prev || "portfolio";
+  state.screen = prev || TAB_SCREENS.find(tab => state.uiConfig?.menu?.[tab.id] !== false)?.id || "unavailable";
   render();
 }
 
@@ -425,7 +426,7 @@ async function init() {
   // Если админ выключил именно этот экран в /admin -> Меню и навигация —
   // не показываем пустой/битый вид, откатываемся на портфолио.
   const menu = state.uiConfig.menu || {};
-  if (menu[state.screen] === false) state.screen = "portfolio";
+  if (menu[state.screen] === false) state.screen = TAB_SCREENS.find(tab => menu[tab.id] !== false)?.id || "unavailable";
 
   const galleryDemo = params.get("gallery_demo") === "1" || realTG?.initDataUnsafe?.start_param === "gallery_demo";
   if (previewCaseId || galleryDemo) state.screen = "portfolio";
@@ -639,6 +640,11 @@ function render() {
       TG.backButton.hide();
       showTabBar = false;
       break;
+    case "unavailable":
+      content = '<div class="empty-state">Разделы приложения временно недоступны.</div>';
+      showTabBar = false;
+      TG.backButton.hide();
+      break;
     default:
       content = "<div class=\"empty-state\">Загрузка…</div>";
       showTabBar = false;
@@ -843,7 +849,7 @@ function renderCase() {
     <div class="case-images">${images}</div>
     ${renderCaseContent(c)}
     ${externalLink}
-    ${state.portfolio?.owner_preview ? '<p class="muted">Предпросмотр владельца. Для публикации вернитесь в чат бота.</p>' : '<button class="btn btn-primary" id="want-similar">Хочу похожий проект</button>'}
+    ${state.portfolio?.owner_preview ? '<p class="muted">Предпросмотр владельца. Для публикации вернитесь в чат бота.</p>' : state.uiConfig?.menu?.brief === false ? "" : '<button class="btn btn-primary" id="want-similar">Хочу похожий проект</button>'}
   `;
 }
 
@@ -986,8 +992,8 @@ function renderAbout() {
     ${linksHTML}
 
     <div class="btn-row">
-      <button class="btn btn-secondary" id="about-portfolio-cta">Смотреть портфолио</button>
-      <button class="btn btn-primary" id="about-cta">Оставить заявку</button>
+      ${state.uiConfig?.menu?.portfolio === false ? "" : '<button class="btn btn-secondary" id="about-portfolio-cta">Смотреть портфолио</button>'}
+      ${state.uiConfig?.menu?.brief === false ? "" : '<button class="btn btn-primary" id="about-cta">Оставить заявку</button>'}
     </div>
   `;
 }
@@ -2103,7 +2109,7 @@ function renderMyLeadDetail(lead) {
     ${isLeadClosed(lead.status)
       ? `<p class="hint">Заявка закрыта — дополнить её нельзя. Если нужно что-то уточнить, напишите нам в чат.</p>`
       : `<button class="btn btn-primary" id="my-lead-continue">Дополнить информацию</button>`}
-    <button class="btn btn-secondary" id="my-lead-start-new">Начать новую заявку</button>
+    ${state.uiConfig?.menu?.brief === false ? "" : '<button class="btn btn-secondary" id="my-lead-start-new">Начать новую заявку</button>'}
   `;
 }
 
@@ -2251,7 +2257,7 @@ function renderSupplement() {
       <button class="btn btn-primary" id="supplement-submit" ${s.submitting ? "disabled" : ""}>${s.submitting ? "Отправляю…" : "Отправить дополнение"}</button>
     </div>
     <div class="btn-row">
-      <button class="btn btn-secondary" id="supplement-start-new">Начать новую заявку</button>
+      ${state.uiConfig?.menu?.brief === false ? "" : '<button class="btn btn-secondary" id="supplement-start-new">Начать новую заявку</button>'}
     </div>
   `;
 }

@@ -30,6 +30,24 @@ class PortfolioReleaseTests(unittest.IsolatedAsyncioTestCase):
             await content_store.set_case_status(actor, "live", "unpublished")
             self.assertNotIn("start_case_id", saved)
 
+    async def test_category_names_are_validated_when_added_and_renamed(self):
+        saved = {"types": [{"id": "cat_1", "label": "Веб дизайн"}]}
+        with (
+            patch.object(content_store, "_upstash_enabled", return_value=False),
+            patch.object(content_store, "_read", AsyncMock(return_value=saved)),
+            patch.object(content_store, "_write", AsyncMock()),
+        ):
+            actor = content_store.config.DESIGNER_CHAT_ID
+            with self.assertRaises(ValueError):
+                await content_store.add_portfolio_type(actor, label=" ВЕБ  ДИЗАЙН ")
+            with self.assertRaises(ValueError):
+                await content_store.add_portfolio_type(actor, label=" ")
+            category = await content_store.add_portfolio_type(actor, label=" Брендинг ")
+            self.assertEqual((category["id"], category["label"]), ("cat_2", "Брендинг"))
+            with self.assertRaises(ValueError):
+                await content_store.rename_portfolio_type(actor, "cat_2", "веб дизайн")
+            self.assertEqual(category["label"], "Брендинг")
+
     async def test_saved_lead_returns_before_telegram_responds(self):
         started = asyncio.Event()
         complete = asyncio.Event()

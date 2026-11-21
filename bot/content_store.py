@@ -568,11 +568,16 @@ async def set_case_status(actor_chat_id: int | str, case_id: str, status: str) -
         if case is None:
             return False
         current = case.get("status", "published")
+        revision = case.get("_editor")
+        can_rebase = revision and revision["base"] == editor_digest(_without_editor(case))
         if status == "trashed" and current != "trashed":
             case["status_before_trash"] = current
         elif current == "trashed" and status != "trashed":
             case.pop("status_before_trash", None)
         case["status"] = status
+        if can_rebase:
+            revision["base"] = editor_digest(_without_editor(case))
+            revision["working"]["status"] = status
         if status != "published" and data.get("start_case_id") == case_id:
             data.pop("start_case_id")
         await _write("portfolio.json", data)
@@ -587,8 +592,13 @@ async def restore_trashed_case(actor_chat_id: int | str, case_id: str) -> bool:
         case = _find_case(data, case_id)
         if case is None or case.get("status") != "trashed":
             return False
+        revision = case.get("_editor")
+        can_rebase = revision and revision["base"] == editor_digest(_without_editor(case))
         previous = case.pop("status_before_trash", "draft")
         case["status"] = previous if previous in PORTFOLIO_STATUSES - {"trashed"} else "draft"
+        if can_rebase:
+            revision["base"] = editor_digest(_without_editor(case))
+            revision["working"]["status"] = case["status"]
         await _write("portfolio.json", data)
         return True
 
@@ -1384,8 +1394,16 @@ async def update_portfolio_type_related_service(actor_chat_id: int | str, type_i
         return False
 
 
-async def next_portfolio_type_id() -> str:
-    data = await _read("portfolio.json")
+def _validate_category_label(types: list[dict], label: str, *, current_id: str | None = None) -> str:
+    label = " ".join(label.split())
+    if not 1 <= len(label) <= 60:
+        raise ValueError("Введите название категории от 1 до 60 символов.")
+    if any(t["id"] != current_id and " ".join(t["label"].split()).casefold() == label.casefold() for t in types):
+        raise ValueError("Категория с таким названием уже есть.")
+    return label
+
+
+def _next_portfolio_type_id(data: dict) -> str:
     nums = []
     for t in data["types"]:
         if t["id"].startswith("cat_"):
@@ -1396,10 +1414,14 @@ async def next_portfolio_type_id() -> str:
     return f"cat_{max(nums, default=0) + 1}"
 
 
-async def add_portfolio_type(actor_chat_id: int | str, *, type_id: str, label: str) -> dict:
+async def add_portfolio_type(actor_chat_id: int | str, *, label: str, type_id: str | None = None) -> dict:
     _require_designer(actor_chat_id)
     async with _lock("portfolio.json"):
         data = await _read("portfolio.json")
+        label = _validate_category_label(data["types"], label)
+        type_id = type_id or _next_portfolio_type_id(data)
+        if any(t["id"] == type_id for t in data["types"]):
+            raise ValueError("Категория с таким идентификатором уже есть.")
         type_entry = {"id": type_id, "label": label, "related_service": None}
         data["types"].append(type_entry)
         await _write("portfolio.json", data)
@@ -1414,7 +1436,7 @@ async def rename_portfolio_type(actor_chat_id: int | str, type_id: str, new_labe
         data = await _read("portfolio.json")
         for t in data["types"]:
             if t["id"] == type_id:
-                t["label"] = new_label
+                t["label"] = _validate_category_label(data["types"], new_label, current_id=type_id)
                 await _write("portfolio.json", data)
                 return True
         return False
