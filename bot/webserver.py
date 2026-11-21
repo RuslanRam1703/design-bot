@@ -358,8 +358,16 @@ async def _handle_lead_supplement(payload: dict, telegram_identity: dict, bot: B
     if not fields and not wants_file:
         return web.json_response({"error": "empty_supplement"}, status=400)
 
+    request_id = payload.get("request_id")
+    if request_id is not None and (
+        not isinstance(request_id, str) or not request_id.isascii() or not 1 <= len(request_id) <= 80
+    ):
+        return web.json_response({"error": "invalid_request_id"}, status=400)
+
     try:
-        lead, supplement_id = await content_store.add_lead_supplement(lead_id, telegram_identity, fields, wants_file=wants_file)
+        lead, supplement_id = await content_store.add_lead_supplement(
+            lead_id, telegram_identity, fields, wants_file=wants_file, request_id=request_id,
+        )
     except (content_store.LeadNotFoundError, content_store.NotLeadOwnerError):
         # Единый внешне наблюдаемый ответ для "такого lead_id нет" и "lead_id
         # чужой" (см. production-аудит, P2-11) — иначе разница 404 vs 403
@@ -377,17 +385,18 @@ async def _handle_lead_supplement(payload: dict, telegram_identity: dict, bot: B
         # относится).
         return web.json_response({"error": "lead_closed"}, status=409)
 
-    await notify_designer_supplement(bot, lead, supplement_id)
+    if not lead.get("_supplement_replayed"):
+        await notify_designer_supplement(bot, lead, supplement_id)
 
-    # Тот же принцип, что и при создании заявки: клиент, закрывший Mini App,
-    # должен увидеть в чате и подтверждение, и — если отметил файл —
-    # инструкцию его прислать (add_lead_supplement уже выставил
-    # awaiting_tz_file, см. wants_file выше).
-    await _notify_client(
-        bot, telegram_identity,
-        texts.supplement_ack_ask_file(lead_id) if wants_file else texts.supplement_ack(lead_id),
-        lead_id=lead_id,
-    )
+        # Тот же принцип, что и при создании заявки: клиент, закрывший Mini App,
+        # должен увидеть в чате и подтверждение, и — если отметил файл —
+        # инструкцию его прислать (add_lead_supplement уже выставил
+        # awaiting_tz_file, см. wants_file выше).
+        await _notify_client(
+            bot, telegram_identity,
+            texts.supplement_ack_ask_file(lead_id) if wants_file else texts.supplement_ack(lead_id),
+            lead_id=lead_id,
+        )
 
     return web.json_response(
         {"lead_id": lead_id, "supplement_id": supplement_id},

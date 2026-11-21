@@ -10181,6 +10181,26 @@ class LeadSupplementTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(body["lead_id"], lead_id)
             self.assertEqual(body["supplement_id"], 1)
 
+    async def test_repeated_supplement_returns_original_id_and_sends_no_duplicate(self):
+        from aiohttp.test_utils import TestClient, TestServer
+
+        bot = AsyncMock()
+        async with TestClient(TestServer(webserver.create_app(bot))) as client:
+            lead_id = await self._create_lead(client)
+            bot.send_message.reset_mock()
+            headers = {"X-Telegram-Init-Data": self._init_data()}
+            payload = {"mode": "supplement", "lead_id": lead_id,
+                       "fields": {"comment": "Уточнение"}, "request_id": "one-operation"}
+            first = await client.post("/api/leads", headers=headers, json=payload)
+            self.assertEqual(first.status, 200)
+            await content_store.update_lead_status("777", lead_id, "DONE")
+            retry = await client.post("/api/leads", headers=headers, json=payload)
+            self.assertEqual(retry.status, 200)
+            self.assertEqual(await first.json(), await retry.json())
+            lead = await content_store.get_lead(lead_id)
+            self.assertEqual(len(lead["supplements"]), 1)
+            self.assertEqual(bot.send_message.await_count, 2)
+
     async def test_supplement_to_nonexistent_lead_is_404(self):
         from aiohttp.test_utils import TestClient, TestServer
 

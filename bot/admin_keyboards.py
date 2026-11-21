@@ -118,7 +118,7 @@ def backup_menu_keyboard() -> InlineKeyboardMarkup:
 
 def case_saved_draft_keyboard(case_id: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Опубликовать", callback_data=f"adminsetcasestatus:published:{case_id}")],
+        [InlineKeyboardButton(text="Проверить и опубликовать", callback_data=f"adminsetcasestatus:published:{case_id}")],
         [InlineKeyboardButton(text="✏️ Редактировать", callback_data="admincasesaction:edit")],
         [InlineKeyboardButton(text="Оставить в черновиках", callback_data="adminmenu:cases")],
     ])
