@@ -776,10 +776,7 @@ async def cases_add_photo_behance(message: Message, state: FSMContext) -> None:
     Telegram: его переименование потребовало бы править уже проходящие
     Behance-тесты, ничего не меняя по существу.
 
-    external_url/source_type здесь только запоминаются в state: add_case()
-    их не принимает (менять content_store.py в этой задаче нельзя), поэтому
-    они проставляются отдельным update_case() уже после создания кейса —
-    см. cases_add_description ниже."""
+    Поля источника передаются в хранилище вместе с остальными полями кейса."""
     # Тот же helper, что и у ветки с caption — один источник истины о том,
     # какая ссылка каким резолвером обрабатывается (см.
     # _source_url_from_message / _cover_from_source_url). Поведение самой
@@ -832,34 +829,28 @@ async def cases_add_photo_wrong(message: Message, state: FSMContext) -> None:
 async def cases_add_description(message: Message, state: FSMContext) -> None:
     data = await state.get_data()
     related_service = await content_store.default_related_service_for_type(data["type_id"])
-    case = await content_store.add_case(
-        message.chat.id,
-        case_id=data["case_id"],
-        title=data["title"],
-        type_id=data["type_id"],
-        cover=data["cover"],
-        task=message.text.strip(),
-        related_service=related_service,
-    )
-    # Кейс создан из внешней ссылки (Behance или публичный пост Telegram):
-    # сохраняем сам URL работы отдельным полем через уже существующий
-    # update_case (add_case не принимает ни external_url, ни source_type, а
-    # content_store.py в этой задаче не меняется). Семантика полей не
-    # смешивается: external_url — ссылка на работу, cover — прямой URL
-    # картинки на чужом CDN.
-    #
-    # source_type пишется отдельно от external_url и БЕЗ него тоже (случай
-    # upload): поле аддитивное, у legacy-кейсов его просто нет, и ни бот, ни
-    # Mini App на его отсутствие не смотрят — "Смотреть подробнее"
-    # по-прежнему определяется наличием external_url (см. app.js
-    # renderCase), поэтому старые кейсы продолжают работать как раньше.
-    extra: dict[str, str | None] = {}
-    for key in ("external_url", "source_type", "source_ref"):
-        value = data.get(key)
-        if value:
-            extra[key] = value
-    if extra:
-        await content_store.update_case(message.chat.id, case["id"], **extra, stage=True)
+    source = {key: data[key] for key in ("external_url", "source_type", "source_ref") if data.get(key)}
+    try:
+        case = await content_store.add_case(
+            message.chat.id,
+            case_id=data["case_id"],
+            title=data["title"],
+            type_id=data["type_id"],
+            cover=data["cover"],
+            task=message.text.strip(),
+            related_service=related_service,
+            source=source,
+        )
+    except content_store.ExistingTelegramCaseError as exc:
+        await flow.step_from_text(
+            message, state, "Этот пост уже привязан к кейсу. Откройте существующую карточку.",
+            InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="Открыть кейс", callback_data=f"adminmoderatecase:{exc.case['id']}")],
+                [InlineKeyboardButton(text="К списку кейсов", callback_data="adminmenu:cases")],
+            ]),
+        )
+        await flow.finish_flow(state)
+        return
     # step_from_text, затем finish_flow, НЕ reset_state_keep_nav (P1-3,
     # Batch 4 — исправляет собственную находку Batch 1): когда edit
     # внутри step_from_text успевает отредактировать существующий anchor
@@ -1056,8 +1047,20 @@ async def cases_moderate_pick_for_id(callback: CallbackQuery, case_id: str) -> N
             [InlineKeyboardButton(text="Переместить в корзину", callback_data=f"admincardtrash:{case_id}")],
             [InlineKeyboardButton(text="К списку кейсов", callback_data="admincasesaction:moderate")],
         ])
+    source_post = case.get("source_post_url")
+    if source_post:
+        source_label = "Канал портфолио" if "source_cover" in case else "Публичный пост Telegram · обложка"
+        if "source_cover" in case and current != "draft":
+            source_label += " · правки в канале не меняют этот кейс"
+    else:
+        source_label = {
+            "telegram_post": "Ссылка на пост Telegram · обложка",
+            "behance": "Ссылка на Behance · обложка",
+            "upload": "Изображение из чата",
+        }.get(case.get("source_type"), "")
     await callback.message.edit_text(
         f"Кейс: {escape(case['title'])}\nСтатус: {_PORTFOLIO_STATUS_LABELS.get(current, current)}" +
+        (f"\nИсточник: {source_label}" if source_label else "") +
         ("\nСтартовый кейс портфолио" if is_start_case else "") +
         ("\nЕсть черновые правки. Проверьте и примените их в редакторе." if case.get("_editor") else ""),
         reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),

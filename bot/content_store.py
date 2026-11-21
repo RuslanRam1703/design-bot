@@ -526,10 +526,32 @@ async def next_case_id() -> str:
     return _next_case_id(await list_cases())
 
 
-async def add_case(actor_chat_id: int | str, *, case_id: str, title: str, type_id: str, cover: str, task: str, related_service: str | None) -> dict:
+class ExistingTelegramCaseError(ValueError):
+    def __init__(self, case: dict):
+        super().__init__("Пост уже привязан к кейсу.")
+        self.case = case
+
+
+def _telegram_case_sources(case: dict) -> set[str]:
+    from bot.telegram_media import normalize_post_url
+
+    values = [case.get("source_post_url"), *case.get("source_post_aliases", [])]
+    for version in (case, case.get("_editor", {}).get("working", {})):
+        if version.get("source_type") == "telegram_post":
+            values.append(version.get("external_url"))
+    return {url.lower() for value in values if value and (url := normalize_post_url(value))}
+
+
+async def add_case(actor_chat_id: int | str, *, case_id: str, title: str, type_id: str, cover: str, task: str, related_service: str | None, source: dict | None = None) -> dict:
     _require_designer(actor_chat_id)
     async with _lock("portfolio.json"):
         data = await _read("portfolio.json")
+        source = source or {}
+        sources = _telegram_case_sources(source)
+        if sources:
+            for existing in data["cases"]:
+                if sources & _telegram_case_sources(existing):
+                    raise ExistingTelegramCaseError(existing)
         # A second wizard/import may have saved since next_case_id().
         # Allocate under the same storage lock as the actual write.
         if any(item["id"] == case_id for item in data["cases"]):
@@ -545,7 +567,10 @@ async def add_case(actor_chat_id: int | str, *, case_id: str, title: str, type_i
             "solution": "",
             "result": "",
             "related_service": related_service,
+            **{key: source[key] for key in ("source_type", "source_ref", "external_url") if key in source},
         }
+        if sources:
+            case["source_post_url"] = next(iter(sources))
         data["cases"].append(case)
         await _write("portfolio.json", data)
         return case
@@ -565,7 +590,19 @@ async def upsert_channel_case(
     async with _lock("portfolio.json"):
         data = await _read("portfolio.json")
         for case in data["cases"]:
-            if (group_key and case.get("source_group_key") == group_key) or case.get("source_post_url", "").lower() == post_url:
+            if (group_key and case.get("source_group_key") == group_key) or post_url in _telegram_case_sources(case):
+                if not case.get("source_post_url") or (group_key and post_url not in case.get("source_post_aliases", [])):
+                    case.setdefault("source_post_url", post_url)
+                    if group_key:
+                        case["source_group_key"] = group_key
+                        aliases = case.setdefault("source_post_aliases", [])
+                        if post_url not in aliases:
+                            aliases.append(post_url)
+                    if "source_cover" not in case or case.get("status", "published") != "draft":
+                        await _write("portfolio.json", data)
+                        return case, False
+                if "source_cover" not in case:
+                    return case, False
                 if case.get("status", "published") != "draft":
                     return case, False
                 old_cover = case.get("source_cover", case.get("cover"))
@@ -603,6 +640,7 @@ async def upsert_channel_case(
         }
         if group_key:
             case["source_group_key"] = group_key
+            case["source_post_aliases"] = [post_url]
         data["cases"].append(case)
         await _write("portfolio.json", data)
         return case, True

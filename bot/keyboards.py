@@ -6,7 +6,7 @@ from aiogram.types import (
     WebAppInfo,
 )
 
-from bot import config, texts
+from bot import config, content_store, texts
 
 
 def main_reply_keyboard(*, is_owner: bool = False) -> ReplyKeyboardMarkup:
@@ -75,16 +75,33 @@ def webapp_open_keyboard(webapp_url: str, path: str, label: str) -> InlineKeyboa
     )
 
 
-def client_home_keyboard(webapp_url: str) -> InlineKeyboardMarkup:
+def client_home_keyboard(webapp_url: str, menu: dict | None = None) -> InlineKeyboardMarkup:
     """Native Telegram menu; WebApp buttons preserve signed initData."""
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📁 Портфолио", web_app=WebAppInfo(url=f"{webapp_url}/portfolio")),
-         InlineKeyboardButton(text="💰 Рассчитать", web_app=WebAppInfo(url=f"{webapp_url}/calculator"))],
-        [InlineKeyboardButton(text="💬 Задать вопрос", callback_data="intake:question"),
-         InlineKeyboardButton(text="⚡ Быстрая заявка", callback_data="intake:quick")],
-        [InlineKeyboardButton(text="✍️ Подробная заявка", web_app=WebAppInfo(url=f"{webapp_url}/brief"))],
-        [InlineKeyboardButton(text="📋 Мои заявки", web_app=WebAppInfo(url=f"{webapp_url}/myleads"))],
-    ])
+    visible = menu or {}
+    rows = [[
+        InlineKeyboardButton(text=label, web_app=WebAppInfo(url=f"{webapp_url}/{screen}"))
+        for screen, label in (("portfolio", "📁 Портфолио"), ("calculator", "💰 Рассчитать"))
+        if visible.get(screen) is not False
+    ], [
+        InlineKeyboardButton(text="💬 Задать вопрос", callback_data="intake:question"),
+        InlineKeyboardButton(text="⚡ Быстрая заявка", callback_data="intake:quick"),
+    ]]
+    for screen, label in (("brief", "✍️ Подробная заявка"), ("myleads", "📋 Мои заявки")):
+        if visible.get(screen) is not False:
+            rows.append([InlineKeyboardButton(text=label, web_app=WebAppInfo(url=f"{webapp_url}/{screen}"))])
+    return InlineKeyboardMarkup(inline_keyboard=[row for row in rows if row])
+
+
+async def client_menu_settings() -> dict:
+    try:
+        config_data = await content_store.get_ui_config()
+    except FileNotFoundError:
+        config_data = {}
+    return config_data.get("menu") or {}
+
+
+async def configured_client_home_keyboard() -> InlineKeyboardMarkup:
+    return client_home_keyboard(config.miniapp_url(), await client_menu_settings())
 
 
 def intake_cancel_keyboard() -> InlineKeyboardMarkup:
