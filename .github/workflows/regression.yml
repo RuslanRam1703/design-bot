@@ -24,3 +24,16 @@ jobs:
       - run: node --check webapp/js/boot.js
       - run: node --check webapp/js/case-viewer.js
       - run: node --test tests/test_webapp_ux.cjs tests/test_webapp_boot.cjs tests/test_case_viewer.cjs
+  portfolio-browser:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Install Chromium for portfolio checks
+        run: |
+          npm install --prefix "$RUNNER_TEMP/portfolio-browser" --no-save playwright@1.62.1
+          "$RUNNER_TEMP/portfolio-browser/node_modules/.bin/playwright" install --with-deps chromium
+      - name: Check demo portfolio at three viewport widths
+        run: NODE_PATH="$RUNNER_TEMP/portfolio-browser/node_modules" node tests/test_portfolio_browser.cjs

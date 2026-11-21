@@ -24,6 +24,8 @@
     const telegram = window.Telegram?.WebApp;
     const restoreSwipes = telegram?.isVerticalSwipesEnabled === true;
     let scale = 1;
+    let slideDirection = 0;
+    let slideAnimation;
     const pointers = new Map();
     let tap = null;
     let swipe = null;
@@ -56,6 +58,8 @@
     }
     function select(nextIndex) {
       if (nextIndex < 0 || nextIndex >= sources.length) return;
+      slideAnimation?.cancel();
+      slideDirection = Math.sign(nextIndex - index);
       index = nextIndex; scale = 1; pointers.clear(); tap = swipe = lastTap = null;
       zoomButton.disabled = true; img.hidden = true;
       zoomButton.textContent = 'Увеличить'; zoomButton.setAttribute('aria-pressed', 'false');
@@ -202,6 +206,12 @@
     img.addEventListener('load', () => {
       zoomButton.disabled = false; img.hidden = false; fit();
       hint();
+      if (slideDirection && !window.matchMedia?.('(prefers-reduced-motion: reduce)').matches) {
+        slideAnimation = img.animate?.(
+          [{ opacity: 0.55, transform: `translateX(${slideDirection * 10}px)` }, { opacity: 1, transform: 'none' }],
+          { duration: 160, easing: 'ease-out' }
+        );
+      }
     });
     img.addEventListener('error', () => {
       zoomButton.disabled = true;
