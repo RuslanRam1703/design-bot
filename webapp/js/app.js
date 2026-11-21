@@ -204,6 +204,15 @@ function getMenuEntries(pricing) {
   return entries;
 }
 
+const widePortfolio = window.matchMedia?.("(min-width: 1100px)");
+let portfolioReturn = null;
+
+function openPortfolioCase(project, button) {
+  portfolioReturn = { caseId: project.id, scrollY: window.scrollY || 0, preview: Boolean(button.dataset.openCase) };
+  state.currentCase = project;
+  navigate("case");
+}
+
 function navigate(screen, { resetBrief = false, hardReset = false, pushHistory = true } = {}) {
   if (state.uiConfig?.menu?.[screen] === false) return;
   if (pushHistory && state.screen !== "loading") state.history.push(state.screen);
@@ -230,9 +239,20 @@ function goBack() {
     }
     return;
   }
+  const returningToPortfolio = state.screen === "case" && state.history.at(-1) === "portfolio";
   const prev = state.history.pop();
   state.screen = prev || TAB_SCREENS.find(tab => state.uiConfig?.menu?.[tab.id] !== false)?.id || "unavailable";
   render();
+  if (returningToPortfolio && portfolioReturn) {
+    const { caseId, scrollY, preview } = portfolioReturn;
+    const selector = preview ? "[data-open-case]" : "[data-preview-case]";
+    [...document.querySelectorAll(selector)].find(button =>
+      (button.dataset.openCase || button.dataset.previewCase) === caseId
+    )?.focus({ preventScroll: true });
+    window.scrollTo(0, scrollY);
+    portfolioReturn = null;
+  }
+
 }
 
 // Черновик брифа переживает переключение вкладок и Back в рамках одной
@@ -347,6 +367,7 @@ function resetBriefState({ hardReset = false } = {}) {
 async function init() {
   const root = document.getElementById("app");
   if (root && !window.DesignAssistantBoot) root.innerHTML = '<div class="empty-state" role="status">Загружаем приложение…</div>';
+  widePortfolio?.addEventListener?.("change", syncPortfolioControls);
   TG.ready();
   TG.expand();
   applyTheme();
@@ -739,7 +760,7 @@ function renderPortfolio() {
   const cards = filtered
     .map(
       (c) => `
-      <button type="button" class="card" data-preview-case="${escapeHtml(c.id)}" aria-pressed="${c === selected}" aria-controls="portfolio-preview">
+      <button type="button" class="card" data-preview-case="${escapeHtml(c.id)}" data-preview-selected="${c === selected}"${widePortfolio?.matches ? ` aria-pressed="${c === selected}" aria-controls="portfolio-preview"` : ""}>
         ${renderPortfolioCover(c, typeLabels[c.type])}
         <div class="card-title">${escapeHtml(c.title)}</div>
       </button>`
@@ -754,10 +775,24 @@ function renderPortfolio() {
     </section>` : ""}
     <div class="section-heading"><h2>Портфолио</h2><span>${count} ${projectWord}</span></div>
     <div class="chips">${chips}</div>
-    ${selected ? `<div id="portfolio-preview" aria-live="polite">${renderPortfolioPreview(selected, typeLabels[selected.type])}</div>`
-      : '<div class="empty-state">Пока нет кейсов в этой категории</div>'}
-    ${count > 1 ? `<div class="grid" role="group" aria-label="Выбрать проект для предпросмотра">${cards}</div>` : ""}
+    ${selected ? `<div class="portfolio-layout${count > 1 ? " has-project-grid" : ""}">
+      <div id="portfolio-preview" aria-live="polite">${renderPortfolioPreview(selected, typeLabels[selected.type])}</div>
+      ${count > 1 ? `<div class="grid" role="group" aria-label="Кейсы портфолио">${cards}</div>` : ""}
+    </div>` : '<div class="empty-state">Пока нет кейсов в этой категории</div>'}
   `;
+}
+
+function syncPortfolioControls() {
+  if (state.screen !== "portfolio") return;
+  document.querySelectorAll("[data-preview-case]").forEach(button => {
+    if (widePortfolio?.matches) {
+      button.setAttribute("aria-pressed", String(button.dataset.previewCase === state.portfolioPreviewId));
+      button.setAttribute("aria-controls", "portfolio-preview");
+    } else {
+      button.removeAttribute("aria-pressed");
+      button.removeAttribute("aria-controls");
+    }
+  });
 }
 
 function attachPortfolioEvents() {
@@ -776,8 +811,7 @@ function attachPortfolioEvents() {
     if (!button) return;
     const project = state.portfolio.cases.find(c => c.id === button.dataset.openCase);
     if (!project) return;
-    state.currentCase = project;
-    navigate("case");
+    openPortfolioCase(project, button);
   });
 
   const thumbnails = document.querySelectorAll("[data-preview-case]");
@@ -785,16 +819,17 @@ function attachPortfolioEvents() {
     el.addEventListener("click", () => {
       const project = state.portfolio.cases.find(c => c.id === el.dataset.previewCase);
       if (!project) return;
-      if (project.id !== state.portfolioPreviewId) {
-        state.portfolioPreviewId = project.id;
-        const typeLabel = state.portfolio.types.find(type => type.id === project.type)?.label;
-        preview.innerHTML = renderPortfolioPreview(project, typeLabel);
-        thumbnails.forEach(button => button.setAttribute("aria-pressed", String(button === el)));
+      if (!widePortfolio?.matches) {
+        openPortfolioCase(project, el);
+        return;
       }
-      if (preview.getBoundingClientRect().top < 0) {
-        preview.querySelector("button").focus({ preventScroll: true });
-        preview.scrollIntoView({ block: "start" });
-      }
+      if (project.id === state.portfolioPreviewId) return;
+      state.portfolioPreviewId = project.id;
+      const typeLabel = state.portfolio.types.find(type => type.id === project.type)?.label;
+      preview.innerHTML = renderPortfolioPreview(project, typeLabel);
+      preview.querySelector(".portfolio-preview-card")?.classList.add("preview-enter");
+      thumbnails.forEach(button => button.setAttribute("data-preview-selected", String(button === el)));
+      syncPortfolioControls();
     })
   );
 }

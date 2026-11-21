@@ -6,10 +6,10 @@ const path = require('node:path');
 const vm = require('node:vm');
 
 const source = fs.readFileSync(path.join(__dirname, '../webapp/js/app.js'), 'utf8');
-function appWithDraft(saved = null, document = { addEventListener() {} }) {
+function appWithDraft(saved = null, document = { addEventListener() {} }, viewport = {}) {
   const storage = { getItem: () => saved, setItem() {}, removeItem() {} };
   const sandbox = {
-    window: { Telegram: { WebApp: { initDataUnsafe: { user: { id: 31, first_name: 'Клиент', username: 'client' } } } } },
+    window: { ...viewport, Telegram: { WebApp: { initDataUnsafe: { user: { id: 31, first_name: 'Клиент', username: 'client' } } } } },
     document,
     localStorage: storage,
     console,
@@ -19,7 +19,7 @@ function appWithDraft(saved = null, document = { addEventListener() {} }) {
   vm.createContext(sandbox);
   const stripped = source.replace(/\ninit\(\);\s*$/, '\n');
   assert.notEqual(stripped, source, 'must skip only the final Mini App bootstrap');
-  vm.runInContext(stripped + '\nglobalThis.__ui = { state, restoreBriefDraft, renderBrief, renderMyLeadDetail, renderMyLeads, renderPortfolio, attachPortfolioEvents, renderTabBar, renderCase, renderCaseContent, renderAbout, imageSrc, safeLinkUrl };', sandbox);
+  vm.runInContext(stripped + '\nglobalThis.__ui = { state, goBack, restoreBriefDraft, renderBrief, renderMyLeadDetail, renderMyLeads, renderPortfolio, attachPortfolioEvents, renderTabBar, renderCase, renderCaseContent, renderAbout, imageSrc, safeLinkUrl };', sandbox);
   return sandbox.__ui;
 }
 
@@ -140,7 +140,7 @@ test('thumbnail taps update the preview without navigating or reordering cards',
       setAttribute(name, value) { this[name] = value; },
     };
   }
-  const preview = element({ getBoundingClientRect: () => ({ top: 10 }) });
+  const preview = element({ querySelector: () => null });
   const first = element({ dataset: { previewCase: 'one' } });
   const second = element({ dataset: { previewCase: 'two' } });
   const document = {
@@ -148,7 +148,7 @@ test('thumbnail taps update the preview without navigating or reordering cards',
     getElementById: id => id === 'portfolio-preview' ? preview : null,
     querySelectorAll: selector => selector === '[data-preview-case]' ? [first, second] : [],
   };
-  const { state, renderPortfolio, attachPortfolioEvents } = appWithDraft(null, document);
+  const { state, renderPortfolio, attachPortfolioEvents } = appWithDraft(null, document, { matchMedia: query => ({ matches: query.includes("1100") }) });
   state.screen = 'portfolio';
   state.portfolio = {types: [], cases: [
     {id: 'one', type: 'web', title: 'One', featured: true},
