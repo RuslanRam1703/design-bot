@@ -109,7 +109,7 @@ async def handle_public_data(request: web.Request) -> web.Response:
         if filename != "portfolio.json" or case is None or case.get("status") == "trashed":
             raise web.HTTPNotFound()
         working = case.get("_editor", {}).get("working", case)
-        data = {"types": data.get("types", []), "cases": [{k: v for k, v in working.items() if k != "_editor"}], "owner_preview": True}
+        data = {"types": data.get("types", []), "cases": [{k: v for k, v in working.items() if k != "_editor"}], "owner_preview": True, "revision": content_store.editor_digest(working)}
     elif filename == "portfolio.json":
         cases = [
             {k: v for k, v in case.items() if k != "_editor"}
@@ -122,6 +122,41 @@ async def handle_public_data(request: web.Request) -> web.Response:
     elif filename == "pricing.json":
         data = {k: v for k, v in data.items() if k != "_editor"}
     return web.json_response(data, dumps=lambda d: json.dumps(d, ensure_ascii=False), headers={"Cache-Control": "no-store"})
+
+
+CASE_GALLERY_PATH = "/api/owner/case-gallery"
+
+
+async def handle_case_gallery(request: web.Request) -> web.Response:
+    user = validate_init_data(request.headers.get("X-Telegram-Init-Data", ""), config.BOT_TOKEN)
+    if user is None or str(user["id"]) != str(config.DESIGNER_CHAT_ID):
+        return web.json_response({"error": "owner_required"}, status=403)
+    if await access_control.is_blocked(user["id"], user.get("username")):
+        return web.json_response({"error": "access_denied"}, status=403)
+    try:
+        payload = await request.json()
+    except ValueError:
+        return web.json_response({"error": "invalid_payload"}, status=400)
+    if not isinstance(payload, dict):
+        return web.json_response({"error": "invalid_payload"}, status=400)
+    case_id = payload.get("case_id")
+    revision = payload.get("revision")
+    order = payload.get("order")
+    cover = payload.get("cover")
+    if (
+        not isinstance(case_id, str) or not case_id
+        or not isinstance(revision, str) or len(revision) != 64
+        or not isinstance(order, list) or any(type(index) is not int for index in order)
+        or (cover is not None and not isinstance(cover, str))
+    ):
+        return web.json_response({"error": "invalid_payload"}, status=400)
+    try:
+        saved = await content_store.save_case_gallery(user["id"], case_id, revision, order, cover)
+    except ValueError as exc:
+        return web.json_response({"error": "gallery_conflict", "message": str(exc)}, status=409)
+    if saved is None:
+        return web.json_response({"error": "not_found"}, status=404)
+    return web.json_response({"case": saved, "revision": content_store.editor_digest(saved)})
 
 
 async def handle_my_leads(request: web.Request) -> web.Response:
@@ -487,7 +522,7 @@ async def miniapp_cors(request: web.Request, handler):
     if origin not in allowed:
         return web.json_response({"error": "origin_denied"}, status=403)
     allowed_methods = {"GET"}
-    if request.path == "/api/leads":
+    if request.path in {"/api/leads", CASE_GALLERY_PATH}:
         allowed_methods = {"POST"}
     allowed_headers = {
         "content-type", "x-telegram-init-data", "x-debug-platform", "x-debug-version",
@@ -527,6 +562,7 @@ def create_app(bot: Bot) -> web.Application:
     app.router.add_get("/draft-bridge", handle_draft_bridge)
     app.router.add_get("/api/my-leads", handle_my_leads)
     app.router.add_post("/api/leads", handle_create_lead)
+    app.router.add_post(CASE_GALLERY_PATH, handle_case_gallery)
     app.router.add_static("/css/", WEBAPP_DIR / "css")
     app.router.add_static("/js/", WEBAPP_DIR / "js")
     app.router.add_static("/img/", WEBAPP_DIR / "img")

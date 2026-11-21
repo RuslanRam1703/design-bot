@@ -3253,7 +3253,9 @@ async def _review_screen(callback: CallbackQuery, state: FSMContext, kind: str) 
         target = case_id
         text = "Проверка кейса: " + escape(working.get("title", "")) + "\n\nОткройте предпросмотр. Клиенты увидят изменения только после публикации."
         back = "adminreviewback"
-        extra = [[InlineKeyboardButton(text="👁 Открыть предпросмотр", web_app=WebAppInfo(url=_preview_url(case_id)))]]
+        extra = [[InlineKeyboardButton(text="👁 Предпросмотр и галерея", web_app=WebAppInfo(url=_preview_url(case_id)))],
+            [InlineKeyboardButton(text="🔄 Обновить после правок в Mini App", callback_data="adminreview:case")],
+        ]
     else:
         await content_store.begin_pricing_edit(actor)
         working = await content_store.get_pricing_edit(actor)

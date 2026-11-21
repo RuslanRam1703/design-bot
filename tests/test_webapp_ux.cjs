@@ -328,3 +328,15 @@ test('case hides its order action when orders are disabled in admin settings', (
   state.uiConfig = { menu: { brief: false } };
   assert.doesNotMatch(renderCase(), /want-similar/);
 });
+
+test('gallery editor entry is available only in an owner preview with images', () => {
+  const { state, renderCase } = appWithDraft();
+  state.currentCase = { id: 'one', title: 'Case', images: ['/img/one.jpg'] };
+  state.portfolio = { owner_preview: true, revision: 'revision' };
+  assert.match(renderCase(), /id="open-gallery-editor"/);
+  state.portfolio.owner_preview = false;
+  assert.doesNotMatch(renderCase(), /id="open-gallery-editor"/);
+  state.portfolio.owner_preview = true;
+  state.currentCase.images = [];
+  assert.doesNotMatch(renderCase(), /id="open-gallery-editor"/);
+});
