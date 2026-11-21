@@ -898,9 +898,10 @@ function renderGalleryEditor(editor) {
       </figure>
       <div class="gallery-editor-actions">
         <button type="button" data-gallery-move="-1" aria-label="Переместить кадр ${position + 1} раньше" ${position === 0 ? "disabled" : locked}>←</button>
-        <button type="button" data-gallery-move="1" aria-label="Переместить кадр ${position + 1} позже" ${position === images.length - 1 ? "disabled" : locked}>→</button>
+        <button type="button" data-gallery-move="1" aria-label="Переместить кадр ${position + 1} позже" ${position === editor.order.length - 1 ? "disabled" : locked}>→</button>
         <button type="button" data-gallery-cover aria-pressed="${isCover}" ${locked}>${isCover ? "Обложка" : "На обложку"}</button>
       </div>
+      <button type="button" class="btn btn-secondary gallery-remove" data-gallery-remove aria-label="Убрать кадр ${position + 1} из галереи" ${locked}>Убрать кадр</button>
     </li>`;
   }).join("");
   const originalCover = state.currentCase.cover;
@@ -910,7 +911,8 @@ function renderGalleryEditor(editor) {
     <p class="hint">Перетащите кадры или поменяйте их порядок стрелками. Обложку можно выбрать отдельно.</p>
     ${separateCover ? `<div class="gallery-editor-current"><img src="${escapeHtml(imageSrc(originalCover))}" alt="">
       <button type="button" class="btn btn-secondary" id="keep-original-cover" aria-pressed="${editor.cover === originalCover}" ${locked}>${editor.cover === originalCover ? "Текущая обложка вне галереи" : "Вернуть отдельную обложку"}</button></div>` : ""}
-    <ol class="gallery-editor-grid">${cards}</ol>
+    ${cards ? `<ol class="gallery-editor-grid">${cards}</ol>` : '<p class="empty-state">В галерее нет кадров.</p>'}
+    ${dirty ? `<button type="button" class="btn btn-secondary" id="reset-gallery" ${locked}>Отменить несохранённые правки</button>` : ""}
     <p class="hint" role="status">${escapeHtml(editor.message || (dirty ? "Есть несохранённые правки" : ""))}</p>
     <div class="btn-row">
       <button type="button" class="btn btn-primary" id="save-gallery" ${dirty ? locked : "disabled"}>${editor.saving ? "Сохраняю…" : "Сохранить в черновик"}</button>
@@ -926,13 +928,15 @@ function attachGalleryEditor() {
 
   function update(position, selector) {
     editor.dirty = editor.cover !== (state.currentCase.cover || null)
+      || editor.order.length !== state.currentCase.images.length
       || editor.order.some((imageIndex, index) => imageIndex !== index);
     editor.message = "";
     const scrollY = window.scrollY;
     panel.outerHTML = renderGalleryEditor(editor);
     attachGalleryEditor();
     if (position === null) {
-      document.getElementById("keep-original-cover")?.focus({ preventScroll: true });
+      (document.getElementById("keep-original-cover") || document.getElementById("close-gallery"))?.focus({ preventScroll: true });
+      window.scrollTo(0, scrollY);
       return;
     }
     const card = document.querySelector(`#gallery-editor [data-position="${position}"]`);
@@ -958,6 +962,14 @@ function attachGalleryEditor() {
       editor.cover = state.currentCase.images[editor.order[position]];
       update(position, "[data-gallery-cover]");
     });
+    card.querySelector("[data-gallery-remove]").addEventListener("click", () => {
+      const images = state.currentCase.images;
+      const [removed] = editor.order.splice(position, 1);
+      if (editor.cover === images[removed] && !editor.order.some(index => images[index] === editor.cover)) {
+        editor.cover = images[editor.order[0]] || null;
+      }
+      update(editor.order.length ? Math.min(position, editor.order.length - 1) : null, "[data-gallery-remove]");
+    });
     card.querySelector("figure").addEventListener("dragstart", event => {
       from = position;
       event.dataTransfer.effectAllowed = "move";
@@ -980,6 +992,10 @@ function attachGalleryEditor() {
   document.getElementById("keep-original-cover")?.addEventListener("click", () => {
     editor.cover = state.currentCase.cover;
     update(null);
+  });
+  document.getElementById("reset-gallery")?.addEventListener("click", () => {
+    Object.assign(editor, createGalleryEditor(state.currentCase));
+    update(0, "[data-gallery-cover]");
   });
   document.getElementById("close-gallery").addEventListener("click", goBack);
   document.getElementById("save-gallery").addEventListener("click", saveGalleryEditor);
@@ -1043,7 +1059,7 @@ function renderCase() {
       <button class="back-btn" id="back">${state.portfolio?.owner_preview ? "← В редактор" : "←"}</button>
       <h1>${escapeHtml(c.title)}</h1>
     </div>
-    ${state.portfolio?.gallerySaved ? '<p id="gallery-saved" class="hint" role="status" tabindex="-1">Галерея сохранена в черновик. Для публикации вернитесь в чат и откройте «Проверить и опубликовать» или обновите открытую проверку.</p>' : ""}
+    ${state.portfolio?.gallerySaved ? '<p id="gallery-saved" class="hint" role="status" tabindex="-1">Галерея сохранена в черновик. Для публикации вернитесь в чат и откройте «Проверить и опубликовать».</p>' : ""}
     ${canEditGallery ? '<button type="button" class="btn btn-secondary gallery-editor-entry" id="open-gallery-editor">Редактировать галерею</button>' : ""}
     <div class="case-images">${images}</div>
     ${renderCaseContent(c)}
@@ -1112,9 +1128,12 @@ function attachCaseEvents() {
 // ---- Экран: Обо мне ----
 function renderAbout() {
   const a = state.about;
+  if (!Object.keys(a).some(key => key !== "needs_review_fields")) {
+    return '<div class="topbar"><h1>Обо мне</h1></div><div class="empty-state">Профиль пока не заполнен.</div>';
+  }
 
-  const specItems = a.specialization.map((s) => `<li>${escapeHtml(s)}</li>`).join("");
-  const toolChips = a.tools.map((t) => `<span class="chip-static">${escapeHtml(t)}</span>`).join("");
+  const specItems = (a.specialization || []).map((s) => `<li>${escapeHtml(s)}</li>`).join("");
+  const toolChips = (a.tools || []).map((t) => `<span class="chip-static">${escapeHtml(t)}</span>`).join("");
   // Навыки — профессиональные компетенции (UX-исследования, прототипирование...)
   // отдельно от Инструментов (софт) — раньше это было смешано в одном списке.
   const skillsHTML = a.skills && a.skills.length
@@ -1141,7 +1160,7 @@ function renderAbout() {
       </div>`
     : "";
 
-  const educationHTML = a.education && a.education.enabled && a.education.items.length
+  const educationHTML = a.education && a.education.enabled && a.education.items?.length
     ? `
       <div class="about-block">
         <h2>Образование</h2>
@@ -1345,6 +1364,13 @@ function serviceItemHTML(s, label) {
     </button>`;
 }
 
+function urgencyLabel() {
+  const multiplier = state.pricing?.coefficients?.urgent?.multiplier ?? 1;
+  const percent = Math.round((multiplier - 1) * 10000) / 100;
+  if (!percent) return "Срочный проект";
+  return `Срочный проект (${percent > 0 ? "+" : "−"}${new Intl.NumberFormat("ru-RU").format(Math.abs(percent))}%)`;
+}
+
 function renderCalculator() {
   if (state.pricing?.services?.length === 0) return '<div class="empty-state">Услуги пока не опубликованы.</div>';
   const { pricing } = state;
@@ -1439,7 +1465,7 @@ function renderCalculator() {
     ${optionRows}
 
     <div class="toggle-row">
-      <span>Срочный проект (+25%)</span>
+      <span>${urgencyLabel()}</span>
       <label class="switch"><input type="checkbox" id="urgent-toggle" ${state.calc.urgent ? "checked" : ""} /><span class="track"></span></label>
     </div>
     <p class="hint">Сложность проекта и окончательную стоимость дизайнер уточнит после обсуждения задачи.</p>
@@ -1904,7 +1930,7 @@ function renderBrief() {
       ${service.includes ? `<p class="hint">В базовую стоимость входит: ${escapeHtml(service.includes)}</p>` : ""}
       ${optionRows}
       <div class="toggle-row">
-        <span>Срочный проект (+25%)</span>
+        <span>${urgencyLabel()}</span>
         <label class="switch"><input type="checkbox" id="order-urgent-toggle" ${b.urgent ? "checked" : ""} /><span class="track"></span></label>
       </div>
       <p class="hint">Сложность проекта оценит дизайнер после изучения задачи.</p>

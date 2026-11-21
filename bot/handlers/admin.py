@@ -675,8 +675,9 @@ async def cases_add_title(message: Message, state: FSMContext) -> None:
     await state.update_data(title=message.text.strip(), case_id=case_id)
     await flow.step_from_text(
         message, state,
-        "Пришлите фото кейса (как фото) — или ссылку на проект Behance "
-        "либо на публичный пост в Telegram:",
+        "Пришлите фото для обложки или ссылку на Behance / публичный пост Telegram. "
+        "Из ссылки подтянется обложка. Чтобы импортировать весь фотоальбом, "
+        "его можно разместить в подключённом канале портфолио: бот создаст отдельный черновик.",
         kb.cancel_keyboard(),
     )
     await state.set_state(AdminStates.add_case_photo)
@@ -1281,7 +1282,7 @@ async def case_image_action(callback: CallbackQuery, state: FSMContext) -> None:
         # всего кейса, у которого уже есть confirm-шаг) — раньше срабатывало
         # одним кликом без подтверждения, в отличие от delete_case_confirm.
         name = image_path.split("/")[-1] if image_path else "изображение"
-        await callback.message.edit_text(f"Удалить {name}? Это необратимо.", reply_markup=kb.confirm_keyboard("admindelcaseimgconfirm"))
+        await callback.message.edit_text(f"Убрать кадр «{escape(name)}» из галереи? У опубликованного кейса изменение вступит в силу после публикации черновика.", reply_markup=kb.confirm_keyboard("admindelcaseimgconfirm"))
         await state.set_state(AdminStates.case_image_pick_delete)
         await callback.answer()
         return
@@ -3247,7 +3248,7 @@ def _preview_url(case_id: str, *, edit_gallery: bool = False) -> str:
     return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), ""))
 
 
-async def _review_screen(callback: CallbackQuery, state: FSMContext, kind: str) -> None:
+async def _review_screen(callback: CallbackQuery, state: FSMContext, kind: str, *, refreshed: bool = False) -> None:
     actor = callback.message.chat.id
     data = await state.get_data()
     if kind == "case":
@@ -3259,6 +3260,8 @@ async def _review_screen(callback: CallbackQuery, state: FSMContext, kind: str) 
         can_discard = "_editor" in live_case
         target = case_id
         text = "Проверка кейса: " + escape(working.get("title", "")) + "\n\nОткройте предпросмотр. Клиенты увидят изменения только после публикации."
+        if refreshed:
+            text = "Черновик изменился. Проверьте новую версию и подтвердите действие ещё раз.\n\n" + text
         back = "adminreviewback"
         extra = [[InlineKeyboardButton(text="👁 Предпросмотр и галерея", web_app=WebAppInfo(url=_preview_url(case_id)))],
             [InlineKeyboardButton(text="🔄 Обновить после правок в Mini App", callback_data="adminreview:case")],
@@ -3327,6 +3330,11 @@ async def review_finish(callback: CallbackQuery, state: FSMContext) -> None:
     publish = callback.data.startswith("adminapply:")
     try:
         if saved.get("review_kind") == "case":
+            working = await content_store.get_case_edit(callback.message.chat.id, saved["review_target"])
+            if working and content_store.editor_digest(working) != expected:
+                await state.update_data(case_id=saved["review_target"])
+                await _review_screen(callback, state, "case", refreshed=True)
+                return
             ok = await content_store.finish_case_edit(callback.message.chat.id, saved["review_target"], expected, publish=publish)
             keyboard = kb.admin_cases_menu_keyboard()
         else:

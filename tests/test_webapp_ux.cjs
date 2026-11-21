@@ -340,3 +340,12 @@ test('gallery editor entry is available only in an owner preview with images', (
   state.currentCase.images = [];
   assert.doesNotMatch(renderCase(), /id="open-gallery-editor"/);
 });
+
+
+test('profile renders after clean start and after the first field is filled', () => {
+  const { state, renderAbout } = appWithDraft();
+  state.about = {};
+  assert.match(renderAbout(), /Профиль пока не заполнен/);
+  state.about = { name: 'Designer' };
+  assert.match(renderAbout(), /Designer/);
+});

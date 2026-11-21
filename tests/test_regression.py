@@ -1306,8 +1306,9 @@ class AdminMultiStepWizardAnchorTests(unittest.IsolatedAsyncioTestCase):
             # Behance, теперь ещё и публичный пост Telegram (см.
             # admin.cases_add_photo_behance). Проверяемое здесь поведение —
             # RULE 3 / anchor, а не сама формулировка.
-            "Пришлите фото кейса (как фото) — или ссылку на проект Behance "
-            "либо на публичный пост в Telegram:",
+            "Пришлите фото для обложки или ссылку на Behance / публичный пост Telegram. "
+            "Из ссылки подтянется обложка. Чтобы импортировать весь фотоальбом, "
+            "его можно разместить в подключённом канале портфолио: бот создаст отдельный черновик.",
             chat_id=self.actor, message_id=500, reply_markup=kb.cancel_keyboard()
         )
         title_msg.answer.assert_not_awaited()  # RULE 3: редактирование на месте, не новое сообщение
@@ -5490,7 +5491,8 @@ class AdminCaseContentWorkflowTests(unittest.IsolatedAsyncioTestCase):
         await admin.case_image_action(cb, state)
 
         cb.message.edit_text.assert_awaited_once_with(
-            "Удалить seed.svg? Это необратимо.", reply_markup=kb.confirm_keyboard("admindelcaseimgconfirm")
+            "Убрать кадр «seed.svg» из галереи? У опубликованного кейса изменение вступит в силу после публикации черновика.",
+            reply_markup=kb.confirm_keyboard("admindelcaseimgconfirm")
         )
         self.assertEqual(await state.get_state(), AdminStates.case_image_pick_delete.state)
         self.assertIn("img/portfolio/seed.svg", (await self._case())["images"])
