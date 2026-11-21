@@ -196,3 +196,11 @@ textarea::placeholder, input::placeholder { color:var(--hint); opacity:.8; }
 .brand-name { min-width:0; overflow-wrap:anywhere; }
 .portfolio-intro h1, .portfolio-intro p, .portfolio-intro .btn { overflow-wrap:anywhere; }
 .portfolio-intro .btn { max-width:100%; }
+
+@media (min-width:1100px) {
+  #app[data-screen="portfolio"], #app[data-screen="case"] {
+    max-width:1380px;
+    padding-inline:32px;
+  }
+  #app[data-screen="portfolio"] .grid { grid-template-columns:repeat(4,minmax(0,1fr)); }
+}

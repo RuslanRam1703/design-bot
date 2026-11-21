@@ -1015,12 +1015,24 @@ async def cases_moderate_apply(callback: CallbackQuery, state: FSMContext) -> No
     await cases_moderate_pick_for_id(callback, case_id)
 
 
+@router.callback_query(F.data.startswith("adminstartcase:"))
+async def cases_set_start_case(callback: CallbackQuery) -> None:
+    case_id = callback.data.split(":", 1)[1]
+    if not await content_store.set_portfolio_start_case(callback.message.chat.id, case_id):
+        await callback.answer("Выберите опубликованный кейс", show_alert=True)
+        return
+    await callback.answer("Стартовый кейс обновлён")
+    await cases_moderate_pick_for_id(callback, case_id)
+
+
 async def cases_moderate_pick_for_id(callback: CallbackQuery, case_id: str) -> None:
     case = next((item for item in await content_store.list_cases() if item["id"] == case_id), None)
     if case is None:
         await callback.message.edit_text("Кейс уже удалён. Откройте актуальный список.", reply_markup=kb.admin_cases_menu_keyboard())
         return
     current = case.get("status", "published")
+    portfolio = await content_store.read_async("portfolio.json") if current == "published" else {}
+    is_start_case = portfolio.get("start_case_id") == case_id
     if current == "trashed":
         rows = [
             [InlineKeyboardButton(text="Восстановить", callback_data=f"adminrestorecase:{case_id}")],
@@ -1032,6 +1044,8 @@ async def cases_moderate_pick_for_id(callback: CallbackQuery, case_id: str) -> N
         if current != "published":
             rows.append([InlineKeyboardButton(text="Проверить и опубликовать", callback_data=f"adminsetcasestatus:published:{case_id}")])
         else:
+            if not is_start_case:
+                rows.append([InlineKeyboardButton(text="Показывать первым", callback_data=f"adminstartcase:{case_id}")])
             rows.append([InlineKeyboardButton(text="Снять с публикации", callback_data=f"adminsetcasestatus:unpublished:{case_id}")])
         rows.extend([
             [InlineKeyboardButton(text="Переместить в корзину", callback_data=f"admincardtrash:{case_id}")],
@@ -1039,6 +1053,7 @@ async def cases_moderate_pick_for_id(callback: CallbackQuery, case_id: str) -> N
         ])
     await callback.message.edit_text(
         f"Кейс: {escape(case['title'])}\nСтатус: {_PORTFOLIO_STATUS_LABELS.get(current, current)}" +
+        ("\nСтартовый кейс портфолио" if is_start_case else "") +
         ("\nЕсть черновые правки. Проверьте и примените их в редакторе." if case.get("_editor") else ""),
         reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
     )

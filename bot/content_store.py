@@ -545,6 +545,18 @@ async def upsert_channel_case(
 PORTFOLIO_STATUSES = frozenset({"draft", "published", "unpublished", "rejected", "trashed"})
 
 
+async def set_portfolio_start_case(actor_chat_id: int | str, case_id: str) -> bool:
+    _require_designer(actor_chat_id)
+    async with _lock("portfolio.json"):
+        data = await _read("portfolio.json")
+        case = _find_case(data, case_id)
+        if case is None or case.get("status", "published") != "published":
+            return False
+        data["start_case_id"] = case_id
+        await _write("portfolio.json", data)
+        return True
+
+
 async def set_case_status(actor_chat_id: int | str, case_id: str, status: str) -> bool:
     """Change visibility without destroying case data or associated images."""
     _require_designer(actor_chat_id)
@@ -561,6 +573,8 @@ async def set_case_status(actor_chat_id: int | str, case_id: str, status: str) -
         elif current == "trashed" and status != "trashed":
             case.pop("status_before_trash", None)
         case["status"] = status
+        if status != "published" and data.get("start_case_id") == case_id:
+            data.pop("start_case_id")
         await _write("portfolio.json", data)
         return True
 
@@ -955,6 +969,8 @@ async def delete_case(actor_chat_id: int | str, case_id: str, *, only_trashed: b
         for section in working.get("sections", []):
             image_paths.extend(section.get("images", []))
         data["cases"] = [c for c in data["cases"] if c["id"] != case_id]
+        if data.get("start_case_id") == case_id:
+            data.pop("start_case_id")
         await _write("portfolio.json", data)
     for path in set(image_paths):
         await _delete_unused_image(path)
