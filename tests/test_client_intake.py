@@ -134,3 +134,13 @@ class NativeIntakeTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ClientMenuVisibilityTests(unittest.TestCase):
+    def test_disabled_miniapp_sections_are_omitted_from_chat_menu(self):
+        keyboard = client_home_keyboard("https://example.invalid", {
+            "portfolio": False, "calculator": False, "brief": False,
+        })
+        buttons = [button for row in keyboard.inline_keyboard for button in row]
+        assert [button.web_app.url for button in buttons if button.web_app] == ["https://example.invalid/myleads"]
+        assert {button.callback_data for button in buttons if button.callback_data} == {"intake:question", "intake:quick"}

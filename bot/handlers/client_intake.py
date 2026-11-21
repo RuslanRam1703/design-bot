@@ -16,7 +16,7 @@ from aiogram.types import CallbackQuery, Message
 
 from bot import config, content_store, flow, texts
 from bot.keyboards import (
-    client_home_keyboard, intake_cancel_keyboard,
+    configured_client_home_keyboard, intake_cancel_keyboard,
     quick_contact_keyboard, quick_lead_confirm_keyboard,
 )
 from bot.notifications import notify_designer_lead
@@ -217,7 +217,7 @@ async def quick_submit(callback: CallbackQuery, state: FSMContext):
     await flow.step_from_callback(
         callback, state,
         texts.lead_received_ack(lead["id"], "Задача для оценки", None),
-        client_home_keyboard(config.miniapp_url()),
+        await configured_client_home_keyboard(),
     )
     await state.set_state(None)
     await callback.answer()
@@ -227,7 +227,7 @@ async def quick_submit(callback: CallbackQuery, state: FSMContext):
 async def intake_cancel(callback: CallbackQuery, state: FSMContext):
     await state.set_state(None)
     await flow.step_from_callback(
-        callback, state, texts.CLIENT_HOME, client_home_keyboard(config.miniapp_url()),
+        callback, state, texts.CLIENT_HOME, await configured_client_home_keyboard(),
     )
     await callback.answer()
 
@@ -235,4 +235,4 @@ async def intake_cancel(callback: CallbackQuery, state: FSMContext):
 @router.message(QuestionStates.awaiting_question, Command("cancel"))
 @router.message(StateFilter(QuickLeadStates), Command("cancel"))
 async def intake_cancel_command(message: Message, state: FSMContext):
-    await flow.open_root(message, state, texts.CLIENT_HOME, client_home_keyboard(config.miniapp_url()))
+    await flow.open_root(message, state, texts.CLIENT_HOME, await configured_client_home_keyboard())

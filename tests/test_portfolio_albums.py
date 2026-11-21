@@ -41,6 +41,32 @@ class AlbumStoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(case['type'])
         self.assertEqual(case['title'], 'Title')
 
+    async def test_manual_link_cannot_duplicate_an_imported_album_member(self):
+        await self.upsert(12)
+        imported, _ = await self.upsert(11)
+        with self.assertRaises(content_store.ExistingTelegramCaseError) as failure:
+            await content_store.add_case(
+                content_store.config.DESIGNER_CHAT_ID, case_id="case_1", title="Duplicate",
+                type_id="landing", cover="manual.jpg", task="", related_service=None,
+                source={"source_type": "telegram_post", "external_url": "https://t.me/PORTFOLIO/12?single"},
+            )
+        self.assertEqual(failure.exception.case["id"], imported["id"])
+        self.assertEqual(len(self.data["cases"]), 1)
+
+    async def test_import_reuses_manually_saved_post_without_changing_fields(self):
+        manual = await content_store.add_case(
+            content_store.config.DESIGNER_CHAT_ID, case_id="case_1", title="Owner title",
+            type_id="landing", cover="manual.jpg", task="Owner description", related_service=None,
+            source={"source_type": "telegram_post", "external_url": "https://t.me/portfolio/11"},
+        )
+        reused, created = await self.upsert()
+        self.assertFalse(created)
+        self.assertEqual(reused["id"], manual["id"])
+        self.assertEqual(reused["title"], "Owner title")
+        self.assertEqual(reused["images"], ["manual.jpg"])
+        await self.upsert(12)
+        self.assertEqual(len(self.data["cases"]), 1)
+
     async def test_other_album_and_channel_are_distinct(self):
         await self.upsert()
         await self.upsert(20, media_group_id='album2')
