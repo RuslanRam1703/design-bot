@@ -89,6 +89,18 @@ node --test tests/test_webapp_ux.cjs
 `WEBAPP_URL`; CI задаёт синтетические значения. Тесты используют временное
 хранилище и mock Telegram. Не подключайте production Redis к тестам.
 
+Быстрая сквозная проверка на демоданных (нужен Node.js 22):
+
+```bash
+BOT_TOKEN=123456:test-token-not-real DESIGNER_CHAT_ID=777 WEBAPP_URL=https://example.invalid python -m unittest tests.test_demo_miniapp_flow -v
+```
+
+Проверка использует временную копию JSON, локальный HTTP-сервер и тестовые
+Telegram-подписи. Она сверяет JS-калькулятор с серверным расчётом, сохраняет
+заявку и повтор дополнения, проверяет права на черновик и результат публикации.
+Вызовы Telegram заменены тестовым объектом. Для жестов и системной навигации
+Telegram нужна отдельная проверка на устройстве.
+
 `GET /health` отвечает `ok` без записи в данные и обращений к Telegram.
 Заголовок `X-App-Revision` содержит SHA из стандартной переменной Render
 `RENDER_GIT_COMMIT`, если она доступна. Сравните его с `main`, затем проверьте
