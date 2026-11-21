@@ -2893,7 +2893,8 @@ class AdminPricingServiceAnchorTests(unittest.IsolatedAsyncioTestCase):
         await admin.price_add_includes(final_msg, state)
 
         final_msg.bot.edit_message_text.assert_awaited_once_with(
-            "Услуга «Полный тест» добавлена ✅", chat_id=self.actor, message_id=msg_id, reply_markup=kb.pricing_menu_keyboard()
+            "Услуга «Полный тест» добавлена в черновик. Примените прайс, чтобы её увидели клиенты.",
+            chat_id=self.actor, message_id=msg_id, reply_markup=unittest.mock.ANY
         )
         self.assertIsNone(await state.get_state())
         services = await content_store.list_services()
@@ -3420,7 +3421,8 @@ class AdminRemainingAnchorGapsTests(unittest.IsolatedAsyncioTestCase):
         msg = make_flow_message_factory(chat_id=self.actor, start_id=14600)(text="Дизайн под ключ")
         await admin.price_add_includes(msg, state)
         msg.bot.edit_message_text.assert_awaited_once_with(
-            "Услуга «Услуга» добавлена ✅", chat_id=self.actor, message_id=msg_id, reply_markup=kb.pricing_menu_keyboard()
+            "Услуга «Услуга» добавлена в черновик. Примените прайс, чтобы её увидели клиенты.",
+            chat_id=self.actor, message_id=msg_id, reply_markup=unittest.mock.ANY
         )
         services = await content_store.list_services()
         self.assertTrue(any(s["name"] == "Услуга" for s in services))

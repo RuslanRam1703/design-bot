@@ -78,40 +78,33 @@ class CaseIdentityTests(unittest.IsolatedAsyncioTestCase):
         await content_store.ensure_gallery_demo_case()
         self.assertEqual(await content_store.list_cases(), [])
 
-    async def test_temporary_pack_preserves_real_cases_and_does_not_return_after_removal(self):
-        existing = await self.add("Real project")
+    async def test_cleanup_removes_only_demo_cases_and_their_empty_category(self):
+        real = await self.add("Real project")
         document = await content_store._read("portfolio.json")
-        document["types"] = [{"id": "landing", "label": "Лендинг"}]
-        document["start_case_id"] = existing["id"]
+        document["cases"].extend([
+            {"id": "demo_pack_case_1", "type": "demo_pack"},
+            {"id": "demo_pack_gallery", "type": "demo_pack"},
+            {"id": "gallery_demo", "type": "landing", "status": "trashed"},
+        ])
+        document["types"] = [
+            {"id": "demo_pack", "label": "Демо"}, {"id": "landing", "label": "Лендинг"},
+        ]
+        document["start_case_id"] = "demo_pack_case_1"
         await content_store._write("portfolio.json", document)
-        source = {"cases": [{
-            "id": "case_1", "title": "Example", "cover": "img/portfolio/demo_case_1.svg",
-            "images": ["img/portfolio/demo_case_1.svg"], "order_template": {"service_id": "LEND"},
-        }]}
         read_local = content_store._read_local
 
         async def read_live(filename):
             return read_local(filename)
 
-        # The live test copy and repository seed are deliberately separate.
         with (
             patch.object(content_store, "_read", side_effect=read_live),
-            patch.object(content_store, "_read_local", return_value=source),
+            patch.object(content_store, "_read_local", return_value={"cases": [{
+                "id": "case_1", "title": "Sample", "cover": "img/portfolio/demo_case_1.svg",
+            }]}),
         ):
-            await content_store.ensure_portfolio_demo_pack()
-            await content_store.ensure_portfolio_demo_pack()
-            await content_store.expand_portfolio_demo_galleries()
-            await content_store.expand_portfolio_demo_galleries()
+            await content_store.remove_production_demo_portfolio()
+            await content_store.remove_production_demo_portfolio()
         live = await content_store._read("portfolio.json")
-        demos = [case for case in live["cases"] if case["id"].startswith(content_store.PORTFOLIO_DEMO_PREFIX)]
-        self.assertEqual(len(demos), 2)
-        self.assertEqual(live["cases"][0], existing)
-        self.assertEqual(live["start_case_id"], existing["id"])
-        self.assertNotIn("order_template", demos[0])
-        self.assertEqual(len(demos[0]["images"]), 3)
-        for case in demos:
-            await content_store.set_case_status(777, case["id"], "trashed")
-        await content_store.ensure_portfolio_demo_pack()
-        cases = await content_store.list_cases()
-        self.assertEqual(len(cases), 3)
-        self.assertEqual([case for case in cases if case.get("status") != "trashed"], [existing])
+        self.assertEqual(live["cases"], [real])
+        self.assertEqual(live["types"], [{"id": "landing", "label": "Лендинг"}])
+        self.assertNotIn("start_case_id", live)

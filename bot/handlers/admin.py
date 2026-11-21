@@ -2210,7 +2210,14 @@ async def price_add_includes(message: Message, state: FSMContext) -> None:
      stage=True)
     # step_from_text, затем finish_flow, НЕ reset_state_keep_nav (P1-3,
     # Batch 4) — см. то же обоснование в cases_add_description выше.
-    await flow.step_from_text(message, state, f"Услуга «{service['name']}» добавлена ✅", kb.pricing_menu_keyboard())
+    await flow.step_from_text(
+        message, state, f"Услуга «{escape(service['name'])}» добавлена в черновик. Примените прайс, чтобы её увидели клиенты.",
+        InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="Проверить и применить прайс", callback_data="adminreview:pricing")],
+            [InlineKeyboardButton(text="Редактировать эту услугу", callback_data=f"adminserviceopen:{service['id']}")],
+            [InlineKeyboardButton(text="К списку услуг", callback_data="adminmenu:pricing")],
+        ]),
+    )
     await flow.finish_flow(state)
 
 
@@ -3279,7 +3286,15 @@ async def _review_screen(callback: CallbackQuery, state: FSMContext, kind: str, 
         extra = [[InlineKeyboardButton(text=service["name"][:60], callback_data=f"adminsample:{i}")] for i, service in enumerate(working["services"])]
     digest = content_store.editor_digest(working)
     await state.update_data(review_kind=kind, review_target=target, review_digest=digest)
-    apply_rows = [[InlineKeyboardButton(text="✅ Опубликовать кейс" if kind == "case" else "✅ Применить прайс", callback_data=f"adminapply:{digest[:16]}")]] if kind == "case" or data.get("sample_digest") == digest else []
+    empty_pricing = kind == "pricing" and not working["services"]
+    if empty_pricing:
+        text = "В черновике нет услуг. Если применить пустой прайс, клиентам будут недоступны калькулятор и подробный бриф."
+    apply_rows = []
+    if kind == "case" or empty_pricing or data.get("sample_digest") == digest:
+        label = "✅ Опубликовать кейс" if kind == "case" else (
+            "Применить пустой прайс" if empty_pricing else "✅ Применить прайс"
+        )
+        apply_rows.append([InlineKeyboardButton(text=label, callback_data=f"adminapply:{digest[:16]}")])
     discard_rows = [[InlineKeyboardButton(text="Отменить черновые правки", callback_data=f"admindiscard:{digest[:16]}")]] if can_discard else []
     rows = extra + apply_rows + discard_rows + [
         [InlineKeyboardButton(text="◀️ Назад", callback_data=back)],
@@ -3305,6 +3320,7 @@ async def review_price_sample(callback: CallbackQuery, state: FSMContext) -> Non
     from bot.calculator import calculate
     saved = await state.get_data()
     pricing = await content_store.get_pricing_edit(callback.message.chat.id)
+    buttons = []
     try:
         if content_store.editor_digest(pricing) != saved.get("review_digest"):
             raise ValueError("Прайс изменился. Откройте проверку заново.")
@@ -3315,11 +3331,14 @@ async def review_price_sample(callback: CallbackQuery, state: FSMContext) -> Non
         for label, options, urgent in [("Базовая услуга", [], False), ("Все опции по 1 шт.", selected, False), ("Все опции по 1 шт. + срочность", selected, True)]:
             result = calculate(pricing, service["id"], options, urgent, False)
             rows.append(f"{label}: {result.price_from:,.0f}–{result.price_to:,.0f} ₽; {result.term_from:g}–{result.term_to:g} дней")
-        await state.update_data(sample_digest=content_store.editor_digest(pricing))
+        digest = content_store.editor_digest(pricing)
+        await state.update_data(sample_digest=digest)
+        buttons.append([InlineKeyboardButton(text="✅ Применить прайс", callback_data=f"adminapply:{digest[:16]}")])
         text = "Контрольный расчёт: " + escape(service["name"]) + "\n\n" + "\n\n".join(rows) + "\n\nЭто пример, заявка не создаётся."
     except (ValueError, IndexError, KeyError, OverflowError) as exc:
         text = escape(str(exc)) if isinstance(exc, ValueError) else "Не удалось проверить прайс. Проверьте значения и повторите."
-    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="◀️ К проверке прайса", callback_data="adminreview:pricing")]]))
+    buttons.append([InlineKeyboardButton(text="◀️ К проверке прайса", callback_data="adminreview:pricing")])
+    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
     await callback.answer()
 
 
@@ -3342,7 +3361,9 @@ async def review_finish(callback: CallbackQuery, state: FSMContext) -> None:
             keyboard = kb.admin_cases_menu_keyboard()
         else:
             if publish and saved.get("sample_digest") != expected:
-                raise ValueError("Сначала выполните контрольный расчёт.")
+                pricing = await content_store.get_pricing_edit(callback.message.chat.id)
+                if pricing["services"] or content_store.editor_digest(pricing) != expected:
+                    raise ValueError("Сначала выполните контрольный расчёт.")
             ok = await content_store.finish_pricing_edit(callback.message.chat.id, expected, publish=publish)
             keyboard = kb.pricing_menu_keyboard()
         if not ok: raise ValueError("Черновик больше недоступен. Откройте редактор заново.")
