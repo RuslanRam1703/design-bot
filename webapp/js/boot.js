@@ -16,6 +16,8 @@
   const status = document.getElementById("boot-status");
   const detail = document.getElementById("boot-detail");
   const retry = document.getElementById("boot-retry");
+  const ring = document.getElementById("boot-ring");
+  const motion = window.matchMedia?.("(prefers-reduced-motion: reduce)");
   const lifetime = new AbortController();
   let activeRequest = null;
   let finished = false;
@@ -124,10 +126,29 @@
       document.body.appendChild(frame);
     });
   }
+  function syncRing() {
+    if (!ring) return;
+    if (lifetime.signal.aborted || document.hidden || motion?.matches ||
+        (typeof navigator !== "undefined" && navigator.connection?.saveData)) {
+      ring.pause();
+      ring.classList.remove("is-playing");
+      return;
+    }
+    if (!ring.getAttribute("src")) ring.src = "/img/boot-ring.mp4";
+    // Autoplay restrictions or a media error leave the static ring visible.
+    ring.play().catch(() => {});
+  }
+  ring?.addEventListener("playing", () => {
+    if (!ring.paused && !lifetime.signal.aborted) ring.classList.add("is-playing");
+  });
+  ring?.addEventListener("error", () => ring.classList.remove("is-playing"));
+  motion?.addEventListener?.("change", syncRing, { signal: lifetime.signal });
+
   function cleanup() {
     clearTimeout(slowTimer);
     clearTimeout(deadlineTimer);
     lifetime.abort();
+    syncRing();
     document.removeEventListener("visibilitychange", onVisibility);
     window.removeEventListener("pagehide", onPageHide);
   }
@@ -144,11 +165,11 @@
     finished = true;
     cleanup();
     if (overlay) overlay.remove();
-    document.documentElement.classList.remove("booting", "page-hidden");
+    document.documentElement.classList.remove("booting");
     if (root) { root.removeAttribute("aria-hidden"); root.removeAttribute("aria-busy"); }
   }
   function onVisibility() {
-    document.documentElement.classList.toggle("page-hidden", document.hidden);
+    syncRing();
     if (document.hidden) activeRequest?.abort();
   }
   function onPageHide() { cleanup(); }
