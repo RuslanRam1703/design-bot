@@ -134,7 +134,7 @@
       ring.classList.remove("is-playing");
       return;
     }
-    if (!ring.getAttribute("src")) ring.src = "/img/boot-ring.mp4";
+    if (!ring.getAttribute("src")) ring.src = "/img/boot-vortex.mp4";
     // Autoplay restrictions or a media error leave the static ring visible.
     ring.play().catch(() => {});
   }
